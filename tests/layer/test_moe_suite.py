@@ -31,6 +31,7 @@ from mega_moe.ops._moonep_torch_forward import (
 )
 from mega_moe.ops._torch_forward import moe_forward
 from mega_moe.kernels.common import all_gather_list
+from mega_moe.runtime.device import device_str, resolve_local_device
 import mega_moe.kernels.fc2_combine as fc2_combine_module
 import mega_moe.kernels.fused_forward as fused_forward_module
 from benchmark.layer import _fwd_phase_timing as fwd_timing_table
@@ -262,7 +263,7 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("functional forward requires torch_npu and ACLSHMEM")
 
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     heap_size = kit.get_ash_size_bytes(default_gb=1)
@@ -382,7 +383,7 @@ def run_single_kernel_forward_case(
         raise RuntimeError("single-kernel forward requires NPU and ACLSHMEM")
 
     hidden, ffn, topk = 256, 512, 2
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     all_passed = True
@@ -983,8 +984,10 @@ def run_single_kernel_forward_case(
 
 def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
     """Validate the fused launch at the trimmed Kimi-K3 W8/T4K shape."""
-    if world_size != 8:
-        raise ValueError("the Kimi-K3 single-kernel case requires eight ranks")
+    if world_size not in (4, 8):
+        raise ValueError(
+            "the Kimi-K3 single-kernel case requires four or eight ranks"
+        )
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("Kimi-K3 single-kernel forward requires NPU and ACLSHMEM")
 
@@ -1004,7 +1007,7 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
             f"required={required_heap}, configured={heap_size}"
         )
 
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     with kit.aclshmem_session(rank, world_size, heap_size):
         op = FusedMoEForward(
@@ -1034,7 +1037,14 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
                     if token_count == base_case.tokens
                     else replace(
                         base_case,
-                        case_id="performance-fwd-kimi-k3-trimmed-w8-t64",
+                        case_id=(
+                            # swap the trailing token slug (…-w4-t4k → …-t64);
+                            # a hardcoded -w8- id would fail validate() at w4
+                            base_case.case_id[
+                                : base_case.case_id.rfind("-")
+                            ]
+                            + "-t64"
+                        ),
                         tokens=token_count,
                     ).validate()
                 )
@@ -1086,7 +1096,7 @@ def run_moonep_hot_expert_case(
         raise RuntimeError("MoonEP forward smoke requires NPU and ACLSHMEM")
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     with kit.aclshmem_session(
         rank, world_size, kit.get_ash_size_bytes(default_gb=1)
@@ -1490,7 +1500,7 @@ def run_moonep_planning_oracle_case(rank: int, world_size: int) -> None:
     tpe_all_cpu = row.repeat(world_size, 1).contiguous()
     torch_plan = plan_moonep_b0_b3(tpe_all_cpu)
     row_stride = 1 << num_experts.bit_length()
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
 
     with kit.aclshmem_session(
         rank, world_size, kit.get_ash_size_bytes(default_gb=1)
@@ -1565,7 +1575,7 @@ def run_moonep_moderate_wide_forward_case(rank: int, world_size: int) -> None:
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     torch.manual_seed(1701 + rank)
 
@@ -1757,7 +1767,7 @@ def run_moonep_physical_forward_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
 
@@ -1867,7 +1877,7 @@ def run_moonep_physical_forward_moderate_wide_case(
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     torch.manual_seed(1801 + rank)
@@ -2080,7 +2090,7 @@ def run_moonep_backward_hot_expert_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
 
@@ -2217,7 +2227,7 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     torch.manual_seed(1901 + rank)
@@ -2588,7 +2598,7 @@ def run_moonep_backward_symmetric_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-symmetric-hot-expert-backward"
@@ -2818,7 +2828,7 @@ def run_moonep_backward_symmetric_moderate_wide_case(
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-symmetric-w8-moderate-wide-backward"
@@ -3733,7 +3743,7 @@ def run_megamoe_native_saved_metadata_case(
     # capacity mirrors the functional forward smoke cases.
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"megamoe-native-saved-metadata-w{world_size}"
@@ -4068,7 +4078,7 @@ def run_moonep_native_saved_hot_expert_case(
         )
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"moonep-native-saved-hot-expert-w{world_size}"
@@ -4198,7 +4208,7 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-native-backward-symmetric-hot-expert"
@@ -4435,7 +4445,7 @@ def run_moonep_multilayer_pool_epoch_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     num_layers = 3
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-multilayer-pool-epoch"
@@ -4659,7 +4669,7 @@ def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
         raise RuntimeError("MegaMoEFunction is unavailable")
 
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "megamoe-native-autograd-w2"
@@ -4848,7 +4858,7 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "megamoe-situglu-autograd-w2"
@@ -5048,7 +5058,7 @@ def run_single_kernel_situglu_autograd_case(
     else:
         tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-situglu-autograd-w{world_size}"
@@ -5354,7 +5364,7 @@ def run_single_kernel_moonep_autograd_case(
     else:
         tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-moonep-autograd-w{world_size}"
@@ -5553,8 +5563,90 @@ def run_single_kernel_moonep_autograd_case(
                             hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
                         )
 
+                    # G2 r45: per-step workspace + replica-panel forensics.
+                    # The op reuses these buffers across forward calls, so
+                    # step1's state must be captured BEFORE fwd(step2)
+                    # overwrites it — hence the in-place dump right after
+                    # each forward instead of inside the deferred probe
+                    # below.  Offline chain: zero-served token ->
+                    # route_to_send -> destination row -> activation /
+                    # fc2_output row -> combine row -> out; the panel
+                    # end-state vs the expected scaled weights splits
+                    # read-before-landing (race) from a permanent hole.
+                    # Host-side sync only; no extra collectives (r43
+                    # lesson: every online collective must be symmetric).
+                    def _fwd_ws_dump(step_name):
+                        if os.environ.get(
+                                "MOE_MEGA_FWD_DUMP", "0") != "1":
+                            return
+                        payload = {
+                            "step": step_name, "rank": rank,
+                            "label": label,
+                            "activation":
+                                op._single_weighted_activation.cpu(),
+                            "fc2_output": op._single_fc2_output.cpu(),
+                            "combine_buf": op._combine_fc2_buf.cpu(),
+                            "route_to_send": op._route_to_send.cpu(),
+                            "pull_tile_dst_start":
+                                op._pull_tile_dst_start.cpu(),
+                        }
+                        rb = op._replica_weight_buffers
+                        if rb is not None:
+                            payload["replica_gate_up"] = (
+                                rb.gate_up_mem.cpu())
+                            payload["replica_down"] = rb.down_mem.cpu()
+                            payload["replica_push_epoch"] = (
+                                int(rb.push_epoch))
+                            payload["gate_up_expert_shape"] = (
+                                rb.gate_up_expert_shape)
+                            payload["down_expert_shape"] = (
+                                rb.down_expert_shape)
+                            payload["replica_epn"] = rb.experts_per_rank
+                        for nm in ("replica_gate_ready",
+                                   "replica_down_ready"):
+                            buf = getattr(op.context, nm, None)
+                            if buf is not None:
+                                payload[nm] = buf.cpu()
+                        # Planning tables (node1's zero-cost pre-step,
+                        # G2 r45): if the hot expert's planned rows/blocks
+                        # are short here, the defect is in the planning
+                        # layer (_build_dynamic_wave_offsets /
+                        # _balanced_count_cube_destination) and the
+                        # execution-layer chain below is moot.
+                        payload["wave_expert_offsets"] = (
+                            op._single_wave_expert_offsets.cpu())
+                        buf = getattr(
+                            op.context, "metadata_recv_seg_starts", None)
+                        if buf is not None:
+                            payload["recv_seg_starts"] = buf.cpu()
+                        buf = getattr(
+                            op.context, "metadata_counts_mem", None)
+                        if buf is not None:
+                            payload["counts_mem"] = buf.cpu()
+                        dump_dir = os.path.join(
+                            "/mnt/share/mmdumps",
+                            os.environ.get(
+                                "MOE_MEGA_FWD_DUMP_TAG", "fwd"),
+                        )
+                        os.makedirs(dump_dir, exist_ok=True)
+                        torch.save(
+                            payload,
+                            os.path.join(
+                                dump_dir,
+                                f"r{rank}_{step_name}_ws.pt"),
+                        )
+                        print(
+                            f"[fwd-dump r{rank}] {step_name} ws saved "
+                            f"act={tuple(payload['activation'].shape)} "
+                            f"combine="
+                            f"{tuple(payload['combine_buf'].shape)} "
+                            f"epoch={payload.get('replica_push_epoch')}",
+                            flush=True,
+                        )
+
                     dist.barrier()
                     out1, leaves1 = forward_step(steps[0])
+                    _fwd_ws_dump("step1")
                     if op._replica_experts_cache is None:
                         raise AssertionError(
                             f"{label}: the adapter did not stage "
@@ -5563,6 +5655,153 @@ def run_single_kernel_moonep_autograd_case(
                     # fwd(step2) rewrites the shared planning workspaces,
                     # the replica tables AND the operator's ETC cache.
                     out2, leaves2 = forward_step(steps[1])
+                    _fwd_ws_dump("step2")
+
+                    # G2 r42b/r43: forward-output row-level probe.  The
+                    # grads compare never looks at out1/out2, so "forward
+                    # green" was an assumption; this decides serve-vs-
+                    # backward by direct row compare against the same SiTU
+                    # eager recipe make_golden trusts.  Hot row = one of
+                    # the token's routes hits the step's hammered expert —
+                    # exactly the rows the OTHER rank's replica slots
+                    # serve.  v2 adds the bad-row portrait: row ids and
+                    # contiguity (block=boundary bug vs scattered=chunk
+                    # index bug), per-row bad-column fraction, and the
+                    # stale/zero fingerprint — each bad row is classified
+                    # by which reference it sits closest to: step1's
+                    # unscaled weights (stale panel), the hot contribution
+                    # zeroed out (missing/zero panel), or neither
+                    # (mapping).  Step1 has no earlier panel version, so
+                    # it only gets the zero-vs-other split.
+                    if os.environ.get("MOE_MEGA_FWD_DUMP", "0") == "1":
+                        # Exactly ONE distributed eager per step per side
+                        # (2<->2, issue-order symmetric — the r43 lesson:
+                        # n_bad-gated extra refs made it 4 vs 5, the HCCL
+                        # collectives cross-paired, and the unpaired fifth
+                        # hung the peer 12 min to SIGKILL).  All stale/zero
+                        # fingerprint work runs OFFLINE from the raw dump.
+                        for name, out, step, g_scale, d_scale in (
+                            ("step1", out1, steps[0], 1.0, 1.0),
+                            ("step2", out2, steps[1], 0.75, 0.5),
+                        ):
+                            hot = 0 if name == "step1" else (
+                                num_experts // world_size
+                            )
+                            with torch.no_grad():
+                                # return_saved=False yields the bare output
+                                # tensor (no saved-state tuple to unpack).
+                                ref = moe_forward(
+                                    step["hs"], step["rw"], step["ei"],
+                                    step["gate_w"], step["up_w"],
+                                    step["down_w"], ep_group, topk,
+                                    return_saved=False,
+                                    activation="situglu",
+                                    situ_beta=situ_beta,
+                                    situ_linear_beta=situ_linear_beta,
+                                )
+                                diff = (out.float() - ref.float()).abs()
+                                rowbad = (diff > 5e-2).any(dim=-1)
+                                has_hot = (step["ei"] == hot).any(dim=-1)
+                                print(
+                                    f"[fwd-dump r{rank}] {name} "
+                                    f"rows_bad={int(rowbad.sum())}/{tokens}"
+                                    f" hot_bad="
+                                    f"{int((rowbad & has_hot).sum())}"
+                                    f"/{int(has_hot.sum())} "
+                                    f"nonhot_bad="
+                                    f"{int((rowbad & ~has_hot).sum())} "
+                                    f"max_abs={float(diff.max()):.6f}",
+                                    flush=True,
+                                )
+                                # Raw dump BEFORE anything that can hang and
+                                # BEFORE the bad-row early-out: unconditional
+                                # (green steps too — they validate the save
+                                # path and land a baseline).  The backward
+                                # below can still kill this worker (r43:
+                                # collective-ordering mismatch, then the
+                                # bwd waiting on a dead peer).  One weight
+                                # set (step2's is step1's scaled by
+                                # g/d_scale) plus the scales rebuilds every
+                                # reference offline — stale/zero refs, full
+                                # argmin classification, portraits, all of
+                                # it; NFS so both nodes' files land in one
+                                # place.
+                                dump_dir = os.path.join(
+                                    "/mnt/share/mmdumps",
+                                    os.environ.get(
+                                        "MOE_MEGA_FWD_DUMP_TAG", "fwd"),
+                                )
+                                os.makedirs(dump_dir, exist_ok=True)
+                                torch.save(
+                                    {
+                                        "label": label, "rank": rank,
+                                        "step": name, "tokens": tokens,
+                                        "num_experts": num_experts,
+                                        "topk": topk, "hot": hot,
+                                        "situ_beta": situ_beta,
+                                        "situ_linear_beta":
+                                            situ_linear_beta,
+                                        "g_scale": g_scale,
+                                        "d_scale": d_scale,
+                                        "out": out.cpu(),
+                                        "ref": ref.cpu(),
+                                        "hs": step["hs"].cpu(),
+                                        "rw": step["rw"].cpu(),
+                                        "ei": step["ei"].cpu(),
+                                        "gate_w":
+                                            steps[0]["gate_w"].cpu(),
+                                        "up_w": steps[0]["up_w"].cpu(),
+                                        "down_w":
+                                            steps[0]["down_w"].cpu(),
+                                    },
+                                    os.path.join(
+                                        dump_dir,
+                                        f"r{rank}_{name}.pt"),
+                                )
+                                print(
+                                    f"[fwd-dump r{rank}] {name} saved "
+                                    f"{dump_dir}/r{rank}_{name}.pt",
+                                    flush=True,
+                                )
+                                bad_ids = rowbad.nonzero(
+                                    as_tuple=True)[0]
+                                n_bad = int(bad_ids.numel())
+                                if n_bad == 0:
+                                    continue
+                                # Contiguity: run-length summary over the
+                                # sorted bad ids plus head/tail samples.
+                                # max_run is the longest CONSECUTIVE run
+                                # (a span measure would read scattered
+                                # ids as one long block).
+                                gaps = bad_ids[1:] - bad_ids[:-1]
+                                breaks = (gaps != 1).nonzero(
+                                    as_tuple=True)[0]
+                                run_starts = torch.cat(
+                                    (bad_ids[:1],
+                                     bad_ids[breaks + 1]))
+                                run_ends = torch.cat(
+                                    (bad_ids[breaks],
+                                     bad_ids[-1:]))
+                                run_lens = run_ends - run_starts + 1
+                                n_runs = int(run_lens.numel())
+                                max_run = int(run_lens.max().item())
+                                colfrac = (
+                                    (diff[bad_ids] > 5e-2)
+                                    .float().mean(dim=-1)
+                                )
+                                show = bad_ids[:32].tolist()
+                                if n_bad > 40:
+                                    show += bad_ids[-8:].tolist()
+                                print(
+                                    f"[fwd-dump r{rank}] {name} portrait: "
+                                    f"n_runs={n_runs} max_run={max_run} "
+                                    f"colfrac(min/med/max)="
+                                    f"{float(colfrac.min()):.3f}/"
+                                    f"{float(colfrac.median()):.3f}/"
+                                    f"{float(colfrac.max()):.3f} "
+                                    f"rows[:32,+8]={show}",
+                                    flush=True,
+                                )
 
                     # Reverse-order backwards (framework autograd order).
                     out2.backward(steps[1]["dy"])
@@ -5683,7 +5922,7 @@ def run_single_kernel_shared_op_interleave_case(
     # per the adapter's scatter guard)
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-shared-op-interleave-w{world_size}"
@@ -5879,6 +6118,18 @@ def test_single_kernel_forward_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
+def test_single_kernel_forward_w4(dist_test):
+    """Dual-node G2 shape: two ranks per node, EPR doubles (experts stay 8).
+
+    The w4 variant covers the 2x2 gate (PE count >= device count semantics)
+    on machines where only two cards per node are free; the w8 forms remain
+    the G3 gate.
+    """
+    dist_test(run_single_kernel_forward_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 def test_single_kernel_forward_fp16_saved_w2(dist_test):
     dist_test(
         run_single_kernel_forward_case, world_size=2, args=(256, 64, 8, "fp16")
@@ -5910,10 +6161,35 @@ def test_single_kernel_routing_large_experts_w8(dist_test, num_experts):
 
 @pytest.mark.dist
 @pytest.mark.functional
+@pytest.mark.parametrize(
+    "tokens,block_m", [(3, 256), (4097, 256), (4097, 128)],
+    ids=("tiny-tail", "m256-multi-wave", "m128-multi-wave"),
+)
+def test_single_kernel_dynamic_waves_w4(dist_test, tokens, block_m):
+    """Multi-wave semantics are token-driven; world=4 keeps experts=32
+    (EPR=8) so the wave-splitting logic is exercised identically."""
+    dist_test(
+        run_single_kernel_forward_case, world_size=4,
+        args=(block_m, tokens, 32),
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 @pytest.mark.slow
 @pytest.mark.kimi
 def test_single_kernel_kimi_k3_t4k_w8(dist_test):
     dist_test(run_single_kernel_kimi_k3_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.slow
+@pytest.mark.kimi
+def test_single_kernel_kimi_k3_t4k_w4(dist_test):
+    """Dual-node G2 shape (2x2): same trimmed Kimi topology with E=32 kept,
+    so each rank hosts eight local experts instead of four."""
+    dist_test(run_single_kernel_kimi_k3_case, world_size=4)
 
 
 @pytest.mark.dist
@@ -5947,6 +6223,23 @@ def test_single_kernel_situglu_autograd_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
+def test_single_kernel_situglu_autograd_w4(dist_test):
+    """Dual-node G2 shape (2x2): world!=8 branch gives the small smoke shape
+    with experts=32, so EPR doubles instead of the shape changing."""
+    dist_test(run_single_kernel_situglu_autograd_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.kimi
+def test_single_kernel_situglu_autograd_fc1offload_w4(dist_test):
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=4, args=(True,)
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 def test_single_kernel_moonep_autograd_w2(dist_test, monkeypatch):
     # Exercise the default selection even when a launch script exports the
     # UDMA workaround. Generic getmem in this combo session loses FC1 chunks.
@@ -5975,6 +6268,25 @@ def test_single_kernel_moonep_autograd_fp8_w2(dist_test):
     """
     dist_test(
         run_single_kernel_moonep_autograd_case, world_size=2, args=("fp8",)
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_w4(dist_test):
+    """Dual-node G2 shape (2x2): the world!=8 branch gives the small smoke
+    shape with experts=32, so EPR doubles instead of the shape changing —
+    the MoonEP mirror of the situglu_w4 twin."""
+    dist_test(run_single_kernel_moonep_autograd_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_fp8_w4(dist_test):
+    """fp8 saved-FC1 + FC1 host offload under the moonep path at the
+    dual-node G2 shape (2x2) — the w4 twin of the fp8_w2 case above."""
+    dist_test(
+        run_single_kernel_moonep_autograd_case, world_size=4, args=("fp8",)
     )
 
 

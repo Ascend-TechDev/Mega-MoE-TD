@@ -4,7 +4,7 @@
 > 目标硬件:2 节点 × 8 卡 Ascend950DT(98GB HDM)
 > 软件环境:cann-shmem 1.6.0(`import shmem as ash`)、triton 3.5.0 + triton_dist overlay、torch 2.10.0 + torch_npu
 > 参考上游:[Ascend/Triton-distributed-ascend#184 — cross-node support for put/get mem, allgather-gemm and reverse-all2all](https://gitcode.com/Ascend/Triton-distributed-ascend/pull/184)
-> 状态:方案文档,尚未实施
+> 状态:**阶段 1-3 已实施**(两仓 `dual-node` 分支,自 `release_v1.0`/`5d68e95` 拉出;2026-09-22)。实施中的两个方案变更见 §3.2a。G0 单机回归绿(w2 51.76s);G2+ 双机验证因对端暂不可用而挂起。
 
 ---
 
@@ -143,6 +143,13 @@ def device_str(dev: int) -> str:
 - `tests/_moe_testkit.py` 的 `make_peer_mem`/`make_moonep_backward_peer_mem` 内部 `dev = resolve_local_device(rank)`(签名不变)
 - `tests/fstage/test_mega_bwd_probes.py`(~8 处)、`tests/layer/test_moe_suite.py`(~20 处)、`benchmark/layer/profile_single_kernel_forward.py:301,309` 机械替换;kernel launch 的 `LOCAL_RANK=rank`(PE)不动
 
+### 3.2a 实施记录(2026-09-22,dual-node 分支):两个方案变更
+
+1. **引导:uniqueid → ip_port(必改)**。实施时核实 python API:`aclshmem_init_using_unique_id(mype, npes, mem_size, uid)` **没有 attr 参数**,内部固定默认引擎 MTE——无法带 `MTE|UDMA` 掩码,即无法跨节点(`aclshmemx_set_attr_uniqueid_args`/`aclshmemx_init_attr` 存在于 C 库但未导出到 python)。因此双机主路径 = **ip_port 引导 + 两节点显式一致的 `ASH_MASTER_ADDR=<node0-IP>` + 固定 `ASH_MASTER_PORT`**,与上游 PR#184 的跨机做法一致。防御:`MEGAMOE_MULTI_NODE=1` 且 `ASH_MASTER_ADDR` 为回环时,testkit 与框架 dispatcher 均**快速报错**(否则表现为首个跨节点 kernel 内挂死)。
+2. **设备拆分落点比 §2.3 清单更广**。除表列 30 处外,实测还有:`tests/_moe_baselines.py`、`tests/layer/test_{single_kernel_moonep,fwd_phase_timing,debug_moonep_saved}.py`、`tests/fstage/test_f0b_probes.py`(4 处)、`benchmark/layer/bench_moe_suite.py`(5 处)——已全部经 `mega_moe.runtime.device` 收口。`kernels/fc2_combine.py` 的 `local_rank` 形参是 PE 语义(`< world_size` 校验),**不改**。
+
+其余按本方案落地:`src/mega_moe/runtime/device.py`(唯一解析源,`MEGAMOE_LOCAL_DEVICE > MULTI_NODE=1→current_device > PE`)、conftest `MMT_NNODES/MMT_NODE_RANK` 偏移(`MASTER_ADDR/PORT` 双机必须显式一致,parent 侧校验)、goldens `RANK/LOCAL_RANK` 拆分、`kernels/common.py` LOCAL_RANK 命名契约注释、框架 `_local_device`/ensure 守卫/heap 预警/会话日志、`finetune_kimik3.sh` 拓扑参数化 + `kimik3_config_2n.yaml`(EP=16)。
+
 ### 3.2 阶段 2:初始化/引导 + 引擎
 
 **引导选型:uniqueid 经 HCCL 广播(推荐),ip_port env 为显式覆盖**
@@ -184,6 +191,17 @@ def device_str(dev: int) -> str:
 - `conftest.py::_worker_wrapper(local_i, global_world, ..., nproc_per_node, node_rank)`:`rank = node_rank*nproc_per_node + local_i`(全局 PE);`torch.npu.set_device(local_i)`;`init_process_group(rank=rank, world_size=global_world)`
 - `run_dist_test`:读 `MMT_NNODES`(默认 1)/`MMT_NODE_RANK`(默认 0)→ `nprocs = world_size // nnodes`;默认路径与现状逐位一致
 - 双机运行 = 两节点各起一次 pytest,共享:`MASTER_ADDR=<node0-IP>`、相同 `MASTER_PORT`、`MMT_NNODES=2`、`MMT_NODE_RANK=0/1`、`MEGAMOE_MULTI_NODE=1`
+- G2(2×2,W4)可直接复制的命令(两节点均在 mmt 仓根;`<node0-ip>` 替换;`w2` 门形状即 world=4 用例按需换名):
+  ```bash
+  source <venv>/activate-moe.sh
+  export MMT_NNODES=2 MMT_NODE_RANK=<0|1> MEGAMOE_MULTI_NODE=1 \
+         MASTER_ADDR=<node0-ip> MASTER_PORT=29511 ASH_MASTER_ADDR=<node0-ip> \
+         ASH_MASTER_PORT=41888 DIST_TEST_TIMEOUT_S=3600 MOE_FUSED_ASH_SIZE_GB=2 \
+         TRITON_CACHE_DIR=/tmp/triton-moe-g2-$MMT_NODE_RANK \
+         MOE_MEGA_GRAD_TRANSPORT=udma MOE_MEGA_REPREFETCH_TRANSPORT=udma MOE_MEGA_HEAP_PROBE=1
+  python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autograd_w2" -x -q -s
+  ```
+  (引擎在 MULTI_NODE=1 下自动 `MTE|UDMA`,无需 MOE_ASH_ENGINE;先 `ping <node0-ip>` 两网段各一次确认路由。)
 - goldens 修复(`_goldens/bigop_ref.py`、`backward.py` 的 `_main`):`rank=int(os.environ["RANK"])`、`set_device(LOCAL_RANK)`、`init_process_group(rank=rank)`、`device=f"npu:{local}"`
 
 ### 4.2 递进门禁 G0→G5
@@ -217,7 +235,7 @@ def device_str(dev: int) -> str:
 | 引导失败(aclshmem_init 挂/报错) | 挂在 ensure 内、无 kernel 日志;`ASCEND_SLOG_PRINT_TO_STDOUT=1` 看 aclshmem 日志;先验 HCCL broadcast 是否完成 | 显式 export `ASH_MASTER_ADDR/PORT` 走 ipport 覆盖;仍失败则 `NNODES=1` |
 | **signal 错位死锁**(对称 slab 尺寸发散) | 一 rank 在 kernel 内 spin、其余 rank 卡 barrier;**先看 heap probe 偏移是否全 rank 一致**;再查两节点 yaml/env 是否同步 | 修配置;`MOE_BENCH_BWD_WARMUP/ITERS=1` + 分段计时二分 |
 | epoch 语义破坏(重置/重叠) | 表现为**静默错值**而非挂死;跑 fstage probes 的 epoch 单调用例 | 本方案不触碰 epoch 计数任何代码 |
-| 跨节点 UDMA 数据损坏 | golden 数值错/NaN 而非挂死;单机 `MTE\|UDMA` vs 双机对比二分;dmesg 查设备 SMMU 错误 | 纯 UDMA 实验回 `MTE\|UDMA`;双机无 MTE-only 回退(MTE 不过节点),只能回单机 |
+| 跨节点 UDMA 数据损坏 | ~~golden 数值错/NaN~~ **实际形态=r27d-r34 判明的方向性静默丢(见 §7)**;发送侧任何日志级别零痕迹,只能行为探针判 | 纯 UDMA 实验回 `MTE\|UDMA`;双机无 MTE-only 回退(MTE 不过节点),只能回单机 |
 | W16 heap 不足 | `aclshmem_create_tensor` OOM/分配失败(显式,易定位) | `MOE_FUSED_ASH_SIZE_GB` 16→24;或临时压 `megamoe_max_tokens_per_rank`(勿压 cf) |
 | HCCL 16 rank 建网超时 | 卡在建网、日志 EI0020/超时 | `HCCL_CONNECT_TIMEOUT`;每节点独立 `SOCKET_PORT_RANGE` 段 |
 | 分段路径 W16 编译膨胀 | 首次 launch 前长编译 | `static_range→range` 局部降级(应急) |
@@ -238,3 +256,24 @@ def device_str(dev: int) -> str:
 - 新建:`examples/kimi_k3/kimik3_config_2n.yaml`
 
 **实施顺序**:阶段 1(设备号)→ G0/G1 → 阶段 2(引导/引擎)→ G2/G3 → 阶段 3(框架)→ G4/G5 → 收尾(文档、静态审计、可选纯 UDMA 实验)。每阶段独立可验证、可合并。
+
+---
+
+## 7. G2 传输层判决心得(r27d-r34,2026-09-23/24)
+
+G2 双机数据面在传输层被完整判死,矩阵见 **docs/g2-vendor-escalation.md**(vendor 主文,含环境指纹/证据链/四条诉求):
+
+| 操作 | n1→n0 | n0→n1 |
+|---|---|---|
+| put_signal bulk 腿 / udma | ✅ | ❌ 静默丢(任何日志级别零痕迹) |
+| put_signal bulk 腿 / mte | ❌ 静默丢 | ✅ |
+| put_signal bulk 腿 / combo | ✅ | ❌(=udma 形,无 op 级选引擎) |
+| signal 腿(任意引擎) | ✅ | ✅(连续 256×SIGNAL_SET 载 2KB 载荷亦全落,~6µs/op) |
+| getmem(任意发起方) | SIGABRT(node1 发起=device aicore 271) | SIGABRT(node0 发起) |
+| 混引擎堆(n0=mte/n1=udma) | init 120s 死:`SHM_(0)_S_0_1_GW` 键 AllGather 双侧互空 | 同 |
+
+- **跟机器不跟角色**:r28 四变量全翻(rank/role/master/channel-client)断向不变。
+- **rootinfo 轨道关闭**:官方生成器(unofficial-ascend-tools 0.0.7rc2)rank_list 只从本地 /dev/davinci* 枚举——每机自述即官方形态,r14-r26 手拼文件全是自造问题。
+- **复现器**:`scripts/g2_vendor_case/`(无仓 torchrun 依赖,push/pull/tunnel 三用例,r34 双机验证全成立)。
+- **残余缓解**:counts 级小载荷(1-4KB)可走 signal 腿隧道(~6µs/op)——host 编排低频交换可用;进每 iter 热循环属架构决策,未评估。
+- **python API 坑**:`InitAttr.ip_port` 收 `tcp://addr:port` 字符串(元组 TypeError);`put_signal`/`SignalOp` 须从 `shmem.core.rma/direct` 显式 import;`LD_LIBRARY_PATH` 须含 `<SP>/shmem/backends/950`。

@@ -79,22 +79,12 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     every call and would go stale between layers).
     """
     use_moonep = bool(op.enable_moonep)
-    if not use_moonep and int(op.world_size) * int(op.experts_per_rank) > 32:
-        # MoonEP uses _single_moonep_scatter, not this legacy scatter.
-        # Its large-expert contract is checked by all tripwires below.
-        # workspace.py pads the bins to next_power_of_2(E); above 32 the
-        # scatter's multi-bin-block loop (bin_block=32) corrupts the send
-        # tables — observed at E=128 as duplicate slots + uninitialized
-        # entries in send_route_indices and an aivec trap in isolation
-        # (upstream latent defect: no upstream case exercises E>32; kimi
-        # integration shapes are E=32).  Fail fast instead of reordering
-        # garbage.
-        raise NotImplementedError(
-            f"single-kernel saved contract validated only for E<=32 (got "
-            f"E={int(op.world_size) * int(op.experts_per_rank)}): the "
-            "kernel scatter's multi-bin-block path corrupts the send "
-            "tables above 32 bins"
-        )
+    # E>32 legacy limit lifted (release_v3): the route scatter now takes
+    # the ordinal path for any expert count past one bin block (see
+    # _scatter_stable_routes in kernels/fused_forward.py), which removes
+    # the multi-bin-block corruption this guard used to fail fast on.
+    # MoonEP was never affected (it uses _single_moonep_scatter); the
+    # tripwires below still police the resulting tables on every path.
     missing = [k for k in _REQUIRED_CONTRACT_KEYS if k not in saved]
     if missing:
         raise ValueError(
@@ -386,6 +376,9 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         topk=int(op.top_k),
         world_size=W,
         ep_rank=int(op.rank),
+        # ep_rank is the ACLSHMEM global PE (kernel LOCAL_RANK); local_device
+        # is the NPU ordinal for backward-side allocations (multi-node split).
+        local_device=int(getattr(op, "local_device", op.rank)),
         ep_group=op.ep_group,
         # HOME experts per rank under MoonEP (mirrors saved_phys in
         # _moonep_torch_forward); the physical stride rides separately.

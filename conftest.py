@@ -16,20 +16,38 @@ import torch.multiprocessing as mp
 # be able to wedge the join (drained continuously below).
 _DIST_TEST_TIMEOUT_S = int(os.environ.get("DIST_TEST_TIMEOUT_S", 900))
 
+# Multi-node spawn layout (dual-node adaptation, 2026-09-22): each node runs
+# its own pytest session; MMT_NNODES/MMT_NODE_RANK split the global world
+# into per-node spawn groups.  Defaults keep the historical single-node path
+# bit-identical (rank == spawn index == device).
+_MMT_NNODES = max(1, int(os.environ.get("MMT_NNODES", "1")))
+_MMT_NODE_RANK = int(os.environ.get("MMT_NODE_RANK", "0"))
 
-def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29500")
+
+def _worker_wrapper(
+    local_i, global_world, backend, fn, args, error_queue,
+    nproc_per_node, node_rank,
+):
+    # Global ACLSHMEM PE = node offset + local spawn index; the NPU device is
+    # ALWAYS the local index (node 1's PEs 8..15 are its devices 0..7 — see
+    # mega_moe.runtime.device).
+    rank = node_rank * nproc_per_node + local_i
+    if _MMT_NNODES == 1:
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+    # Multi-node: MASTER_ADDR/MASTER_PORT were validated in the parent pytest
+    # process (both nodes must rendezvous at the SAME node0 store) and are
+    # inherited verbatim — never defaulted per-process here.
     try:
-        torch.npu.set_device(rank)
+        torch.npu.set_device(local_i)
         dist.init_process_group(
             backend=backend,
             rank=rank,
-            world_size=world_size,
+            world_size=global_world,
         )
         # Align HCCL workers before each test initializes ACLSHMEM.
         dist.barrier()
-        fn(rank, world_size, *args)
+        fn(rank, global_world, *args)
     except Exception as error:
         # Print at raise time: the parent only drains the queue after every
         # worker exits, and a peer of a failed rank usually hangs inside a
@@ -65,15 +83,33 @@ def run_dist_test(fn, world_size=2, backend="hccl", args=()):
     # failed bind surfaces as EADDRINUSE on rank 0 plus an HCCL
     # RootInfoDetect hang or failure on the remaining ranks.  Pick a
     # per-session port outside the HCCL range above (also inherited).
-    os.environ.setdefault(
-        "MASTER_PORT", str(40000 + (os.getpid() % 20000))
-    )
+    # Multi-node is the exception: both nodes' pytest sessions must agree on
+    # ONE port, so the runbook exports it and defaulting is refused.
+    if _MMT_NNODES > 1:
+        if os.environ.get("MASTER_ADDR", "localhost") in ("localhost", "127.0.0.1"):
+            raise RuntimeError(
+                "MMT_NNODES>1 requires MASTER_ADDR=<node0-IP> on both nodes"
+            )
+        if "MASTER_PORT" not in os.environ:
+            raise RuntimeError(
+                "MMT_NNODES>1 requires an explicit, identical MASTER_PORT on "
+                "both nodes"
+            )
+    else:
+        os.environ.setdefault(
+            "MASTER_PORT", str(40000 + (os.getpid() % 20000))
+        )
     context = mp.get_context("spawn")
+    if world_size % _MMT_NNODES:
+        raise ValueError(
+            f"world_size={world_size} is not divisible by MMT_NNODES={_MMT_NNODES}"
+        )
+    nprocs = world_size // _MMT_NNODES
     error_queue = context.Queue()
     spawn_context = mp.spawn(
         _worker_wrapper,
-        args=(world_size, backend, fn, args, error_queue),
-        nprocs=world_size,
+        args=(world_size, backend, fn, args, error_queue, nprocs, _MMT_NODE_RANK),
+        nprocs=nprocs,
         join=False,
     )
 

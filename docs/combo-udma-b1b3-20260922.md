@@ -87,7 +87,19 @@ for task in ...:                                # 原消费循环
 ### 3.6 快速死锁定位（用户要求缩短定位时间，已落地）
 
 - CANN 无 aicore watchdog 的环境变量可调（libruntime.so 只暴露 rtSetOpExecuteTimeOut API）→ 改为**kernel 内有界自旋 bail**：`_wait_bounded_report`（dispatch_fc2_bwd.py）把 grad 传输 4 类 wait（site 10=GU arrival、11=DN arrival、12=GU credit、13=DN credit）换成 ~1M 次自旋后记录 `[site,slot,want,observed,expert,spins]` 到 `dbg_ptr+pid*8` 并**带错继续**。死锁从 ~10min watchdog 变成 **~102s** 在梯度比对处快速失败，且记录齐全（w8 实测：128 条 site-10 + 12 条 site-12，两步 backward 的记录分别可辨）。
-- `MOE_MEGA_WAIT_DEBUG=1` 牺牲数值正确性（满足路径也无 acquire fence），只用于诊断；`MOE_MEGA_GRAD_PROBE=1`（host-only，不触发 kernel 重编译）dump 双方表 + epoch + scratch 指针 + launch 后四族 word 非零内容。
+- `MOE_MEGA_WAIT_DEBUG=1` 牺牲数值正确性（满足路径也无 acquire fence），只用于诊断；`MOE_MEGA_GRAD_PROBE=1`（host-only，不触发 kernel 重编译）dump 双方表 + epoch + scratch 指针 + launch 后四族 word 非零内容，并附 **expected-vs-observed 审计**（每 rank 前 3 个 launch，host 端从 ETC 推导应到的 arrival word 集合求差，missing 按 task%32 分桶区分死程序/传输丢弃）。
+
+### 3.7 整网死锁真根因：signal_op credit 在框架负载下静默丢弃（2026-09-22 晚定位，已修，整网绿）
+
+整网（framework kimi_k3 8 卡，mock 数据）首个 grad mega launch 即挂：aicore watchdog ~9.5min（run 5）。WAIT_DEBUG 快速诊断显示 site 10/12 大量 `observed=0`；heap5 审计对账锁定真相：
+
+- **credit 丢失率 33-41%**：r0 收到 99/168、r3 104/168、r4 146/168——且 `nz + missing == expected` **精确对账**（零错写、零多余），missing 散布在**全部 32 个 program**（各 1-5 个 task；死程序会呈现干净的 residue class 缺失）→ 纯传输级丢弃，非逻辑错误；
+- **对照实验**：同一 kernel 同一窗口，`udma_put_signal_nbi` 的 arrival word **100% 落地**（r5 336/336、r2 504/504）；
+- **为何算子测试没抓到**：算子 w8 门跑在安静设备上；框架里 16 层 KDA/HCCL/FSDP 并发把 signal 路径打满——环境级并发差异。bail-and-continue（WAIT_DEBUG）下整网竟能跑完 10 迭代但 77-86s/iter（每 wait 烧 1M 自旋）。
+
+**修复（credit-free 协议）**：删除整个 credit 握手——每个 `(task, ordinal)` 拥有**私有 staging 行 + 私有 arrival word**（索引 `task*ORD_STRIDE + ordinal`，`ORD_STRIDE=W-1`，kernel 签名不变、调用点从现成 `WORLD_SIZE` constexpr 推导），pusher **完全无等待**（结构性无死锁：没有任何 consumer→pusher 信号），全部通信走已被证明可靠的 `put_signal_nbi`。消费端 ordinal 顺序与 fp32 加法序不变（与 getmem 形式 bit-identical）。代价：staging ×(W-1)（框架形状 GU 1.23GB + DN 0.62GB，8GB 堆内 ~3.3GB 峰值，放得下）；`cred_*` word 保分配不写（签名冻结）。
+
+**验证**：w2 门 53.30s / w8 门 56.52s / fp8+offload 46.37s 三绿（credit-free 首掷即中）；**整网 10/10 迭代全绿**（run 9，无 WAIT_DEBUG 真数值）：loss 8.68e-2→5.42e-2 下降，grad norm 健康，47/47 audit `missing=0`，零 aicore 错误，**8.59s/iter**（warmup=3）。
 
 ## 4. B1/B3/A 三个交付点
 
@@ -137,20 +149,19 @@ python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autog
 | probe w2（single + combo + udma 双 transport） | ✅ PASS |
 | autograd w2（GRAD=udma） | ✅ PASS 23.3s |
 | autograd w2（GRAD+REPREFETCH 均 udma） | ✅ PASS 14.19s |
-| autograd w8（双 udma） | ✅ **PASS 47.16s**（此前 564.77s 挂死；根因 ordinal ABI §3.5，w2 门 53.33s） |
+| autograd w8（双 udma） | ✅ PASS 56.52s（credit-free；credit 版 47.16s，根因链 §3.5/§3.7） |
+| fp8+FC1_OFFLOAD moonep w2 | ✅ PASS 46.37s（credit-free） |
 | A 框架 dispatcher/脚本 | ✅ 代码完成，已提交推送 |
-| #6 FC1_OFFLOAD/DOWN_DIRECT/量化 MoonEP 补齐 | fp8+offload moonep 用例已写（`test_single_kernel_moonep_autograd_fp8_w2`），验证跑中；DOWN_DIRECT 按 §8 结论保留 guard |
-| #5 整网 | 未开始（w8 已绿，就差 #6 用例验证 + 整网脚本起跑） |
+| #6 FC1_OFFLOAD/DOWN_DIRECT/量化 MoonEP 补齐 | ✅ fp8+offload 用例绿；DOWN_DIRECT 按 §8 结论保留 guard |
+| #5 整网（kimi_k3 减层 8 卡 mock 数据） | ✅ **10/10 迭代全绿**：loss 8.68e-2→5.42e-2、47/47 audit missing=0、零 aicore 错误、8.59s/iter（§3.7 credit-free 修复后） |
 
 ## 8. 后续计划（按序）
 
-1. ~~验证预 credit 修复~~ **已完成**（commit `bb6fe9b`）：真根因是 ordinal ABI（§3.5），预 credit 保留为多持有者 home 的正确协议；w2 门 53.33s + w8 47.16s 双绿。
-2. **#6 MoonEP 补齐验证**：
-   - fp8+FC1_OFFLOAD（生产配对，合并验证）：`test_single_kernel_moonep_autograd_fp8_w2` —— golden 侧 gate/up 同点 e4m3 量化（`_quantize_fc1_half`，group = block_n//2）+ `_compare_grads_relaxed(rtol=1e-1, atol=5e-2)` + offload 计数断言（d2h≥2/h2d≥2/bytes>0）；fp8 配置下 M 块减半（128）镜像 !29 量化几何；
-   - DOWN_DIRECT：**不要**删 `forward.py` 里 `_down_direct` 的 `not self.enable_moonep` 条件——MoonEP 下 flat RMA push（`fused_moonep.py::_single_moonep_push` 的面板寻址）要求 home down 表连续，strided home 表会打乱推送；后向 `dispatch_fc2_bwd.py` 的 `fc2=saved["fc2"].contiguous()` 双胞胎在 saved fc2 已是 staged 连续 `_fc2_ws` 时本来就是 no-op → 验证该别名关系即可。
-3. **#10/#5 整网**：framework `examples/kimi_k3/finetune_kimik3.sh` 8 卡跑；观察 `[mega-heap]` 审计行、首次迭代数值与 hang。
-4. **cutover 决策（推迟到整网绿后，需用户确认）**：算子侧默认值仍是 `getmem/store`（`MOE_MEGA_GRAD_TRANSPORT`/`MOE_MEGA_REPREFETCH_TRANSPORT`），框架脚本显式 export udma；整网绿后再议是否把默认翻成 udma。
-5. 遗留：REPREFETCH=1 的 W4 回归（旧项，未在本轮复现）；memory 文件更新（本次已做）。
+1. ~~验证预 credit 修复~~ **已完成**（commit `bb6fe9b`）：真根因是 ordinal ABI（§3.5）；credit 协议本身随后又在整网暴露 signal_op 丢弃（§3.7），最终被 credit-free 布局取代。
+2. ~~#6 MoonEP 补齐验证~~ **已完成**：fp8+FC1_OFFLOAD 用例绿（46.37s，credit-free 复验）；DOWN_DIRECT 按 §8 结论保留 guard。
+3. ~~#10/#5 整网~~ **已完成**（§3.7）：10/10 迭代绿、8.59s/iter。环境侧补装：MindSpeed 0.12.1 本地 editable、`triton-ascend-kernels` MR288 + 本仓 chunk.py 覆盖（pyproject 版本约束清空 + `--no-deps` 安装）、16 个数据链路依赖（constraints 文件保护 torch/numpy/transformers 版本）、launcher `torchrun`→`python -m torch.distributed.run`（venv 无 torchrun 入口）。
+4. **cutover 决策（整网已绿，待用户确认）**：算子侧默认值仍是 `getmem/store`（`MOE_MEGA_GRAD_TRANSPORT`/`MOE_MEGA_REPREFETCH_TRANSPORT`），框架脚本显式 export udma；combo+credit-free 已整网验证，可议把默认翻成 udma。
+5. 性能观察：整网 8.59s/iter 中迭代间波动大（1.3s~9.7s，mock 数据/dataloader 侧），后续可在真数据上测稳态；W4 REPREFETCH 回归旧项未复现。
 
 ## 9. 本次提交内容
 

@@ -191,6 +191,31 @@ def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
 
 
 @triton.jit
+def _fwd_wait_bounded(sig_ptr, want, site, slot_id, expert_id, pid, dbg_ptr):
+    """Bounded replica-ready spin (MOE_MEGA_WAIT_DEBUG=1): returns 1 once the
+    slot reached `want` — the caller then still issues the real dl.wait, so
+    the healthy path keeps the acquire fence and a proper token (bit-for-bit
+    production semantics, one extra poll loop).  On ~1M iterations it writes
+    [site, slot, want, observed, expert, spins] into dbg_ptr[pid*8..] and
+    returns 0: the caller skips the wait, the deadlock becomes a diagnosable
+    numeric failure, and the host drain prints the report (G2 r40)."""
+    cur = tl.load(sig_ptr)
+    spins = 0
+    while (cur < want) & (spins < 1000000):
+        cur = tl.load(sig_ptr)
+        spins += 1
+    ok = cur >= want
+    if not ok:
+        tl.store(dbg_ptr + pid * 8 + 0, site)
+        tl.store(dbg_ptr + pid * 8 + 1, slot_id)
+        tl.store(dbg_ptr + pid * 8 + 2, want)
+        tl.store(dbg_ptr + pid * 8 + 3, cur)
+        tl.store(dbg_ptr + pid * 8 + 4, expert_id)
+        tl.store(dbg_ptr + pid * 8 + 5, spins)
+    return ok
+
+
+@triton.jit
 def _publish_count_row(
     core_bucket_cursor_ptr,
     counts_mem_ptr,
@@ -202,6 +227,7 @@ def _publish_count_row(
     num_routes=0,
     MOONEP: tl.constexpr = False,
     CURSOR_STRIDE: tl.constexpr = 0,
+    COUNTS_GATE: tl.constexpr = 0,
 ):
     cursor_stride: tl.constexpr = CURSOR_STRIDE if CURSOR_STRIDE else NUM_BINS_PAD
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
@@ -226,16 +252,44 @@ def _publish_count_row(
     libshmem_device.fence()
     for peer_rank in range(0, WORLD_SIZE):
         if peer_rank != LOCAL_RANK:
-            if MOONEP:
-                # Keep fine-grained metadata off the UDMA weight QPs.
-                remote = dl.symm_at(counts_mem_ptr, peer_rank)
-                bins = tl.arange(0, NUM_BINS_PAD)
-                values = tl.load(local_row_ptr + bins)
-                tl.store(remote + LOCAL_RANK * NUM_BINS_PAD + bins, values)
-            else:
-                libshmem_device.putmem(
-                    local_row_ptr, local_row_ptr, NUM_BINS_PAD * 4, peer_rank)
+            # G2 r38: the bare engine putmem below never landed in the peer's
+            # symmetric table cross-node (both directions, every wheel/engine
+            # combination — counts-trace post-kernel peer row stayed 0 while
+            # the own row was full), which starved the backward's HCCL-truth
+            # assert (2024 != 997 family).  Both this kernel's token dispatch
+            # and its return rows already use the symm_at direct-store idiom
+            # (engine-free, no CQ — same rationale as dispatch_fc2_bwd's
+            # 2026-09-20 putmem -> put_store switch), so the count row now
+            # publishes the same way for every branch: keep fine-grained
+            # metadata off the UDMA weight QPs AND off the putmem engine leg.
+            remote = dl.symm_at(counts_mem_ptr, peer_rank)
+            bins = tl.arange(0, NUM_BINS_PAD)
+            values = tl.load(local_row_ptr + bins)
+            tl.store(remote + LOCAL_RANK * NUM_BINS_PAD + bins, values)
     libshmem_device.fence()
+    # Cross-node arrival gate (G2 r21): nothing below orders the PEER's
+    # row write against this rank's reads — intra-node HCCS latency always
+    # won that race, cross-node CLOS/UDMA latency always lost it (r18/r19:
+    # each kernel materialized only its own routing rows, both directions,
+    # deterministically; slab offsets were verified identical).  Bounded
+    # poll on the peer row's live-bin sum: opens as soon as the write
+    # lands; a peer with genuinely nothing to send exits via the spin
+    # bound.  COUNTS_GATE=0 (default) compiles the gate out entirely —
+    # single-node behavior is bit-identical.
+    if COUNTS_GATE > 0:
+        gate_bins = tl.arange(0, NUM_BINS_PAD)
+        spins = 0
+        ready = 0
+        while (ready == 0) & (spins < COUNTS_GATE):
+            acc = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
+            for peer_rank in range(0, WORLD_SIZE):
+                if peer_rank != LOCAL_RANK:
+                    acc += tl.load(
+                        counts_mem_ptr +
+                        peer_rank * NUM_BINS_PAD + gate_bins)
+            ready = tl.sum(
+                tl.where(gate_bins < NUM_EXPERTS, acc, 0), axis=0)
+            spins += 1
 
 
 @triton.jit
@@ -406,7 +460,11 @@ def _scatter_stable_routes(pid, selected_experts_ptr, core_bucket_cursor_ptr,
                            NUM_BINS_PAD: tl.constexpr, TOPK: tl.constexpr,
                            BLOCK_SIZE: tl.constexpr):
     """Stable expert-major scatter; each lane owns disjoint expert bins."""
-    if NUM_EXPERTS >= 128:
+    # >32 bins: the multi-bin-block loop below (bin_block=32) corrupts the
+    # send tables (duplicate slots / uninitialized send_route_indices,
+    # observed at E=128) — the ordinal scatter is the correct path for any
+    # E past one bin block.  E<=32 keeps the historical single-block form.
+    if NUM_EXPERTS > 32:
         _scatter_routes_by_ordinal(
             pid, selected_experts_ptr, core_bucket_cursor_ptr,
             send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
@@ -560,7 +618,8 @@ def _partition_pipeline_fc1_activation_group_ub(
         # MOE_FWD_TIMING=1 only: this program's ring row base and the call's
         # ring slot (dead args when TIMING=0; stores clamp to RING_SLOTS).
         ring_base=None, ring_slot=0,
-        TIMING: tl.constexpr = False, RING_SLOTS: tl.constexpr = 0):
+        TIMING: tl.constexpr = False, RING_SLOTS: tl.constexpr = 0,
+        wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0):
     """Pipeline FC1 gate/up tiles through UB directly into activation output.
 
     ``SAVE_FC1`` stores the raw gate/up Fixpipe results (pre-activation,
@@ -671,8 +730,15 @@ def _partition_pipeline_fc1_activation_group_ub(
                 mask_n = gate_cols < FFN
                 if WAIT_REPLICA:
                     replica = cube_expert_id - WEIGHT_EXPERT_BASE
-                    ready = dl.wait(replica_ready_ptr + replica * 16, 1,
-                                    'gpu', 'acquire', waitValue=signal_epoch)
+                    if WAIT_DEBUG and not _fwd_wait_bounded(
+                            replica_ready_ptr + replica * 16,
+                            signal_epoch, 1, replica, cube_expert_id,
+                            pid, wait_dbg_ptr):
+                        ready = 0
+                    else:
+                        ready = dl.wait(
+                            replica_ready_ptr + replica * 16, 1,
+                            'gpu', 'acquire', waitValue=signal_epoch)
                     weight_base = dl.consume_token(weight_ptr, ready)
                     weight_base += replica.to(tl.int64) * stride_weight_e
                 else:
@@ -1163,7 +1229,8 @@ def _fc2_dynamic_wave(
         HIDDEN: tl.constexpr, FFN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
         replica_weight_ptr, replica_ready_ptr,
-        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
+        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr,
+        wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0):
     completion_base: tl.constexpr = MAX_WAVES * NUM_CORES
     n_tiles: tl.constexpr = (HIDDEN + BLOCK_N - 1) // BLOCK_N
     task_begin, task_end = _wave_task_range(
@@ -1186,9 +1253,18 @@ def _fc2_dynamic_wave(
                     n_start = tile % n_tiles * BLOCK_N
                     first_panel = n_start // (HIDDEN // 2)
                     last_panel = tl.minimum(n_start + BLOCK_N - 1, HIDDEN - 1) // (HIDDEN // 2)
-                    ready = dl.wait(replica_ready_ptr + (2 * weight_expert + first_panel) * 16,
-                                    last_panel - first_panel + 1, 'gpu', 'acquire',
-                                    waitValue=signal_epoch)
+                    if WAIT_DEBUG and not _fwd_wait_bounded(
+                            replica_ready_ptr
+                            + (2 * weight_expert + first_panel) * 16,
+                            signal_epoch, 2, 2 * weight_expert + first_panel,
+                            expert, pid, wait_dbg_ptr):
+                        ready = 0
+                    else:
+                        ready = dl.wait(
+                            replica_ready_ptr
+                            + (2 * weight_expert + first_panel) * 16,
+                            last_panel - first_panel + 1, 'gpu', 'acquire',
+                            waitValue=signal_epoch)
                     ready_weight = dl.consume_token(replica_weight_ptr, ready)
                     _fc2_gemm_one_mn_tile(
                         wave_input, ready_weight, output_ptr, weight_expert,
@@ -1409,7 +1485,8 @@ def _run_dynamic_wave_pipeline(
         # accumulators and the per-call FC1 ring.
         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,
         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,
-        RING_SLOTS: tl.constexpr = 0):
+        RING_SLOTS: tl.constexpr = 0,
+        wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0):
     global_waves = 0
     for rank in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
@@ -1542,7 +1619,9 @@ def _run_dynamic_wave_pipeline(
                                         FC1_SAVE_FP16=FC1_SAVE_FP16,
                                         SEARCH_STEPS=SEARCH_STEPS,
                                         ring_base=ring_base, ring_slot=ring_slot,
-                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS,
+                                        wait_dbg_ptr=wait_dbg_ptr,
+                                        WAIT_DEBUG=WAIT_DEBUG)
                                 else:
                                     _partition_pipeline_fc1_activation_group_ub(
                                         lane, peer_mem_ptr, signal_mem_ptr,
@@ -1559,7 +1638,9 @@ def _run_dynamic_wave_pipeline(
                                         FC1_SAVE_FP16=FC1_SAVE_FP16,
                                         SEARCH_STEPS=SEARCH_STEPS,
                                         ring_base=ring_base, ring_slot=ring_slot,
-                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS,
+                                        wait_dbg_ptr=wait_dbg_ptr,
+                                        WAIT_DEBUG=WAIT_DEBUG)
             with al.scope(core_mode='vector', disable_auto_sync=True):
                 libshmem_device.fence()
                 libshmem_device.signal_op(
@@ -1580,7 +1661,8 @@ def _run_dynamic_wave_pipeline(
                     pipeline_signal_ptr, wave_task_offsets_ptr, wave_tasks_ptr, signal_epoch, stride_down_e,
                     stride_down_n, stride_down_k, NUM_CORES, LOCAL_RANK, EXPERTS_PER_RANK, MAX_WAVES,
                     HIDDEN, FFN, BLOCK_M, FC2_BLOCK_N, FC2_BLOCK_K, WAVE_WINDOWS,
-                    replica_down_ptr, down_ready_ptr, HOME_EXPERTS, MOONEP)
+                    replica_down_ptr, down_ready_ptr, HOME_EXPERTS, MOONEP,
+                    wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (step >= 2) & (step - 2 < local_waves):
                 if TIMING:
@@ -1682,6 +1764,7 @@ num_routes, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
         LOCAL_RANK, WORLD_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, TOPK: tl.constexpr, HIDDEN: tl.constexpr, FFN: tl.constexpr,
         MAX_RECEIVED_ROUTES: tl.constexpr, NUM_BINS_PAD: tl.constexpr,
+        COUNTS_GATE: tl.constexpr,
         MAX_SOURCE_TILES: tl.constexpr, MAX_PIPELINE_GROUPS: tl.constexpr,
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
@@ -1691,7 +1774,8 @@ num_routes, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
         TS_SLOTS: tl.constexpr, ACC_SLOTS: tl.constexpr,
         RING_SLOTS: tl.constexpr, TIMING: tl.constexpr,
-        WORLD_SEARCH_STEPS: tl.constexpr):
+        WORLD_SEARCH_STEPS: tl.constexpr,
+        wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
     # One shared dummy + one precomputed ts row for all ten stamps (the
@@ -1722,11 +1806,13 @@ num_routes, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
             if MOONEP:
                 _publish_count_row(core_bucket_cursor_ptr, raw_counts_ptr,
                                    LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
-                                   NUM_EXPERTS, RAW_NUM_BINS, num_routes, True, NUM_BINS_PAD)
+                                   NUM_EXPERTS, RAW_NUM_BINS, num_routes, True, NUM_BINS_PAD,
+                                   COUNTS_GATE=COUNTS_GATE)
             else:
                 _publish_count_row(core_bucket_cursor_ptr, counts_mem_ptr,
                                    LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
-                                   NUM_EXPERTS, NUM_BINS_PAD)
+                                   NUM_EXPERTS, NUM_BINS_PAD,
+                                   COUNTS_GATE=COUNTS_GATE)
     _mixed_forward_barrier()
     if TIMING:
         _fwd_stamp_lane0(ts_row, 2, ts_dummy)   # counts published
@@ -1879,7 +1965,8 @@ num_routes, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         EXPERTS_PER_RANK, MOONEP, WORLD_SEARCH_STEPS,
         acc_ptr=acc_ptr, ring_ptr=ring_ptr, fc2w_ptr=fc2w_ptr,
-        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS)
+        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS,
+        wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
     if TIMING:
         _fwd_stamp_lane0(ts_row, 8, ts_dummy)   # pipeline + reduce done
     if MOONEP:

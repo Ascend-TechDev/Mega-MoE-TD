@@ -43,6 +43,7 @@ from ..runtime.replica_weight_prefetch import (
     replica_pool_enabled,
     replica_weight_push_geometry,
 )
+from ..runtime.device import resolve_local_device
 from ..runtime.workspace import create_moe_forward_context
 from ._native_saved import (
     assemble_native_saved,
@@ -112,6 +113,10 @@ class FusedMoEForward(torch.nn.Module):
             self.world_size = torch.distributed.get_world_size()
         if num_experts % self.world_size:
             raise ValueError("num_experts must be divisible by the EP world size")
+        # self.rank is the ACLSHMEM global PE (peer addressing, kernel
+        # LOCAL_RANK); local_device is the NPU ordinal for allocations.
+        # Single-node the two coincide (see mega_moe.runtime.device).
+        self.local_device = resolve_local_device(self.rank)
 
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden_size = hidden_size
@@ -172,6 +177,7 @@ class FusedMoEForward(torch.nn.Module):
             ),
             enable_moonep=self.enable_moonep,
             ep_group=self.ep_group,
+            local_device=self.local_device,
         )
 
         # FC2/combine workspaces remain lazy so
@@ -210,6 +216,9 @@ class FusedMoEForward(torch.nn.Module):
         self._fwd_fc2w_buf = None
         self._fwd_ring_slots = 0
         self._fwd_timing_last = None
+        # MOE_MEGA_WAIT_DEBUG=1 (G2 r40): forward-side bounded replica-wait
+        # timeout reports (sites 1/2 in fused_forward).
+        self._fwd_wait_dbg = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
         # True when _replica_weight_buffers came from the session pool
@@ -363,6 +372,7 @@ class FusedMoEForward(torch.nn.Module):
         self._fwd_fc2w_buf = None
         self._fwd_ring_slots = 0
         self._fwd_timing_last = None
+        self._fwd_wait_dbg = None
         self.context.finalize()
 
     def _reserve_single_signal_epoch(self) -> int:
@@ -409,6 +419,7 @@ class FusedMoEForward(torch.nn.Module):
                         down_weight,
                         rank=self.rank,
                         world_size=self.world_size,
+                        local_device=self.local_device,
                     )
                 )
                 self._replica_weight_pooled = True
@@ -419,6 +430,7 @@ class FusedMoEForward(torch.nn.Module):
                         down_weight,
                         rank=self.rank,
                         world_size=self.world_size,
+                        local_device=self.local_device,
                     )
                 )
                 fresh = True
@@ -580,7 +592,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_fc2_storage = ash.aclshmem_create_tensor(
             [max_send * self.hidden_size],
             dtype=self.activation_dtype,
-            device_id=self.rank,
+            device_id=self.local_device,
         )
         self._combine_fc2_buf = self._combine_fc2_storage.view(
             max_send, self.hidden_size
@@ -695,7 +707,7 @@ class FusedMoEForward(torch.nn.Module):
             self._single_pipeline_signal_storage = ash.aclshmem_create_tensor(
                 [pipeline_slots * 16],
                 dtype=torch.int32,
-                device_id=self.rank,
+                device_id=self.local_device,
             )
             self._single_pipeline_signal_storage.zero_()
             # MOE_FWD_TIMING dead-arg buffers: the launch always receives
@@ -727,6 +739,13 @@ class FusedMoEForward(torch.nn.Module):
                 (self.num_aicore_programs,
                  self._single_pipeline_max_groups),
                 dtype=torch.int64,
+                device=device,
+            )
+            # One report row per core: [site, slot, want, observed, expert,
+            # spins] (see dispatch_fc2_bwd._wait_bounded_report).
+            self._fwd_wait_dbg = torch.zeros(
+                self.num_aicore_programs * 8,
+                dtype=torch.int32,
                 device=device,
             )
         elif (
@@ -1667,6 +1686,59 @@ class FusedMoEForward(torch.nn.Module):
         # the launch stream so reused workspaces cannot retain stale rows.
         # This device fill is part of the end-to-end forward timing boundary.
         self._route_to_send[:num_routes].fill_(-1)
+        # MOE_MEGA_WAIT_DEBUG=1: bounded replica-wait spins replace the two
+        # unbounded dl.waits, so a starving cross-node panel turns the
+        # deadlock into a diagnosable report + numeric failure instead of an
+        # aicore timeout (r40 mutual-spin form).
+        wait_debug_on = os.environ.get("MOE_MEGA_WAIT_DEBUG", "0") == "1"
+        if wait_debug_on:
+            self._fwd_wait_dbg.zero_()
+        # MOE_MEGA_HEAP_PROBE=1: forward-side symmetric-heap audit.  The
+        # backward audit (mega_bwd) prints offsets RELATIVE to peer_mem;
+        # putmem/symm_at translation actually assumes the ABSOLUTE offset
+        # (slab ptr - aclshmemx heap base) is identical on every PE.  HCCL's
+        # own InitSymmetricMemory slab (400M cclBuffer) shares the heap and
+        # can shift it per node — compare this line across nodes.
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            import shmem as ash
+
+            try:
+                _base = ash.aclshmemx_get_heap_base()
+
+                def _abs(t):
+                    return None if t is None else hex(t.data_ptr() - _base)
+
+                print(
+                    f"[fwd-heap r{self.rank}] base=0x{_base:x} "
+                    f"peer={_abs(self.context.peer_mem)} "
+                    f"sig={_abs(self.context.signal_mem)} "
+                    f"md_counts={_abs(self.context.metadata_counts_mem)} "
+                    f"pl_counts={_abs(self.context.planning_counts_mem)}",
+                    flush=True)
+            except Exception as e:  # probe must never break the launch
+                print(f"[fwd-heap r{self.rank}] probe-failed {e}", flush=True)
+        # MOE_COUNTS_TRACE=1 (r38 probe): host-side sampling of the counts
+        # cube around the launch.  Row i of metadata_counts_mem is the row
+        # rank i publishes (local tl.store + cross-node putmem at the same
+        # symmetric offset), so on a healthy dual-node run BOTH row-sums are
+        # non-zero post-kernel; a zero PEER row with the own row intact is
+        # the "putmem never landed in peer GM" signature, separating a
+        # publish-side failure from gate/read-side staleness.
+        counts_trace = (
+            os.environ.get("MOE_COUNTS_TRACE") == "1" and self.world_size > 1
+        )
+
+        def _counts_row_sums(tag):
+            torch.npu.synchronize()
+            rows = self.context.metadata_counts_mem.view(
+                self.world_size, self.context.metadata_num_bins)
+            print(
+                f"[counts-trace r{self.rank}] {tag} row-sums="
+                f"{[int(r.sum().item()) for r in rows]}",
+                flush=True)
+
+        if counts_trace:
+            _counts_row_sums("pre-kernel")
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
             selected_experts,
@@ -1747,6 +1819,9 @@ float(self.clamp_limit),
             FFN=ffn_size,
             MAX_RECEIVED_ROUTES=max_received_routes,
             NUM_BINS_PAD=self.context.metadata_num_bins,
+            # Bounded counts-arrival gate spin bound (see _publish_count_row);
+            # 0 = compiled out, single-node bit-identical.
+            COUNTS_GATE=int(os.environ.get("MOE_FUSED_COUNTS_GATE", "0")),
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
             DISPATCH_BLOCK_M=self.config.single_kernel_dispatch_block_size_m,
@@ -1768,6 +1843,8 @@ float(self.clamp_limit),
             ACC_SLOTS=FWD_ACC_SLOTS,
             RING_SLOTS=self._fwd_ring_slots,
             TIMING=timing_on,
+            wait_dbg_ptr=self._fwd_wait_dbg,
+            WAIT_DEBUG=wait_debug_on,
             # Guarded fixed-step binary searches over the closed rank
             # interval [0, W] (scatter destination lookup and dispatch
             # readiness) converge in exactly W.bit_length() steps; fewer
@@ -1776,6 +1853,26 @@ float(self.clamp_limit),
             WORLD_SEARCH_STEPS=self.world_size.bit_length(),
             **launch_options,
         )
+        if counts_trace:
+            _counts_row_sums("post-kernel")
+        # MOE_MEGA_WAIT_DEBUG=1: drain the bounded replica-wait reports.
+        # site 1 = FC1 gate/up weight panel, site 2 = FC2 down weight panel;
+        # want/observed are the signal_epoch the waiter wanted vs the last
+        # value in the slot (0 = no panel ever landed, epoch-1 = the peer's
+        # push for THIS forward never arrived).
+        if wait_debug_on:
+            _wd = self._fwd_wait_dbg.view(-1, 8)
+            _rows = (_wd != 0).any(dim=1).nonzero().flatten().tolist()
+            if not _rows:
+                print(f"[wait-dbg r{self.rank}] no replica-wait starvation",
+                      flush=True)
+            for _r in _rows:
+                print(
+                    f"[wait-dbg r{self.rank}] core{_r}"
+                    f" site={int(_wd[_r, 0])} slot={int(_wd[_r, 1])}"
+                    f" want={int(_wd[_r, 2])} observed={int(_wd[_r, 3])}"
+                    f" expert={int(_wd[_r, 4])} spins={int(_wd[_r, 5])}",
+                    flush=True)
         self._tile_signal_epoch += 1
         if timing_on:
             self._fwd_timing_last = (
@@ -1805,6 +1902,31 @@ float(self.clamp_limit),
         # The saved capture needs the receive row count on host; the .item()
         # drains the launch (the only host sync on this path).
         num_received_routes = int(self.context.metadata_stats[0].item())
+        # MOE_MEGA_COUNTS_DEBUG=1: G2 r38 cross-node counts forensics.  Dumps
+        # every input to the saved-layout assertion on both ranks: the
+        # symmetric counts table (peer putmem landing), the receive tables
+        # (_build_destination_metadata output), and metadata_stats — one line
+        # per artifact so cross-node diffing stays unambiguous.
+        if os.environ.get("MOE_MEGA_COUNTS_DEBUG") == "1":
+            _cm = self.context.metadata_counts_mem
+            _rows = [
+                int(_cm[r * self.context.metadata_num_bins:
+                        (r + 1) * self.context.metadata_num_bins].sum().item())
+                for r in range(self.world_size)
+            ]
+            _live = [
+                _cm[r * self.context.metadata_num_bins:
+                    r * self.context.metadata_num_bins
+                    + self.context.num_experts].tolist()
+                for r in range(self.world_size)
+            ]
+            print(
+                f"[counts-dbg r{self.rank}] stats={self.context.metadata_stats.tolist()}"
+                f" num_recv={num_received_routes}"
+                f" table_rowsum={_rows} live_bins={_live}"
+                f" recv_re={self.context.metadata_recv_counts_re.tolist()}"
+                f" recv_offs={self.context.metadata_recv_expert_offs.tolist()}",
+                flush=True)
         # Dropped routes keep their route_to_send sentinel (-1); the send
         # tables below are only populated for the valid prefix.
         num_sent_routes = int(

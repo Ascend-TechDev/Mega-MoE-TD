@@ -12,10 +12,11 @@ from tests import _moe_testkit as kit
 from tests._moe_baselines import (
     make_gate_up_weights, make_down_weights, make_routing_weights, run_full_one,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 
 def run_single_moonep(rank, world, tokens=64, chunk_bytes=64 * 1024 * 1024):
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     experts, hidden, ffn, topk = 32, 256, 512, 16
     bootstrap = torch.zeros(world, device=device)
     dist.all_reduce(bootstrap)

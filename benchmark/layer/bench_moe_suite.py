@@ -104,6 +104,7 @@ from tests._moe_baselines import (
     build_backward_saved,
     torch_moe_fwd_golden,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 
 ACTIVATION_DTYPE = torch.bfloat16
@@ -1536,7 +1537,7 @@ def run_forward_benchmark(rank: int, world_size: int, case: CaseSpec):
 
     ep_group = dist.group.WORLD
     with kit.aclshmem_session(rank, world_size, G_ASH_SIZE):
-        device = f"npu:{rank}"
+        device = device_str(resolve_local_device(rank))
         experts_per_rank = case.num_experts // world_size
         grouped_baseline = GroupedForwardBaseline(case, ep_group)
         config = MoEForwardConfig(
@@ -1867,7 +1868,7 @@ def run_moonep_forward_benchmark(
     required_free_hbm = _required_moonep_free_hbm_bytes(case, world_size)
     local_free_hbm, local_total_hbm = torch.npu.mem_get_info()
     hbm_info = torch.tensor(
-        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=f"npu:{rank}"
+        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=device_str(resolve_local_device(rank))
     )
     dist.all_reduce(hbm_info, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
     min_free_hbm, min_total_hbm = (int(value) for value in hbm_info.cpu().tolist())
@@ -1885,7 +1886,7 @@ def run_moonep_forward_benchmark(
     }
 
     ep_group = dist.group.WORLD
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     experts_per_rank = case.num_experts // world_size
     _log_moonep_phase(rank, case, "allocating weights and deterministic hot routes")
     packed_w1, down_weight, _ = _make_local_weights(
@@ -2445,7 +2446,9 @@ def _moonep_backward_transport_samples(
             setup_ms.append((time.perf_counter() - setup_start) * 1000.0)
         start = time.perf_counter()
         with torch.no_grad():
-            moe_backward_triton(sample_saved, dy, peer_mem, grad_transport=transport)
+            moe_backward_triton(
+                sample_saved, dy, peer_mem, grad_transport=transport,
+                hidden_states=hidden_states)
         torch.npu.synchronize(device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         value = torch.tensor([elapsed_ms], dtype=torch.float32, device=device)
@@ -2519,7 +2522,7 @@ def run_moonep_backward_benchmark(
     required_free_hbm = _required_moonep_free_hbm_bytes(case, world_size)
     local_free_hbm, local_total_hbm = torch.npu.mem_get_info()
     hbm_info = torch.tensor(
-        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=f"npu:{rank}"
+        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=device_str(resolve_local_device(rank))
     )
     dist.all_reduce(hbm_info, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
     min_free_hbm, min_total_hbm = (int(value) for value in hbm_info.cpu().tolist())
@@ -2537,7 +2540,7 @@ def run_moonep_backward_benchmark(
     }
 
     ep_group = dist.group.WORLD
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     experts_per_rank = case.num_experts // world_size
 
     # Logical Torch baseline first, outside the symmetric session: the
@@ -2625,7 +2628,12 @@ def run_moonep_backward_benchmark(
 
                 _log_moonep_phase(rank, case, "running untimed structure gate")
                 with torch.no_grad():
-                    gate_result = moe_backward_triton(native_saved, dy, peer_mem)
+                    # hidden_states kwarg: the MOE_SAVED_RECOMPUTE=1 backward
+                    # re-dispatches from the forward's pre-dispatch token copy
+                    # (production autograd hands it via ctx.hidden_states; the
+                    # bench bypasses autograd so it must pass it explicitly).
+                    gate_result = moe_backward_triton(
+                        native_saved, dy, peer_mem, hidden_states=hidden_states)
                 gate_keys = sorted(gate_result)
                 for key, value in gate_result.items():
                     if not _all_finite_memory_lean(value):
@@ -2640,7 +2648,8 @@ def run_moonep_backward_benchmark(
 
                 def _local():
                     with torch.no_grad():
-                        moe_backward_triton(native_saved, dy, peer_mem)
+                        moe_backward_triton(
+                            native_saved, dy, peer_mem, hidden_states=hidden_states)
 
                 local_timing, _ = kit.PerformanceRunner(
                     _local, _local, BACKWARD_TIMING, device=device, ep_group=ep_group
@@ -2650,24 +2659,39 @@ def run_moonep_backward_benchmark(
                 _log_moonep_phase(
                     rank, case, "timing physical backward with grad transport"
                 )
-                transport_samples, setup_samples = (
-                    _moonep_backward_transport_samples(
-                        device,
-                        ep_group,
-                        op,
-                        dy,
-                        peer_mem,
-                        hidden_states,
-                        selected_experts,
-                        packed_w1,
-                        down_weight,
-                        routing_weights,
-                        warmup=BACKWARD_TIMING.warmup,
-                        iterations=BACKWARD_TIMING.iterations,
+                # MOE_MOONEP_BENCH_SKIP_TRANSPORT=1: 跳过带 grad transport 的
+                # 计时相（该相每样本重捕获+lend，在脱离训练框架的裸 bench 环境
+                # 下两次踩 aicore trap——getmem 与 udma 都见过；训练框架内 udma
+                # 已被 5d68e95 之后的全网跑验证）。本地相 local_only_ms 不受
+                # 影响，JSON 里 with_transport_ms 记 null。
+                if os.environ.get("MOE_MOONEP_BENCH_SKIP_TRANSPORT") == "1":
+                    _log_moonep_phase(
+                        rank, case, "skipping grad transport phase (env)"
                     )
+                    transport_samples, setup_samples = [], []
+                else:
+                    transport_samples, setup_samples = (
+                        _moonep_backward_transport_samples(
+                            device,
+                            ep_group,
+                            op,
+                            dy,
+                            peer_mem,
+                            hidden_states,
+                            selected_experts,
+                            packed_w1,
+                            down_weight,
+                            routing_weights,
+                            warmup=BACKWARD_TIMING.warmup,
+                            iterations=BACKWARD_TIMING.iterations,
+                        )
+                    )
+                transport_ms = (
+                    statistics.median(transport_samples) if transport_samples else None
                 )
-                transport_ms = statistics.median(transport_samples)
-                setup_stats = _stats(setup_samples, device)
+                setup_stats = (
+                    _stats(setup_samples, device) if setup_samples else None
+                )
 
                 # Per-stage breakdown of the SERIAL transport backward —
                 # skipped under MOE_BWD_MEGA: the one-launch path records no
@@ -2760,7 +2784,9 @@ def run_moonep_backward_benchmark(
                             else None
                         ),
                         "with_transport_over_torch": (
-                            torch_ms / transport_ms if transport_ms > 0 else float("inf")
+                            torch_ms / transport_ms
+                            if transport_ms is not None and transport_ms > 0
+                            else None
                         ),
                         "local_over_torch": (
                             torch_ms / local_ms if local_ms > 0 else float("inf")

@@ -111,6 +111,11 @@ class ReplicaWeightBuffers:
     gate_up_expert_shape: tuple[int, int]
     down_expert_shape: tuple[int, int]
     rank: int
+    # Local NPU ordinal for every symmetric allocation owned by these buffers
+    # (tables themselves and the grad-push scratch).  ``rank`` stays the
+    # ACLSHMEM global PE; multi-node splits the two
+    # (see mega_moe.runtime.device).
+    local_device: Optional[int] = None
     # Table-level SET-epoch counter (pooling era, 2026-09-17): EVERY push
     # into these slots — forward prefetch or backward re-prefetch, any layer
     # sharing the pool entry — mints the next value here.  Monotonic
@@ -132,17 +137,22 @@ class ReplicaWeightBuffers:
 
     def ensure_grad_push_scratch(
         self, gu_tasks, gu_chunk, dn_tasks, dn_chunk, device,
+        ord_stride=1,
     ) -> dict:
         """Allocate (once) the symmetric grad-push staging and word slabs.
 
-        Staging rows are TASK-indexed (``home * chunks + chunk``), one row
-        per (home, chunk) task, reused across ordinals under the owner's
-        credit handshake.  Arrival/credit words are int32 pairs viewed as
-        uint64 for the UDMA tail SET and read as the low int32 by the
-        local ``dl.wait`` — values are ``epoch * 256 + ordinal``, strictly
-        increasing across calls, which is why zero-init once suffices.
+        Staging rows are (task, ordinal)-indexed (``(home * chunks + chunk)
+        * ord_stride + ordinal``) — credit-free since the 2026-09-22
+        zengwang fix (signal_op credit SETs dropped 33-41% under framework
+        load while put_signal_nbi arrivals landed 100%), every ordinal owns
+        a private row so pushers never wait.  Arrival words are int32 pairs
+        viewed as uint64 for the UDMA tail SET and read as the low int32 by
+        the local ``dl.wait`` — values are ``epoch * 256 + ordinal``,
+        strictly increasing across calls, which is why zero-init once
+        suffices.  ``cred_*`` stay allocated for the frozen kernel
+        signature but are written by nobody.
         """
-        key = (gu_tasks, gu_chunk, dn_tasks, dn_chunk)
+        key = (gu_tasks, gu_chunk, dn_tasks, dn_chunk, ord_stride)
         cached = self.grad_push_scratch
         if cached is not None:
             if cached["key"] != key:
@@ -153,21 +163,25 @@ class ReplicaWeightBuffers:
             return cached
         import shmem as ash
 
+        dev = self.rank if self.local_device is None else self.local_device
+
         def _alloc(count, dtype):
             tensor = ash.aclshmem_create_tensor(
-                [count], dtype=dtype, device_id=self.rank)
+                [count], dtype=dtype, device_id=dev)
             tensor.zero_()
             return tensor
 
-        # int32 pairs (u64-viewable), 2 words per task per family
+        # int32 pairs (u64-viewable), 2 words per (task, ordinal) per family
+        gu_cells = gu_tasks * ord_stride
+        dn_cells = dn_tasks * ord_stride
         scratch = {
             "key": key,
-            "staging_gu": _alloc(gu_tasks * gu_chunk, torch.bfloat16),
-            "staging_dn": _alloc(dn_tasks * dn_chunk, torch.bfloat16),
-            "arr_gu": _alloc(2 * gu_tasks, torch.int32),
-            "arr_dn": _alloc(2 * dn_tasks, torch.int32),
-            "cred_gu": _alloc(2 * gu_tasks, torch.int32),
-            "cred_dn": _alloc(2 * dn_tasks, torch.int32),
+            "staging_gu": _alloc(gu_cells * gu_chunk, torch.bfloat16),
+            "staging_dn": _alloc(dn_cells * dn_chunk, torch.bfloat16),
+            "arr_gu": _alloc(2 * gu_cells, torch.int32),
+            "arr_dn": _alloc(2 * dn_cells, torch.int32),
+            "cred_gu": _alloc(2 * gu_cells, torch.int32),
+            "cred_dn": _alloc(2 * dn_cells, torch.int32),
         }
         self.grad_push_scratch = scratch
         return scratch
@@ -239,6 +253,7 @@ def allocate_replica_weight_buffers(
     *,
     rank: int,
     world_size: int,
+    local_device: Optional[int] = None,
 ) -> ReplicaWeightBuffers:
     """Allocate equal-shaped symmetric replica tables on every EP rank.
 
@@ -259,16 +274,17 @@ def allocate_replica_weight_buffers(
             "replica prefetch requires the EP group to match the ACLSHMEM world"
         )
 
+    dev = rank if local_device is None else local_device
     gate_up_mem = ash.aclshmem_create_tensor(
         [experts_per_rank * gate_up_elements],
         dtype=torch.bfloat16,
-        device_id=rank,
+        device_id=dev,
     )
     try:
         down_mem = ash.aclshmem_create_tensor(
             [experts_per_rank * down_elements],
             dtype=torch.bfloat16,
-            device_id=rank,
+            device_id=dev,
         )
     except Exception:
         ash.aclshmem_free_tensor(gate_up_mem)
@@ -281,6 +297,7 @@ def allocate_replica_weight_buffers(
         gate_up_expert_shape=tuple(gate_up_weight.shape[1:]),
         down_expert_shape=tuple(down_weight.shape[1:]),
         rank=rank,
+        local_device=dev,
     )
 
 
@@ -319,6 +336,7 @@ def acquire_replica_weight_buffers(
     *,
     rank: int,
     world_size: int,
+    local_device: Optional[int] = None,
 ) -> tuple[ReplicaWeightBuffers, bool]:
     """Take a pooled handle; returns ``(buffers, fresh)``.
 
@@ -340,8 +358,10 @@ def acquire_replica_weight_buffers(
     if entry is not None and not entry[0].closed:
         entry[1] += 1
         return entry[0], False
+    # Pool key intentionally omits local_device: it is constant per process.
     buffers = allocate_replica_weight_buffers(
-        gate_up_weight, down_weight, rank=rank, world_size=world_size
+        gate_up_weight, down_weight, rank=rank, world_size=world_size,
+        local_device=local_device,
     )
     _REPLICA_POOL[key] = [buffers, 1]
     return buffers, True

@@ -37,6 +37,7 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
+from ..runtime.device import device_str, saved_device_id
 from .common import ncore, nvec, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
 
 # Each peer_mem row packs the H hidden elements plus a trailing gate channel
@@ -83,7 +84,7 @@ def _gemm_tile_maps(saved, block_m):
     cached = saved.get(cache_key)
     if cached is not None:
         return cached
-    device = f"npu:{saved['ep_rank']}"
+    device = device_str(saved_device_id(saved))
     counts = saved["expert_counts"].to(device)
     epr = counts.shape[0]
     home_experts = (
@@ -407,7 +408,7 @@ def _combine_static_maps(saved):
     cache = saved.get("_combine_cache")
     if cache is not None:
         return cache
-    device = f"npu:{saved['ep_rank']}"
+    device = device_str(saved_device_id(saved))
     pe = saved["ep_rank"]; W = saved["world_size"]; H = saved["hidden_dim"]
     ep_group = saved["ep_group"]; M = saved["M"]
 
@@ -528,7 +529,7 @@ def _combine_put_segments(saved, prep):
     cache = saved.get("_combine_put_seg")
     if cache is not None:
         return cache
-    device = f"npu:{saved['ep_rank']}"
+    device = device_str(saved_device_id(saved))
     rank = prep["write_rank_by_src"]
     off = prep["write_off_by_src"].to(torch.int64)
     M = int(prep["M"])
