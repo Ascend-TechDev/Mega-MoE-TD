@@ -2125,6 +2125,16 @@ def kernel_moe_backward_mega(
     "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
     "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
     "w5_split", "w5_total",                      # P5 wgrad split geometry
+    # grad-UDMA transport (added after the list above was written): the
+    # epoch counts up every push and the element counts ride the routing,
+    # so their ÷16/==1 buckets flip mid-run — each flip mints a fresh cache
+    # key and pays a ~12s JIT recompile inside the launch on ONE rank while
+    # the other seven spin at the kernel's first cross-rank barrier
+    # (release_v3 r4: [mega-lpre r7]→[mega-lret r7] = 12.16s, new cache
+    # dirs minted at each stall's end).
+    "gtrans_epoch", "consumed_count6",           # grad-UDMA transport state
+    "gu6_elems", "dn6_elems",                    # grad-UDMA payload geometry
+    "home_base4",                                # P4 replica home base
 ])
 def kernel_moe_backward_mega_recompute(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
@@ -3033,7 +3043,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             and int(saved["active_physical_experts_per_rank"]) > int(saved["home_experts_per_rank"])):
         if not (reprefetch_transport == "udma"
                 and os.environ.get("MOE_MEGA_REPREFETCH_FUSED", "1") == "1"
-                and os.environ.get("MOE_MEGA_REPREFETCH_PIPELINE", "0") == "1"):
+                and os.environ.get("MOE_MEGA_REPREFETCH_PIPELINE", "1") == "1"):
             raise ValueError("fine sync requires fused UDMA and PIPELINE=1")
         if any(os.environ.get(phase, "1") == "0"
                for phase in ("MOE_MEGA_P1", "MOE_MEGA_P23")):
@@ -3382,8 +3392,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # quiet+B2; fine sync acquires at P4 and drains before B5 instead.
     # PIPELINE=0 keeps the serialized control. No-replica launches leave
     # the optional acquire paths disabled even if the process opts in.
+    # Default flipped to 1 (release_v3, 2026-01-03): the fullnet A/B
+    # (r3 serial vs r4 pipelined) showed the serialized P0 quiet+barrier
+    # cost p50 3.3ms -> 0.8ms with identical steady-state numerics; set
+    # MOE_MEGA_REPREFETCH_PIPELINE=0 to restore the old control.
     reprefetch_wait = (reprefetch_fused and os.environ.get(
-        "MOE_MEGA_REPREFETCH_PIPELINE", "0") == "1")
+        "MOE_MEGA_REPREFETCH_PIPELINE", "1") == "1")
     reprefetch_fine_sync = reprefetch and fine_sync_requested
     local_b2 = (reprefetch_fine_sync
                 and os.environ.get("MOE_MEGA_COMBINE_BUF", "1") == "1")
@@ -4103,8 +4117,17 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         _segs = " ".join(
             f"{_n}={float(_hi[_i + 1] - _lo[_i]) / 978000.0:.1f}"
             for _i, _n in enumerate(_names))
+        # P6b windows (GRAD_REDUCE tail): stamps 10/11/12 are the B5/B6/
+        # final-barrier crossings — segment w2 = the DN pull/push window,
+        # w3 = the GU pull/push window (the structural tail; the max-end
+        # minus min-start form deliberately includes cross-program skew).
+        _p6 = ""
+        if _ts.shape[1] > 12 and int(_hi[12]) > 0:
+            _p6 = (f" w2(B5>B6)={float(_hi[11] - _lo[10]) / 978000.0:.1f}"
+                   f" w3(B6>fin)={float(_hi[12] - _lo[11]) / 978000.0:.1f}")
         print(
-            f"[mega-phases r{rank}] {_segs} "
+            f"[mega-phases r{rank}] {_segs}"
+            f" P6tail={float(_hi[10] - _lo[9]) / 978000.0:.1f}{_p6} "
             f"total={float(_hi[9] - _lo[0]) / 978000.0:.1f}ms",
             flush=True,
         )

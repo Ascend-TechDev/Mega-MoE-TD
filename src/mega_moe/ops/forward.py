@@ -1878,6 +1878,29 @@ float(self.clamp_limit),
             self._fwd_timing_last = (
                 self._fwd_ts_buf, self._fwd_acc_buf, self._fwd_ring_buf,
                 self._fwd_fc2w_buf)
+            # [fwd-phases]: compact per-launch segment wall (the mega
+            # backward's [mega-phases] twin).  Segment table mirrors
+            # benchmark/layer/_fwd_phase_timing.py FWD_TS_SEGMENTS; SYS_CNT
+            # ≈ 978 ticks/us (see mega_bwd's dump).  max(end)-min(start)
+            # across programs, deliberately including cross-program skew.
+            if os.environ.get("MOE_FWD_PHASES_DUMP", "1") == "1":
+                torch.npu.synchronize()
+                _ts = self._fwd_ts_buf.cpu()
+                _lo = _ts.min(dim=0).values
+                _hi = _ts.max(dim=0).values
+                _segs = " ".join(
+                    f"{_n}={float(_hi[_b] - _lo[_a]) / 978000.0:.1f}"
+                    for _n, _a, _b in (
+                        ("zero_hist", 0, 1), ("cnts_pub", 1, 2),
+                        ("moonep_plan", 2, 3), ("dest_meta", 3, 4),
+                        ("cursors", 4, 5), ("scatter", 5, 6),
+                        ("pipe_entry", 6, 7), ("waves", 7, 8),
+                        ("quiet_tail", 8, 9)))
+                print(
+                    f"[fwd-phases r{self.rank} g{self._routing_generation}] "
+                    f"{_segs} "
+                    f"total={float(_hi[9] - _lo[0]) / 978000.0:.1f}ms",
+                    flush=True)
         # Every call rewrites the shared metadata workspaces and the fc1
         # buffer in place; the generation bump lets a consumer reject a saved
         # dict superseded by any later forward on this operator.
