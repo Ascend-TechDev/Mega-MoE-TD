@@ -32,7 +32,7 @@ Mega-MoE-TD/
 
 ```bash
 # golden 后向 vs autograd 交叉验证
-torchrun --nproc-per-node=2 --master-port=29513 benchmark/moe_backward_golden.py
+torchrun --nproc-per-node=2  benchmark/moe_backward_golden.py
 
 # 端到端 triton vs torch 精度 + 性能
 torchrun --nproc-per-node=2 test/layer/run_moe_backward.py
