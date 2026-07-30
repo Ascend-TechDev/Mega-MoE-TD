@@ -1,4 +1,4 @@
-# MEGA-MOE-TA
+# MEGA-MOE-TD
 
 基于[Triton-dist-ascend](https://gitcode.com/Ascend/Triton-distributed-ascend)项目开发MOE kernel的仓库。
 
