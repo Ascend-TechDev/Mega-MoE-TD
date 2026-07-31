@@ -113,16 +113,16 @@ def kernel_combine_push_reduce(
             tl.store(output_ptr + oo, acc.to(output_ptr.dtype.element_ty), mask=mask)
 
 
-def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
-    """Build combine push maps (expert->home) — same as 06 _prepare_fc2_combine."""
-    device = grad_fc1_output.device
-    pe = saved["ep_rank"]
-    W = saved["world_size"]
-    H = saved["hidden_dim"]
-    ep_group = saved["ep_group"]
-    M = saved["M"]
-    total_send = saved["total_send"]
-    total_recv = saved["total_recv"]
+def _combine_static_maps(saved):
+    """Build the dy-independent combine push maps once and cache them on `saved`.
+    Vectorized — no per-element Python writes (the old O(M) scalar-assign loop was
+    the dominant backward cost: ~265 ms/call)."""
+    cache = saved.get("_combine_cache")
+    if cache is not None:
+        return cache
+    device = f"npu:{saved['ep_rank']}"
+    pe = saved["ep_rank"]; W = saved["world_size"]; H = saved["hidden_dim"]
+    ep_group = saved["ep_group"]; M = saved["M"]
 
     send_t = torch.tensor(saved["splits_send_list"], dtype=torch.int64, device=device)
     all_send = torch.stack(all_gather_list(send_t, ep_group))     # [W,W]: all_send[r][d] = r sends to d
@@ -130,34 +130,47 @@ def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
     send_cum[:, 1:] = all_send[:, :-1].cumsum(dim=1)               # send_cum[d, me] = sum_{s<me} all_send[d, s]
 
     recv_t = torch.tensor(saved["splits_recv_list"], dtype=torch.int64, device=device)
-    write_rank = torch.zeros(M, dtype=torch.int32, device=device)
-    write_off = torch.zeros(M, dtype=torch.int64, device=device)
-    seg = 0
-    for d in range(W):
-        n = int(recv_t[d].item())
-        base = int(send_cum[d, pe].item())
-        for p in range(seg, seg + n):
-            write_rank[p] = d
-            write_off[p] = base + (p - seg)
-        seg += n
+    # write_rank[p] = d for p in dest-d segment  -> repeat_interleave(arange(W), recv_t)
+    write_rank = torch.repeat_interleave(torch.arange(W, dtype=torch.int32, device=device), recv_t)
+    # within-segment position of each p
+    seg_start = torch.zeros(W, dtype=torch.int64, device=device)
+    seg_start[1:] = recv_t[:-1].cumsum(0)
+    within = torch.arange(M, dtype=torch.int64, device=device) - torch.repeat_interleave(seg_start, recv_t)
+    base_per_dest = send_cum[:, pe].to(torch.int64)               # [W]: base offset per dest
+    write_off = base_per_dest[write_rank.to(torch.int64)] + within  # [M]
 
-    inv_local = torch.argsort(saved["local_sort_idxs"]).to(torch.int64).to(device).contiguous()
-    inv_sort = torch.argsort(saved["sort_idxs"]).to(torch.int64).to(device).contiguous()
+    # inv_local / inv_sort are already in saved (computed in forward) — reuse, don't re-argsort.
+    inv_local = saved["inv_local"].to(torch.int64).to(device).contiguous()
+    inv_sort = saved["inv_sort"].to(torch.int64).to(device).contiguous()
 
     num_tm = int(saved["num_tiles_total"].item())
     num_tn = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     fc1_combined = saved["fc1_combined"].contiguous()
-    return dict(
-        inp=grad_fc1_output.contiguous(), weight=fc1_combined, grad_gate=grad_gate.contiguous(),
+    cache = dict(
+        weight=fc1_combined,
         meta_expert_ids=saved["meta_expert_ids"].to(device), meta_split_cum=saved["meta_split_cum"].to(device),
         meta_tile_num=saved["meta_tile_num"].to(device), expert_counts=saved["expert_counts"].to(device),
         M=M, N=H, K=fc1_combined.shape[1], E=saved["experts_per_rank"], num_tm=num_tm, num_tn=num_tn,
         inv_local=inv_local, write_rank=write_rank, write_off=write_off, inv_sort=inv_sort,
-        total_recv=total_recv, H=H, B=saved["batch_size"], topk=saved["topk"], total_send=total_send,
-        inp_stride_im=grad_fc1_output.stride(0), inp_stride_ik=grad_fc1_output.stride(1),
+        total_recv=saved["total_recv"], H=H, B=saved["batch_size"], topk=saved["topk"],
+        total_send=saved["total_send"],
         we=fc1_combined.stride(0), wk=fc1_combined.stride(1), wn=fc1_combined.stride(2),
         stride_om=H, stride_on=1,
     )
+    saved["_combine_cache"] = cache
+    return cache
+
+
+def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
+    """Build combine push maps (expert->home) — same as 06 _prepare_fc2_combine.
+    Static maps are cached on `saved`; only the grad-dependent strides are added."""
+    p = _combine_static_maps(saved)
+    p = dict(p)  # shallow copy so we can add grad-dependent fields
+    p["inp"] = grad_fc1_output.contiguous()
+    p["grad_gate"] = grad_gate.contiguous()
+    p["inp_stride_im"] = grad_fc1_output.stride(0)
+    p["inp_stride_ik"] = grad_fc1_output.stride(1)
+    return p
 
 
 def _gate_bwd_host(saved, grad_gate):
@@ -186,9 +199,10 @@ def _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output):
         prep["M"], prep["N"], prep["K"], prep["E"], prep["num_tm"], prep["num_tn"],
         prep["inp_stride_im"], prep["inp_stride_ik"], prep["we"], prep["wk"], prep["wn"],
         BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, num_warps=8)
-    # host sync: GEMM must finish writing hidden_buf before the push reads it.
-    torch.npu.synchronize()
-    dist.barrier()
+    # No host sync needed: the push kernel reads local hidden_buf, and the two
+    # launches are ordered on the same stream. The push kernel's device barrier_all
+    # syncs the cross-rank push->reduce phase. (The sync was a workaround for a
+    # long-since-removed fused kernel; with separate launches it is pure overhead.)
     # Launch 2: reverse-A2A push + topk reduce (hidden)
     kernel_combine_push_reduce[(ncore(), 1, 1)](
         hidden_buf,
@@ -209,7 +223,9 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     prep = _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate)
     hidden_buf = torch.zeros(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     output = torch.zeros(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
-    peer_mem.zero_(); dist.barrier(saved["ep_group"])
+    # peer_mem is fully overwritten by the push phase (every row read by the
+    # reduce was written by some rank's push); the push kernel's barrier_all
+    # handles cross-rank sync, so no host zero/barrier is needed.
     _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output)
     grad_routing_weights = _gate_bwd_host(saved, grad_gate)
     if return_hidden:
