@@ -39,7 +39,7 @@ import torch.distributed as dist
 from benchmark.moe_backward_golden import moe_forward, moe_backward_torch
 from functions.moe_backward import moe_backward_triton
 
-g_ash_size = 512 * 1024 * 1024
+g_ash_size = 2 * 1024 * 1024 * 1024
 G_IP_PORT = "tcp://127.0.0.1:8666"
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -100,10 +100,10 @@ def _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, see
     return saved, dy, dtype, device
 
 
-def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
+def run_one(name, ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     pe = dist.get_rank(ep_group)
     saved, dy, dtype, device = _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group)
-    label = f"tk={ntokens:>5} h={hidden_dim} ffn={ffn_dim} k={topk}"
+    label = f"{name:16} tk={ntokens:>5} h={hidden_dim} ffn={ffn_dim} k={topk} E={num_experts}"
 
     # shared symmetric buffer at heap offset 0 (reused by step1 & step4)
     peer_elems = max(saved["total_recv"], saved["total_send"]) * saved["hidden_dim"]
@@ -153,24 +153,27 @@ def run_test_distributed():
     attr.ip_port = G_IP_PORT; attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
     assert ash.aclshmem_init(attr) == 0
 
-    num_experts = 128
-    # Small configs (always fit). Enable the Qwen3-30B-A3B perf configs below
-    # once the NPU is fully free (leaked memory from crashed runs must be cleared
-    # by a reboot — `npu-smi reset` fails on this box).
+    # Configs are 5-tuples: (ntokens, hidden_dim, ffn_dim, topk, num_experts).
+    # MOE_PERF_CONFIGS=1 selects real model shapes from the mega_kernel paper
+    # (ntokens=4096), EP-sharded across all cards so each fits in the ~13 GB HBM
+    # left after leaked-memory. The small default set is a fast regression smoke.
     if os.environ.get("MOE_PERF_CONFIGS") == "1":
-        # Qwen3-30B-A3B perf configs — need a fully-free NPU.
+        # (name, ntokens, hidden, ffn, topk, E) — real MoE models (paper Fig.)
         test_configs = [
-            (2048,  2048, 768, 8),
-            (8192,  2048, 768, 8),
-            (16384, 2048, 768, 8),
-            (32768, 2048, 768, 8),
+            ("Qwen3-30B-A3B",   4096, 2048,  768,  8, 128),
+            ("Qwen3-30B-A3B",   8192, 2048,  768,  8, 128),
+            ("Qwen3-30B-A3B",  16384, 2048,  768,  8, 128),
+            ("DeepSeek-MoE-16B",4096, 2048, 1408,  6,  64),
+            ("Qwen3-235B-A22B", 4096, 4096, 1536,  8, 128),
+            ("Qwen3-Next-80B",  4096, 2048,  512, 10, 512),
+            ("Qwen3-Omni-30B",  4096, 1024,  384,  6, 128),
         ]
     else:
         test_configs = [
-            (512,  512, 256, 4),
-            (1024, 512, 256, 4),
-            (2048, 512, 256, 4),
-            (512,  1024, 512, 8),
+            ("small",  512,  512, 256, 4, 128),
+            ("small", 1024,  512, 256, 4, 128),
+            ("small", 2048,  512, 256, 4, 128),
+            ("small",  512, 1024, 512, 8, 128),
         ]
 
     if pe == 0:
@@ -181,16 +184,16 @@ def run_test_distributed():
     try:
         for cfg in test_configs:
             dist.barrier()
-            rows.append(run_one(*cfg, num_experts, ep_group))
+            rows.append(run_one(*cfg, ep_group))
         dist.barrier()
         if pe == 0:
             print(f"\n{BOLD}==== Summary: triton vs torch (MoE backward end-to-end) ===={RESET}")
-            print(f"  {'config':24} {'torch(ms)':>9} {'triton(ms)':>10} {'triton/torch':>12}  correct")
+            print(f"  {'config':52} {'torch(ms)':>9} {'triton(ms)':>10} {'triton/torch':>12}  correct")
             sps = []
             for label, t_ms, r_ms, sp, ok in rows:
                 cor = f"{GREEN}PASS{RESET}" if ok else f"{RED}FAIL{RESET}"
                 sps.append(sp)
-                print(f"  {label:24} {t_ms:>9.3f} {r_ms:>10.3f} {sp:>10.2f}x  {cor}")
+                print(f"  {label:52} {t_ms:>9.3f} {r_ms:>10.3f} {sp:>10.2f}x  {cor}")
             if sps:
                 print(f"\n  avg triton/torch speedup: {sum(sps)/len(sps):.2f}x over {len(sps)} configs")
             print(f"{BOLD}==== done ===={RESET}", flush=True)
