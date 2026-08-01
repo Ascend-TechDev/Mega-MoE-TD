@@ -1,20 +1,20 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # ============================================================================
-#  functions/moe_backward.py
+#  mega_moe/ops/backward.py
 #
 #  Integration layer for the Ascend MoE backward triton mega-kernels.
 #
 #  Two things live here:
 #
 #  1. ``moe_backward_triton(saved, dy, peer_mem)`` — the 5-op orchestrator that
-#     chains the per-kernel wrappers from ``benchmark.kernel.*`` end-to-end
+#     chains the per-kernel wrappers from ``mega_moe.kernels`` end-to-end
 #     (mirrors the GPU ``TritonDistFusedEpMoeFunction.backward`` 5-op split).
 #
 #  2. ``MegaMoEBackwardFunction`` — a ``torch.autograd.Function`` modeled on the
 #     GPU ``TritonDistFusedEpMoeFunction``: its ``forward`` runs the (torch)
 #     EP-MoE forward and stashes the saved intermediates + the shared symmetric
 #     buffer; its ``backward`` runs the 5 triton mega-ops. The forward reuses the
-#     differentiable golden forward from ``benchmark.moe_backward_golden``; only
+#     differentiable legacy golden forward in this package; only
 #     the backward is the fused triton path (the Ascend tutorial only ships a
 #     triton backward — forward is the torch reference).
 #
@@ -30,8 +30,8 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from benchmark.moe_backward_golden import moe_forward
-from kernels import (
+from ._legacy_backward_golden import moe_forward
+from ..kernels import (
     dispatch_fc2_bwd_triton,
     swiglu_bwd_triton,
     transposed_grouped_gemm_triton,
