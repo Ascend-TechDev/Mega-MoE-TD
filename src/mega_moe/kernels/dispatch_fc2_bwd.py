@@ -153,7 +153,7 @@ def _launch_dispatch_fc2_bwd(prep, peer_mem, out):
         prep["fc2"].stride(0), prep["fc2"].stride(1), prep["fc2"].stride(2),
         out,
         BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-        BLOCK_H_PUSH=512, num_warps=8)
+        BLOCK_H_PUSH=512, num_warps=8, use_bytecode=True)
     return out
 
 
@@ -161,7 +161,8 @@ def dispatch_fc2_bwd_triton(saved, dy, peer_mem):
     """Step 1: returns (grad_swiglu [M,ffn], grad_fc2_out_sorted [M,H]).
     peer_mem is the shared symmetric buffer at heap offset 0 (reused with step 4)."""
     prep = _prepare_dispatch_fc2_bwd(saved, dy)
-    out = torch.zeros(prep["M"], prep["N"], dtype=dy.dtype, device=dy.device)
+    # GEMM writes every (m,n) tile (meta covers all tokens) -> empty, no zero-fill
+    out = torch.empty(prep["M"], prep["N"], dtype=dy.dtype, device=dy.device)
     # peer_mem is fully overwritten by the push phase (every arrival row read by
     # the GEMM is written by some sender's push); the kernel's barrier_all syncs
     # push->GEMM, so no host zero/barrier is needed here.
