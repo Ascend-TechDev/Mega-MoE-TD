@@ -1,0 +1,288 @@
+[
+  {
+    "model_profile": "DSV4",
+    "config": "dsv4_pro_8k",
+    "hidden": 7168,
+    "ffn_dim": 3072,
+    "topk": 6,
+    "num_experts": 384,
+    "tokens_per_rank": 8192,
+    "global_tokens": 65536,
+    "token_count_scope": "profile specifies tokens per rank",
+    "world_size": 8,
+    "hardware": {
+      "name": "Ascend910B1",
+      "physical_cube_core_num": 24,
+      "physical_vector_core_num": 48,
+      "l2_cache_size_bytes": 201326592,
+      "launch_program_count": 24
+    },
+    "activation_dtype": "bfloat16",
+    "w1_dtype": "bfloat16",
+    "w1_model_load_layout": "[E_local,K,N]",
+    "w2_dtype": "bfloat16",
+    "routing_weight_input_dtype": "float32",
+    "routing_weight_transport_dtype": "float32",
+    "routing_weight_compute_dtype": "float32",
+    "routing_weight_semantics": "FP32 input and transport; FP32 weighted-SwiGLU compute",
+    "synthetic_input_generation": {
+      "hidden_states": "rank-seeded BF16 normal values scaled by 0.5",
+      "selected_experts": "top-k of rank-seeded FP32 normal logits; generated outside timing",
+      "routing_weights": "FP32 softmax over selected logits",
+      "timed_normal_case_has_dropped_routes": false
+    },
+    "measured_boundary": "post-router full forward; router/top-k generation excluded",
+    "weight_layout_preparation": "one-time packed/grouped views excluded from timing",
+    "correctness_gates": {
+      "status": "passed_before_timing",
+      "cases": [
+        "normal",
+        "zero-receive/empty-expert",
+        "negative/out-of-range all-drop"
+      ],
+      "providers": [
+        "Ascend production",
+        "Torch-NPU grouped-GEMM + HCCL"
+      ],
+      "comparison_baseline": "Torch-NPU grouped-GEMM + HCCL",
+      "routing_transport_dtype_asserted": true
+    },
+    "provenance": {
+      "result_contract": "bf16-activations-fp32-routing-transport-v2",
+      "benchmark_source": "/home/w00845909/distribution/Triton-distributed-ascend/tutorials/ascend/mega-moe/forward/tests/perf/bench_full_forward.py",
+      "benchmark_source_sha256": "7950ff8557486f84f0dbe8de29cc23ad70c5fc76df8f3fb7db201bd5f17a330c",
+      "command": "/usr/local/python3.11.14/bin/pytest tutorials/ascend/mega-moe/forward/tests/perf/bench_full_forward.py::test_bench_full_forward_dsv4_8ranks -m dist -v -s"
+    },
+    "baseline_semantics": {
+      "torch_npu_grouped_hccl": "optimized BF16 npu_grouped_matmul provider; accumulator dtype is not asserted by this benchmark"
+    },
+    "warmup_iters": 5,
+    "benchmark_iters": 50,
+    "sample_rank_reduction": "MAX before statistics",
+    "receive_capacity_factor": 4.0,
+    "dispatch_readiness": "tile",
+    "dispatch_fc1_schedule": "allcore_expert_n_tile",
+    "dispatch_fc1_task_order": "expert_major",
+    "fc1_gemm_load_cache_num": null,
+    "dispatch_producer_cores": 4,
+    "routing_load_stats": {
+      "scope": "untimed normal-case routing metadata gathered across EP ranks",
+      "traffic_interpretation": "static logical FC1 M-window and padded-row model; not measured HBM/L2 bytes",
+      "dispatch_tile_m": 128,
+      "fc1_gemm_tile_m": 128,
+      "effective_fc1_n_tile": 256,
+      "fc1_n_tiles": 24,
+      "received_routes_per_rank": {
+        "count": 8,
+        "sum": 393216,
+        "min": 48779,
+        "p50": 49114,
+        "p95": 49681,
+        "max": 49681
+      },
+      "active_local_experts_per_rank": {
+        "count": 8,
+        "sum": 384,
+        "min": 48,
+        "p50": 48,
+        "p95": 48,
+        "max": 48
+      },
+      "nonempty_source_expert_buckets_per_rank": {
+        "count": 8,
+        "sum": 3072,
+        "min": 384,
+        "p50": 384,
+        "p95": 384,
+        "max": 384
+      },
+      "nonempty_source_expert_bucket_rows": {
+        "count": 3072,
+        "sum": 393216,
+        "min": 89,
+        "p50": 128,
+        "p95": 147,
+        "max": 170
+      },
+      "active_local_expert_rows": {
+        "count": 384,
+        "sum": 393216,
+        "min": 925,
+        "p50": 1023,
+        "p95": 1079,
+        "max": 1115
+      },
+      "logical_weight_scan_m_windows_per_rank": {
+        "source_fragmented": {
+          "count": 8,
+          "sum": 4533,
+          "min": 551,
+          "p50": 565,
+          "p95": 588,
+          "max": 588
+        },
+        "expert_merged": {
+          "count": 8,
+          "sum": 3255,
+          "min": 403,
+          "p50": 406,
+          "p95": 412,
+          "max": 412
+        },
+        "source_fragmented_over_expert_merged_sum": 1.393
+      },
+      "logical_fc1_mn_tasks_per_rank": {
+        "source_fragmented": {
+          "count": 8,
+          "sum": 108792,
+          "min": 13224,
+          "p50": 13560,
+          "p95": 14112,
+          "max": 14112
+        },
+        "expert_merged": {
+          "count": 8,
+          "sum": 78120,
+          "min": 9672,
+          "p50": 9744,
+          "p95": 9888,
+          "max": 9888
+        }
+      },
+      "logical_tail_padding_rows_per_rank": {
+        "source_fragmented": {
+          "count": 8,
+          "sum": 46944,
+          "min": 5635,
+          "p50": 5833,
+          "p95": 6067,
+          "max": 6067
+        },
+        "expert_merged": {
+          "count": 8,
+          "sum": 7584,
+          "min": 806,
+          "p50": 914,
+          "p95": 1141,
+          "max": 1141
+        }
+      }
+    },
+    "tiles": {
+      "dispatch_fc1_m": 128,
+      "dispatch_tile_m": 128,
+      "fc1_gemm_m": 128,
+      "fc1_gemm_n": 256,
+      "fc1_gemm_k": 128,
+      "fc2_combine_m": 64,
+      "fc2_gemm_n": 128,
+      "fc2_gemm_k": 128,
+      "note": "runtime dot tiles may halve until they divide the actual dimension"
+    },
+    "metrics": {
+      "ascend_full_direct_e2e_ms": {
+        "min_ms": 95.065,
+        "max_ms": 98.669,
+        "mean_ms": 96.16,
+        "median_ms": 95.97
+      },
+      "torch_npu_grouped_hccl_full_direct_e2e_ms": {
+        "min_ms": 83.961,
+        "max_ms": 85.571,
+        "mean_ms": 84.627,
+        "median_ms": 84.487
+      }
+    },
+    "torch_npu_grouped_hccl_over_ascend_full_median": 0.88,
+    "diagnostics": {
+      "ascend_event_slices": {
+        "preprocess_event_ms": {
+          "min_ms": 3.74,
+          "max_ms": 6.642,
+          "mean_ms": 4.029,
+          "median_ms": 3.906
+        },
+        "dispatch_fc1_event_ms": {
+          "min_ms": 24.959,
+          "max_ms": 26.432,
+          "mean_ms": 25.324,
+          "median_ms": 25.191
+        },
+        "weighted_swiglu_event_ms": {
+          "min_ms": 1.697,
+          "max_ms": 1.723,
+          "mean_ms": 1.705,
+          "median_ms": 1.705
+        },
+        "fc2_combine_event_ms": {
+          "min_ms": 64.931,
+          "max_ms": 66.123,
+          "mean_ms": 65.631,
+          "median_ms": 65.61
+        }
+      },
+      "torch_npu_grouped_hccl_event_slices": {
+        "preprocess_event_ms": {
+          "min_ms": 10.842,
+          "max_ms": 12.707,
+          "mean_ms": 11.366,
+          "median_ms": 11.266
+        },
+        "dispatch_fc1_event_ms": {
+          "min_ms": 26.841,
+          "max_ms": 28.305,
+          "mean_ms": 27.115,
+          "median_ms": 27.056
+        },
+        "weighted_swiglu_event_ms": {
+          "min_ms": 6.581,
+          "max_ms": 6.615,
+          "mean_ms": 6.593,
+          "median_ms": 6.592
+        },
+        "fc2_combine_event_ms": {
+          "min_ms": 39.673,
+          "max_ms": 40.557,
+          "mean_ms": 39.92,
+          "median_ms": 39.905
+        }
+      },
+      "torch_npu_grouped_hccl_over_ascend_median": {
+        "preprocess": 2.884,
+        "dispatch_fc1": 1.074,
+        "weighted_swiglu": 3.866,
+        "fc2_combine": 0.608
+      },
+      "warning": "independent complete-execution event samples reduced by rank MAX; do not add independently summarized stage statistics into E2E"
+    },
+    "fc1_component_diagnostics": {
+      "protocol": "5 warmup + 50 samples; rank-MAX before statistics",
+      "same_received_data": true,
+      "m_windows_per_group": 1,
+      "n_tiles_per_task": 1,
+      "compiler_pipeline_reorder": null,
+      "consumer_only_fc1_ms": {
+        "expert_n_merged_no_wait": {
+          "min_ms": 23.753,
+          "max_ms": 25.686,
+          "mean_ms": 23.978,
+          "median_ms": 23.918
+        },
+        "torch_npu_grouped_matmul": {
+          "min_ms": 14.633,
+          "max_ms": 15.19,
+          "mean_ms": 14.752,
+          "median_ms": 14.733
+        }
+      },
+      "torch_npu_grouped_over_merged_no_wait_median": 0.616,
+      "dispatch_only_real_rma_ms": {
+        "min_ms": 9.335,
+        "max_ms": 10.931,
+        "mean_ms": 9.444,
+        "median_ms": 9.399
+      },
+      "boundary_note": "dispatch-only includes row putmem, routing-weight putmem, fence, SET signal, and final rank barrier; consumer-only excludes dispatch and waits. Standalone dl.wait is not linkable on this backend, so wait idle time requires fused-kernel profiling."
+    }
+  }
+]

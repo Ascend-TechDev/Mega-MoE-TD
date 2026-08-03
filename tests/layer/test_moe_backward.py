@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # ============================================================================
-#  test/layer/run_moe_backward.py
+#  tests/layer/test_moe_backward.py
 #
 #  End-to-end MoE backward harness for Ascend NPU: correctness + performance.
 #
@@ -16,28 +16,22 @@
 #  Usage (2 cards, AscendNPU-IR 1.2.0 bishengir):
 #    PATH=/home/z00905891/triton_dist/AscendNPU-IR/build/bin:$PATH \
 #    TRITON_CACHE_DIR=/tmp/triton_mb \
-#    torchrun --nproc-per-node=2 test/layer/run_moe_backward.py
+#    torchrun --nproc-per-node=2 tests/layer/test_moe_backward.py
 #
-#  NOTE: dl.symm_at only resolves at heap offset 0 (see benchmark/kernel), so
+#  NOTE: dl.symm_at only resolves at heap offset 0 (see mega_moe.kernels), so
 #  ONE shared peer_mem is allocated per config and reused by step 1 & step 4.
 # ============================================================================
 
 import os
-import sys
 import time
-
-# make the repo root importable (benchmark.*, functions.*) when launched via torchrun
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 import torch
 import torch_npu  # noqa: F401
 import shmem as ash
 import torch.distributed as dist
 
-from benchmark.moe_backward_golden import moe_forward, moe_backward_torch
-from functions.moe_backward import moe_backward_triton
+from mega_moe import moe_backward_triton
+from mega_moe.ops._legacy_backward_golden import moe_forward, moe_backward_torch
 
 g_ash_size = 2 * 1024 * 1024 * 1024
 G_IP_PORT = "tcp://127.0.0.1:8666"

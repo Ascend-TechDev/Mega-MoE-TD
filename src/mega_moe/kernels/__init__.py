@@ -3,10 +3,10 @@
 Mirrors the GPU ``TritonDistFusedEpMoeFunction.backward`` 5-op split and reuses
 the 06 tutorial's ``barrier_all`` + ``dl.symm_at`` symmetric-memory idiom:
 
-  * :mod:`benchmark.kernel.swiglu_bwd`            step2: SwiGLU backward
-  * :mod:`benchmark.kernel.transposed_grouped_gemm` step3/5: weight-grad (fc2/fc1)
-  * :mod:`benchmark.kernel.dispatch_fc2_bwd`       step1: dispatch-A2A + fc2 input-grad
-  * :mod:`benchmark.kernel.combine_fc1_bwd`        step4: fc1 input-grad + reverse-A2A + gate-grad
+  * :mod:`mega_moe.kernels.swiglu_bwd` step2: SwiGLU backward
+  * :mod:`mega_moe.kernels.transposed_grouped_gemm` step3/5: weight-grad
+  * :mod:`mega_moe.kernels.dispatch_fc2_bwd` step1: dispatch-A2A + fc2 input-grad
+  * :mod:`mega_moe.kernels.combine_fc1_bwd` step4: input-grad + reverse-A2A + gate-grad
 """
 
 from .common import (  # noqa: F401

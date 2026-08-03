@@ -25,7 +25,7 @@
 #  autograd (output.backward(dy)) on every grad tensor.
 #
 #  Usage:
-#    torchrun --nproc-per-node=2 tutorials/ascend/moe_backward/moe_backward_golden.py
+#    torchrun --nproc-per-node=2 -m mega_moe.ops._legacy_backward_golden
 # ============================================================================
 
 import os
