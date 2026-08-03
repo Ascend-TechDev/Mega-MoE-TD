@@ -151,7 +151,14 @@ def run_test_distributed():
     # MOE_PERF_CONFIGS=1 selects real model shapes from the mega_kernel paper
     # (ntokens=4096), EP-sharded across all cards so each fits in the ~13 GB HBM
     # left after leaked-memory. The small default set is a fast regression smoke.
-    if os.environ.get("MOE_PERF_CONFIGS") == "1":
+    if os.environ.get("MOE_KIMI") == "1":
+        # Kimi-K3 only: hidden=3584, ffn=3072, topk=16, E=896 (8-card EP focus).
+        test_configs = [
+            ("Kimi-K3",  4096, 3584, 3072, 16, 896),
+            ("Kimi-K3",  8192, 3584, 3072, 16, 896),
+            ("Kimi-K3", 16384, 3584, 3072, 16, 896),
+        ]
+    elif os.environ.get("MOE_PERF_CONFIGS") == "1":
         # (name, ntokens, hidden, ffn, topk, E) — real MoE models (paper Fig.)
         test_configs = [
             ("Qwen3-30B-A3B",   4096, 2048,  768,  8, 128),
@@ -161,6 +168,9 @@ def run_test_distributed():
             ("Qwen3-235B-A22B", 4096, 4096, 1536,  8, 128),
             ("Qwen3-Next-80B",  4096, 2048,  512, 10, 512),
             ("Qwen3-Omni-30B",  4096, 1024,  384,  6, 128),
+            ("Kimi-K3",           4096, 3584, 3072, 16, 896),
+            ("Kimi-K3",           8192, 3584, 3072, 16, 896),
+            ("Kimi-K3",          16384, 3584, 3072, 16, 896),
         ]
     else:
         test_configs = [

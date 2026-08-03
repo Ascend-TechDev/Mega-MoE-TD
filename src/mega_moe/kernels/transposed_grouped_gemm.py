@@ -25,7 +25,7 @@ def kernel_transposed_grouped_gemm(
     orig_in_ptr,              # [M, K] contiguous
     grad_w_ptr,               # [E, N, K]
     split_size_cum_per_expert_ptr, expert_counts_ptr,
-    N, K, E, num_tiles_n, num_tiles_k,
+    N: tl.constexpr, K: tl.constexpr, E, num_tiles_n: tl.constexpr, num_tiles_k: tl.constexpr,
     stride_tn, stride_tm,     # grad_out_T: (M, 1)
     stride_om, stride_ok,     # orig_in:   (K, 1)
     stride_we, stride_wn, stride_wk,
