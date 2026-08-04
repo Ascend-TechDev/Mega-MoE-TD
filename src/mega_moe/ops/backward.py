@@ -58,7 +58,7 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
     K = orig_in.shape[1]
     dtype = grad_out.dtype
     dev = grad_out.device
-    grad_w = torch.empty(E, N, K, dtype=dtype, device=dev)
+    grad_w = torch.zeros(E, N, K, dtype=dtype, device=dev)
     ec_list = expert_counts.cpu().tolist()  # one sync, avoid per-iter .item()
     start = 0
     for e in range(E):

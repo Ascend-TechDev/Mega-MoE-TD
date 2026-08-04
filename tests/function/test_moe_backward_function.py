@@ -67,6 +67,12 @@ def _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, see
     return hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device
 
 
+def _all_ranks_pass(local_pass, device, ep_group):
+    status = torch.tensor([int(local_pass)], dtype=torch.int32, device=device)
+    dist.all_reduce(status, op=dist.ReduceOp.MIN, group=ep_group)
+    return bool(status.item())
+
+
 def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     pe = dist.get_rank(ep_group)
     hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = _build_inputs(
@@ -141,19 +147,27 @@ def run_test_distributed():
             dist.barrier()
             results.append(run_one(*cfg, num_experts, ep_group))
         dist.barrier()
+        local_pass = bool(results) and all(results)
+        passed = _all_ranks_pass(local_pass, f"npu:{pe}", ep_group)
         if pe == 0:
             print(f"\n{BOLD}==== MegaMoEBackwardFunction: "
-                  f"{'ALL PASS' if all(results) else 'SOME FAILED'} ===={RESET}", flush=True)
+                  f"{'ALL PASS' if passed else 'SOME FAILED'} ===={RESET}", flush=True)
+        return passed
     finally:
         _ = ash.aclshmem_finalize()
 
 
-if __name__ == "__main__":
+def main():
     local_pe = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_pe)
     dist.init_process_group(backend="hccl", rank=local_pe)
     print(f"[INFO] Rank {local_pe} of {dist.get_world_size()} initialised", flush=True)
     dist.barrier()
-    run_test_distributed()
+    passed = run_test_distributed()
     if local_pe == 0:
-        print(f"[INFO] MegaMoEBackwardFunction test done", flush=True)
+        print(f"[INFO] MegaMoEBackwardFunction test {'PASS' if passed else 'FAIL'}", flush=True)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

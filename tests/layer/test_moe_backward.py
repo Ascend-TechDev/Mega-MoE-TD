@@ -22,8 +22,10 @@
 #  ONE shared peer_mem is allocated per config and reused by step 1 & step 4.
 # ============================================================================
 
+import json
 import os
 import time
+from enum import Enum
 
 import torch
 import torch_npu  # noqa: F401
@@ -42,6 +44,17 @@ BOLD = "\033[1m"
 
 BENCH_WARMUP = 5
 BENCH_ITERS = 20
+
+
+class SkipReason(str, Enum):
+    SYMMETRIC_HEAP_CAPACITY = "symmetric_heap_capacity"
+
+
+class HarnessSkip(Exception):
+    def __init__(self, reason, **details):
+        super().__init__(reason.value)
+        self.reason = reason
+        self.details = details
 
 
 def _cmp(name, tri, gold, rtol=2e-2, atol=1e-2):
@@ -94,6 +107,37 @@ def _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, see
     return saved, dy, dtype, device
 
 
+def _global_required_bytes(peer_elems, dtype, device, ep_group):
+    local_bytes = peer_elems * torch.empty((), dtype=dtype).element_size()
+    required = torch.tensor([local_bytes], dtype=torch.int64, device=device)
+    dist.all_reduce(required, op=dist.ReduceOp.MAX, group=ep_group)
+    return int(required.item())
+
+
+def _all_ranks_pass(local_pass, device, ep_group):
+    status = torch.tensor([int(local_pass)], dtype=torch.int32, device=device)
+    dist.all_reduce(status, op=dist.ReduceOp.MIN, group=ep_group)
+    return bool(status.item())
+
+
+def _format_skip(cfg, skip):
+    name, ntokens, hidden_dim, ffn_dim, topk, num_experts = cfg
+    payload = {
+        "event": "skip",
+        "reason": skip.reason.value,
+        "config": {
+            "name": name,
+            "ntokens": ntokens,
+            "hidden_dim": hidden_dim,
+            "ffn_dim": ffn_dim,
+            "topk": topk,
+            "num_experts": num_experts,
+        },
+        **skip.details,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
 def run_one(name, ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     pe = dist.get_rank(ep_group)
     saved, dy, dtype, device = _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group)
@@ -101,6 +145,13 @@ def run_one(name, ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
 
     # shared symmetric buffer at heap offset 0 (reused by step1 & step4)
     peer_elems = max(saved["total_recv"], saved["total_send"]) * saved["hidden_dim"]
+    required_bytes = _global_required_bytes(peer_elems, dtype, device, ep_group)
+    if required_bytes > g_ash_size:
+        raise HarnessSkip(
+            SkipReason.SYMMETRIC_HEAP_CAPACITY,
+            required_bytes=required_bytes,
+            configured_bytes=g_ash_size,
+        )
     peer_mem = ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=pe)
 
     # ---- correctness: triton end-to-end vs golden (hand torch+hccl) ----
@@ -191,11 +242,13 @@ def run_test_distributed():
             dist.barrier()
             try:
                 rows.append(run_one(*cfg, ep_group))
-            except Exception as ex:
+            except HarnessSkip as skip:
                 if pe == 0:
-                    print(f"  [skip] {cfg}: {str(ex)[:80]}", flush=True)
+                    print(f"  [skip] {_format_skip(cfg, skip)}", flush=True)
             dist.barrier()
         dist.barrier()
+        local_pass = bool(rows) and all(row[-1] for row in rows)
+        passed = _all_ranks_pass(local_pass, f"npu:{pe}", ep_group)
         if pe == 0:
             print(f"\n{BOLD}==== Summary: triton vs torch (MoE backward end-to-end) ===={RESET}")
             print(f"  {'config':52} {'torch(ms)':>9} {'triton(ms)':>10} {'triton/torch':>12}  correct")
@@ -207,16 +260,22 @@ def run_test_distributed():
             if sps:
                 print(f"\n  avg triton/torch speedup: {sum(sps)/len(sps):.2f}x over {len(sps)} configs")
             print(f"{BOLD}==== done ===={RESET}", flush=True)
+        return passed
     finally:
         _ = ash.aclshmem_finalize()
 
 
-if __name__ == "__main__":
+def main():
     local_pe = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_pe)
     dist.init_process_group(backend="hccl", rank=local_pe)
     print(f"[INFO] Rank {local_pe} of {dist.get_world_size()} initialised", flush=True)
     dist.barrier()
-    run_test_distributed()
+    passed = run_test_distributed()
     if local_pe == 0:
-        print(f"[INFO] MoE backward harness done", flush=True)
+        print(f"[INFO] MoE backward harness {'PASS' if passed else 'FAIL'}", flush=True)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
