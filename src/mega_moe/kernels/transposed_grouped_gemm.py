@@ -25,7 +25,7 @@ def kernel_transposed_grouped_gemm(
     orig_in_ptr,              # [M, K] contiguous
     grad_w_ptr,               # [E, N, K]
     split_size_cum_per_expert_ptr, expert_counts_ptr,
-    N, K, E, num_tiles_n, num_tiles_k,
+    N: tl.constexpr, K: tl.constexpr, E, num_tiles_n: tl.constexpr, num_tiles_k: tl.constexpr,
     stride_tn, stride_tm,     # grad_out_T: (M, 1)
     stride_om, stride_ok,     # orig_in:   (K, 1)
     stride_we, stride_wn, stride_wk,
@@ -75,7 +75,8 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     dev = grad_out.device
     split_size_cum_per_expert = split_size_cum_per_expert.to(dev)
     expert_counts = expert_counts.to(dev)
-    grad_w = torch.zeros(E, N, K, dtype=grad_out.dtype, device=dev)
+    # kernel writes every (e,n,k) tile (0-token experts store a zero acc) -> empty
+    grad_w = torch.empty(E, N, K, dtype=grad_out.dtype, device=dev)
     num_tn = (N + WGRAD_BLOCK_N - 1) // WGRAD_BLOCK_N
     num_tk = (K + WGRAD_BLOCK_K - 1) // WGRAD_BLOCK_K
     kernel_transposed_grouped_gemm[(ncore(), 1, 1)](
@@ -84,5 +85,6 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
         N, K, E, num_tn, num_tk,
         grad_out_T.stride(0), grad_out_T.stride(1), orig_in_c.stride(0), orig_in_c.stride(1),
         grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
-        BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K, num_warps=8)
+        BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K, num_warps=8,
+        use_bytecode=True)
     return grad_w

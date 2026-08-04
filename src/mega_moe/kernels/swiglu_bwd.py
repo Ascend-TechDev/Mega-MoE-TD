@@ -53,5 +53,6 @@ def swiglu_bwd_triton(grad_swiglu, fc1_output, recv_weights_sorted):
     BLOCK_SIZE = triton.next_power_of_2(ffn)
     kernel_swiglu_bwd[(ncore(), 1, 1)](
         grad_swiglu, grad_swiglu.stride(0), fc1_output, fc1_output.stride(0),
-        ffn, recv_weights_sorted, dAB, dscale, M, BLOCK_SIZE=BLOCK_SIZE, num_warps=8)
+        ffn, recv_weights_sorted, dAB, dscale, M, BLOCK_SIZE=BLOCK_SIZE, num_warps=8,
+        use_bytecode=True)
     return dAB, dscale
