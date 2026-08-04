@@ -19,6 +19,7 @@
 #    torchrun --nproc-per-node=2 tests/function/test_moe_backward_function.py
 # ============================================================================
 
+import math
 import os
 
 import torch
@@ -38,13 +39,19 @@ BOLD = "\033[1m"
 
 
 def _cmp(name, tri, gold, rtol=2e-2, atol=1e-2):
-    tri = tri.float(); gold = gold.float()
+    tri = tri.float()
+    gold = gold.float()
     d = (tri - gold).abs()
     max_d = float(d.max().item())
     gmax = float(gold.abs().max().item())
-    n_bad = int((d > atol + rtol * gmax).sum().item())
+    allowed = float(atol + rtol * gmax)
+    rel = max_d / (gmax + 1e-9)
+    bad = ~torch.isfinite(tri) | ~torch.isfinite(gold) | ~torch.isfinite(d) | (d > allowed)
+    n_bad = int(bad.sum().item())
+    if not all(math.isfinite(metric) for metric in (max_d, gmax, allowed, rel)):
+        n_bad = max(n_bad, 1)
     ok = n_bad == 0
-    return ok, max_d, max_d / (gmax + 1e-9), n_bad
+    return ok, max_d, rel, n_bad
 
 
 def _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):

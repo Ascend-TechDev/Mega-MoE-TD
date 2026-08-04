@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -12,6 +13,40 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+CMP_SUBPROCESS = r"""
+import importlib.util
+import sys
+import types
+
+import torch
+
+path, actual_text, reference_text = sys.argv[1:]
+mega_moe = types.ModuleType("mega_moe")
+mega_moe.moe_backward_triton = lambda *args, **kwargs: None
+mega_moe.MegaMoEBackwardFunction = object
+golden = types.ModuleType("mega_moe.ops._legacy_backward_golden")
+golden.moe_forward = lambda *args, **kwargs: None
+golden.moe_backward_torch = lambda *args, **kwargs: None
+sys.modules.update(
+    {
+        "torch_npu": types.ModuleType("torch_npu"),
+        "shmem": types.ModuleType("shmem"),
+        "mega_moe": mega_moe,
+        "mega_moe.ops": types.ModuleType("mega_moe.ops"),
+        "mega_moe.ops._legacy_backward_golden": golden,
+    }
+)
+spec = importlib.util.spec_from_file_location("gate0_cmp_subprocess", path)
+harness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(harness)
+actual = torch.tensor([float(actual_text)])
+reference = torch.tensor([float(reference_text)])
+ok, _, _, n_bad = harness._cmp("subprocess", actual, reference)
+print(f"cmp_ok={int(ok)} n_bad={n_bad}", flush=True)
+raise SystemExit(0 if ok else 1)
+"""
 
 
 def _load_module(monkeypatch, name, relative_path, stubs):
@@ -78,6 +113,25 @@ def _load_harness(monkeypatch, kind):
             "mega_moe.ops._legacy_backward_golden": golden,
         },
     )
+
+
+def _comparison_case(case):
+    max_float = torch.finfo(torch.float32).max
+    cases = {
+        "finite_pass": (torch.tensor([1.0, 2.0]), torch.tensor([1.0, 2.0]), {}),
+        "finite_mismatch": (torch.tensor([1.0, 2.0]), torch.tensor([1.0, 4.0]), {}),
+        "actual_nan": (torch.tensor([float("nan")]), torch.tensor([1.0]), {}),
+        "actual_pos_inf": (torch.tensor([float("inf")]), torch.tensor([1.0]), {}),
+        "actual_neg_inf": (torch.tensor([-float("inf")]), torch.tensor([1.0]), {}),
+        "reference_nan": (torch.tensor([1.0]), torch.tensor([float("nan")]), {}),
+        "reference_pos_inf": (torch.tensor([1.0]), torch.tensor([float("inf")]), {}),
+        "reference_neg_inf": (torch.tensor([1.0]), torch.tensor([-float("inf")]), {}),
+        "difference_inf": (torch.tensor([max_float]), torch.tensor([-max_float]), {}),
+        "metric_nan": (torch.tensor([1.0]), torch.tensor([1.0]), {"atol": float("nan")}),
+        "metric_pos_inf": (torch.tensor([1.0]), torch.tensor([1.0]), {"rtol": float("inf")}),
+        "metric_neg_inf": (torch.tensor([1.0]), torch.tensor([1.0]), {"rtol": -float("inf")}),
+    }
+    return cases[case]
 
 
 def _stub_distributed_runtime(monkeypatch, harness):
@@ -171,6 +225,69 @@ def test_backward_harness_main_exit_code(monkeypatch, kind, passed, expected):
     monkeypatch.setattr(harness, "run_test_distributed", lambda: passed)
 
     assert harness.main() == expected
+
+
+@pytest.mark.parametrize("kind", ["layer", "function"])
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("finite_pass", True),
+        ("finite_mismatch", False),
+        ("actual_nan", False),
+        ("actual_pos_inf", False),
+        ("actual_neg_inf", False),
+        ("reference_nan", False),
+        ("reference_pos_inf", False),
+        ("reference_neg_inf", False),
+        ("difference_inf", False),
+        ("metric_nan", False),
+        ("metric_pos_inf", False),
+        ("metric_neg_inf", False),
+    ],
+)
+def test_backward_harness_comparator_fails_closed(monkeypatch, kind, case, expected):
+    harness = _load_harness(monkeypatch, kind)
+    actual, reference, kwargs = _comparison_case(case)
+
+    ok, _, _, n_bad = harness._cmp(case, actual, reference, **kwargs)
+
+    assert ok is expected
+    assert (n_bad == 0) is expected
+
+
+@pytest.mark.parametrize(
+    "kind, relative_path",
+    [
+        ("layer", "tests/layer/test_moe_backward.py"),
+        ("function", "tests/function/test_moe_backward_function.py"),
+    ],
+)
+@pytest.mark.parametrize(
+    "actual, reference, expected",
+    [
+        ("1.0", "1.0", 0),
+        ("2.0", "1.0", 1),
+        ("nan", "1.0", 1),
+        ("inf", "1.0", 1),
+        ("-inf", "1.0", 1),
+    ],
+)
+def test_backward_harness_comparator_real_process_exit(
+    kind, relative_path, actual, reference, expected
+):
+    result = subprocess.run(
+        [sys.executable, "-c", CMP_SUBPROCESS, str(ROOT / relative_path), actual, reference],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == expected, result.stderr
+    assert f"cmp_ok={int(expected == 0)}" in result.stdout
+    if expected == 0:
+        assert "n_bad=0" in result.stdout
+    else:
+        assert "n_bad=0" not in result.stdout
 
 
 def test_layer_harness_skip_is_enumerated_and_machine_readable(monkeypatch):
