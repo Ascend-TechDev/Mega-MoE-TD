@@ -16,14 +16,13 @@ import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
 
-_META_BLOCK = 256
 _ROUTE_BLOCK = 256
 
 
 @triton.jit
-def _fill_route_to_send_kernel(route_to_send_ptr, num_routes, BLOCK: tl.constexpr):
+def _fill_int_kernel(output_ptr, size, BLOCK: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(route_to_send_ptr + offs, -1, mask=offs < num_routes)
+    tl.store(output_ptr + offs, -1, mask=offs < size)
 
 
 @triton.jit
@@ -46,24 +45,13 @@ def _prepare_fc2_combine_metadata_kernel(
     reverse_tile_src_start_ptr,
     reverse_tile_dst_start_ptr,
     reverse_tile_row_count_ptr,
-    num_fc2_slots,
-    num_reverse_slots,
     LOCAL_RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    META_BLOCK: tl.constexpr,
 ):
     """Build compact FC2 and reverse-A2A tile descriptions on one Vector core."""
-    meta_offs = tl.arange(0, META_BLOCK)
-    for start in range(0, num_fc2_slots, META_BLOCK):
-        offs = start + meta_offs
-        tl.store(fc2_tile_expert_ptr + offs, -1, mask=offs < num_fc2_slots)
-    for start in range(0, num_reverse_slots, META_BLOCK):
-        offs = start + meta_offs
-        tl.store(reverse_tile_rank_ptr + offs, -1, mask=offs < num_reverse_slots)
-
     fc2_cursor = 0
     for expert_id in range(0, EXPERTS_PER_RANK):
         expert_count = tl.load(recv_counts_re_ptr + expert_id)
@@ -279,12 +267,12 @@ def build_route_to_send(send_route_idx: torch.Tensor, route_to_send: torch.Tenso
     if send_route_idx.numel() > num_routes:
         raise ValueError("the valid send count cannot exceed the flattened route count")
     if num_routes:
-        _fill_route_to_send_kernel[(triton.cdiv(num_routes, _ROUTE_BLOCK), )](
-            route_to_send, num_routes, BLOCK=_ROUTE_BLOCK, use_bytecode=True)
+        _fill_int_kernel[(triton.cdiv(num_routes, _ROUTE_BLOCK), )](
+            route_to_send, num_routes, BLOCK=_ROUTE_BLOCK)
     num_send = send_route_idx.numel()
     if num_send:
         _scatter_route_to_send_kernel[(triton.cdiv(num_send, _ROUTE_BLOCK), )](
-            send_route_idx, route_to_send, num_send, BLOCK=_ROUTE_BLOCK, use_bytecode=True)
+            send_route_idx, route_to_send, num_send, BLOCK=_ROUTE_BLOCK)
     return route_to_send
 
 
@@ -360,6 +348,14 @@ def prepare_fc2_combine_metadata(
     if block_m < 16 or block_m & (block_m - 1):
         raise ValueError("block_m must be a power of two no smaller than 16")
 
+    # A single-core dynamic vector fill is miscompiled for DSV4-sized partial
+    # blocks on the current Ascend backend.  Give each 256-element block its
+    # own program; this is the same fill path used by route restoration.
+    _fill_int_kernel[(triton.cdiv(num_fc2_slots, _ROUTE_BLOCK), )](
+        fc2_tile_expert, num_fc2_slots, BLOCK=_ROUTE_BLOCK)
+    _fill_int_kernel[(triton.cdiv(num_reverse_slots, _ROUTE_BLOCK), )](
+        reverse_tile_rank, num_reverse_slots, BLOCK=_ROUTE_BLOCK)
+
     _prepare_fc2_combine_metadata_kernel[(1, )](
         recv_counts_re,
         recv_expert_offs,
@@ -371,15 +367,14 @@ def prepare_fc2_combine_metadata(
         reverse_tile_src_start,
         reverse_tile_dst_start,
         reverse_tile_row_count,
-        num_fc2_slots,
-        num_reverse_slots,
         LOCAL_RANK=local_rank,
         WORLD_SIZE=world_size,
         EXPERTS_PER_RANK=experts_per_rank,
         NUM_BINS_PAD=num_bins_pad,
         BLOCK_M=block_m,
-        META_BLOCK=_META_BLOCK,
-        use_bytecode=True,
+        # Keep the remaining single-core scalar control loops on the Vector
+        # SIMD path without speculative multi-buffering.
+        multibuffer=True,
     )
 
 
@@ -524,7 +519,6 @@ def launch_fc2_combine(
         BLOCK_K=block_k,
         BLOCK_N_PUSH=push_width,
         BLOCK_N_REDUCE=push_width,
-        use_bytecode=True,
     )
     return output
 

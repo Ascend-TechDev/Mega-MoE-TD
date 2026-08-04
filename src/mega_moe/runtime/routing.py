@@ -81,7 +81,10 @@ def _kernel_build_routing_metadata(
                 peer_rank,
             )
 
-    libshmem_device.barrier_all()
+    # This metadata kernel is AIV-only.  On the current CANN/Triton stack the
+    # generic barrier waits for Cube-side participants and deadlocks; use the
+    # Vector-only collective so every rank has the same participating domain.
+    libshmem_device.barrier_all_vec()
 
     send_running = 0
     recv_running = 0
@@ -132,7 +135,7 @@ def _kernel_build_routing_metadata(
     tl.store(stats_ptr + 1, max_required)
 
     # Protect the shared count cube from a faster rank's next invocation.
-    libshmem_device.barrier_all()
+    libshmem_device.barrier_all_vec()
 
 
 def build_routing_plan(
@@ -180,7 +183,6 @@ def build_routing_plan(
         NUM_BUCKETS=num_experts,
         NUM_BINS_PAD=context.metadata_num_bins,
         HISTOGRAM_BLOCK_SIZE=2048,
-        use_bytecode=True,
     )
 
     num_received_routes = int(context.metadata_stats[0].item())
