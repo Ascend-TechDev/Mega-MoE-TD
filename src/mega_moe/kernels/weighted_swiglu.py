@@ -146,7 +146,6 @@ def weighted_swiglu_forward(
         NUM_PROGRAMS=num_programs,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
-        use_bytecode=True,
     )
     return output
 
