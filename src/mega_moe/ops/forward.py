@@ -560,7 +560,6 @@ class FusedMoEForward(torch.nn.Module):
             BLOCK_SIZE_M=block_m,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
-            use_bytecode=True,
         )
         if tile_readiness:
             self._tile_signal_epoch += 1
