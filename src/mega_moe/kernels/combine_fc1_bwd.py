@@ -198,7 +198,8 @@ def _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output):
         prep["meta_expert_ids"], prep["meta_split_cum"], prep["meta_tile_num"], prep["expert_counts"],
         prep["M"], prep["N"], prep["K"], prep["E"], prep["num_tm"], prep["num_tn"],
         prep["inp_stride_im"], prep["inp_stride_ik"], prep["we"], prep["wk"], prep["wn"],
-        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, num_warps=8)
+        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, num_warps=8,
+        use_bytecode=True)
     # No host sync needed: the push kernel reads local hidden_buf, and the two
     # launches are ordered on the same stream. The push kernel's device barrier_all
     # syncs the cross-rank push->reduce phase. (The sync was a workaround for a
@@ -211,7 +212,7 @@ def _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output):
         prep["inv_sort"], output,
         prep["B"], prep["topk"], prep["total_send"],
         prep["stride_om"], prep["stride_on"],
-        BLOCK_N_PUSH=512, num_warps=8)
+        BLOCK_N_PUSH=512, num_warps=8, use_bytecode=True)
     return output
 
 
@@ -221,8 +222,10 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     which has finished by now). The gate grad is computed on the host (all_to_all).
     If return_hidden, also returns hidden_buf (=grad_recv_hidden_sorted)."""
     prep = _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate)
-    hidden_buf = torch.zeros(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
-    output = torch.zeros(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
+    # GEMM writes every hidden_buf tile (meta covers all tokens); push_reduce
+    # writes every output row -> empty, no zero-fill needed.
+    hidden_buf = torch.empty(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
+    output = torch.empty(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     # peer_mem is fully overwritten by the push phase (every row read by the
     # reduce was written by some rank's push); the push kernel's barrier_all
     # handles cross-rank sync, so no host zero/barrier is needed.

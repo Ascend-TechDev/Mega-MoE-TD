@@ -57,9 +57,6 @@ benchmark/layer/              # 完整前向性能入口与结果汇总
 results/forward/              # 正式 forward benchmark JSON
 ```
 
-`_legacy_backward_golden.py` 只用于维持当前
-`MegaMoEBackwardFunction.forward` 的既有行为；正式前后向接通不在本次目录迁移范围内。
-
 ## 公开接口
 
 ```python
@@ -136,36 +133,7 @@ torchrun --nproc-per-node=2 tests/layer/test_moe_backward.py
 torchrun --nproc-per-node=2 tests/function/test_moe_backward_function.py
 ```
 
-## 完整 forward 性能测试
-
-性能入口为 `benchmark/layer/bench_full_forward.py`。该文件位于 `tests/` 之外，运行
-pytest 时需要显式加载共享 fixture：
-
-```bash
-export MOE_FULL_BENCH_CONFIG=2K
-export MOE_FULL_BENCH_RESULTS_DIR=/tmp/mega_moe_results
-python -m pytest -p tests.conftest \
-  benchmark/layer/bench_full_forward.py::test_bench_full_forward_2ranks \
-  -m dist -v -s
-```
-
-性能协议固定为 5 次 warmup、50 次采样；每个样本先在 rank 间取 `MAX`。加速比为
-`Torch-NPU grouped + HCCL latency / Ascend candidate latency`，大于 1 表示 candidate
-更快。四阶段 event 数据只用于定位瓶颈，不能相加还原完整 forward latency。
-
-不指定 `MOE_FULL_BENCH_RESULTS_DIR` 时，新结果写入 `results/forward/`。日常实验建议使用
-临时目录，避免覆盖仓库中的六份正式 Qwen/DSV4 W2、W4、W8 结果。
-
-汇总正式结果：
-
-```bash
-python benchmark/layer/summarize_results.py
-```
-
 ## 现有性能结果
-
-以下均为迁移前已有的历史结果，本次目录迁移没有重新采样。forward 与 backward 的
-计算边界和基线不同，两张表不能横向比较。
 
 ### Backward
 
