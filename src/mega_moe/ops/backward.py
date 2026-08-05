@@ -1,30 +1,28 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-# ============================================================================
-#  mega_moe/ops/backward.py
-#
-#  Integration layer for the Ascend MoE backward triton mega-kernels.
-#
-#  Two things live here:
-#
-#  1. ``moe_backward_triton(saved, dy, peer_mem)`` — the 5-op orchestrator that
-#     chains the per-kernel wrappers from ``mega_moe.kernels`` end-to-end
-#     (mirrors the GPU ``TritonDistFusedEpMoeFunction.backward`` 5-op split).
-#
-#  2. ``MegaMoEBackwardFunction`` — a ``torch.autograd.Function`` modeled on the
-#     GPU ``TritonDistFusedEpMoeFunction``: its ``forward`` runs the (torch)
-#     EP-MoE forward and stashes the saved intermediates + the shared symmetric
-#     buffer; its ``backward`` runs the 5 triton mega-ops. The forward reuses the
-#     differentiable legacy golden forward in this package; only
-#     the backward is the fused triton path (the Ascend tutorial only ships a
-#     triton backward — forward is the torch reference).
-#
-#  The 5 backward mega-ops (given dy [B,H]):
-#    1. dispatch_fc2_bwd   : dispatch-A2A(home->expert) + fc2 input-grad
-#    2. swiglu_bwd         : SwiGLU backward
-#    3. transposed_gemm    : fc2 weight-grad  (reused for fc1)
-#    4. combine_fc1_bwd    : fc1 input-grad + reverse-A2A + gate-grad
-#    5. transposed_gemm    : fc1 weight-grad -> chunk(grad_fc1_1, grad_fc1_2)
-# ============================================================================
+"""Integration layer for the Ascend MoE backward triton mega-kernels.
+
+Two things live here:
+
+1. :func:`moe_backward_triton` — the 5-op orchestrator that chains the
+   per-kernel wrappers from :mod:`mega_moe.kernels` end-to-end (mirrors the GPU
+   ``TritonDistFusedEpMoeFunction.backward`` 5-op split).
+
+2. :class:`MegaMoEBackwardFunction` — a ``torch.autograd.Function`` modeled on
+   the GPU ``TritonDistFusedEpMoeFunction``: its ``forward`` runs the (torch)
+   EP-MoE forward and stashes the saved intermediates + the shared symmetric
+   buffer; its ``backward`` runs the 5 triton mega-ops. The forward reuses the
+   differentiable torch forward in :mod:`mega_moe.ops._torch_forward`; only the
+   backward is the fused triton path (the Ascend tutorial only ships a triton
+   backward — forward is the torch reference).
+
+The 5 backward mega-ops (given dy [B,H]):
+
+1. ``dispatch_fc2_bwd``  — dispatch-A2A(home->expert) + fc2 input-grad
+2. ``swiglu_bwd``        — SwiGLU backward
+3. ``transposed_gemm``   — fc2 weight-grad  (reused for fc1)
+4. ``combine_fc1_bwd``   — fc1 input-grad + reverse-A2A + gate-grad
+5. ``transposed_gemm``   — fc1 weight-grad -> chunk(grad_fc1_1, grad_fc1_2)
+"""
 
 import os
 
@@ -32,7 +30,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from ._legacy_backward_golden import moe_forward
+from ._torch_forward import moe_forward
 from ..kernels import (
     dispatch_fc2_bwd_triton,
     swiglu_bwd_triton,
