@@ -173,16 +173,47 @@ def _a2a(input, output_split_sizes, input_split_sizes, group):
 
 
 # ----------------------------------------------------------------------------
+# Gated activation (SwiGLU / SiTU-GLU), torch reference
+# ----------------------------------------------------------------------------
+
+def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta):
+    """Gated activation in FP32, mirroring the triton ``weighted_swiglu`` kernel.
+
+    ``swiglu``  : ``silu(gate) * up``  = ``gate * sigmoid(gate) * up``
+    ``situglu`` : ``beta * tanh(gate / beta) * sigmoid(gate) * up``, with an
+                  optional ``linear_beta * tanh(up / linear_beta)`` on ``up``.
+
+    ``gate`` and ``up`` are promoted to FP32; the caller casts the result back.
+    """
+    gate = gate.float()
+    up = up.float()
+    if activation == "swiglu":
+        return torch.nn.functional.silu(gate) * up
+    if activation == "situglu":
+        situ_a = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+        if situ_linear_beta is not None:
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+        return situ_a * up
+    raise ValueError(f"activation must be 'swiglu' or 'situglu', got {activation!r}")
+
+
+# ----------------------------------------------------------------------------
 # Forward  (differentiable; returns output + saved dict for the hand bwd)
 # ----------------------------------------------------------------------------
 
 def moe_forward(hidden_states, routing_weights, selected_experts,
-                fc1_1, fc1_2, fc2, ep_group, topk, return_saved=False):
+                fc1_1, fc1_2, fc2, ep_group, topk, return_saved=False,
+                activation="swiglu", situ_beta=1.0, situ_linear_beta=None):
     """EP-MoE forward. routing_weights [B,topk], selected_experts [B,topk] (global ids).
 
     Mirrors GPU torch_moe_fwd / 06 build_moe_fwd_inputs. No token dropping.
     When return_saved=True, also returns a dict of all intermediates needed by
     the torch backward golden (detached under torch.no_grad() by the caller).
+
+    ``activation`` selects the post-FC1 gated activation (``"swiglu"`` default
+    or ``"situglu"``); ``situ_beta`` / ``situ_linear_beta`` configure SiTU-GLU
+    and are ignored for SwiGLU.  The default keeps the SwiGLU contract used by
+    :class:`MegaMoEBackwardFunction` unchanged.
     """
     dtype = hidden_states.dtype
     device = hidden_states.device
@@ -235,7 +266,7 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
     fc1_combined = torch.cat([fc1_1, fc1_2], dim=1)                      # [E, 2*ffn, H]
     fc1_out = grouped_matmul(recv_hidden_sorted, fc1_combined, expert_counts, transpose=True)
     gate, up = fc1_out.chunk(2, dim=-1)                                  # each [M, ffn]
-    swiglu_out = (torch.nn.functional.silu(gate.float()) * up.float())
+    swiglu_out = _gated_activation(gate, up, activation, situ_beta, situ_linear_beta)
     swiglu_out_weighted = (swiglu_out * recv_weights_sorted.float().unsqueeze(-1)).to(dtype)
     fc2_out = grouped_matmul(swiglu_out_weighted, fc2, expert_counts, transpose=True)  # [M, H]
 

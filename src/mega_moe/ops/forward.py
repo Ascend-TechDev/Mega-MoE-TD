@@ -98,6 +98,9 @@ class FusedMoEForward(torch.nn.Module):
         )
         self.dispatch_readiness = self.config.dispatch_readiness
         self.dispatch_fc1_schedule = self.config.dispatch_fc1_schedule
+        self.activation = self.config.activation
+        self.situ_beta = self.config.situ_beta
+        self.situ_linear_beta = self.config.situ_linear_beta
 
         # Tile SET slots and expert ADD counters use disjoint signal regions.
         self._tile_signal_epoch = 1
@@ -566,11 +569,19 @@ class FusedMoEForward(torch.nn.Module):
         self,
         dispatch_result: DispatchFC1Result,
     ) -> torch.Tensor:
-        """Apply SwiGLU and transported route scaling in FP32."""
+        """Apply the configured gated activation and route scaling in FP32.
+
+        ``self.activation`` selects between SwiGLU (``"swiglu"``) and SiTU-GLU
+        (``"situglu"``); ``self.situ_beta`` / ``self.situ_linear_beta`` configure
+        the SiTU-GLU branch and are ignored for SwiGLU.
+        """
         return weighted_swiglu_forward(
             dispatch_result.fc1_output,
             dispatch_result.received_routing_weights,
             self.num_aicore_programs,
+            activation=self.activation,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
         )
 
     def dispatch_fc1_weighted_swiglu(
