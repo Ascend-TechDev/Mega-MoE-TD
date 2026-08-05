@@ -1,5 +1,23 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Ascend Triton kernel for routing-weighted SwiGLU activation."""
+"""Ascend Triton kernel for routing-weighted gated activation (SwiGLU / SiTU-GLU).
+
+The FC1 output is packed as ``[M, 2 * F]`` with the gate projection in the
+first half and the up projection in the second half.  The activation is applied
+in FP32 and the per-row FP32 routing weight is folded in before the BF16 store.
+
+Two gated activations are selectable at compile time via ``ACTIVATION``:
+
+* ``swiglu``  (0):  ``silu(gate) * up``               = ``gate * sigmoid(gate) * up``
+* ``situglu`` (1):  ``beta * tanh(gate / beta) * sigmoid(gate) * up``
+                    with an optional ``linear_beta * tanh(up / linear_beta)``
+                    transform on ``up`` when ``HAS_LINEAR_BETA`` is set.
+
+``ACTIVATION`` and ``HAS_LINEAR_BETA`` are ``tl.constexpr`` so the unused
+branch is dead-code eliminated; ``situ_beta`` / ``situ_linear_beta`` are runtime
+scalar arguments only read by the SiTU-GLU branch.
+"""
+
+from typing import Optional
 
 import torch
 import triton
@@ -9,18 +27,27 @@ import triton.language as tl
 _BLOCK_M = 8
 _BLOCK_N = 128
 
+# Compile-time activation ids (kept in sync with ``weighted_swiglu_forward``).
+# Use literals inside the @jit body — Triton cannot reference module globals.
+_SWIGLU = 0
+_SITUGLU = 1
+
 
 @triton.jit
-def _weighted_swiglu_kernel(
+def _weighted_activation_kernel(
     fc1_output_ptr,
     routing_weight_ptr,
     output_ptr,
     num_rows,
     ffn_dim,
+    situ_beta,                                   # runtime float, SiTU-GLU only
+    situ_linear_beta,                            # runtime float, SiTU-GLU + HAS_LINEAR_BETA only
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
 ):
-    """Apply SwiGLU and one routing scale to each dispatched token row."""
+    """Apply a gated activation and one routing scale to each dispatched token row."""
     pid = tl.program_id(axis=0)
     num_programs = tl.num_programs(axis=0)
     num_n_tiles = tl.cdiv(ffn_dim, BLOCK_N)
@@ -46,10 +73,18 @@ def _weighted_swiglu_kernel(
 
         gate = tl.load(fc1_output_ptr + gate_offsets, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(fc1_output_ptr + up_offsets, mask=mask, other=0.0).to(tl.float32)
-        # FC1 is BF16.  Promote the inputs so SwiGLU and transported route
-        # scaling are evaluated in FP32; the output store is the only cast
+        # FC1 is BF16.  Promote the inputs so the activation and transported
+        # route scaling are evaluated in FP32; the output store is the only cast
         # back to BF16.
-        activated = gate * tl.sigmoid(gate) * up
+        if ACTIVATION == 0:
+            # SwiGLU: silu(gate) * up = gate * sigmoid(gate) * up
+            activated = gate * tl.sigmoid(gate) * up
+        else:
+            # SiTU-GLU: beta * tanh(gate / beta) * sigmoid(gate) * up
+            situ_a = situ_beta * tl.math.tanh(gate / situ_beta) * tl.sigmoid(gate)
+            if HAS_LINEAR_BETA:
+                up = situ_linear_beta * tl.math.tanh(up / situ_linear_beta)
+            activated = situ_a * up
         routing_weight = tl.load(
             routing_weight_ptr + offs_m,
             mask=mask_m,
@@ -63,8 +98,12 @@ def weighted_swiglu_forward(
     fc1_output: torch.Tensor,
     routing_weight_recv: torch.Tensor,
     num_cores: int,
+    *,
+    activation: str = "swiglu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: Optional[float] = None,
 ) -> torch.Tensor:
-    """Compute routing-weighted SwiGLU for an Ascend FC1 result.
+    """Compute a routing-weighted gated activation for an Ascend FC1 result.
 
     Args:
         fc1_output: Contiguous BF16 tensor shaped ``[M, 2 * F]``.  Its
@@ -75,10 +114,16 @@ def weighted_swiglu_forward(
             public routing-weight input remains FP32 throughout dispatch and
             this function consumes the transported FP32 payload directly.
         num_cores: Maximum number of persistent Triton programs to launch.
+        activation: ``"swiglu"`` (default, ``silu(gate) * up``) or ``"situglu"``
+            (``beta * tanh(gate / beta) * sigmoid(gate) * up``).
+        situ_beta: Gate tanh width for SiTU-GLU.  Ignored for SwiGLU.
+        situ_linear_beta: When not None, apply
+            ``linear_beta * tanh(up / linear_beta)`` to the up projection
+            (SiTU-GLU only).  Ignored for SwiGLU.
     Returns:
-        Contiguous BF16 tensor shaped ``[M, F]`` containing
-        ``SiLU(gate) * up * routing_weight``.  SwiGLU and routing-weight
-        multiplication are evaluated in FP32 and converted to BF16 on store.
+        Contiguous BF16 tensor shaped ``[M, F]`` containing the routing-weighted
+        activation.  The activation and routing-weight multiplication are
+        evaluated in FP32 and converted to BF16 on store.
     """
     if fc1_output.ndim != 2:
         raise ValueError(f"fc1_output must be 2D [M, 2F], got shape {tuple(fc1_output.shape)}")
@@ -111,6 +156,24 @@ def weighted_swiglu_forward(
         )
     if not isinstance(num_cores, int) or isinstance(num_cores, bool) or num_cores <= 0:
         raise ValueError(f"num_cores must be a positive integer, got {num_cores!r}")
+
+    if activation == "swiglu":
+        act_id = _SWIGLU
+    elif activation == "situglu":
+        act_id = _SITUGLU
+    else:
+        raise ValueError(
+            f"activation must be 'swiglu' or 'situglu', got {activation!r}"
+        )
+    if float(situ_beta) <= 0.0:
+        raise ValueError("situ_beta must be positive")
+    has_linear_beta = situ_linear_beta is not None
+    if has_linear_beta and float(situ_linear_beta) <= 0.0:
+        raise ValueError("situ_linear_beta must be positive when set")
+    # The linear-beta value is only read inside the HAS_LINEAR_BETA branch; pass
+    # a harmless 0.0 placeholder otherwise so the kernel signature stays uniform.
+    linear_beta_val = float(situ_linear_beta) if has_linear_beta else 0.0
+
     output = torch.empty(
         (num_rows, ffn_dim),
         dtype=fc1_output.dtype,
@@ -121,14 +184,18 @@ def weighted_swiglu_forward(
 
     num_tiles = triton.cdiv(num_rows, _BLOCK_M) * triton.cdiv(ffn_dim, _BLOCK_N)
     num_programs = min(num_cores, num_tiles)
-    _weighted_swiglu_kernel[(num_programs, )](
+    _weighted_activation_kernel[(num_programs, )](
         fc1_output,
         routing_weight_recv,
         output,
         num_rows,
         ffn_dim,
+        float(situ_beta),
+        linear_beta_val,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
+        ACTIVATION=act_id,
+        HAS_LINEAR_BETA=has_linear_beta,
     )
     return output
 
