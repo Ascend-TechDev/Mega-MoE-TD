@@ -6,12 +6,6 @@ from typing import Optional
 
 
 _DISPATCH_FC1_SCHEDULES = (
-    "static",
-    "count",
-    "allcore",
-    "allcore_expert",
-    "allcore_expert_mn",
-    "allcore_expert_n",
     "allcore_expert_n_tile",
 )
 
@@ -52,9 +46,11 @@ class MoEForwardConfig:
     ``fc2_reverse_vector_workers`` and ``fc2_reduce_vector_workers``
     independently select one or both Vector sub-cores per AI Core for the
     reverse-A2A and final token-reduction A/B experiments.
-    ``dispatch_producer_cores`` is used by the split-role ``static`` and
-    ``count`` schedules.  All-core schedules still receive the resolved value
-    as a compile-time argument, but do not assign fixed producer-only cores.
+    ``dispatch_producer_cores`` is retained for compatibility but unused by
+    the single all-core pipeline schedule.  ``dispatch_fc1_schedule`` and
+    ``dispatch_readiness`` accept only the default
+    ``allcore_expert_n_tile`` / ``tile`` pair; the former split-role and
+    expert-readiness schedules have been removed.
     """
 
     num_aicore_programs: int = 24
@@ -122,8 +118,8 @@ class MoEForwardConfig:
             or self.fc2_reduce_vector_workers not in (1, 2)
         ):
             raise ValueError("fc2_reduce_vector_workers must be 1 or 2")
-        if self.dispatch_readiness not in ("expert", "tile"):
-            raise ValueError("dispatch_readiness must be 'expert' or 'tile'")
+        if self.dispatch_readiness != "tile":
+            raise ValueError("dispatch_readiness must be 'tile'")
         if self.activation not in _ACTIVATIONS:
             raise ValueError(
                 "activation must be one of "
@@ -145,20 +141,6 @@ class MoEForwardConfig:
             raise ValueError(
                 "dispatch_fc1_schedule must be one of "
                 + ", ".join(repr(value) for value in _DISPATCH_FC1_SCHEDULES)
-            )
-        expert_schedules = {
-            "allcore_expert",
-            "allcore_expert_mn",
-            "allcore_expert_n",
-        }
-        if self.dispatch_fc1_schedule in expert_schedules and self.dispatch_readiness != "expert":
-            raise ValueError(
-                f"{self.dispatch_fc1_schedule} requires dispatch_readiness='expert'"
-            )
-        tile_schedules = {"count", "allcore", "allcore_expert_n_tile"}
-        if self.dispatch_fc1_schedule in tile_schedules and self.dispatch_readiness != "tile":
-            raise ValueError(
-                f"{self.dispatch_fc1_schedule} requires dispatch_readiness='tile'"
             )
         producer_cores = self.dispatch_producer_cores
         if producer_cores is not None and not 0 < producer_cores < self.num_aicore_programs:

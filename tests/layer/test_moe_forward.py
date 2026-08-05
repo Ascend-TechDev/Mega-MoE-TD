@@ -1035,12 +1035,12 @@ def test_config_keeps_multi_profile_candidates_and_best_defaults():
     with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
         MoEForwardConfig(activation="situglu", situ_linear_beta=-1.0)
 
-    with pytest.raises(ValueError, match="requires dispatch_readiness='expert'"):
+    with pytest.raises(ValueError, match="dispatch_fc1_schedule must be one of"):
         MoEForwardConfig(
             dispatch_fc1_schedule="allcore_expert_n",
             dispatch_readiness="tile",
         )
-    with pytest.raises(ValueError, match="requires dispatch_readiness='tile'"):
+    with pytest.raises(ValueError, match="dispatch_readiness must be 'tile'"):
         MoEForwardConfig(
             dispatch_fc1_schedule="allcore_expert_n_tile",
             dispatch_readiness="expert",
@@ -1069,39 +1069,34 @@ def test_direct_pull_workspace_is_sized_by_sent_routes_only():
     assert op._reverse_tile_rank.shape == (1 + 8 * 112,)
 
 
-def test_dispatch_kernel_keeps_candidates_without_optional_weight_branch():
+def test_dispatch_kernel_keeps_default_only_pipeline():
     # Brittle source-string contract: these asserts grep the kernel/launcher
-    # source to guard against silently dropping a schedule branch or the packed
-    # gate/up layout. Update the expected strings on rename, not the contract.
+    # source to guard against silently dropping the default all-core pipeline
+    # or the packed gate/up layout. Update the expected strings on rename, not
+    # the contract.
     launch_source = inspect.getsource(FusedMoEForward.dispatch_fc1)
     kernel_source = inspect.getsource(dispatch_fc1_module._kernel_dispatch_fc1.fn)
     consumer_source = inspect.getsource(
         dispatch_fc1_module._triton_grouped_gemm_expert_n_merged_tiles_wait.fn
     )
-    direct_dispatch_source = inspect.getsource(
-        dispatch_fc1_module._dispatch_direct_expert_buckets.fn
-    )
     tile_dispatch_source = inspect.getsource(
         dispatch_fc1_module._dispatch_one_source_tile_task.fn
     )
 
-    assert "ALL_CORE_PIPELINE" in kernel_source
-    assert "DIRECT_EXPERT_DISPATCH" in kernel_source
-    assert "COUNT_DERIVED_SCHEDULE" in kernel_source
     assert "_triton_grouped_gemm_expert_n_merged_tiles_wait(" in kernel_source
+    assert "_dispatch_count_derived_source_tiles(" in kernel_source
     assert "if sub_vec_id() == 0:" in kernel_source
     assert "FINAL_BARRIER" in kernel_source
     assert "source_id" in consumer_source
     assert "overlap_start" in consumer_source
-    assert "self.dispatch_fc1_schedule" in launch_source
-    assert "N_DISPATCH_CORES" in launch_source
-    assert "TILE_READINESS" in launch_source
+    # The default-only launcher must not pass any removed strategy selectors.
+    assert "N_DISPATCH_CORES" not in launch_source
+    assert "TILE_READINESS" not in launch_source
+    assert "ALL_CORE_PIPELINE" not in launch_source
+    assert "DIRECT_EXPERT_DISPATCH" not in launch_source
     assert "HAS_ROUTING_WEIGHT" not in launch_source
     assert "HAS_ROUTING_WEIGHT" not in kernel_source
-    assert "hidden * 2" in kernel_source
     assert "hidden * 2" in tile_dispatch_source
-    assert "task_count * hidden * 2" in direct_dispatch_source
-    assert "task_count * 4" in direct_dispatch_source
 
 
 def test_routing_metadata_keeps_width_specific_910b1_lowering():

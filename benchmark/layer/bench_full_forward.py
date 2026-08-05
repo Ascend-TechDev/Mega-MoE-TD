@@ -44,9 +44,9 @@ Environment:
     MOE_FULL_BENCH_ACTIVE_EXPERTS=16       # optional sparse mode override;
                                            # must be >= top-k and divisible by W
     MOE_FUSED_NUM_AICORE_PROGRAMS=24      # 910B1 default; override for other devices
-    MOE_FUSED_DISPATCH_PRODUCER_CORES=4   # static/count schedules only
-    MOE_FUSED_DISPATCH_READINESS=tile|expert
-    MOE_FUSED_DISPATCH_FC1_SCHEDULE=static|count|allcore|allcore_expert|allcore_expert_mn|allcore_expert_n|allcore_expert_n_tile
+    MOE_FUSED_DISPATCH_PRODUCER_CORES=4   # retained for compatibility (unused by default schedule)
+    MOE_FUSED_DISPATCH_READINESS=tile
+    MOE_FUSED_DISPATCH_FC1_SCHEDULE=allcore_expert_n_tile
     MOE_FUSED_FC2_GEMM_SCHEDULE=tile_n_major|expert_n_persistent
     MOE_FUSED_FC2_COMBINE_TRANSPORT=reverse_push|direct_pull
     MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS=1|2  # reverse_push only

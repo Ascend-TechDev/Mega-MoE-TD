@@ -102,9 +102,8 @@ class FusedMoEForward(torch.nn.Module):
         self.situ_beta = self.config.situ_beta
         self.situ_linear_beta = self.config.situ_linear_beta
 
-        # Tile SET slots and expert ADD counters use disjoint signal regions.
+        # Tile SET slots publish per-source-tile readiness for the Cube consumer.
         self._tile_signal_epoch = 1
-        self._expert_signal_epoch = 1
         self.context = create_moe_forward_context(
             max_tokens_per_rank=max_tokens_per_rank,
             hidden_size=hidden_size,
@@ -129,8 +128,6 @@ class FusedMoEForward(torch.nn.Module):
         self._reverse_tile_row_count = None
         self._max_fc2_tile_slots = 0
         self._max_reverse_tile_slots = 0
-        self._dispatch_send_staging = None
-        self._dispatch_route_staging = None
         self._routing_weights_keepalive = None
 
         # All ranks must observe zeroed symmetric buffers before first use.
@@ -142,8 +139,6 @@ class FusedMoEForward(torch.nn.Module):
         torch.npu.synchronize()
 
     def finalize(self):
-        self._dispatch_send_staging = None
-        self._dispatch_route_staging = None
         self._routing_weights_keepalive = None
         self._combine_fc2_buf = None
         self._route_to_send = None
@@ -405,38 +400,6 @@ class FusedMoEForward(torch.nn.Module):
         ].to(torch.int32).contiguous()
 
         num_received_routes = routing_plan.num_received_routes
-        direct_bucket_schedule = self.dispatch_fc1_schedule in (
-            "allcore_expert",
-            "allcore_expert_mn",
-            "allcore_expert_n",
-        )
-        if direct_bucket_schedule:
-            staging_rows = selected_experts.numel()
-            if (
-                self._dispatch_send_staging is None
-                or self._dispatch_send_staging.shape[0] < staging_rows
-            ):
-                self._dispatch_send_staging = torch.empty(
-                    (staging_rows, hidden_size),
-                    dtype=self.activation_dtype,
-                    device=device,
-                )
-                self._dispatch_route_staging = torch.empty(
-                    staging_rows, dtype=torch.float32, device=device
-                )
-            num_sent_routes = routing_plan.num_sent_routes
-            torch.index_select(
-                hidden_states,
-                0,
-                routing_plan.send_token_indices,
-                out=self._dispatch_send_staging[:num_sent_routes],
-            )
-            torch.index_select(
-                routing_weights.view(-1),
-                0,
-                send_route_indices,
-                out=self._dispatch_route_staging[:num_sent_routes],
-            )
 
         # Present a logical [expert, N, K] view without materializing a second
         # multi-GiB weight table.  N remains contiguous in the physical KN
@@ -479,20 +442,11 @@ class FusedMoEForward(torch.nn.Module):
         dispatched_tokens = self.context.peer_mem[
             :num_received_routes * hidden_size
         ].view(num_received_routes, hidden_size)
-        tile_readiness = self.dispatch_readiness == "tile"
-        signal_epoch = (
-            self._tile_signal_epoch if tile_readiness else self._expert_signal_epoch
-        )
+        signal_epoch = self._tile_signal_epoch
         _kernel_dispatch_fc1[self.num_aicore_programs, 1, 1](
             hidden_states,
-            self._dispatch_send_staging
-            if direct_bucket_schedule
-            else hidden_states,
             self.context.peer_mem,
             routing_weights,
-            self._dispatch_route_staging
-            if direct_bucket_schedule
-            else routing_weights,
             self.context.routing_weight_mem,
             self.context.signal_mem,
             weight_for_gemm,
@@ -516,40 +470,17 @@ class FusedMoEForward(torch.nn.Module):
             weight_for_gemm.stride(2),
             output.stride(0),
             output.stride(1),
-            N_DISPATCH_CORES=self.dispatch_producer_cores,
-            NUM_CONSUMER_CORES=(
-                self.num_aicore_programs - self.dispatch_producer_cores
-            ),
             NUM_PROGRAM_CORES=self.num_aicore_programs,
             LOCAL_RANK=self.rank,
             WORLD_SIZE=self.world_size,
             EXPERTS_PER_RANK=self.experts_per_rank,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
-            TILE_READINESS=tile_readiness,
-            COUNT_DERIVED_SCHEDULE=self.dispatch_fc1_schedule == "count",
-            ALL_CORE_PIPELINE=self.dispatch_fc1_schedule
-            in (
-                "allcore",
-                "allcore_expert",
-                "allcore_expert_mn",
-                "allcore_expert_n",
-                "allcore_expert_n_tile",
-            ),
-            DIRECT_EXPERT_DISPATCH=direct_bucket_schedule,
-            EXPERT_N_TILE_CONSUMER=(
-                self.dispatch_fc1_schedule == "allcore_expert_n_tile"
-            ),
-            MN_TILE_FC1=self.dispatch_fc1_schedule == "allcore_expert_mn",
-            N_TILE_FC1=self.dispatch_fc1_schedule == "allcore_expert_n",
             FINAL_BARRIER=final_barrier,
             BLOCK_SIZE_M=block_m,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
         )
-        if tile_readiness:
-            self._tile_signal_epoch += 1
-        else:
-            self._expert_signal_epoch += 1
+        self._tile_signal_epoch += 1
 
         received_routing_weights = self.context.routing_weight_mem[
             :num_received_routes
