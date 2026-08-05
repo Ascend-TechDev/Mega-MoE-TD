@@ -1014,7 +1014,26 @@ def test_config_keeps_multi_profile_candidates_and_best_defaults():
         "fc2_combine_transport",
         "fc2_reverse_vector_workers",
         "fc2_reduce_vector_workers",
+        "activation",
+        "situ_beta",
+        "situ_linear_beta",
     }
+
+    assert config.activation == "swiglu"
+    assert config.situ_beta == 1.0
+    assert config.situ_linear_beta is None
+
+    with pytest.raises(ValueError, match="activation must be one of"):
+        MoEForwardConfig(activation="relu")
+    situglu_cfg = MoEForwardConfig(
+        activation="situglu", situ_beta=2.0, situ_linear_beta=1.5)
+    assert situglu_cfg.activation == "situglu"
+    assert situglu_cfg.situ_beta == 2.0
+    assert situglu_cfg.situ_linear_beta == 1.5
+    with pytest.raises(ValueError, match="situ_beta must be positive"):
+        MoEForwardConfig(activation="situglu", situ_beta=0.0)
+    with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
+        MoEForwardConfig(activation="situglu", situ_linear_beta=-1.0)
 
     with pytest.raises(ValueError, match="requires dispatch_readiness='expert'"):
         MoEForwardConfig(
@@ -1335,6 +1354,65 @@ def test_pack_gate_up_weights_returns_contiguous_kn_layout():
     assert packed.is_contiguous()
     torch.testing.assert_close(packed[:, :, :3], gate.transpose(1, 2))
     torch.testing.assert_close(packed[:, :, 3:], up.transpose(1, 2))
+
+
+def _situglu_torch_ref(fc1, rw, activation, beta, lin_beta):
+    """FP32 torch reference mirroring the weighted_swiglu kernel."""
+    d = fc1.shape[-1] // 2
+    gate = fc1[..., :d].float()
+    up = fc1[..., d:].float()
+    if activation == "swiglu":
+        a = torch.nn.functional.silu(gate) * up
+    else:
+        a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+        if lin_beta is not None:
+            up = lin_beta * torch.tanh(up / lin_beta)
+        a = a * up
+    return (a * rw.float().unsqueeze(-1)).to(fc1.dtype)
+
+
+@pytest.mark.skipif(
+    not torch.npu.is_available(),
+    reason="SiTU-GLU kernel correctness requires an NPU device",
+)
+def test_weighted_swiglu_kernel_supports_swiglu_and_situglu():
+    """The activation switch matches an independent torch reference on NPU.
+
+    Covers SwiGLU, SiTU-GLU (with/without ``linear_beta``), and the M=0 edge.
+    """
+    device = "npu:0"
+    torch.npu.set_device(0)
+    torch.manual_seed(0)
+    M, F = 64, 256
+    fc1 = (torch.randn(M, 2 * F, dtype=torch.float32) * 0.5).to(torch.bfloat16).to(device)
+    rw = (torch.rand(M, dtype=torch.float32, device=device) + 0.1).contiguous()
+    num_cores = 24
+
+    cases = [
+        ("swiglu", 1.0, None),
+        ("situglu", 1.0, None),
+        ("situglu", 1.5, None),
+        ("situglu", 2.0, 1.0),
+        ("situglu", 0.5, 2.0),
+    ]
+    for activation, beta, lin_beta in cases:
+        out = weighted_swiglu_forward(
+            fc1, rw, num_cores,
+            activation=activation, situ_beta=beta, situ_linear_beta=lin_beta,
+        )
+        ref = _situglu_torch_ref(fc1, rw, activation, beta, lin_beta)
+        torch.testing.assert_close(
+            out.float(), ref.float(), rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+
+    # M=0 must short-circuit and return an empty [0, F] tensor.
+    empty_out = weighted_swiglu_forward(
+        fc1[:0], rw[:0], num_cores, activation="situglu", situ_beta=1.0)
+    assert empty_out.shape == (0, F)
+    assert empty_out.dtype == torch.bfloat16
+
+    # Invalid activation name is rejected on the host.
+    with pytest.raises(ValueError, match="activation must be 'swiglu' or 'situglu'"):
+        weighted_swiglu_forward(fc1, rw, num_cores, activation="relu")
 
 
 def test_make_down_weights_returns_contiguous_nk_layout():

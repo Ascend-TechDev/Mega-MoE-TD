@@ -25,6 +25,14 @@ _FC2_COMBINE_TRANSPORTS = (
     "direct_pull",
 )
 
+# Supported post-FC1 gated activations.  ``swiglu`` is ``silu(gate) * up``;
+# ``situglu`` is ``beta * tanh(gate / beta) * sigmoid(gate) * up`` (with an
+# optional ``linear_beta * tanh(up / linear_beta)`` transform on ``up``).
+_ACTIVATIONS = (
+    "swiglu",
+    "situglu",
+)
+
 @dataclass(frozen=True)
 class MoEForwardConfig:
     """Stage-specific launch and tiling parameters.
@@ -64,6 +72,16 @@ class MoEForwardConfig:
     dispatch_producer_cores: Optional[int] = None
     dispatch_readiness: str = "tile"
     dispatch_fc1_schedule: str = "allcore_expert_n_tile"
+
+    # Post-FC1 gated activation.  ``swiglu`` (default) preserves the original
+    # ``silu(gate) * up`` path; ``situglu`` selects SiTU-GLU
+    # (``beta * tanh(gate / beta) * sigmoid(gate) * up``).  ``situ_beta`` is the
+    # gate tanh width; ``situ_linear_beta`` optionally applies
+    # ``linear_beta * tanh(up / linear_beta)`` to the up projection (None leaves
+    # ``up`` unchanged).  Both are ignored when ``activation == "swiglu"``.
+    activation: str = "swiglu"
+    situ_beta: float = 1.0
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self):
         if self.num_aicore_programs < 2:
@@ -106,6 +124,23 @@ class MoEForwardConfig:
             raise ValueError("fc2_reduce_vector_workers must be 1 or 2")
         if self.dispatch_readiness not in ("expert", "tile"):
             raise ValueError("dispatch_readiness must be 'expert' or 'tile'")
+        if self.activation not in _ACTIVATIONS:
+            raise ValueError(
+                "activation must be one of "
+                + ", ".join(repr(value) for value in _ACTIVATIONS)
+            )
+        if not (type(self.situ_beta) is float or type(self.situ_beta) is int):
+            raise TypeError("situ_beta must be a float")
+        if float(self.situ_beta) <= 0.0:
+            raise ValueError("situ_beta must be positive")
+        if self.situ_linear_beta is not None:
+            if not (
+                type(self.situ_linear_beta) is float
+                or type(self.situ_linear_beta) is int
+            ):
+                raise TypeError("situ_linear_beta must be a float or None")
+            if float(self.situ_linear_beta) <= 0.0:
+                raise ValueError("situ_linear_beta must be positive when set")
         if self.dispatch_fc1_schedule not in _DISPATCH_FC1_SCHEDULES:
             raise ValueError(
                 "dispatch_fc1_schedule must be one of "
