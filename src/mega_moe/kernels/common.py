@@ -13,7 +13,7 @@ from triton.backends.ascend.driver import NPUUtils
 
 # GEMM dot-tiles for the input-grad GEMMs (step1 dispatch_fc2, step4 combine_fc1).
 # BLOCK_SIZE_M is LOCKED to 64: the forward meta tiling (prepare_moe_metadata in
-# _legacy_backward_golden.py) tiles tokens in BLOCK_M chunks and BOTH step1 and
+# _torch_forward.py) tiles tokens in BLOCK_M chunks and BOTH step1 and
 # step4 consume that meta, so they must share M. K=256 (reduction tile) fills L0B
 # (b-tile [256,128] bf16 = 64KB) per the Ascend 'small reduction tile -> MTE-bound'
 # wiki pattern (same fix as wgrad BM=256). M=128 was tried but overflows UB with

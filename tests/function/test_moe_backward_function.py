@@ -14,62 +14,43 @@
 #       with the bf16-appropriate metric from run_moe_backward
 #
 #  Usage (2 cards, AscendNPU-IR 1.2.0 bishengir):
-#    PATH=/home/z00905891/triton_dist/AscendNPU-IR/build/bin:$PATH \
-#    TRITON_CACHE_DIR=/tmp/triton_mb \
+#    python -m pytest tests/function/test_moe_backward_function.py::test_backward_function_2ranks \
+#        -m dist -v -s
+#  The legacy torchrun entry point is also kept:
+#    PATH=.../AscendNPU-IR/build/bin:$PATH TRITON_CACHE_DIR=/tmp/triton_mb \
 #    torchrun --nproc-per-node=2 tests/function/test_moe_backward_function.py
 # ============================================================================
 
 import os
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 import shmem as ash
 import torch.distributed as dist
 
 from mega_moe import MegaMoEBackwardFunction
-from mega_moe.ops._legacy_backward_golden import moe_forward, moe_backward_torch
+from mega_moe.ops._torch_forward import moe_forward
+from tests._goldens.backward import moe_backward_torch
+from tests._moe_dist_utils import (
+    BOLD,
+    GREEN,
+    RED,
+    RESET,
+    get_ash_size_bytes,
+    init_aclshmem,
+    make_backward_inputs,
+    make_peer_mem,
+)
+from tests._numeric import cmp_grad
+from tests._shapes import BACKWARD_FUNCTION_SHAPES
 
-g_ash_size = 512 * 1024 * 1024
-G_IP_PORT = "tcp://127.0.0.1:8666"
-GREEN = "\033[92m"
-RED = "\033[91m"
-RESET = "\033[0m"
-BOLD = "\033[1m"
-
-
-def _cmp(name, tri, gold, rtol=2e-2, atol=1e-2):
-    tri = tri.float(); gold = gold.float()
-    d = (tri - gold).abs()
-    max_d = float(d.max().item())
-    gmax = float(gold.abs().max().item())
-    n_bad = int((d > atol + rtol * gmax).sum().item())
-    ok = n_bad == 0
-    return ok, max_d, max_d / (gmax + 1e-9), n_bad
-
-
-def _build_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):
-    pe = dist.get_rank(ep_group); W = dist.get_world_size(ep_group)
-    epr = num_experts // W
-    dtype = torch.bfloat16
-    device = f"npu:{pe}"
-    torch.manual_seed(seed + pe * 1000)
-    hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
-    gw = torch.randn(num_experts, hidden_dim, dtype=dtype, device=device)
-    fc1_1 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
-    fc1_2 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
-    fc2 = torch.randn(epr, hidden_dim, ffn_dim, dtype=dtype, device=device)
-    dist.broadcast(gw, src=0, group=ep_group)
-    logits = hs.float() @ gw.float().T
-    rw = torch.softmax(logits, dim=-1).to(dtype)
-    topk_w, topk_idx = torch.topk(rw, topk, dim=-1)
-    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
-    dy = torch.randn_like(hs)
-    return hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device
+g_ash_size = get_ash_size_bytes(default_gb=1)
 
 
 def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     pe = dist.get_rank(ep_group)
-    hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = _build_inputs(
+    hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = make_backward_inputs(
         ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group)
     label = f"tk={ntokens:>5} h={hidden_dim} ffn={ffn_dim} k={topk}"
 
@@ -77,8 +58,7 @@ def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     # size from a no_grad forward probe
     with torch.no_grad():
         _, probe = moe_forward(hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, ep_group, topk, return_saved=True)
-    peer_elems = max(probe["total_recv"], probe["total_send"]) * probe["hidden_dim"]
-    peer_mem = ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=pe)
+    peer_mem = make_peer_mem(probe, dtype, pe)
 
     # ---- autograd path: MegaMoEBackwardFunction ----
     hs_a = hs.clone().detach().requires_grad_(True)
@@ -105,7 +85,7 @@ def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     all_ok = True
     detail = []
     for n in checks:
-        ok, mx, rel, nbad = _cmp(n, tri[n], gold[n])
+        ok, mx, rel, nbad = cmp_grad(n, tri[n], gold[n])
         all_ok &= ok
         detail.append(f"{n}:{GREEN}PASS{RESET}" if ok else f"{n}:{RED}FAIL{RESET}({nbad},mx={mx:.1e})")
 
@@ -117,35 +97,43 @@ def run_one(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     return all_ok
 
 
-def run_test_distributed():
-    pe = dist.get_rank(); ep_group = dist.group.WORLD
-    ash.set_conf_store_tls(False, "")
-    attr = ash.InitAttr()
-    attr.my_rank = pe; attr.n_ranks = dist.get_world_size(); attr.local_mem_size = g_ash_size
-    attr.ip_port = G_IP_PORT; attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
-    assert ash.aclshmem_init(attr) == 0
+def run_test(rank, world_size):
+    ep_group = dist.group.WORLD
+    init_aclshmem(rank, world_size, g_ash_size)
 
-    num_experts = 128
-    test_configs = [
-        (512,  512, 256, 4),
-        (1024, 512, 256, 4),
-        (512,  1024, 512, 8),
-    ]
+    test_configs = BACKWARD_FUNCTION_SHAPES
 
-    if pe == 0:
+    if rank == 0:
         print(f"{BOLD}[START]{RESET} MegaMoEBackwardFunction (autograd) vs golden "
-              f"on world_size={dist.get_world_size()}", flush=True)
+              f"on world_size={world_size}", flush=True)
     results = []
     try:
         for cfg in test_configs:
             dist.barrier()
-            results.append(run_one(*cfg, num_experts, ep_group))
+            results.append(run_one(
+                cfg.tokens, cfg.hidden, cfg.ffn, cfg.topk, cfg.num_experts, ep_group))
         dist.barrier()
-        if pe == 0:
+        if rank == 0:
             print(f"\n{BOLD}==== MegaMoEBackwardFunction: "
                   f"{'ALL PASS' if all(results) else 'SOME FAILED'} ===={RESET}", flush=True)
     finally:
-        _ = ash.aclshmem_finalize()
+        ash.aclshmem_finalize()
+
+    # Failure must raise so pytest/CI can detect a correctness regression.
+    all_ok = bool(results) and all(results)
+    flag = torch.tensor([1 if all_ok else 0], dtype=torch.int32, device=f"npu:{rank}")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if not bool(flag.item()):
+        raise AssertionError("MegaMoEBackwardFunction correctness check failed.")
+
+
+# ---------------------------------------------------------------------------
+#  Pytest
+# ---------------------------------------------------------------------------
+
+@pytest.mark.dist
+def test_backward_function_2ranks(dist_test):
+    dist_test(run_test, world_size=2)
 
 
 if __name__ == "__main__":
@@ -154,6 +142,6 @@ if __name__ == "__main__":
     dist.init_process_group(backend="hccl", rank=local_pe)
     print(f"[INFO] Rank {local_pe} of {dist.get_world_size()} initialised", flush=True)
     dist.barrier()
-    run_test_distributed()
+    run_test(local_pe, dist.get_world_size())
     if local_pe == 0:
         print(f"[INFO] MegaMoEBackwardFunction test done", flush=True)

@@ -46,7 +46,7 @@ src/mega_moe/
 ├── ops/
 │   ├── forward.py            # 完整前向编排与输入校验
 │   ├── backward.py           # 五阶段反向编排及 autograd.Function
-│   └── _legacy_backward_golden.py
+│   └── _torch_forward.py     # 可微 torch 前向（被 backward 复用）
 ├── runtime/
 │   ├── workspace.py          # ACLSHMEM 对称内存及 workspace 生命周期
 │   └── routing.py            # 路由过滤、排序、计数交换和 offset
@@ -144,7 +144,7 @@ backward 五阶段和 autograd 测试使用 `torchrun`：
 
 ```bash
 # legacy torch golden：手写 backward 与 autograd 交叉验证
-torchrun --nproc-per-node=2 -m mega_moe.ops._legacy_backward_golden
+torchrun --nproc-per-node=2 -m tests._goldens.backward
 
 # 五阶段 Triton backward 与 torch golden
 torchrun --nproc-per-node=2 tests/layer/test_moe_backward.py
