@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cann.extension import sub_vec_id
 from triton_dist.language.extra import libshmem_device
 
 from .workspace import MoEForwardContext
@@ -35,9 +36,10 @@ class MoERoutingPlan:
     valid_route_mask: torch.Tensor
 
 
-@triton.jit(do_not_specialize=["num_valid"])
-def _kernel_build_routing_metadata(
-    sorted_key_ptr,
+@triton.jit
+def _publish_counts_and_build_metadata(
+    local_counts,
+    bin_offs,
     counts_mem_ptr,
     send_bucket_starts_ptr,
     send_bucket_dst_starts_ptr,
@@ -45,45 +47,28 @@ def _kernel_build_routing_metadata(
     recv_per_expert_ptr,
     recv_expert_offs_ptr,
     stats_ptr,
-    num_valid,
     LOCAL_RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
-    NUM_BUCKETS: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
-    HISTOGRAM_BLOCK_SIZE: tl.constexpr,
 ):
-    """Build compact dispatch metadata on one Vector AI core per rank."""
-    bin_offs = tl.arange(0, NUM_BINS_PAD)
-    local_counts = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
-    invalid_lanes = 0
-
-    # The Ascend histogram lowering used here does not reliably support its
-    # optional mask.  Padding lanes map to bin zero and are subtracted once.
-    for route_start in range(0, num_valid, HISTOGRAM_BLOCK_SIZE):
-        route_offs = route_start + tl.arange(0, HISTOGRAM_BLOCK_SIZE)
-        route_mask = route_offs < num_valid
-        route_keys = tl.load(
-            sorted_key_ptr + route_offs, mask=route_mask, other=0
-        ).to(tl.int32)
-        local_counts += tl.histogram(route_keys, NUM_BINS_PAD)
-        invalid_lanes += HISTOGRAM_BLOCK_SIZE - tl.sum(route_mask.to(tl.int32))
-    local_counts -= tl.where(bin_offs == 0, invalid_lanes, 0)
-
+    """Publish one count row, then construct shared dispatch metadata."""
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
     tl.store(local_row_ptr + bin_offs, local_counts)
-    for peer_rank in range(WORLD_SIZE):
-        if peer_rank != LOCAL_RANK:
-            libshmem_device.putmem(
-                local_row_ptr,
-                local_row_ptr,
-                NUM_BINS_PAD * 4,
-                peer_rank,
-            )
+    if sub_vec_id() == 0:
+        for peer_rank in range(WORLD_SIZE):
+            if peer_rank != LOCAL_RANK:
+                libshmem_device.putmem(
+                    local_row_ptr,
+                    local_row_ptr,
+                    # The Triton symbol is dtype-specialized, but its generated
+                    # wrapper forwards this value to the void* ACLSHMEM API as a
+                    # byte count.
+                    NUM_BINS_PAD * 4,
+                    peer_rank,
+                )
 
-    # This metadata kernel is AIV-only.  On the current CANN/Triton stack the
-    # generic barrier waits for Cube-side participants and deadlocks; use the
-    # Vector-only collective so every rank has the same participating domain.
+    # Completes count-row RMA updates before any rank reads the count cube.
     libshmem_device.barrier_all_vec()
 
     send_running = 0
@@ -138,6 +123,172 @@ def _kernel_build_routing_metadata(
     libshmem_device.barrier_all_vec()
 
 
+@triton.jit(do_not_specialize=["num_valid"])
+def _kernel_build_routing_metadata(
+    sorted_key_ptr,
+    counts_mem_ptr,
+    send_bucket_starts_ptr,
+    send_bucket_dst_starts_ptr,
+    recv_counts_re_ptr,
+    recv_per_expert_ptr,
+    recv_expert_offs_ptr,
+    stats_ptr,
+    num_valid,
+    LOCAL_RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    NUM_BUCKETS: tl.constexpr,
+    NUM_BINS_PAD: tl.constexpr,
+    HISTOGRAM_BLOCK_SIZE: tl.constexpr,
+):
+    """Build the Qwen/DSV4 metadata with the historically validated entry."""
+    bin_offs = tl.arange(0, NUM_BINS_PAD)
+    local_counts = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
+    invalid_lanes = 0
+
+    # The Ascend histogram lowering used here does not reliably support its
+    # optional mask. Padding lanes map to bin zero and are subtracted once.
+    for route_start in range(0, num_valid, HISTOGRAM_BLOCK_SIZE):
+        route_offs = route_start + tl.arange(0, HISTOGRAM_BLOCK_SIZE)
+        route_mask = route_offs < num_valid
+        route_keys = tl.load(
+            sorted_key_ptr + route_offs, mask=route_mask, other=0
+        ).to(tl.int32)
+        local_counts += tl.histogram(route_keys, NUM_BINS_PAD)
+        invalid_lanes += HISTOGRAM_BLOCK_SIZE - tl.sum(route_mask.to(tl.int32))
+    local_counts -= tl.where(bin_offs == 0, invalid_lanes, 0)
+
+    local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
+    tl.store(local_row_ptr + bin_offs, local_counts)
+    if sub_vec_id() == 0:
+        for peer_rank in range(WORLD_SIZE):
+            if peer_rank != LOCAL_RANK:
+                libshmem_device.putmem(
+                    local_row_ptr,
+                    local_row_ptr,
+                    NUM_BINS_PAD * 4,
+                    peer_rank,
+                )
+
+    libshmem_device.barrier_all_vec()
+
+    send_running = 0
+    recv_running = 0
+    max_required = 0
+    for dst_rank in range(WORLD_SIZE):
+        expert_base = 0
+        required_for_dst = 0
+        for local_expert in range(EXPERTS_PER_RANK):
+            bucket = dst_rank * EXPERTS_PER_RANK + local_expert
+            local_count = tl.load(local_row_ptr + bucket)
+            tl.store(send_bucket_starts_ptr + bucket, send_running)
+
+            target_total = 0
+            source_prefix = 0
+            for source_rank in range(WORLD_SIZE):
+                source_count = tl.load(
+                    counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
+                )
+                target_total += source_count
+                if source_rank < LOCAL_RANK:
+                    source_prefix += source_count
+                if dst_rank == LOCAL_RANK:
+                    tl.store(
+                        recv_counts_re_ptr
+                        + source_rank * EXPERTS_PER_RANK
+                        + local_expert,
+                        source_count,
+                    )
+
+            tl.store(
+                send_bucket_dst_starts_ptr + bucket,
+                expert_base + source_prefix,
+            )
+
+            if dst_rank == LOCAL_RANK:
+                tl.store(recv_per_expert_ptr + local_expert, target_total)
+                tl.store(recv_expert_offs_ptr + local_expert, recv_running)
+                recv_running += target_total
+
+            send_running += local_count
+            expert_base += target_total
+            required_for_dst += target_total
+
+        max_required = tl.maximum(max_required, required_for_dst)
+
+    tl.store(recv_expert_offs_ptr + EXPERTS_PER_RANK, recv_running)
+    tl.store(stats_ptr, recv_running)
+    tl.store(stats_ptr + 1, max_required)
+
+    # Protect the shared count cube from a faster rank's next invocation.
+    libshmem_device.barrier_all_vec()
+
+
+@triton.jit(do_not_specialize=["num_valid"])
+def _kernel_build_routing_metadata_lower_bound(
+    sorted_key_ptr,
+    counts_mem_ptr,
+    send_bucket_starts_ptr,
+    send_bucket_dst_starts_ptr,
+    recv_counts_re_ptr,
+    recv_per_expert_ptr,
+    recv_expert_offs_ptr,
+    stats_ptr,
+    num_valid,
+    LOCAL_RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    NUM_BINS_PAD: tl.constexpr,
+):
+    """Build 1024-bin Kimi metadata without the unsupported histogram."""
+    bin_offs = tl.arange(0, NUM_BINS_PAD)
+    left_lo = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
+    left_hi = left_lo + num_valid
+    right_lo = left_lo
+    right_hi = left_hi
+    right_keys = bin_offs + 1
+    for _ in range(32):
+        left_active = left_lo < left_hi
+        left_mid = (left_lo + left_hi) // 2
+        left_safe_mid = tl.where(left_active, left_mid, 0)
+        left_values = tl.load(
+            sorted_key_ptr + left_safe_mid,
+            mask=left_active,
+            other=NUM_BINS_PAD,
+        ).to(tl.int32)
+        left_advance = left_active & (left_values < bin_offs)
+        left_lo = tl.where(left_advance, left_mid + 1, left_lo)
+        left_hi = tl.where(left_active & ~left_advance, left_mid, left_hi)
+
+        right_active = right_lo < right_hi
+        right_mid = (right_lo + right_hi) // 2
+        right_safe_mid = tl.where(right_active, right_mid, 0)
+        right_values = tl.load(
+            sorted_key_ptr + right_safe_mid,
+            mask=right_active,
+            other=NUM_BINS_PAD,
+        ).to(tl.int32)
+        right_advance = right_active & (right_values < right_keys)
+        right_lo = tl.where(right_advance, right_mid + 1, right_lo)
+        right_hi = tl.where(right_active & ~right_advance, right_mid, right_hi)
+    local_counts = right_lo - left_lo
+    _publish_counts_and_build_metadata(
+        local_counts,
+        bin_offs,
+        counts_mem_ptr,
+        send_bucket_starts_ptr,
+        send_bucket_dst_starts_ptr,
+        recv_counts_re_ptr,
+        recv_per_expert_ptr,
+        recv_expert_offs_ptr,
+        stats_ptr,
+        LOCAL_RANK,
+        WORLD_SIZE,
+        EXPERTS_PER_RANK,
+        NUM_BINS_PAD,
+    )
+
+
 def build_routing_plan(
     context: MoEForwardContext,
     selected_experts: torch.Tensor,
@@ -167,8 +318,16 @@ def build_routing_plan(
         torch.int32
     ).contiguous()
 
-    _kernel_build_routing_metadata[(1, 1, 1)](
-        sorted_experts,
+    # Ascend's vector masked-load lowering still performs the physical load
+    # before selecting the ``other`` value.  Give the all-drop/zero-route case
+    # one valid int32 backing element; ``num_valid == 0`` keeps every lane
+    # masked and the element's value is never observed.
+    metadata_sorted_experts = (
+        sorted_experts if num_valid else context.metadata_stats[:1]
+    )
+
+    metadata_args = (
+        metadata_sorted_experts,
         context.metadata_counts_mem,
         context.metadata_send_bucket_starts,
         context.metadata_send_bucket_dst_starts,
@@ -177,13 +336,25 @@ def build_routing_plan(
         context.metadata_recv_expert_offs,
         context.metadata_stats,
         num_valid,
-        LOCAL_RANK=context.rank,
-        WORLD_SIZE=world_size,
-        EXPERTS_PER_RANK=experts_per_rank,
-        NUM_BUCKETS=num_experts,
-        NUM_BINS_PAD=context.metadata_num_bins,
-        HISTOGRAM_BLOCK_SIZE=2048,
     )
+    if context.metadata_num_bins > 512:
+        _kernel_build_routing_metadata_lower_bound[(1, 1, 1)](
+            *metadata_args,
+            LOCAL_RANK=context.rank,
+            WORLD_SIZE=world_size,
+            EXPERTS_PER_RANK=experts_per_rank,
+            NUM_BINS_PAD=context.metadata_num_bins,
+        )
+    else:
+        _kernel_build_routing_metadata[(1, 1, 1)](
+            *metadata_args,
+            LOCAL_RANK=context.rank,
+            WORLD_SIZE=world_size,
+            EXPERTS_PER_RANK=experts_per_rank,
+            NUM_BUCKETS=num_experts,
+            NUM_BINS_PAD=context.metadata_num_bins,
+            HISTOGRAM_BLOCK_SIZE=2048,
+        )
 
     num_received_routes = int(context.metadata_stats[0].item())
     max_received_routes = context.peer_mem.numel() // context.hidden_size

@@ -15,20 +15,35 @@ _DISPATCH_FC1_SCHEDULES = (
     "allcore_expert_n_tile",
 )
 
+_FC2_GEMM_SCHEDULES = (
+    "tile_n_major",
+    "expert_n_persistent",
+)
+
+_FC2_COMBINE_TRANSPORTS = (
+    "reverse_push",
+    "direct_pull",
+)
 
 @dataclass(frozen=True)
 class MoEForwardConfig:
     """Stage-specific launch and tiling parameters.
 
-    The defaults preserve the previously tuned implementation.  FC1 and FC2
-    tiles are deliberately independent because they have different shapes and
-    data-movement paths.
+    Defaults select the current Kimi-K3 best path, while the retained schedule
+    controls cover Qwen, DeepSeek/DSV4, and Kimi shapes that do not yet have a
+    same-snapshot cross-profile A/B result.  FC1 and FC2 tiles are deliberately
+    independent because they have different shapes and data-movement paths.
 
     ``dispatch_fc1_block_size_m`` controls both dispatch readiness slots and
     FC1 dot rows; ``fc1_gemm_block_size_{n,k}`` control the other FC1 dot axes.
     Likewise, ``fc2_combine_block_size_m`` controls FC2/reverse-A2A row tiles, while
     ``fc2_gemm_block_size_{n,k}`` control only FC2 dot tiles.
-
+    ``fc2_gemm_schedule`` selects the original N-major tile pool or the
+    expert-N persistent implementation.  ``fc2_combine_transport`` selects
+    reverse push or direct pull, which leaves FC2 rows in symmetric memory.
+    ``fc2_reverse_vector_workers`` and ``fc2_reduce_vector_workers``
+    independently select one or both Vector sub-cores per AI Core for the
+    reverse-A2A and final token-reduction A/B experiments.
     ``dispatch_producer_cores`` is used by the split-role ``static`` and
     ``count`` schedules.  All-core schedules still receive the resolved value
     as a compile-time argument, but do not assign fixed producer-only cores.
@@ -39,9 +54,13 @@ class MoEForwardConfig:
     dispatch_fc1_block_size_m: int = 128
     fc1_gemm_block_size_n: int = 256
     fc1_gemm_block_size_k: int = 128
-    fc2_combine_block_size_m: int = 64
-    fc2_gemm_block_size_n: int = 128
+    fc2_combine_block_size_m: int = 128
+    fc2_gemm_block_size_n: int = 256
     fc2_gemm_block_size_k: int = 128
+    fc2_gemm_schedule: str = "expert_n_persistent"
+    fc2_combine_transport: str = "direct_pull"
+    fc2_reverse_vector_workers: int = 1
+    fc2_reduce_vector_workers: int = 2
     dispatch_producer_cores: Optional[int] = None
     dispatch_readiness: str = "tile"
     dispatch_fc1_schedule: str = "allcore_expert_n_tile"
@@ -63,6 +82,28 @@ class MoEForwardConfig:
 
         if self.receive_capacity_factor is not None and self.receive_capacity_factor < 1.0:
             raise ValueError("receive_capacity_factor must be at least 1")
+        if self.fc2_gemm_schedule not in _FC2_GEMM_SCHEDULES:
+            raise ValueError(
+                "fc2_gemm_schedule must be one of "
+                + ", ".join(repr(value) for value in _FC2_GEMM_SCHEDULES)
+            )
+        if self.fc2_combine_transport not in _FC2_COMBINE_TRANSPORTS:
+            raise ValueError(
+                "fc2_combine_transport must be one of "
+                + ", ".join(
+                    repr(value) for value in _FC2_COMBINE_TRANSPORTS
+                )
+            )
+        if (
+            type(self.fc2_reverse_vector_workers) is not int
+            or self.fc2_reverse_vector_workers not in (1, 2)
+        ):
+            raise ValueError("fc2_reverse_vector_workers must be 1 or 2")
+        if (
+            type(self.fc2_reduce_vector_workers) is not int
+            or self.fc2_reduce_vector_workers not in (1, 2)
+        ):
+            raise ValueError("fc2_reduce_vector_workers must be 1 or 2")
         if self.dispatch_readiness not in ("expert", "tile"):
             raise ValueError("dispatch_readiness must be 'expert' or 'tile'")
         if self.dispatch_fc1_schedule not in _DISPATCH_FC1_SCHEDULES:
