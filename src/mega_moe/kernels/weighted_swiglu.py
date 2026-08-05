@@ -17,22 +17,17 @@ def _weighted_swiglu_kernel(
     output_ptr,
     num_rows,
     ffn_dim,
-    stride_fc1_m,
-    stride_fc1_n,
-    stride_routing_weight,
-    stride_output_m,
-    stride_output_n,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Apply SwiGLU and one routing scale to each dispatched token row."""
     pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
     num_n_tiles = tl.cdiv(ffn_dim, BLOCK_N)
     num_m_tiles = tl.cdiv(num_rows, BLOCK_M)
     num_tiles = num_m_tiles * num_n_tiles
 
-    for tile_id in range(pid, num_tiles, NUM_PROGRAMS):
+    for tile_id in range(pid, num_tiles, num_programs):
         tile_m = tile_id // num_n_tiles
         tile_n = tile_id % num_n_tiles
 
@@ -42,28 +37,24 @@ def _weighted_swiglu_kernel(
         mask_n = offs_n < ffn_dim
         mask = mask_m[:, None] & mask_n[None, :]
 
-        gate_offsets = (
-            offs_m[:, None] * stride_fc1_m
-            + offs_n[None, :] * stride_fc1_n
-        )
-        up_offsets = gate_offsets + ffn_dim * stride_fc1_n
-        output_offsets = (
-            offs_m[:, None] * stride_output_m
-            + offs_n[None, :] * stride_output_n
-        )
+        # The host contract rejects non-contiguous inputs, and ``output`` is
+        # allocated contiguous here.  Encode those layouts directly instead
+        # of specializing a second copy of their fixed strides.
+        gate_offsets = offs_m[:, None] * (2 * ffn_dim) + offs_n[None, :]
+        up_offsets = gate_offsets + ffn_dim
+        output_offsets = offs_m[:, None] * ffn_dim + offs_n[None, :]
 
         gate = tl.load(fc1_output_ptr + gate_offsets, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(fc1_output_ptr + up_offsets, mask=mask, other=0.0).to(tl.float32)
+        # FC1 is BF16.  Promote the inputs so SwiGLU and transported route
+        # scaling are evaluated in FP32; the output store is the only cast
+        # back to BF16.
+        activated = gate * tl.sigmoid(gate) * up
         routing_weight = tl.load(
-            routing_weight_ptr + offs_m * stride_routing_weight,
+            routing_weight_ptr + offs_m,
             mask=mask_m,
             other=0.0,
         ).to(tl.float32)
-
-        # FC1 is BF16 while the transported route scale remains FP32.  Promote
-        # the FC1 inputs above so activation and weighting are evaluated in
-        # FP32; storing through the BF16 output pointer performs the only cast.
-        activated = gate * tl.sigmoid(gate) * up
         activated *= routing_weight[:, None]
         tl.store(output_ptr + output_offsets, activated, mask=mask)
 
@@ -84,7 +75,6 @@ def weighted_swiglu_forward(
             public routing-weight input remains FP32 throughout dispatch and
             this function consumes the transported FP32 payload directly.
         num_cores: Maximum number of persistent Triton programs to launch.
-
     Returns:
         Contiguous BF16 tensor shaped ``[M, F]`` containing
         ``SiLU(gate) * up * routing_weight``.  SwiGLU and routing-weight
@@ -121,7 +111,6 @@ def weighted_swiglu_forward(
         )
     if not isinstance(num_cores, int) or isinstance(num_cores, bool) or num_cores <= 0:
         raise ValueError(f"num_cores must be a positive integer, got {num_cores!r}")
-
     output = torch.empty(
         (num_rows, ffn_dim),
         dtype=fc1_output.dtype,
@@ -138,12 +127,6 @@ def weighted_swiglu_forward(
         output,
         num_rows,
         ffn_dim,
-        fc1_output.stride(0),
-        fc1_output.stride(1),
-        routing_weight_recv.stride(0),
-        output.stride(0),
-        output.stride(1),
-        NUM_PROGRAMS=num_programs,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
     )

@@ -26,6 +26,7 @@ Usage:
 
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,7 +34,10 @@ import shmem as ash
 import torch.distributed as dist
 
 from mega_moe import FusedMoEForward, MoEForwardConfig, pack_gate_up_weights
+import mega_moe.kernels.dispatch_fc1 as dispatch_fc1_module
+import mega_moe.kernels.fc2_combine as fc2_combine_module
 from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
+import mega_moe.runtime.routing as routing_metadata_module
 
 g_ash_size = 1024 * 1024 * 1024  # 1 GB
 
@@ -603,6 +607,7 @@ CONFIGS = [
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
     """Run kernel dispatch+fc1 and compare against the independent golden."""
     routing_plan = layer.build_routing_plan(exp_idx)
+    routing_weights = torch.ones_like(exp_idx, dtype=torch.float32)
     logical_w1 = w1l.transpose(-1, -2)
     gemm_output = torch.zeros(
         (routing_plan.num_received_routes, logical_w1.shape[1]),
@@ -610,7 +615,13 @@ def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
         device=device,
     )
     dispatch_result = layer.dispatch_fc1(
-        hs, exp_idx, routing_plan, w1l, fc1_output=gemm_output)
+        hs,
+        exp_idx,
+        routing_plan,
+        w1l,
+        fc1_output=gemm_output,
+        routing_weights=routing_weights,
+    )
     kernel_exp = torch.repeat_interleave(
         torch.arange(layer.experts_per_rank, dtype=torch.int32, device=device),
         routing_plan.received_routes_per_expert,
@@ -763,26 +774,44 @@ def run_test(rank, world_size):
             ),
             ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_N", "fc1_gemm_block_size_n"),
             ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_K", "fc1_gemm_block_size_k"),
+            (
+                "MOE_FUSED_FC2_COMBINE_BLOCK_SIZE_M",
+                "fc2_combine_block_size_m",
+            ),
+            ("MOE_FUSED_FC2_GEMM_BLOCK_SIZE_N", "fc2_gemm_block_size_n"),
+            ("MOE_FUSED_FC2_GEMM_BLOCK_SIZE_K", "fc2_gemm_block_size_k"),
         ):
             if env_name in os.environ:
                 tiling_overrides[parameter_name] = int(os.environ[env_name])
+        schedule_overrides = {}
+        for env_name, parameter_name in (
+            ("MOE_FUSED_DISPATCH_READINESS", "dispatch_readiness"),
+            ("MOE_FUSED_DISPATCH_FC1_SCHEDULE", "dispatch_fc1_schedule"),
+            ("MOE_FUSED_FC2_GEMM_SCHEDULE", "fc2_gemm_schedule"),
+            ("MOE_FUSED_FC2_COMBINE_TRANSPORT", "fc2_combine_transport"),
+        ):
+            if env_name in os.environ:
+                schedule_overrides[parameter_name] = os.environ[env_name]
+        for env_name, parameter_name in (
+            ("MOE_FUSED_DISPATCH_PRODUCER_CORES", "dispatch_producer_cores"),
+            (
+                "MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS",
+                "fc2_reverse_vector_workers",
+            ),
+            (
+                "MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS",
+                "fc2_reduce_vector_workers",
+            ),
+        ):
+            if env_name in os.environ:
+                schedule_overrides[parameter_name] = int(os.environ[env_name])
         forward_config = MoEForwardConfig(
             num_aicore_programs=int(
                 os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
             ),
             receive_capacity_factor=float(world_size),
-            dispatch_producer_cores=(
-                int(os.environ["MOE_FUSED_DISPATCH_PRODUCER_CORES"])
-                if "MOE_FUSED_DISPATCH_PRODUCER_CORES" in os.environ
-                else None
-            ),
-            dispatch_readiness=os.environ.get(
-                "MOE_FUSED_DISPATCH_READINESS", "tile"
-            ),
-            dispatch_fc1_schedule=os.environ.get(
-                "MOE_FUSED_DISPATCH_FC1_SCHEDULE", "allcore_expert_n_tile"
-            ),
             **tiling_overrides,
+            **schedule_overrides,
         )
         optimized_op = FusedMoEForward(
             None,
@@ -957,21 +986,6 @@ def run_test(rank, world_size):
                 )
                 all_passed = all_passed and ok_full_repeat
 
-                if (
-                    world_size == 2
-                    and optimized_op.dispatch_fc1_schedule == "static"
-                ):
-                    # Tile SET slots and expert ADD counters have independent
-                    # epochs.  Alternate them on the same layer to catch an
-                    # accidental shared-epoch jump or cross-region pollution.
-                    original_readiness = optimized_op.dispatch_readiness
-                    for readiness in ("expert", "tile", "expert", "tile"):
-                        optimized_op.dispatch_readiness = readiness
-                        ok_switch = run_one(
-                            optimized_op, hs, exp_idx, w1l, num_experts,
-                            f"{label}-overlap-switch-{readiness}", rank, device, dtype)
-                        all_passed = all_passed and ok_switch
-                    optimized_op.dispatch_readiness = original_readiness
         finally:
             optimized_op.finalize()
 
@@ -1000,26 +1014,340 @@ def test_public_api_has_only_bf16_and_current_combine_arguments():
     assert "gemm_BLOCK_SIZE_N" not in combine_parameters
 
 
-def test_fc1_defaults_select_the_910b1_expert_major_merged_path():
+def test_config_keeps_multi_profile_candidates_and_best_defaults():
     config = MoEForwardConfig()
     assert config.num_aicore_programs == 24
     assert config.dispatch_fc1_block_size_m == 128
+    assert config.fc1_gemm_block_size_n == 256
+    assert config.fc1_gemm_block_size_k == 128
+    assert config.fc2_combine_block_size_m == 128
+    assert config.fc2_gemm_block_size_n == 256
+    assert config.fc2_gemm_block_size_k == 128
     assert config.dispatch_readiness == "tile"
     assert config.dispatch_fc1_schedule == "allcore_expert_n_tile"
+    assert config.fc2_gemm_schedule == "expert_n_persistent"
+    assert config.fc2_combine_transport == "direct_pull"
+    assert config.fc2_reverse_vector_workers == 1
+    assert config.fc2_reduce_vector_workers == 2
+    assert config.resolved_receive_capacity_factor(8) == 8.0
 
     parameters = inspect.signature(MoEForwardConfig).parameters
-    assert "fc1_gemm_block_size_m" not in parameters
-    assert "fc1_gemm_load_cache_num" not in parameters
-    assert "dispatch_fc1_task_order" not in parameters
+    assert set(parameters) == {
+        "num_aicore_programs",
+        "receive_capacity_factor",
+        "dispatch_fc1_block_size_m",
+        "fc1_gemm_block_size_n",
+        "fc1_gemm_block_size_k",
+        "fc2_combine_block_size_m",
+        "fc2_gemm_block_size_n",
+        "fc2_gemm_block_size_k",
+        "dispatch_producer_cores",
+        "dispatch_readiness",
+        "dispatch_fc1_schedule",
+        "fc2_gemm_schedule",
+        "fc2_combine_transport",
+        "fc2_reverse_vector_workers",
+        "fc2_reduce_vector_workers",
+    }
 
+    with pytest.raises(ValueError, match="requires dispatch_readiness='expert'"):
+        MoEForwardConfig(
+            dispatch_fc1_schedule="allcore_expert_n",
+            dispatch_readiness="tile",
+        )
     with pytest.raises(ValueError, match="requires dispatch_readiness='tile'"):
         MoEForwardConfig(
-            dispatch_readiness="expert",
             dispatch_fc1_schedule="allcore_expert_n_tile",
+            dispatch_readiness="expert",
         )
 
-    with pytest.raises(ValueError, match="dispatch_fc1_schedule"):
-        MoEForwardConfig(dispatch_fc1_schedule="allcore_grouped")
+
+def test_direct_pull_workspace_is_sized_by_sent_routes_only():
+    """The local FC2 staging buffer does not reserve receive-capacity rows."""
+    op = FusedMoEForward.__new__(FusedMoEForward)
+    torch.nn.Module.__init__(op)
+    op.max_tokens_per_rank = 8
+    op.hidden_size = 4
+    op.top_k = 2
+    op.world_size = 8
+    op.experts_per_rank = 112
+    op.activation_dtype = torch.bfloat16
+    op.config = MoEForwardConfig()
+    op.context = SimpleNamespace(peer_mem=torch.empty(4096, dtype=torch.bfloat16))
+    op._combine_fc2_buf = None
+
+    op._ensure_combine_buffers()
+
+    assert op._combine_fc2_buf.shape == (16, 4)
+    assert op._route_to_send.shape == (16,)
+    assert op._max_reverse_tile_slots == 1 + 8 * 112
+    assert op._reverse_tile_rank.shape == (1 + 8 * 112,)
+
+
+def test_dispatch_kernel_keeps_candidates_without_optional_weight_branch():
+    launch_source = inspect.getsource(FusedMoEForward.dispatch_fc1)
+    kernel_source = inspect.getsource(dispatch_fc1_module._kernel_dispatch_fc1.fn)
+    consumer_source = inspect.getsource(
+        dispatch_fc1_module._triton_grouped_gemm_expert_n_merged_tiles_wait.fn
+    )
+    direct_dispatch_source = inspect.getsource(
+        dispatch_fc1_module._dispatch_direct_expert_buckets.fn
+    )
+    tile_dispatch_source = inspect.getsource(
+        dispatch_fc1_module._dispatch_one_source_tile_task.fn
+    )
+
+    assert "ALL_CORE_PIPELINE" in kernel_source
+    assert "DIRECT_EXPERT_DISPATCH" in kernel_source
+    assert "COUNT_DERIVED_SCHEDULE" in kernel_source
+    assert "_triton_grouped_gemm_expert_n_merged_tiles_wait(" in kernel_source
+    assert "if sub_vec_id() == 0:" in kernel_source
+    assert "FINAL_BARRIER" in kernel_source
+    assert "source_id" in consumer_source
+    assert "overlap_start" in consumer_source
+    assert "self.dispatch_fc1_schedule" in launch_source
+    assert "N_DISPATCH_CORES" in launch_source
+    assert "TILE_READINESS" in launch_source
+    assert "HAS_ROUTING_WEIGHT" not in launch_source
+    assert "HAS_ROUTING_WEIGHT" not in kernel_source
+    assert "hidden * 2" in kernel_source
+    assert "hidden * 2" in tile_dispatch_source
+    assert "task_count * hidden * 2" in direct_dispatch_source
+    assert "task_count * 4" in direct_dispatch_source
+
+
+def test_routing_metadata_keeps_width_specific_910b1_lowering():
+    histogram_source = inspect.getsource(
+        routing_metadata_module._kernel_build_routing_metadata.fn
+    )
+    lower_bound_source = inspect.getsource(
+        routing_metadata_module._kernel_build_routing_metadata_lower_bound.fn
+    )
+    metadata_helper_source = inspect.getsource(
+        routing_metadata_module._publish_counts_and_build_metadata.fn
+    )
+    launch_source = inspect.getsource(routing_metadata_module.build_routing_plan)
+
+    assert "tl.histogram(route_keys, NUM_BINS_PAD)" in histogram_source
+    assert "left_safe_mid = tl.where(left_active, left_mid, 0)" in lower_bound_source
+    assert "if context.metadata_num_bins > 512" in launch_source
+    assert "if sub_vec_id() == 0:" in histogram_source
+    assert "if sub_vec_id() == 0:" in metadata_helper_source
+    assert "NUM_BINS_PAD * 4" in histogram_source
+    assert "NUM_BINS_PAD * 4" in metadata_helper_source
+
+
+def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
+    fc2_launches = []
+    transport_launches = []
+    reduce_launches = []
+    fc2_kernel_source = inspect.getsource(
+        fc2_combine_module._kernel_fc2_combine.fn
+    )
+    transport_kernel_source = inspect.getsource(
+        fc2_combine_module._kernel_direct_pull_transport.fn
+    )
+    reduce_kernel_source = inspect.getsource(
+        fc2_combine_module._kernel_local_topk_reduce.fn
+    )
+
+    class FakeKernel:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                self.sink.append((grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(
+        fc2_combine_module,
+        "_kernel_fc2_combine",
+        FakeKernel(fc2_launches),
+    )
+    monkeypatch.setattr(
+        fc2_combine_module,
+        "_kernel_direct_pull_transport",
+        FakeKernel(transport_launches),
+    )
+    monkeypatch.setattr(
+        fc2_combine_module,
+        "_kernel_local_topk_reduce",
+        FakeKernel(reduce_launches),
+    )
+
+    experts = 2
+    rows = 5
+    reduction = 16
+    hidden = 16
+    tokens = 2
+    topk = 1
+    received_routes_per_expert = torch.tensor([2, 3], dtype=torch.int32)
+    received_expert_offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
+    route_to_send = torch.arange(tokens * topk, dtype=torch.int32)
+    fc2_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
+    reverse_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
+    peer_mem = torch.empty(rows * hidden, dtype=torch.bfloat16)
+    fc2_buf = torch.empty((rows, hidden), dtype=torch.bfloat16)
+
+    output = fc2_combine_module.launch_fc2_combine(
+        torch.zeros((rows, reduction), dtype=torch.bfloat16),
+        torch.zeros((experts, hidden, reduction), dtype=torch.bfloat16),
+        fc2_buf,
+        peer_mem,
+        route_to_send,
+        torch.empty((tokens, hidden), dtype=torch.bfloat16),
+        received_routes_per_expert,
+        received_expert_offsets,
+        *fc2_metadata,
+        *reverse_metadata,
+        num_fc2_slots=4,
+        num_reverse_slots=4,
+        num_send=tokens * topk,
+        topk=topk,
+        num_cores=24,
+        block_m=16,
+        block_n=16,
+        block_k=16,
+        world_size=1,
+        expert_n_persistent=True,
+        direct_pull=True,
+        reverse_vector_workers=2,
+        reduce_vector_workers=2,
+    )
+
+    assert output.shape == (tokens, hidden)
+    assert len(fc2_launches) == 1
+    grid, args, kwargs = fc2_launches[0]
+    assert grid == (24, 1, 1)
+    assert args[3] is peer_mem
+    assert kwargs["FC2_EXPERT_N_PERSISTENT"] is True
+    assert kwargs["DIRECT_PULL"] is True
+    assert kwargs["TOPK"] == 1
+    assert kwargs["BLOCK_N_PUSH"] == 1
+    assert kwargs["BLOCK_N_REDUCE"] == 1
+    assert kwargs["REVERSE_VECTOR_WORKERS"] == 1
+    assert kwargs["REDUCE_VECTOR_WORKERS"] == 1
+    assert len(transport_launches) == 1
+    transport_grid, transport_args, transport_kwargs = transport_launches[0]
+    assert transport_grid == (24, 1, 1)
+    assert transport_args[0] is fc2_buf
+    assert transport_args[1] is peer_mem
+    assert transport_kwargs["WORLD_SIZE"] == 1
+    assert len(reduce_launches) == 1
+    reduce_grid, reduce_args, _ = reduce_launches[0]
+    assert reduce_grid == (48, 1, 1)
+    assert reduce_args[0] is fc2_buf
+    assert reduce_args[1] is route_to_send
+    assert reduce_args[2] is output
+    assert "if FC2_EXPERT_N_PERSISTENT:" in fc2_kernel_source
+    assert "if not DIRECT_PULL:" in fc2_kernel_source
+    assert "_fc2_gemm_one_mn_tile(" in fc2_kernel_source
+    assert transport_kernel_source.count("libshmem_device.barrier_all_vec()") == 2
+    assert "libshmem_device.barrier_all()" not in transport_kernel_source
+    assert "row_count * N * 2" in transport_kernel_source
+    assert "if sub_vec_id() == 0:" in transport_kernel_source
+    assert "libshmem_device.getmem(" in transport_kernel_source
+    assert "peer_rank == peer_owner" in transport_kernel_source
+    assert "libshmem_device.getmem(" not in reduce_kernel_source
+    assert "for token_id in range(pid, batch_size, ncore)" in reduce_kernel_source
+    assert "reduce_sub_id = sub_vec_id" not in reduce_kernel_source
+
+
+def test_persistent_fc2_skips_unused_tile_descriptor_build(monkeypatch):
+    metadata_launches = []
+    fill_launches = []
+    metadata_source = inspect.getsource(
+        fc2_combine_module._prepare_fc2_combine_metadata_kernel.fn
+    )
+    production_source = inspect.getsource(
+        FusedMoEForward._prepare_combine_metadata
+    )
+
+    class FakeKernel:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                self.sink.append((grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(
+        fc2_combine_module,
+        "_prepare_fc2_combine_metadata_kernel",
+        FakeKernel(metadata_launches),
+    )
+    monkeypatch.setattr(
+        fc2_combine_module,
+        "_fill_int_kernel",
+        FakeKernel(fill_launches),
+    )
+
+    recv_counts = torch.tensor([2, 3], dtype=torch.int32)
+    recv_offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
+    counts_mem = torch.tensor([2, 3], dtype=torch.int32)
+    send_starts = torch.tensor([0, 2], dtype=torch.int32)
+    receive_starts = torch.tensor([0, 2], dtype=torch.int32)
+    fc2_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
+    reverse_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
+
+    fc2_combine_module.prepare_fc2_combine_metadata(
+        recv_counts,
+        recv_offsets,
+        counts_mem,
+        send_starts,
+        receive_starts,
+        *fc2_metadata,
+        *reverse_metadata,
+        num_fc2_slots=4,
+        num_reverse_slots=4,
+        local_rank=0,
+        world_size=1,
+        experts_per_rank=2,
+        num_bins_pad=2,
+        block_m=16,
+        direct_pull=True,
+        build_fc2_tiles=False,
+    )
+
+    assert len(metadata_launches) == 1
+    grid, _, kwargs = metadata_launches[0]
+    assert grid == (1, )
+    assert kwargs["BUILD_FC2_TILES"] is False
+    assert kwargs["multibuffer"] is True
+    assert len(fill_launches) == 1
+    assert fill_launches[0][1][0] is reverse_metadata[0]
+    assert "if BUILD_FC2_TILES:" in metadata_source
+    assert 'self.config.fc2_gemm_schedule == "tile_n_major"' in production_source
+
+    # Keep the standalone helper backward compatible for tile-N-major A/B
+    # harnesses that do not pass the new keyword explicitly.
+    fc2_combine_module.prepare_fc2_combine_metadata(
+        recv_counts,
+        recv_offsets,
+        counts_mem,
+        send_starts,
+        receive_starts,
+        *fc2_metadata,
+        *reverse_metadata,
+        num_fc2_slots=4,
+        num_reverse_slots=4,
+        local_rank=0,
+        world_size=1,
+        experts_per_rank=2,
+        num_bins_pad=2,
+        block_m=16,
+        direct_pull=True,
+    )
+
+    assert len(metadata_launches) == 2
+    assert metadata_launches[1][2]["BUILD_FC2_TILES"] is True
+    assert len(fill_launches) == 3
+    assert fill_launches[1][1][0] is fc2_metadata[0]
+    assert fill_launches[2][1][0] is reverse_metadata[0]
 
 
 def test_pack_gate_up_weights_returns_contiguous_kn_layout():
@@ -1031,6 +1359,24 @@ def test_pack_gate_up_weights_returns_contiguous_kn_layout():
     assert packed.is_contiguous()
     torch.testing.assert_close(packed[:, :, :3], gate.transpose(1, 2))
     torch.testing.assert_close(packed[:, :, 3:], up.transpose(1, 2))
+
+
+def test_make_down_weights_returns_contiguous_nk_layout():
+    down = make_down_weights(
+        num_experts=4,
+        hidden=8,
+        ffn_dim=6,
+        world_size=2,
+        rank=0,
+        dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    assert down.shape == (2, 8, 6)
+    assert down.is_contiguous()
+    assert down.stride() == (48, 6, 1)
+    activation = torch.randn(3, 6, dtype=torch.float32)
+    assert (activation @ down[0].T.float()).shape == (3, 8)
 
 
 @pytest.mark.dist

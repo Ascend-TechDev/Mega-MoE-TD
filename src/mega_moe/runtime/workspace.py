@@ -118,6 +118,8 @@ def create_moe_forward_context(
     context.routing_weight_mem.zero_()
 
     source_tile_slots = world_size * experts_per_rank * max_source_tiles
+    # Expert-ready fallback schedules use one ADD counter per local expert.
+    # Keep these slots disjoint from the source-tile SET epochs.
     expert_counter_slots = experts_per_rank
     signal_slots = source_tile_slots + expert_counter_slots
     context.signal_mem = ash.aclshmem_create_tensor(
