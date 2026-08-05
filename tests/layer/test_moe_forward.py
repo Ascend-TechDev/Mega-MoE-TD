@@ -38,14 +38,17 @@ import mega_moe.kernels.dispatch_fc1 as dispatch_fc1_module
 import mega_moe.kernels.fc2_combine as fc2_combine_module
 from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
 import mega_moe.runtime.routing as routing_metadata_module
+from tests._moe_dist_utils import get_ash_size_bytes, init_aclshmem
+from tests._numeric import (
+    APPROX_ATOL,
+    APPROX_RTOL,
+    LAYOUT_ATOL,
+    LAYOUT_RTOL,
+    OUTPUT_ATOL,
+    OUTPUT_RTOL,
+)
 
-g_ash_size = 1024 * 1024 * 1024  # 1 GB
-
-def _get_ash_ip_port():
-    """Return a per-invocation overrideable ACLSHMEM bootstrap endpoint."""
-    addr = os.environ.get("ASH_MASTER_ADDR", "127.0.0.1")
-    port = os.environ.get("ASH_MASTER_PORT", "8666")
-    return f"tcp://{addr}:{port}"
+g_ash_size = get_ash_size_bytes(default_gb=1)
 
 
 # ---------------------------------------------------------------------------
@@ -456,12 +459,12 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
         msgs.append(f"expert shape kernel={tuple(kernel_exp.shape)} golden={tuple(golden_exp.shape)}")
     if ok:
         try:
-            torch.testing.assert_close(kernel_exp, golden_exp, rtol=0, atol=0)
+            torch.testing.assert_close(kernel_exp, golden_exp, rtol=LAYOUT_RTOL, atol=LAYOUT_ATOL)
         except AssertionError as exc:
             ok = False
             msgs.append(f"expert layout mismatch: {str(exc).splitlines()[0]}")
         try:
-            torch.testing.assert_close(kernel_out.float(), golden_out.float(), rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(kernel_out.float(), golden_out.float(), rtol=APPROX_RTOL, atol=APPROX_ATOL)
         except AssertionError:
             ok = False
             diff = (kernel_out.float() - golden_out.float()).abs()
@@ -474,13 +477,13 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
                 expert_mask = golden_exp == expert_idx
                 if bool(expert_mask.any()):
                     expert_diff = diff[expert_mask]
-                    if float(expert_diff.max().item()) > 2e-2:
+                    if float(expert_diff.max().item()) > APPROX_ATOL:
                         msgs.append(
                             f"exp{expert_idx} max={expert_diff.max().item():.4f} "
                             f"mean={expert_diff.mean().item():.4f}"
                         )
         try:
-            torch.testing.assert_close(kernel_dispatch.float(), golden_dispatch.float(), rtol=0, atol=0)
+            torch.testing.assert_close(kernel_dispatch.float(), golden_dispatch.float(), rtol=LAYOUT_RTOL, atol=LAYOUT_ATOL)
         except AssertionError:
             ok = False
             diff = (kernel_dispatch.float() - golden_dispatch.float()).abs()
@@ -511,8 +514,8 @@ def _compare_weighted_stage(kernel_values, golden_values, label, rank, device):
             msgs.append(
                 f"{key} shape kernel={tuple(actual.shape)} golden={tuple(expected.shape)}")
             continue
-        rtol = 0 if key in exact_keys else 2e-2
-        atol = 0 if key in exact_keys else 2e-2
+        rtol = LAYOUT_RTOL if key in exact_keys else APPROX_RTOL
+        atol = LAYOUT_ATOL if key in exact_keys else APPROX_ATOL
         try:
             torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
         except AssertionError:
@@ -555,7 +558,7 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
             ok = False
             msgs.append("kernel output contains non-finite values")
         try:
-            torch.testing.assert_close(actual_fp32, expected_fp32, rtol=4e-2, atol=4e-2)
+            torch.testing.assert_close(actual_fp32, expected_fp32, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
         except AssertionError:
             ok = False
             diff = (actual_fp32 - expected_fp32).abs()
@@ -581,27 +584,7 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
 #  Configs & worker
 # ---------------------------------------------------------------------------
 
-CONFIGS = [
-    dict(label="S", hidden=256, inter=512, topk=2, tokens=128, epr=2, drop_frac=0.0),
-    dict(label="M", hidden=512, inter=1024, topk=2, tokens=256, epr=2, drop_frac=0.0),
-    dict(label="L", hidden=1024, inter=2048, topk=2, tokens=512, epr=2, drop_frac=0.0),
-    dict(label="S-drop", hidden=256, inter=512, topk=2, tokens=128, epr=2, drop_frac=0.3),
-    dict(label="EPR4", hidden=512, inter=1024, topk=2, tokens=256, epr=4, drop_frac=0.0),
-    # DeepSeek-V4-Pro routed-expert shape from the sibling NVIDIA dsv4 case:
-    # H=7168, F=3072, K=6, E=384. This BF16 correctness smoke excludes the
-    # shared-expert branch and the model's FP4 expert format. It deliberately
-    # keeps a smaller global-token count; the performance benchmark owns the
-    # exact 2K/8K/32K/128K per-rank workloads.
-    dict(
-        label="DSV4-smoke",
-        hidden=7168,
-        inter=3072,
-        topk=6,
-        global_tokens=1024,
-        num_experts=384,
-        drop_frac=0.0,
-    ),
-]
+from tests._shapes import FORWARD_SHAPES as CONFIGS
 
 
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
@@ -727,18 +710,7 @@ def run_full_one(
 
 def run_test(rank, world_size):
     # ---- init aclshmem ----
-    ret = ash.set_conf_store_tls(False, "")
-    if ret != 0:
-        raise RuntimeError("set_conf_store_tls failed")
-    attr = ash.InitAttr()
-    attr.my_rank = rank
-    attr.n_ranks = world_size
-    attr.local_mem_size = g_ash_size
-    attr.ip_port = _get_ash_ip_port()
-    attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
-    ret = ash.aclshmem_init(attr)
-    if ret != 0:
-        raise RuntimeError("aclshmem_init failed")
+    init_aclshmem(rank, world_size, g_ash_size)
 
     device = f"npu:{rank}"
     dtype = torch.bfloat16
@@ -747,25 +719,19 @@ def run_test(rank, world_size):
     only_config = os.environ.get("MOE_FUSED_TEST_CONFIG")
     configs = [
         config for config in CONFIGS
-        if only_config in (None, config["label"])
+        if only_config in (None, config.label)
     ]
 
     for config in configs:
-        label = config["label"]
-        hidden = config["hidden"]
-        inter = config["inter"]
-        topk = config["topk"]
-        drop_frac = config["drop_frac"]
-        if "global_tokens" in config:
-            if config["global_tokens"] % world_size != 0:
-                raise ValueError("DSV4 global token count must be divisible by world_size")
-            n_per_rank = config["global_tokens"] // world_size
-            num_experts = config["num_experts"]
-            if num_experts % world_size != 0:
-                raise ValueError("DSV4 expert count must be divisible by world_size")
-        else:
-            n_per_rank = config["tokens"]
-            num_experts = config["epr"] * world_size
+        label = config.label
+        hidden = config.hidden
+        inter = config.ffn
+        topk = config.topk
+        drop_frac = config.drop_frac
+        n_per_rank = config.resolved_tokens_per_rank(world_size)
+        num_experts = config.resolved_num_experts(world_size)
+        if num_experts % world_size != 0:
+            raise ValueError("expert count must be divisible by world_size")
         tiling_overrides = {}
         for env_name, parameter_name in (
             (
@@ -989,7 +955,7 @@ def run_test(rank, world_size):
         finally:
             optimized_op.finalize()
 
-    _ = ash.aclshmem_finialize()
+    _ = ash.aclshmem_finalize()
 
     final_flag = torch.tensor([1 if all_passed else 0], dtype=torch.int32, device=device)
     dist.all_reduce(final_flag, op=dist.ReduceOp.MIN)
@@ -1085,6 +1051,9 @@ def test_direct_pull_workspace_is_sized_by_sent_routes_only():
 
 
 def test_dispatch_kernel_keeps_candidates_without_optional_weight_branch():
+    # Brittle source-string contract: these asserts grep the kernel/launcher
+    # source to guard against silently dropping a schedule branch or the packed
+    # gate/up layout. Update the expected strings on rename, not the contract.
     launch_source = inspect.getsource(FusedMoEForward.dispatch_fc1)
     kernel_source = inspect.getsource(dispatch_fc1_module._kernel_dispatch_fc1.fn)
     consumer_source = inspect.getsource(
@@ -1117,6 +1086,8 @@ def test_dispatch_kernel_keeps_candidates_without_optional_weight_branch():
 
 
 def test_routing_metadata_keeps_width_specific_910b1_lowering():
+    # Brittle source-string contract: guards the 910B1 width-specific routing
+    # metadata lowering (1024-bin lower-bound path + NUM_BINS_PAD layout).
     histogram_source = inspect.getsource(
         routing_metadata_module._kernel_build_routing_metadata.fn
     )
@@ -1241,6 +1212,9 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
     assert reduce_args[0] is fc2_buf
     assert reduce_args[1] is route_to_send
     assert reduce_args[2] is output
+    # Brittle source-string contract (the launch-arg asserts above are
+    # behavioral via FakeKernel; these grep the kernel source to guard the
+    # persistent/direct-pull branch shapes against silent removal).
     assert "if FC2_EXPERT_N_PERSISTENT:" in fc2_kernel_source
     assert "if not DIRECT_PULL:" in fc2_kernel_source
     assert "_fc2_gemm_one_mn_tile(" in fc2_kernel_source
@@ -1256,6 +1230,8 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
 
 
 def test_persistent_fc2_skips_unused_tile_descriptor_build(monkeypatch):
+    # Mixed: behavioral launch-arg asserts via FakeKernel + brittle source-string
+    # contract on the BUILD_FC2_TILES branch and the tile_n_major schedule check.
     metadata_launches = []
     fill_launches = []
     metadata_source = inspect.getsource(
