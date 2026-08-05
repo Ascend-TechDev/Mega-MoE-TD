@@ -78,11 +78,9 @@ def _kernel_dispatch_fc1(
     COUNT_DERIVED_SCHEDULE: tl.constexpr,
     ALL_CORE_PIPELINE: tl.constexpr,
     DIRECT_EXPERT_DISPATCH: tl.constexpr,
-    TILE_BULK_DISPATCH: tl.constexpr,
     EXPERT_N_TILE_CONSUMER: tl.constexpr,
     MN_TILE_FC1: tl.constexpr,
     N_TILE_FC1: tl.constexpr,
-    HAS_ROUTING_WEIGHT: tl.constexpr,
     FINAL_BARRIER: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -113,9 +111,7 @@ def _kernel_dispatch_fc1(
                         send_bucket_dst_starts_ptr,
                         send_bucket_starts_ptr, send_counts_re_ptr,
                         hidden, stride_input_m,
-                        WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
-                        True,
-                        HAS_ROUTING_WEIGHT)
+                        WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES)
                 else:
                     _dispatch_count_derived_source_tiles(
                         pid, NUM_PROGRAM_CORES,
@@ -128,7 +124,6 @@ def _kernel_dispatch_fc1(
                         signal_epoch, hidden, stride_input_m,
                         LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                         MAX_SOURCE_TILES, BLOCK_SIZE_M,
-                        HAS_ROUTING_WEIGHT, TILE_BULK_DISPATCH,
                         EXPERT_N_TILE_CONSUMER)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             if EXPERT_N_TILE_CONSUMER:
@@ -205,8 +200,7 @@ def _kernel_dispatch_fc1(
                         send_bucket_starts_ptr, send_counts_re_ptr,
                         signal_epoch, hidden, stride_input_m,
                         LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
-                        MAX_SOURCE_TILES, BLOCK_SIZE_M,
-                        HAS_ROUTING_WEIGHT, False, False)
+                        MAX_SOURCE_TILES, BLOCK_SIZE_M, False)
                 else:
                     for task_idx in range(pid, WORLD_SIZE * EXPERTS_PER_RANK, N_DISPATCH_CORES):
                         task_start = tl.load(send_bucket_starts_ptr + task_idx)
@@ -230,14 +224,13 @@ def _kernel_dispatch_fc1(
                                     src_base = input_ptr + src_idx * stride_input_m
                                     dst_base = peer_mem_ptr + dst_offs * stride_input_m
                                     libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
-                                    if HAS_ROUTING_WEIGHT:
-                                        route_idx = tl.load(send_route_idx_ptr + send_idx)
-                                        libshmem_device.putmem(
-                                            routing_weight_recv_ptr + dst_offs,
-                                            routing_weight_ptr + route_idx,
-                                            4,
-                                            dst_rank,
-                                        )
+                                    route_idx = tl.load(send_route_idx_ptr + send_idx)
+                                    libshmem_device.putmem(
+                                        routing_weight_recv_ptr + dst_offs,
+                                        routing_weight_ptr + route_idx,
+                                        4,
+                                        dst_rank,
+                                    )
                                 libshmem_device.fence()
                                 tile_signal_slot = (
                                     (LOCAL_RANK * EXPERTS_PER_RANK + signal_slot) * MAX_SOURCE_TILES
@@ -257,14 +250,13 @@ def _kernel_dispatch_fc1(
                                 src_base = input_ptr + src_idx * stride_input_m
                                 dst_base = peer_mem_ptr + dst_offs * stride_input_m
                                 libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
-                                if HAS_ROUTING_WEIGHT:
-                                    route_idx = tl.load(send_route_idx_ptr + send_idx)
-                                    libshmem_device.putmem(
-                                        routing_weight_recv_ptr + dst_offs,
-                                        routing_weight_ptr + route_idx,
-                                        4,
-                                        dst_rank,
-                                    )
+                                route_idx = tl.load(send_route_idx_ptr + send_idx)
+                                libshmem_device.putmem(
+                                    routing_weight_recv_ptr + dst_offs,
+                                    routing_weight_ptr + route_idx,
+                                    4,
+                                    dst_rank,
+                                )
 
                             # Empty buckets also contribute one ADD so the expert
                             # counter advances by WORLD_SIZE on every epoch.
@@ -677,8 +669,6 @@ def _dispatch_direct_expert_buckets(
     WORLD_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
-    PUBLISH_READINESS: tl.constexpr,
-    HAS_ROUTING_WEIGHT: tl.constexpr,
 ):
     """Bulk-dispatch one pre-gathered bucket, then publish readiness."""
     num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
@@ -696,42 +686,25 @@ def _dispatch_direct_expert_buckets(
         task_count = tl.load(send_counts_re_ptr + task_id)
         task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
         if task_count > 0:
-            if PUBLISH_READINESS:
-                libshmem_device.putmem(
-                    peer_mem_ptr + task_dst_start * stride_input_m,
-                    send_staging_ptr + task_start * hidden,
-                    task_count * hidden * 2,
-                    dst_rank,
-                )
-                if HAS_ROUTING_WEIGHT:
-                    libshmem_device.putmem(
-                        routing_weight_recv_ptr + task_dst_start,
-                        routing_staging_ptr + task_start,
-                        task_count * 4,
-                        dst_rank,
-                    )
-                libshmem_device.fence()
-            else:
-                libshmem_device.putmem(
-                    peer_mem_ptr + task_dst_start * stride_input_m,
-                    send_staging_ptr + task_start * hidden,
-                    task_count * hidden * 2,
-                    dst_rank,
-                )
-                if HAS_ROUTING_WEIGHT:
-                    libshmem_device.putmem(
-                        routing_weight_recv_ptr + task_dst_start,
-                        routing_staging_ptr + task_start,
-                        task_count * 4,
-                        dst_rank,
-                    )
-        if PUBLISH_READINESS:
-            libshmem_device.signal_op(
-                signal_mem_ptr + (expert_counter_base + expert_id) * 16,
-                1,
-                libshmem_device.ACLSHMEM_SIGNAL_ADD,
+            libshmem_device.putmem(
+                peer_mem_ptr + task_dst_start * stride_input_m,
+                send_staging_ptr + task_start * hidden,
+                task_count * hidden * 2,
                 dst_rank,
             )
+            libshmem_device.putmem(
+                routing_weight_recv_ptr + task_dst_start,
+                routing_staging_ptr + task_start,
+                task_count * 4,
+                dst_rank,
+            )
+            libshmem_device.fence()
+        libshmem_device.signal_op(
+            signal_mem_ptr + (expert_counter_base + expert_id) * 16,
+            1,
+            libshmem_device.ACLSHMEM_SIGNAL_ADD,
+            dst_rank,
+        )
 
 
 @triton.jit
@@ -749,8 +722,6 @@ def _dispatch_one_source_tile_task(
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    HAS_ROUTING_WEIGHT: tl.constexpr,
-    TILE_BULK_DISPATCH: tl.constexpr,
 ):
     """Dispatch the source-local tiles assigned to one lane of a nonempty bucket."""
     task_start = tl.load(send_bucket_starts_ptr + task_id)
@@ -763,38 +734,20 @@ def _dispatch_one_source_tile_task(
     for source_tile in range(task_lane, num_source_tiles, task_cores):
         tile_start = source_tile * BLOCK_SIZE_M
         tile_count = tl.minimum(BLOCK_SIZE_M, task_count - tile_start)
-        if TILE_BULK_DISPATCH:
-            send_offs = task_start + tile_start
-            dst_offs = task_dst_start + tile_start
+        for tile_token in range(tile_count):
+            send_idx = task_start + tile_start + tile_token
+            src_idx = tl.load(send_src_idx_ptr + send_idx)
+            dst_offs = task_dst_start + tile_start + tile_token
+            src_base = input_ptr + src_idx * stride_input_m
+            dst_base = peer_mem_ptr + dst_offs * stride_input_m
+            libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
+            route_idx = tl.load(send_route_idx_ptr + send_idx)
             libshmem_device.putmem(
-                peer_mem_ptr + dst_offs * stride_input_m,
-                input_ptr + send_offs * stride_input_m,
-                tile_count * hidden * 2,
+                routing_weight_recv_ptr + dst_offs,
+                routing_weight_ptr + route_idx,
+                4,
                 dst_rank,
             )
-            if HAS_ROUTING_WEIGHT:
-                libshmem_device.putmem(
-                    routing_weight_recv_ptr + dst_offs,
-                    routing_weight_ptr + send_offs,
-                    tile_count * 4,
-                    dst_rank,
-                )
-        else:
-            for tile_token in range(tile_count):
-                send_idx = task_start + tile_start + tile_token
-                src_idx = tl.load(send_src_idx_ptr + send_idx)
-                dst_offs = task_dst_start + tile_start + tile_token
-                src_base = input_ptr + src_idx * stride_input_m
-                dst_base = peer_mem_ptr + dst_offs * stride_input_m
-                libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
-                if HAS_ROUTING_WEIGHT:
-                    route_idx = tl.load(send_route_idx_ptr + send_idx)
-                    libshmem_device.putmem(
-                        routing_weight_recv_ptr + dst_offs,
-                        routing_weight_ptr + route_idx,
-                        4,
-                        dst_rank,
-                    )
 
         libshmem_device.fence()
         signal_slot = (
@@ -825,8 +778,6 @@ def _dispatch_count_derived_source_tiles(
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    HAS_ROUTING_WEIGHT: tl.constexpr,
-    TILE_BULK_DISPATCH: tl.constexpr,
     EXPERT_MAJOR_TASK_ORDER: tl.constexpr,
 ):
     """Assign cores only to nonempty buckets, then stripe each bucket's tiles."""
@@ -856,7 +807,7 @@ def _dispatch_count_derived_source_tiles(
                 send_bucket_starts_ptr, send_counts_re_ptr,
                 signal_epoch, hidden, stride_input_m,
                 LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
-                BLOCK_SIZE_M, HAS_ROUTING_WEIGHT, TILE_BULK_DISPATCH)
+                BLOCK_SIZE_M)
         else:
             for active_task_id in range(pid, num_active_tasks, num_cores):
                 task_id = _find_nth_nonempty_task(
@@ -871,8 +822,8 @@ def _dispatch_count_derived_source_tiles(
                     send_bucket_dst_starts_ptr,
                     send_bucket_starts_ptr, send_counts_re_ptr,
                     signal_epoch, hidden, stride_input_m,
-                    LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
-                    BLOCK_SIZE_M, HAS_ROUTING_WEIGHT, TILE_BULK_DISPATCH)
+                    LOCAL_RANK, EXPERTS_PER_RANK,
+                    MAX_SOURCE_TILES, BLOCK_SIZE_M)
 
 
 @triton.jit

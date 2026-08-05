@@ -23,20 +23,34 @@ Before timing, the candidate and grouped baseline must pass normal,
 zero-receive/empty-expert, and negative/out-of-range all-drop comparison gates.
 
 Workload profiles:
+    KIMI-K3: H=3584, F=3072, top-k=16, E=896,
+             tokens/rank in {4096, 8192, 16384}; primary optimization target
     QWEN: H=2048, F=768, top-k=8, E=128,
           tokens/rank in {2048, 8192, 16384, 32768}
     DSV4: H=7168, F=3072, top-k=6, E=384,
           tokens/rank in {2048, 8192, 32768, 131072}; BF16 routed experts only
 
 Usage (the pytest fixture starts workers; do not wrap in torchrun):
+    source ./run.sh
     python -m pytest -p tests.conftest benchmark/layer/bench_full_forward.py -m dist -v -s
 
 Environment:
-    MOE_FULL_BENCH_CONFIG=2K|8K|16K|32K  # comma-separated selection is accepted
-    MOE_DSV4_BENCH_CONFIG=dsv4_pro_2k,dsv4_pro_8k,dsv4_pro_32k,dsv4_pro_128k
-                                           # comma-separated subset; unset runs all four
+    MOE_FULL_BENCH_CONFIG=kimi_k3_4k,kimi_k3_8k,kimi_k3_16k
+                                           # comma-separated selection is accepted
+    MOE_DSV4_BENCH_CONFIG=dsv4_pro_2k,dsv4_pro_4k,dsv4_pro_8k,dsv4_pro_32k,dsv4_pro_128k
+                                           # comma-separated subset; unset runs all five
     MOE_FULL_BENCH_BREAKDOWN=0            # disable four-stage event diagnostics
-    MOE_FUSED_NUM_AICORE_PROGRAMS=24      # matches the 24 physical Cube cores on Ascend 910B1
+    MOE_FULL_BENCH_ROUTE_MODE=dense_random|sparse_balanced
+    MOE_FULL_BENCH_ACTIVE_EXPERTS=16       # optional sparse mode override;
+                                           # must be >= top-k and divisible by W
+    MOE_FUSED_NUM_AICORE_PROGRAMS=24      # 910B1 default; override for other devices
+    MOE_FUSED_DISPATCH_PRODUCER_CORES=4   # static/count schedules only
+    MOE_FUSED_DISPATCH_READINESS=tile|expert
+    MOE_FUSED_DISPATCH_FC1_SCHEDULE=static|count|allcore|allcore_expert|allcore_expert_mn|allcore_expert_n|allcore_expert_n_tile
+    MOE_FUSED_FC2_GEMM_SCHEDULE=tile_n_major|expert_n_persistent
+    MOE_FUSED_FC2_COMBINE_TRANSPORT=reverse_push|direct_pull
+    MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS=1|2  # reverse_push only
+    MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS=1|2
     MOE_FULL_BENCH_RESULTS_DIR=/tmp/...   # optional experimental output directory
     MOE_FULL_BENCH_CAPACITY=1.25          # optional active-profile override;
                                            # use 4.0 or unset for default DSV4
@@ -64,6 +78,8 @@ try:
 except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-npu
     torch_npu = None
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 from mega_moe import FusedMoEForward, MoEForwardConfig
 
 
@@ -81,7 +97,6 @@ MODEL_PROFILES = {
         "num_experts": 128,
         "capacity": 1.25,
         "tiling_overrides": {},
-        "tokens_are_global": False,
         "bench_configs": [
             ("2K", 2048),
             ("8K", 8192),
@@ -100,12 +115,25 @@ MODEL_PROFILES = {
         "num_experts": 384,
         "capacity": 4.0,
         "tiling_overrides": {},
-        "tokens_are_global": False,
         "bench_configs": [
             ("dsv4_pro_2k", 2048),
+            ("dsv4_pro_4k", 4096),
             ("dsv4_pro_8k", 8192),
             ("dsv4_pro_32k", 32768),
             ("dsv4_pro_128k", 131072),
+        ],
+    },
+    "KIMI-K3": {
+        "hidden": 3584,
+        "ffn_dim": 3072,
+        "topk": 16,
+        "num_experts": 896,
+        "capacity": 1.25,
+        "tiling_overrides": {},
+        "bench_configs": [
+            ("kimi_k3_4k", 4096),
+            ("kimi_k3_8k", 8192),
+            ("kimi_k3_16k", 16384),
         ],
     },
 }
@@ -115,10 +143,18 @@ MODEL_PROFILES = {
 WARMUP_ITERS = 5
 BENCH_ITERS = 50
 RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "1") == "1"
+ROUTE_MODE = os.environ.get(
+    "MOE_FULL_BENCH_ROUTE_MODE", "dense_random"
+).lower()
+if ROUTE_MODE not in {"dense_random", "sparse_balanced"}:
+    raise ValueError(
+        "MOE_FULL_BENCH_ROUTE_MODE must be 'dense_random' or "
+        "'sparse_balanced'"
+    )
 G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "4"))
 RESULTS_DIR = os.environ.get(
     "MOE_FULL_BENCH_RESULTS_DIR",
-    str(Path(__file__).resolve().parents[2] / "results" / "forward"),
+    str(PROJECT_ROOT / "results" / "forward"),
 )
 
 if G_ASH_SIZE_GB <= 0:
@@ -130,10 +166,26 @@ def _benchmark_provenance():
     """Return enough immutable context to distinguish new results from old JSON."""
     with open(__file__, "rb") as source_file:
         source_sha256 = hashlib.sha256(source_file.read()).hexdigest()
+    production_sources = (
+        PROJECT_ROOT / "src" / "mega_moe" / "config.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "kernels" / "dispatch_fc1.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "kernels" / "fc2_combine.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "ops" / "forward.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "runtime" / "routing.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "runtime" / "workspace.py",
+        PROJECT_ROOT / "src" / "mega_moe" / "kernels" / "weighted_swiglu.py",
+    )
+    forward_source_sha256 = {}
+    for path in production_sources:
+        with open(path, "rb") as source_file:
+            forward_source_sha256[str(path.relative_to(PROJECT_ROOT))] = (
+                hashlib.sha256(source_file.read()).hexdigest()
+            )
     return {
         "result_contract": RESULT_CONTRACT,
         "benchmark_source": os.path.abspath(__file__),
         "benchmark_source_sha256": source_sha256,
+        "forward_source_sha256": forward_source_sha256,
         "command": shlex.join(sys.argv),
     }
 
@@ -147,14 +199,13 @@ def _activate_model_profile(model_name):
         )
     profile = MODEL_PROFILES[normalized]
     global MODEL_NAME, HIDDEN, FFN_DIM, TOPK, NUM_EXPERTS
-    global BENCH_CONFIGS, TOKENS_ARE_GLOBAL, CAPACITY, PROFILE_TILING_OVERRIDES
+    global BENCH_CONFIGS, CAPACITY, PROFILE_TILING_OVERRIDES
     MODEL_NAME = normalized
     HIDDEN = profile["hidden"]
     FFN_DIM = profile["ffn_dim"]
     TOPK = profile["topk"]
     NUM_EXPERTS = profile["num_experts"]
     BENCH_CONFIGS = profile["bench_configs"]
-    TOKENS_ARE_GLOBAL = profile["tokens_are_global"]
     PROFILE_TILING_OVERRIDES = profile["tiling_overrides"]
     CAPACITY = float(
         os.environ.get("MOE_FULL_BENCH_CAPACITY", str(profile["capacity"]))
@@ -166,7 +217,7 @@ def _activate_model_profile(model_name):
 _activate_model_profile(os.environ.get("MOE_FULL_BENCH_MODEL", "QWEN"))
 
 
-def _selected_bench_configs(world_size):
+def _selected_bench_configs():
     config_env = (
         "MOE_DSV4_BENCH_CONFIG"
         if MODEL_NAME == "DSV4"
@@ -193,16 +244,7 @@ def _selected_bench_configs(world_size):
             if config[0].upper() in labels
         ]
 
-    if not TOKENS_ARE_GLOBAL:
-        return selected
-    converted = []
-    for label, global_tokens in selected:
-        if global_tokens % world_size != 0:
-            raise ValueError(
-                f"global token count {global_tokens} is not divisible by world_size={world_size}"
-            )
-        converted.append((label, global_tokens // world_size))
-    return converted
+    return selected
 
 
 def _get_ash_ip_port():
@@ -217,17 +259,20 @@ def _required_ash_bytes(tokens_per_rank, world_size):
     max_recv_rows = int(tokens_per_rank * TOPK * CAPACITY)
     token_peer_bytes = max_recv_rows * HIDDEN * ACTIVATION_DTYPE.itemsize
     routing_peer_bytes = max_recv_rows * ROUTING_TRANSPORT_DTYPE.itemsize
-    # The combine implementation may use a second symmetric route-output area.
-    combine_peer_bytes = tokens_per_rank * TOPK * HIDDEN * ACTIVATION_DTYPE.itemsize
     dispatch_tile_m = int(
         os.environ.get("MOE_FUSED_DISPATCH_FC1_BLOCK_SIZE_M", "128")
     )
     max_source_tiles = (
         tokens_per_rank * TOPK + dispatch_tile_m - 1
     ) // dispatch_tile_m
-    signal_slots = world_size * experts_per_rank * max_source_tiles + experts_per_rank
+    signal_slots = (
+        world_size * experts_per_rank * max_source_tiles
+        + experts_per_rank
+    )
     signal_bytes = signal_slots * 16 * torch.int32.itemsize
-    return token_peer_bytes + routing_peer_bytes + combine_peer_bytes + signal_bytes
+    metadata_bins = 1 << (NUM_EXPERTS - 1).bit_length()
+    metadata_bytes = world_size * metadata_bins * torch.int32.itemsize
+    return token_peer_bytes + routing_peer_bytes + signal_bytes + metadata_bytes
 
 
 def _layer_tiling_overrides():
@@ -253,6 +298,33 @@ def _layer_tiling_overrides():
             raise ValueError(f"{env_name} must be a positive power of two")
         overrides[parameter_name] = value
 
+    return overrides
+
+
+def _layer_schedule_overrides():
+    """Read explicit A/B schedule controls; production defaults stay in config."""
+    overrides = {}
+    for env_name, parameter_name in (
+        ("MOE_FUSED_DISPATCH_READINESS", "dispatch_readiness"),
+        ("MOE_FUSED_DISPATCH_FC1_SCHEDULE", "dispatch_fc1_schedule"),
+        ("MOE_FUSED_FC2_GEMM_SCHEDULE", "fc2_gemm_schedule"),
+        ("MOE_FUSED_FC2_COMBINE_TRANSPORT", "fc2_combine_transport"),
+    ):
+        if env_name in os.environ:
+            overrides[parameter_name] = os.environ[env_name]
+    for env_name, parameter_name in (
+        ("MOE_FUSED_DISPATCH_PRODUCER_CORES", "dispatch_producer_cores"),
+        (
+            "MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS",
+            "fc2_reverse_vector_workers",
+        ),
+        (
+            "MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS",
+            "fc2_reduce_vector_workers",
+        ),
+    ):
+        if env_name in os.environ:
+            overrides[parameter_name] = int(os.environ[env_name])
     return overrides
 
 
@@ -300,8 +372,8 @@ def _make_local_weights(experts_per_rank, rank, device, seed=42):
         device,
     )
 
-    # W1 already has the KN layout consumed by both providers.  W2's logical
-    # baseline view is a one-time model-load concern outside both timed paths.
+    # Layout preparation is outside both timed paths.  W2 remains physically
+    # [E,N,K] because the W4 DSV4 A/B measured it 12.6% faster than [E,K,N].
     torch_w2_kn = down_weight.transpose(1, 2)
     return packed_w1, down_weight, torch_w2_kn
 
@@ -313,12 +385,87 @@ def _prepare_inputs(tokens_per_rank, rank, device, seed=43):
     hidden_states = torch.randn(
         (tokens_per_rank, HIDDEN), dtype=ACTIVATION_DTYPE, device=device
     ).mul_(0.5).contiguous()
-    router_logits = torch.randn(
-        (tokens_per_rank, NUM_EXPERTS), dtype=ROUTING_INPUT_DTYPE, device=device
-    )
-    topk_logits, selected_experts = torch.topk(router_logits, k=TOPK, dim=-1)
+    if ROUTE_MODE == "dense_random":
+        router_logits = torch.randn(
+            (tokens_per_rank, NUM_EXPERTS),
+            dtype=ROUTING_INPUT_DTYPE,
+            device=device,
+        )
+        topk_logits, selected_experts = torch.topk(
+            router_logits, k=TOPK, dim=-1
+        )
+    else:
+        world_size = dist.get_world_size()
+        experts_per_rank = NUM_EXPERTS // world_size
+        default_active_experts = (
+            (TOPK + world_size - 1) // world_size
+        ) * world_size
+        active_experts = int(
+            os.environ.get(
+                "MOE_FULL_BENCH_ACTIVE_EXPERTS",
+                str(default_active_experts),
+            )
+        )
+        if (
+            active_experts < TOPK
+            or active_experts > NUM_EXPERTS
+            or active_experts % world_size
+        ):
+            raise ValueError(
+                "MOE_FULL_BENCH_ACTIVE_EXPERTS must be in [top-k, E] "
+                "and divisible by the EP world size"
+            )
+        active_per_rank = active_experts // world_size
+        if active_per_rank > experts_per_rank:
+            raise ValueError(
+                "sparse active experts per rank exceed local expert count"
+            )
+        destination_ranks = torch.arange(
+            world_size, dtype=torch.int64, device=device
+        )
+        local_experts = torch.arange(
+            active_per_rank, dtype=torch.int64, device=device
+        )
+        active_global_experts = (
+            destination_ranks[:, None] * experts_per_rank
+            + local_experts[None, :]
+        ).reshape(-1)
+        active_logits = torch.randn(
+            (tokens_per_rank, active_experts),
+            dtype=ROUTING_INPUT_DTYPE,
+            device=device,
+        )
+        topk_logits, active_indices = torch.topk(
+            active_logits, k=TOPK, dim=-1
+        )
+        selected_experts = active_global_experts[active_indices]
     routing_weights = F.softmax(topk_logits, dim=-1).to(ROUTING_INPUT_DTYPE).contiguous()
     return hidden_states, selected_experts.to(torch.int32).contiguous(), routing_weights
+
+
+@torch.no_grad()
+def _summarize_route_distribution(selected_experts, world_size):
+    """Collect untimed global route-distribution provenance on every rank."""
+    experts_per_rank = NUM_EXPERTS // world_size
+    destination_ranks = torch.div(
+        selected_experts.reshape(-1),
+        experts_per_rank,
+        rounding_mode="floor",
+    ).to(torch.int64)
+    routes_received_per_rank = torch.bincount(
+        destination_ranks, minlength=world_size
+    ).to(torch.int64)
+    dist.all_reduce(routes_received_per_rank, op=dist.ReduceOp.SUM)
+
+    active_mask = torch.bincount(
+        selected_experts.reshape(-1).to(torch.int64),
+        minlength=NUM_EXPERTS,
+    ).gt(0).to(torch.int32)
+    dist.all_reduce(active_mask, op=dist.ReduceOp.MAX)
+    return {
+        "active_global_experts": int(active_mask.sum().item()),
+        "routes_received_per_rank": routes_received_per_rank.cpu().tolist(),
+    }
 
 
 def _grouped_matmul(inputs, weight_kn, group_list):
@@ -1014,6 +1161,7 @@ def _make_entry(
     world_size,
     op,
     measured,
+    route_distribution,
 ):
     ascend_full = measured["ascend_full"]
     torch_grouped_full = measured["torch_grouped_full"]
@@ -1028,11 +1176,7 @@ def _make_entry(
             "num_experts": NUM_EXPERTS,
             "tokens_per_rank": tokens_per_rank,
             "global_tokens": tokens_per_rank * world_size,
-            "token_count_scope": (
-                "profile specifies global tokens"
-                if TOKENS_ARE_GLOBAL
-                else "profile specifies tokens per rank"
-            ),
+            "token_count_scope": "profile specifies tokens per rank",
             "world_size": world_size,
             "hardware": {
                 "name": device_properties.name,
@@ -1045,20 +1189,29 @@ def _make_entry(
             "w1_dtype": "bfloat16",
             "w1_model_load_layout": "[E_local,K,N]",
             "w2_dtype": "bfloat16",
+            "w2_model_load_layout": "[E_local,N,K]",
             "routing_weight_input_dtype": "float32",
             "routing_weight_transport_dtype": "float32",
             "routing_weight_compute_dtype": "float32",
             "routing_weight_semantics": "FP32 input and transport; FP32 weighted-SwiGLU compute",
             "synthetic_input_generation": {
                 "hidden_states": "rank-seeded BF16 normal values scaled by 0.5",
-                "selected_experts": "top-k of rank-seeded FP32 normal logits; generated outside timing",
+                "route_mode": ROUTE_MODE,
+                "selected_experts": (
+                    "top-k of rank-seeded FP32 normal logits over all experts; "
+                    "generated outside timing"
+                    if ROUTE_MODE == "dense_random"
+                    else "top-k over a rank-balanced sparse global-expert set; "
+                    "generated outside timing"
+                ),
                 "routing_weights": "FP32 softmax over selected logits",
                 "timed_normal_case_has_dropped_routes": False,
+                **route_distribution,
             },
             "measured_boundary": "post-router full forward; router/top-k generation excluded",
             "weight_layout_preparation": (
-                "candidate and grouped baseline share contiguous KN W1 storage; "
-                "one-time W2 logical view excluded from timing"
+                "candidate and grouped baseline share the same W1/W2 physical storage; "
+                "grouped GEMM consumes untimed transpose views"
             ),
             "correctness_gates": {
                 "status": "passed_before_timing",
@@ -1085,9 +1238,21 @@ def _make_entry(
             "benchmark_iters": BENCH_ITERS,
             "sample_rank_reduction": "MAX before statistics",
             "receive_capacity_factor": CAPACITY,
-            "dispatch_readiness": op.dispatch_readiness,
-            "dispatch_fc1_schedule": op.dispatch_fc1_schedule,
-            "dispatch_producer_cores": op.dispatch_producer_cores,
+            "dispatch_readiness": op.config.dispatch_readiness,
+            "dispatch_fc1_schedule": op.config.dispatch_fc1_schedule,
+            "dispatch_producer_cores": (
+                op.dispatch_producer_cores
+                if op.config.dispatch_fc1_schedule in {"static", "count"}
+                else None
+            ),
+            "fc2_gemm_schedule": op.config.fc2_gemm_schedule,
+            "fc2_combine_transport": op.config.fc2_combine_transport,
+            "fc2_reverse_vector_workers": (
+                op.config.fc2_reverse_vector_workers
+                if op.config.fc2_combine_transport == "reverse_push"
+                else None
+            ),
+            "fc2_reduce_vector_workers": op.config.fc2_reduce_vector_workers,
             "tiles": {
                 "dispatch_fc1_m": op.config.dispatch_fc1_block_size_m,
                 "fc1_gemm_n": op.config.fc1_gemm_block_size_n,
@@ -1095,7 +1260,7 @@ def _make_entry(
                 "fc2_combine_m": op.config.fc2_combine_block_size_m,
                 "fc2_gemm_n": op.config.fc2_gemm_block_size_n,
                 "fc2_gemm_k": op.config.fc2_gemm_block_size_k,
-                "note": "runtime dot tiles may halve until they divide the actual dimension",
+                "note": "dot N/K tiles must divide the selected model dimensions",
             },
             "metrics": OrderedDict(
                 {
@@ -1217,7 +1382,7 @@ def run_benchmark(rank, world_size, model_name=None):
         raise ValueError(
             f"{MODEL_NAME} expert count {NUM_EXPERTS} is not divisible by world_size={world_size}"
         )
-    configs = _selected_bench_configs(world_size)
+    configs = _selected_bench_configs()
     required_ash_bytes = max(_required_ash_bytes(tokens, world_size) for _, tokens in configs)
     if required_ash_bytes >= G_ASH_SIZE:
         raise RuntimeError(
@@ -1241,21 +1406,11 @@ def run_benchmark(rank, world_size, model_name=None):
     device = f"npu:{rank}"
     ep_group = None
     experts_per_rank = NUM_EXPERTS // world_size
-    dispatch_producer_cores = (
-        int(os.environ["MOE_FUSED_DISPATCH_PRODUCER_CORES"])
-        if "MOE_FUSED_DISPATCH_PRODUCER_CORES" in os.environ
-        else None
-    )
     num_aicore_programs = int(
         os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
     )
-    dispatch_readiness = os.environ.get(
-        "MOE_FUSED_DISPATCH_READINESS", "tile"
-    )
-    dispatch_fc1_schedule = os.environ.get(
-        "MOE_FUSED_DISPATCH_FC1_SCHEDULE", "allcore_expert_n_tile"
-    )
     tiling_overrides = _layer_tiling_overrides()
+    schedule_overrides = _layer_schedule_overrides()
     entries = []
 
     if rank == 0:
@@ -1275,10 +1430,8 @@ def run_benchmark(rank, world_size, model_name=None):
             config = MoEForwardConfig(
                 num_aicore_programs=num_aicore_programs,
                 receive_capacity_factor=CAPACITY,
-                dispatch_producer_cores=dispatch_producer_cores,
-                dispatch_readiness=dispatch_readiness,
-                dispatch_fc1_schedule=dispatch_fc1_schedule,
                 **tiling_overrides,
+                **schedule_overrides,
             )
             op = FusedMoEForward(
                 ep_group,
@@ -1300,6 +1453,9 @@ def run_benchmark(rank, world_size, model_name=None):
                 )
                 hidden_states, selected_experts, routing_weights = _prepare_inputs(
                     tokens_per_rank, rank, device
+                )
+                route_distribution = _summarize_route_distribution(
+                    selected_experts, world_size
                 )
                 dist.barrier(group=ep_group)
                 _validate_case(
@@ -1344,6 +1500,7 @@ def run_benchmark(rank, world_size, model_name=None):
                     world_size,
                     op,
                     measured,
+                    route_distribution,
                 )
                 entries.append(entry)
                 if rank == 0:
@@ -1401,6 +1558,16 @@ def test_bench_full_forward_dsv4_4ranks(dist_test):
 @pytest.mark.dist
 def test_bench_full_forward_dsv4_8ranks(dist_test):
     dist_test(run_benchmark, world_size=8, args=("DSV4", ))
+
+
+@pytest.mark.dist
+def test_bench_full_forward_kimi_k3_4ranks(dist_test):
+    dist_test(run_benchmark, world_size=4, args=("KIMI-K3", ))
+
+
+@pytest.mark.dist
+def test_bench_full_forward_kimi_k3_8ranks(dist_test):
+    dist_test(run_benchmark, world_size=8, args=("KIMI-K3", ))
 
 
 if __name__ == "__main__":
