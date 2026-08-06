@@ -64,8 +64,8 @@ class _Recorder:
         return call
 
 
-def _invoke(module, **overrides):
-    recorder = _Recorder()
+def _invoke(module, recorder=None, **overrides):
+    recorder = _Recorder() if recorder is None else recorder
     module.kernel_transposed_grouped_gemm = recorder
     experts, rows, output_dim, reduction_dim = 4, 64, 512, 512
     grad_out = torch.zeros(rows, output_dim)
@@ -164,13 +164,93 @@ def test_invalid_integer_grid_fails_closed(monkeypatch, tmp_path, value, message
         _invoke(module, grid=value)
 
 
+def test_direct_wrapper_rejects_none_physical_core_count_before_launch(
+    monkeypatch, tmp_path
+):
+    module, _ = _load_kernel(monkeypatch, tmp_path, core_count=None)
+    recorder = _Recorder()
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        _invoke(module, recorder=recorder)
+
+    assert recorder.grid is None
+
+
+@pytest.mark.parametrize("core_count", [True, 1.5, "64", 0, -1])
+def test_direct_wrapper_rejects_other_malformed_physical_core_counts(
+    monkeypatch, tmp_path, core_count
+):
+    module, _ = _load_kernel(monkeypatch, tmp_path, core_count=core_count)
+    recorder = _Recorder()
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        _invoke(module, recorder=recorder)
+
+    assert recorder.grid is None
+
+
+def test_direct_wrapper_rejects_block_beyond_triton_tensor_domain_before_launch(
+    monkeypatch, tmp_path
+):
+    module, _ = _load_kernel(monkeypatch, tmp_path)
+    recorder = _Recorder()
+
+    with pytest.raises(ValueError, match="block_n.*Triton tensor element limit"):
+        _invoke(module, recorder=recorder, block_n=2**32)
+
+    assert recorder.grid is None
+
+
+def test_direct_wrapper_rejects_tile_product_beyond_triton_tensor_domain(
+    monkeypatch, tmp_path
+):
+    module, _ = _load_kernel(monkeypatch, tmp_path)
+    recorder = _Recorder()
+
+    with pytest.raises(ValueError, match="block_m/block_n tile.*Triton tensor"):
+        _invoke(
+            module,
+            recorder=recorder,
+            block_m=16,
+            block_n=131072,
+            block_k=16,
+        )
+
+    assert recorder.grid is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"block_m": 65536, "block_n": 16, "block_k": 16},
+        {"block_m": 16, "block_n": 65536, "block_k": 16},
+        {"block_m": 16, "block_n": 16, "block_k": 65536},
+    ],
+)
+def test_direct_wrapper_accepts_triton_tensor_domain_boundary(
+    monkeypatch, tmp_path, overrides
+):
+    module, _ = _load_kernel(monkeypatch, tmp_path)
+
+    recorder = _invoke(module, **overrides)
+
+    assert recorder.kwargs is not None
+
+
 def _load_backward(monkeypatch, core_count=64):
     common = _load_common(
         monkeypatch, core_count, "mega_moe.kernels.common"
     )
     calls = []
+    events = []
 
     def transposed(grad_out, orig_in, expert_counts, cumulative, **kwargs):
+        stage = "fc2_wgrad" if not calls else "fc1_wgrad"
+        events.append(stage)
         calls.append((grad_out, orig_in, kwargs))
         return torch.zeros(
             len(expert_counts), grad_out.shape[1], orig_in.shape[1]
@@ -178,22 +258,26 @@ def _load_backward(monkeypatch, core_count=64):
 
     kernels = types.ModuleType("mega_moe.kernels")
     kernels.__path__ = []
-    kernels.dispatch_fc2_bwd_triton = (
-        lambda saved, dy, peer_mem: (saved["grad_swiglu"], saved["fc2_grad_out"])
-    )
-    kernels.swiglu_bwd_triton = (
-        lambda grad_swiglu, fc1_output, weights: (
+
+    def dispatch(saved, dy, peer_mem):
+        events.append("dispatch")
+        return saved["grad_swiglu"], saved["fc2_grad_out"]
+
+    def swiglu(grad_swiglu, fc1_output, weights):
+        events.append("swiglu")
+        return (
             torch.zeros_like(fc1_output),
             torch.zeros_like(weights),
         )
-    )
+
+    def combine(saved, grad_fc1_output, grad_gate, peer_mem):
+        events.append("combine")
+        return saved["grad_hidden"], saved["grad_routing_weights"]
+
+    kernels.dispatch_fc2_bwd_triton = dispatch
+    kernels.swiglu_bwd_triton = swiglu
     kernels.transposed_grouped_gemm_triton = transposed
-    kernels.combine_fc1_bwd_triton = (
-        lambda saved, grad_fc1_output, grad_gate, peer_mem: (
-            saved["grad_hidden"],
-            saved["grad_routing_weights"],
-        )
-    )
+    kernels.combine_fc1_bwd_triton = combine
 
     torch_forward = types.ModuleType("mega_moe.ops._torch_forward")
     torch_forward.moe_forward = lambda *args, **kwargs: None
@@ -216,7 +300,7 @@ def _load_backward(monkeypatch, core_count=64):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    return module, calls
+    return module, calls, events
 
 
 def _saved_for_backward():
@@ -237,16 +321,17 @@ def _saved_for_backward():
 
 
 def test_public_backward_defaults_keep_both_wgrad_calls_positional(monkeypatch):
-    backward, calls = _load_backward(monkeypatch)
+    backward, calls, events = _load_backward(monkeypatch)
     backward.moe_backward_triton(
         _saved_for_backward(), torch.zeros(6, 4), object()
     )
 
     assert [kwargs for _, _, kwargs in calls] == [{}, {}]
+    assert events == ["dispatch", "swiglu", "fc2_wgrad", "combine", "fc1_wgrad"]
 
 
 def test_public_backward_wires_independent_fc2_and_fc1_controls(monkeypatch):
-    backward, calls = _load_backward(monkeypatch)
+    backward, calls, _ = _load_backward(monkeypatch)
     backward.moe_backward_triton(
         _saved_for_backward(),
         torch.zeros(6, 4),
@@ -275,23 +360,80 @@ def test_public_backward_wires_independent_fc2_and_fc1_controls(monkeypatch):
     }
 
 
-def test_public_backward_rejects_invalid_controls_before_any_kernel(monkeypatch):
-    backward, calls = _load_backward(monkeypatch)
-    with pytest.raises(ValueError, match="fc2_wgrad_block_n.*power of two"):
+def test_public_backward_accepts_triton_tensor_domain_boundary(monkeypatch):
+    backward, calls, events = _load_backward(monkeypatch)
+
+    backward.moe_backward_triton(
+        _saved_for_backward(),
+        torch.zeros(6, 4),
+        object(),
+        fc2_wgrad_block_m=4096,
+        fc2_wgrad_block_n=256,
+        fc2_wgrad_block_k=256,
+    )
+
+    assert calls[0][2] == {"block_m": 4096, "block_n": 256, "block_k": 256}
+    assert events == ["dispatch", "swiglu", "fc2_wgrad", "combine", "fc1_wgrad"]
+
+
+@pytest.mark.parametrize("stage", ["fc2", "fc1"])
+def test_public_backward_rejects_invalid_controls_before_any_kernel(
+    monkeypatch, stage
+):
+    backward, calls, events = _load_backward(monkeypatch)
+    with pytest.raises(ValueError, match=rf"{stage}_wgrad_block_n.*power of two"):
         backward.moe_backward_triton(
             _saved_for_backward(),
             torch.zeros(6, 4),
             object(),
-            fc2_wgrad_block_n=48,
+            **{f"{stage}_wgrad_block_n": 48},
         )
     assert calls == []
+    assert events == []
+
+
+def test_public_backward_rejects_none_physical_core_count_before_any_stage(
+    monkeypatch,
+):
+    backward, calls, events = _load_backward(monkeypatch, core_count=None)
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        backward.moe_backward_triton(
+            _saved_for_backward(),
+            torch.zeros(6, 4),
+            object(),
+        )
+
+    assert calls == []
+    assert events == []
+
+
+def test_public_backward_rejects_block_beyond_triton_domain_before_any_stage(
+    monkeypatch,
+):
+    backward, calls, events = _load_backward(monkeypatch)
+
+    with pytest.raises(
+        ValueError, match="fc2_wgrad_block_n.*Triton tensor element limit"
+    ):
+        backward.moe_backward_triton(
+            _saved_for_backward(),
+            torch.zeros(6, 4),
+            object(),
+            fc2_wgrad_block_n=2**32,
+        )
+
+    assert calls == []
+    assert events == []
 
 
 @pytest.mark.parametrize("stage", ["fc1", "fc2"])
 def test_public_backward_rejects_overrides_hidden_by_torch_fallback(
     monkeypatch, stage
 ):
-    backward, calls = _load_backward(monkeypatch)
+    backward, calls, events = _load_backward(monkeypatch)
     monkeypatch.setenv(f"MOE_{stage.upper()}_WGRAD_TORCH", "1")
     with pytest.raises(ValueError, match=rf"{stage} wgrad overrides.*Torch fallback"):
         backward.moe_backward_triton(
@@ -301,3 +443,4 @@ def test_public_backward_rejects_overrides_hidden_by_torch_fallback(
             **{f"{stage}_wgrad_block_m": 512},
         )
     assert calls == []
+    assert events == []

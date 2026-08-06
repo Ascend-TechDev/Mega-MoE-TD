@@ -73,7 +73,7 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
 # 1.  5-op orchestrator
 # ============================================================================
 def _validated_wgrad_overrides(
-    stage, block_m, block_n, block_k, grid
+    stage, block_m, block_n, block_k, grid, max_grid
 ):
     values = {
         "block_m": block_m,
@@ -81,10 +81,12 @@ def _validated_wgrad_overrides(
         "block_k": block_k,
         "grid": grid,
     }
+    grid_bound = {} if max_grid is None else {"max_grid": max_grid}
     validate_wgrad_launch_params(
         **values,
-        max_grid=ncore() if grid is not None else None,
+        **grid_bound,
         name_prefix=f"{stage}_wgrad_",
+        apply_defaults=True,
     )
     return {name: value for name, value in values.items() if value is not None}
 
@@ -108,12 +110,20 @@ def moe_backward_triton(
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching moe_backward_torch."""
+    fc2_torch = os.environ.get("MOE_FC2_WGRAD_TORCH") == "1"
+    fc1_torch = os.environ.get("MOE_FC1_WGRAD_TORCH") == "1"
+    physical_cores = None
+    if not fc2_torch or not fc1_torch:
+        physical_cores = ncore()
+        validate_wgrad_launch_params(max_grid=physical_cores)
+
     fc2_wgrad = _validated_wgrad_overrides(
         "fc2",
         fc2_wgrad_block_m,
         fc2_wgrad_block_n,
         fc2_wgrad_block_k,
         fc2_wgrad_grid,
+        physical_cores if not fc2_torch else None,
     )
     fc1_wgrad = _validated_wgrad_overrides(
         "fc1",
@@ -121,9 +131,8 @@ def moe_backward_triton(
         fc1_wgrad_block_n,
         fc1_wgrad_block_k,
         fc1_wgrad_grid,
+        physical_cores if not fc1_torch else None,
     )
-    fc2_torch = os.environ.get("MOE_FC2_WGRAD_TORCH") == "1"
-    fc1_torch = os.environ.get("MOE_FC1_WGRAD_TORCH") == "1"
     if fc2_torch and fc2_wgrad:
         raise ValueError("fc2 wgrad overrides cannot be used with the Torch fallback")
     if fc1_torch and fc1_wgrad:
