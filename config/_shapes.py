@@ -228,3 +228,15 @@ def rank_size(default: int = 8) -> int:
     if rs not in (2, 8):
         raise ValueError(f"RANK_SIZE must be 2 or 8, got {rs}")
     return rs
+
+
+def shape_slug(shape):
+    """Stable slug like ``kimi_k3_small_4k`` for a MoETestShape.
+
+    ``label`` lowercased with ``-`` -> ``_``, plus a ``<tokens/1024>k`` suffix.
+    Matches the forward benchmark's bench_config slug style (e.g. the
+    KIMI-K3-SMALL @4096 slug ``kimi_k3_small_4k``), so the two benchmarks share
+    one config-name vocabulary.
+    """
+    name = shape.label.lower().replace("-", "_")
+    return f"{name}_{shape.tokens // 1024}k"

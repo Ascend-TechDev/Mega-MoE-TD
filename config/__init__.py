@@ -16,6 +16,7 @@ from config._shapes import (
     MoETestShape,
     rank_size,
     select_perf_shapes,
+    shape_slug,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "MODEL_PROFILES",
     "select_perf_shapes",
     "rank_size",
+    "shape_slug",
 ]

@@ -14,10 +14,10 @@
 #                             (comma-separated, case-insensitive; see select_perf_shapes)
 #    RANK_SIZE=2|8         -> world_size + default shape (Kimi-K3-small at 2 cards,
 #                             full Kimi-K3 at 8); see test_bench_backward / rank_size()
-#    MOE_BACKWARD_BENCH_CONFIG=tokens
-#                          -> keep only shapes with the given per-rank token count(s),
-#                             e.g. 4096 or 4096,8192 (mirrors the forward's
-#                             MOE_FULL_BENCH_CONFIG slug selection)
+#    MOE_BACKWARD_BENCH_CONFIG=slug
+#                          -> keep only shapes whose slug (or token count) matches,
+#                             e.g. kimi_k3_small_4k or 4096,8192 (mirrors the forward's
+#                             MOE_FULL_BENCH_CONFIG slug selection; see shape_slug)
 #    (otherwise)           -> BACKWARD_SHAPES_SMALL (regression smoke)
 #
 #  The triton wgrad kernels are pathologically slow on some shapes; set
@@ -61,6 +61,7 @@ from config import (
     BACKWARD_SHAPES_SMALL,
     rank_size,
     select_perf_shapes,
+    shape_slug,
 )
 
 g_ash_size = get_ash_size_bytes(default_gb=2)
@@ -129,15 +130,15 @@ def _select_shapes():
         shapes = BACKWARD_SHAPES_KIMI_SMALL if rank_size() == 2 else BACKWARD_SHAPES_KIMI
     else:
         shapes = BACKWARD_SHAPES_SMALL
-    # Optional per-rank token filter, mirroring MOE_FULL_BENCH_CONFIG granularity.
+    # Optional slug/token filter, mirroring MOE_FULL_BENCH_CONFIG granularity.
     cfg = os.environ.get("MOE_BACKWARD_BENCH_CONFIG")
     if cfg:
-        wanted = {int(x) for x in cfg.split(",") if x.strip()}
-        filtered = [s for s in shapes if s.tokens in wanted]
+        wanted = {x.strip().lower() for x in cfg.split(",") if x.strip()}
+        filtered = [s for s in shapes if shape_slug(s) in wanted or str(s.tokens) in wanted]
         if not filtered:
             raise ValueError(
                 f"MOE_BACKWARD_BENCH_CONFIG={cfg!r} matched no shape; "
-                f"available tokens: {sorted({s.tokens for s in shapes})}"
+                f"available slugs: {sorted({shape_slug(s) for s in shapes})}"
             )
         shapes = filtered
     return shapes
