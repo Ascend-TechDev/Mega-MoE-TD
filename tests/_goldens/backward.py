@@ -24,7 +24,7 @@
 #  autograd (output.backward(dy)) on every grad tensor.
 #
 #  The forward and grouped-matmul primitives live in
-#  ``mega_moe.ops._torch_forward`` (the production differentiable forward reused
+#  ``mega_moe.runtime._torch_forward_for_backward`` (the production differentiable forward reused
 #  by ``MegaMoEBackwardFunction``); this module imports them so the golden and
 #  the production path share one source of truth.
 #
@@ -37,7 +37,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from mega_moe.ops._torch_forward import (
+from mega_moe.runtime._torch_forward_for_backward import (
     grouped_matmul,
     grouped_transposed_matmul,
     moe_forward,
