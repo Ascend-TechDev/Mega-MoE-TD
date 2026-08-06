@@ -36,7 +36,7 @@ _MAX_GRID_UNSET = object()
 
 def ncore():
     """Return the device-reported physical AICore count."""
-    return NPUUtils().get_aicore_num()
+    return validate_physical_aicore_count(NPUUtils().get_aicore_num())
 
 
 def validate_physical_aicore_count(value):

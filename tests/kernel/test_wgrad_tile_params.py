@@ -48,6 +48,37 @@ def _load_kernel(monkeypatch, tmp_path, core_count=48):
     return module, common
 
 
+def _install_triton_dist_stubs(monkeypatch):
+    triton_dist = types.ModuleType("triton_dist")
+    triton_dist.__path__ = []
+    language = types.ModuleType("triton_dist.language")
+    language.symm_at = lambda *args, **kwargs: None
+    extra = types.ModuleType("triton_dist.language.extra")
+    extra.libshmem_device = types.SimpleNamespace(barrier_all=None)
+    monkeypatch.setitem(sys.modules, "triton_dist", triton_dist)
+    monkeypatch.setitem(sys.modules, "triton_dist.language", language)
+    monkeypatch.setitem(sys.modules, "triton_dist.language.extra", extra)
+
+
+def _load_launch_module(monkeypatch, tmp_path, filename, core_count=48, name=None):
+    stem = Path(filename).stem
+    label = repr(core_count).replace("-", "neg").replace(".", "_")
+    common_name = f"_{stem}_common_{label}"
+    common = _load_common(monkeypatch, core_count, common_name)
+    _install_triton_dist_stubs(monkeypatch)
+    source = (KERNELS / filename).read_text().replace(
+        "from .common import", f"from {common.__name__} import"
+    )
+    target = tmp_path / f"_{filename}"
+    target.write_text(source)
+    module_name = name or f"_{stem}_{label}"
+    spec = importlib.util.spec_from_file_location(module_name, target)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
 class _Recorder:
     def __init__(self):
         self.grid = None
@@ -241,6 +272,232 @@ def test_direct_wrapper_accepts_triton_tensor_domain_boundary(
     assert recorder.kwargs is not None
 
 
+def test_dispatch_direct_launch_uses_validated_physical_core_grid(
+    monkeypatch, tmp_path
+):
+    module = _load_launch_module(
+        monkeypatch, tmp_path, "dispatch_fc2_bwd.py", core_count=48
+    )
+    push = _Recorder()
+    gemm = _Recorder()
+    module.kernel_dispatch_push = push
+    module.kernel_fc2_input_grad_gemm = gemm
+    prep = {
+        "gco": torch.zeros(2, 4),
+        "h_dst_rank": torch.zeros(2, dtype=torch.int32),
+        "h_dst_off": torch.zeros(2, dtype=torch.int64),
+        "total_send": 2,
+        "H": 4,
+        "fc2": torch.zeros(3, 4, 8),
+        "local_sort_idxs": torch.zeros(2, dtype=torch.int64),
+        "meta_expert_ids": torch.zeros(1, dtype=torch.int32),
+        "meta_split_cum": torch.zeros(1, dtype=torch.int32),
+        "meta_tile_num": torch.zeros(1, dtype=torch.int32),
+        "expert_counts": torch.zeros(1, dtype=torch.int32),
+        "M": 2,
+        "N": 8,
+        "K": 4,
+        "E": 3,
+        "num_tm": 1,
+        "num_tn": 1,
+    }
+
+    module._launch_dispatch_fc2_bwd(prep, torch.zeros(8), torch.zeros(2, 8))
+
+    assert push.grid == (48, 1, 1)
+    assert gemm.grid == (48, 1, 1)
+
+
+@pytest.mark.parametrize("core_count", [None, True, 0, -1])
+def test_dispatch_direct_launch_rejects_malformed_physical_core_grid(
+    monkeypatch, tmp_path, core_count
+):
+    module = _load_launch_module(
+        monkeypatch,
+        tmp_path,
+        "dispatch_fc2_bwd.py",
+        core_count=core_count,
+        name=f"_dispatch_launch_{repr(core_count)}",
+    )
+    push = _Recorder()
+    gemm = _Recorder()
+    module.kernel_dispatch_push = push
+    module.kernel_fc2_input_grad_gemm = gemm
+    prep = {
+        "gco": torch.zeros(2, 4),
+        "h_dst_rank": torch.zeros(2, dtype=torch.int32),
+        "h_dst_off": torch.zeros(2, dtype=torch.int64),
+        "total_send": 2,
+        "H": 4,
+        "fc2": torch.zeros(3, 4, 8),
+        "local_sort_idxs": torch.zeros(2, dtype=torch.int64),
+        "meta_expert_ids": torch.zeros(1, dtype=torch.int32),
+        "meta_split_cum": torch.zeros(1, dtype=torch.int32),
+        "meta_tile_num": torch.zeros(1, dtype=torch.int32),
+        "expert_counts": torch.zeros(1, dtype=torch.int32),
+        "M": 2,
+        "N": 8,
+        "K": 4,
+        "E": 3,
+        "num_tm": 1,
+        "num_tn": 1,
+    }
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        module._launch_dispatch_fc2_bwd(prep, torch.zeros(8), torch.zeros(2, 8))
+
+    assert push.grid is None
+    assert gemm.grid is None
+
+
+def test_swiglu_direct_launch_uses_validated_physical_core_grid(
+    monkeypatch, tmp_path
+):
+    module = _load_launch_module(
+        monkeypatch, tmp_path, "swiglu_bwd.py", core_count=48
+    )
+    recorder = _Recorder()
+    module.kernel_swiglu_bwd = recorder
+
+    module.swiglu_bwd_triton(
+        torch.zeros(2, 8), torch.zeros(2, 16), torch.zeros(2)
+    )
+
+    assert recorder.grid == (48, 1, 1)
+
+
+@pytest.mark.parametrize("core_count", [None, True, 0, -1])
+def test_swiglu_direct_launch_rejects_malformed_physical_core_grid(
+    monkeypatch, tmp_path, core_count
+):
+    module = _load_launch_module(
+        monkeypatch,
+        tmp_path,
+        "swiglu_bwd.py",
+        core_count=core_count,
+        name=f"_swiglu_launch_{repr(core_count)}",
+    )
+    recorder = _Recorder()
+    module.kernel_swiglu_bwd = recorder
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        module.swiglu_bwd_triton(
+            torch.zeros(2, 8), torch.zeros(2, 16), torch.zeros(2)
+        )
+
+    assert recorder.grid is None
+
+
+def test_combine_direct_launch_uses_validated_physical_core_grid(
+    monkeypatch, tmp_path
+):
+    module = _load_launch_module(
+        monkeypatch, tmp_path, "combine_fc1_bwd.py", core_count=48
+    )
+    gemm = _Recorder()
+    reduce_kernel = _Recorder()
+    module.kernel_fc1_input_grad_gemm = gemm
+    module.kernel_combine_push_reduce = reduce_kernel
+    prep = {
+        "inp": torch.zeros(2, 16),
+        "weight": torch.zeros(3, 16, 4),
+        "meta_expert_ids": torch.zeros(1, dtype=torch.int32),
+        "meta_split_cum": torch.zeros(1, dtype=torch.int32),
+        "meta_tile_num": torch.zeros(1, dtype=torch.int32),
+        "expert_counts": torch.zeros(1, dtype=torch.int32),
+        "M": 2,
+        "N": 4,
+        "K": 16,
+        "E": 3,
+        "num_tm": 1,
+        "num_tn": 1,
+        "inp_stride_im": 16,
+        "inp_stride_ik": 1,
+        "we": 64,
+        "wk": 4,
+        "wn": 1,
+        "inv_local": torch.zeros(2, dtype=torch.int64),
+        "write_rank": torch.zeros(2, dtype=torch.int32),
+        "write_off": torch.zeros(2, dtype=torch.int64),
+        "total_recv": 2,
+        "H": 4,
+        "inv_sort": torch.zeros(2, dtype=torch.int64),
+        "B": 2,
+        "topk": 1,
+        "total_send": 2,
+        "stride_om": 4,
+        "stride_on": 1,
+    }
+
+    module._launch_combine_fc1_bwd(
+        prep, torch.zeros(8), torch.zeros(2, 4), torch.zeros(2, 4)
+    )
+
+    assert gemm.grid == (48, 1, 1)
+    assert reduce_kernel.grid == (48, 1, 1)
+
+
+@pytest.mark.parametrize("core_count", [None, True, 0, -1])
+def test_combine_direct_launch_rejects_malformed_physical_core_grid(
+    monkeypatch, tmp_path, core_count
+):
+    module = _load_launch_module(
+        monkeypatch,
+        tmp_path,
+        "combine_fc1_bwd.py",
+        core_count=core_count,
+        name=f"_combine_launch_{repr(core_count)}",
+    )
+    gemm = _Recorder()
+    reduce_kernel = _Recorder()
+    module.kernel_fc1_input_grad_gemm = gemm
+    module.kernel_combine_push_reduce = reduce_kernel
+    prep = {
+        "inp": torch.zeros(2, 16),
+        "weight": torch.zeros(3, 16, 4),
+        "meta_expert_ids": torch.zeros(1, dtype=torch.int32),
+        "meta_split_cum": torch.zeros(1, dtype=torch.int32),
+        "meta_tile_num": torch.zeros(1, dtype=torch.int32),
+        "expert_counts": torch.zeros(1, dtype=torch.int32),
+        "M": 2,
+        "N": 4,
+        "K": 16,
+        "E": 3,
+        "num_tm": 1,
+        "num_tn": 1,
+        "inp_stride_im": 16,
+        "inp_stride_ik": 1,
+        "we": 64,
+        "wk": 4,
+        "wn": 1,
+        "inv_local": torch.zeros(2, dtype=torch.int64),
+        "write_rank": torch.zeros(2, dtype=torch.int32),
+        "write_off": torch.zeros(2, dtype=torch.int64),
+        "total_recv": 2,
+        "H": 4,
+        "inv_sort": torch.zeros(2, dtype=torch.int64),
+        "B": 2,
+        "topk": 1,
+        "total_send": 2,
+        "stride_om": 4,
+        "stride_on": 1,
+    }
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        module._launch_combine_fc1_bwd(
+            prep, torch.zeros(8), torch.zeros(2, 4), torch.zeros(2, 4)
+        )
+
+    assert gemm.grid is None
+    assert reduce_kernel.grid is None
+
+
 def _load_backward(monkeypatch, core_count=64):
     common = _load_common(
         monkeypatch, core_count, "mega_moe.kernels.common"
@@ -396,6 +653,27 @@ def test_public_backward_rejects_none_physical_core_count_before_any_stage(
     monkeypatch,
 ):
     backward, calls, events = _load_backward(monkeypatch, core_count=None)
+
+    with pytest.raises(
+        RuntimeError, match="physical AICore count must be a positive integer"
+    ):
+        backward.moe_backward_triton(
+            _saved_for_backward(),
+            torch.zeros(6, 4),
+            object(),
+        )
+
+    assert calls == []
+    assert events == []
+
+
+@pytest.mark.parametrize("core_count", [None, True, 0, -1])
+def test_public_backward_rejects_malformed_physical_core_count_with_both_torch_fallbacks(
+    monkeypatch, core_count
+):
+    backward, calls, events = _load_backward(monkeypatch, core_count=core_count)
+    monkeypatch.setenv("MOE_FC2_WGRAD_TORCH", "1")
+    monkeypatch.setenv("MOE_FC1_WGRAD_TORCH", "1")
 
     with pytest.raises(
         RuntimeError, match="physical AICore count must be a positive integer"

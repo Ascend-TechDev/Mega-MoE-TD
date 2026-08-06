@@ -110,12 +110,10 @@ def moe_backward_triton(
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching moe_backward_torch."""
+    physical_cores = ncore()
     fc2_torch = os.environ.get("MOE_FC2_WGRAD_TORCH") == "1"
     fc1_torch = os.environ.get("MOE_FC1_WGRAD_TORCH") == "1"
-    physical_cores = None
-    if not fc2_torch or not fc1_torch:
-        physical_cores = ncore()
-        validate_wgrad_launch_params(max_grid=physical_cores)
+    validate_wgrad_launch_params(max_grid=physical_cores)
 
     fc2_wgrad = _validated_wgrad_overrides(
         "fc2",
