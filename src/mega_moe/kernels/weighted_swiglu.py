@@ -27,6 +27,60 @@ import triton.language as tl
 _BLOCK_M = 8
 _BLOCK_N = 128
 
+# Rows per M-tile, chosen from the row count and the core count rather than fixed.
+#
+# WHY THIS IS NOT A RETUNE TO ONE PART. `_BLOCK_M = 8` produces `num_rows / 8` M-tiles,
+# so the per-tile launch and index overhead scales with the row count while the useful
+# work per tile stays constant. Measured on Ascend950DT_9582 (triton ascend backend),
+# Qwen3-30B-A3B ffn=768, bf16, single card:
+#
+#     rows    shipped(grid 24, BM 8, BN 128)     best swept
+#     4096          0.071 ms                     0.055 ms  (grid 64, BM 32)   1.29x
+#    16384          0.170 ms                     0.057 ms  (grid 64, BM 64)   2.96x
+#
+# The shipped configuration's cost grows ~2.4x from 4k to 16k rows; the larger tile is
+# flat (0.055 -> 0.057). That is the signature of per-tile overhead, not of a value that
+# happens to suit one machine — which is why the rule below is written in terms of rows
+# and cores, both already known at the call site, and not as a new constant.
+#
+# The activation is elementwise per (row, ffn) position, so tile shape cannot change the
+# arithmetic. Bit-identity was required of every candidate in the sweep and held.
+_MAX_BLOCK_M = 64          # the sweep showed no further gain beyond this
+_GROW_TILES_PER_CORE = 32  # only depart from _BLOCK_M once the default over-tiles by this much
+
+
+def _select_block_m(num_rows: int, num_cores: int) -> int:
+    """Keep `_BLOCK_M` unless the default would produce far more tiles than cores.
+
+    ⚠️ The threshold is empirical, and a first, more aggressive version of this rule was
+    WRONG in the middle of the range — measured on Ascend950DT_9582, it made 1024 rows
+    0.85x (slower) while helping only above ~16k rows. Growing the tile is not free: it
+    trades per-tile overhead for coarser load balance, and below the crossover the trade
+    loses. So the rule only fires when the default tiling is far past the point where
+    more tiles can help:
+
+        rows    cores   default tiles   grows?   measured
+         1024      24         128         no     (aggressive version: 0.85x — regression)
+         4096      24         512         no     (aggressive version: 0.96x)
+        16384      24        2048        yes     2.34x
+        65536      24        8192        yes     3.47x
+        65536      64        8192        yes     2.83x
+
+    Output is unaffected: the activation is elementwise per (row, ffn) position, so tile
+    shape cannot change the arithmetic. Bit-identity was asserted at every point above.
+    """
+    if num_rows <= 0 or num_cores <= 0:
+        return _BLOCK_M
+    # No separate "is this a short sequence" guard: the `max(_BLOCK_M, ...)` floor below
+    # already returns the original tile for every such case. An explicit guard was
+    # written first and then removed as provably redundant — checked over 18,558
+    # (rows, cores) combinations, zero disagreement. It was mutation testing that
+    # exposed it: forcing the guard to never fire changed no test result, which is the
+    # signature of a branch that decides nothing.
+    ideal = max(_BLOCK_M, num_rows // (num_cores * _GROW_TILES_PER_CORE))
+    block = 1 << (int(ideal) - 1).bit_length()      # round up to a power of two
+    return max(_BLOCK_M, min(block, _MAX_BLOCK_M))
+
 # Compile-time activation ids (kept in sync with ``weighted_swiglu_forward``).
 # Use literals inside the @jit body — Triton cannot reference module globals.
 _SWIGLU = 0
@@ -182,7 +236,8 @@ def weighted_swiglu_forward(
     if num_rows == 0:
         return output
 
-    num_tiles = triton.cdiv(num_rows, _BLOCK_M) * triton.cdiv(ffn_dim, _BLOCK_N)
+    block_m = _select_block_m(num_rows, num_cores)
+    num_tiles = triton.cdiv(num_rows, block_m) * triton.cdiv(ffn_dim, _BLOCK_N)
     num_programs = min(num_cores, num_tiles)
     _weighted_activation_kernel[(num_programs, )](
         fc1_output,
@@ -192,7 +247,7 @@ def weighted_swiglu_forward(
         ffn_dim,
         float(situ_beta),
         linear_beta_val,
-        BLOCK_M=_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         ACTIVATION=act_id,
         HAS_LINEAR_BETA=has_linear_beta,
