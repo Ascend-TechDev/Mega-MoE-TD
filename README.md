@@ -51,6 +51,8 @@ benchmark/layer/              # 前向/反向 benchmark 入口与结果汇总
 
 ## How to start
 
+### 正确性测试
+
 基础环境依赖配置测试：
 
 ```bash
@@ -64,12 +66,39 @@ python -m pytest \
   -m dist -v -s
 ```
 
-后向两卡用例
+后向两卡用例：
 ```bash
 python -m pytest \
   tests/layer/test_moe_backward.py::test_backward_2ranks \
   -m dist -v -s
 ```
+
+### 性能测试（benchmark）
+
+benchmark 在 `benchmark/layer/` 下，由 pytest fixture 起多进程，**不要再套 `torchrun`**；因为它们位于 `tests/` 之外，需加 `-p tests.conftest` 来加载 `dist` marker 与 `dist_test` fixture。
+
+前向性能（`bench_full_forward.py`，Kimi-K3 为主目标，对照 Torch-NPU grouped-GEMM baseline）：
+
+```bash
+source ./run.sh   # 配置 Ascend / Triton-Ascend 运行环境与 PATH
+MOE_FULL_BENCH_CONFIG=kimi_k3_4k,kimi_k3_8k,kimi_k3_16k \
+python -m pytest -p tests.conftest \
+  benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3_8ranks \
+  -m dist -v -s
+```
+
+后向性能（`bench_backward.py`，triton 5-mega-op vs 手写 torch+HCCL golden）：
+
+```bash
+MOE_PERF_CONFIGS=1 \
+python -m pytest -p tests.conftest \
+  benchmark/layer/bench_backward.py::test_bench_backward_2ranks \
+  -m dist -v -s
+```
+
+- 前向 shape 由 `MOE_FULL_BENCH_CONFIG`（Kimi-K3）/ `MOE_DSV4_BENCH_CONFIG`（DSV4）选；后向 shape 由 `MOE_KIMI=1`（Kimi-K3）/ `MOE_PERF_CONFIGS=1`（真模型 shape）/ 默认 small smoke 选。
+- 前向另有 `test_bench_full_forward_kimi_k3_4ranks`，后向另有 `test_bench_backward_8ranks`。
+- 调度 A/B、tile、路由模式等更多开关见各 benchmark 文件头部（`MOE_FUSED_*`、`MOE_FULL_BENCH_*`）。
 
 ## 现有性能结果
 
