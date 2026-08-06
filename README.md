@@ -90,8 +90,8 @@ python -m pytest -p tests.conftest \
 后向性能（`bench_backward.py`）：
 
 ```bash
-# RANK_SIZE=2 默认跑 Kimi-K3-small；MOE_BACKWARD_BENCH_CONFIG 限定 token 档（如 4096）
-RANK_SIZE=2 MOE_BACKWARD_BENCH_CONFIG=4096 \
+# RANK_SIZE=2 默认跑 Kimi-K3-small；MOE_BACKWARD_BENCH_CONFIG 用 slug 限定（如 kimi_k3_small_4k）
+RANK_SIZE=2 MOE_BACKWARD_BENCH_CONFIG=kimi_k3_small_4k \
 python -m pytest -p tests.conftest \
   benchmark/layer/bench_backward.py::test_bench_backward \
   -m dist -v -s
