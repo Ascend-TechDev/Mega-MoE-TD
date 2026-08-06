@@ -8,7 +8,13 @@ import torch
 import triton
 import triton.language as tl
 
-from .common import ncore, WGRAD_BLOCK_M, WGRAD_BLOCK_N, WGRAD_BLOCK_K
+from .common import (
+    WGRAD_BLOCK_K,
+    WGRAD_BLOCK_M,
+    WGRAD_BLOCK_N,
+    ncore,
+    validate_wgrad_launch_params,
+)
 
 
 # grad_weight[e][n][k] = sum_m grad_out[m,n] * orig_in[m,k] = grad_out^T @ orig_in
@@ -60,8 +66,11 @@ def kernel_transposed_grouped_gemm(
             b = tl.load(orig_in_ptr + b_off, mask=mmask[:, None] & kmask[None, :], other=0.0)
             acc += tl.dot(a, b)
         c_off = e * stride_we + (n_start + offs_n[:, None]) * stride_wn + (k_start + offs_k[None, :]) * stride_wk
-        tl.store(grad_w_ptr + c_off, acc.to(grad_w_ptr.dtype.element_ty),
-                 mask=nmask[:, None] & kmask[None, :])
+        tl.store(
+            grad_w_ptr + c_off,
+            acc.to(grad_w_ptr.dtype.element_ty),
+            mask=nmask[:, None] & kmask[None, :] & (split_size > 0),
+        )
 
 
 def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_cum_per_expert,
@@ -69,47 +78,34 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     """Weight-grad grouped gemm: grad_w [E,N,K] = grad_out^T @ orig_in.
     grad_out [M,N], orig_in [M,K] (rows sorted by expert).
 
-    `block_m/n/k` and `grid` default to the module constants and `ncore()`, so an
-    unchanged call site behaves exactly as before — this is a parameterisation, not a
-    retune. They exist because the shipped constants were fitted to one part: their own
-    comments justify BM=256 against "L0A 1/4-full" and BK=256 against a 192KB UB, and
-    `ncore()` asserted the part had <=24 AICore.
-
-    Measured 2026-08-06, Ascend950DT_9582 (cube=32), Qwen3-30B-A3B, 64 experts/rank,
-    bf16, isolated single-card, stock triton (no `use_bytecode`):
-
-        tokens  rows/expert   shipped(24,256,128,256)   (32,512,256,256)
-          4096      256            0.412 ms                0.385 ms   1.07x
-          8192      512            0.782 ms                0.434 ms   1.80x
-         16384     1024            6.894 ms                3.166 ms   2.18x
-
-    The gain appears exactly where per-expert rows exceed BLOCK_M, i.e. where the
-    reduction starts needing multiple passes — the same shape range where the repo's
-    README reports the backward ratio collapsing (0.51x at 8k, 0.37x at 16k).
-
-    Output was bit-identical between the two configurations at 16384. That check is
-    only meaningful because the comparator was first shown to be live: perturbing one
-    input element moved it by 3.5 absolute. ⚠️ Still one seed and one shape — measured,
-    not proven. ⚠️ Also NOT established: whether every output region is written. That
-    test used even routing, which has no empty experts, so it is structurally unable to
-    speak to the empty-expert case.
+    The block sizes default to the shipped constants and the grid defaults to the
+    device-reported AICore count. Empty-expert slices are zero-initialized and excluded
+    from device stores.
     """
     M, N = grad_out.shape
     K = orig_in.shape[1]
     E = int(expert_counts.shape[0])
+    bm = WGRAD_BLOCK_M if block_m is None else block_m
+    bn = WGRAD_BLOCK_N if block_n is None else block_n
+    bk = WGRAD_BLOCK_K if block_k is None else block_k
+    physical_cores = ncore()
+    launch_grid = physical_cores if grid is None else grid
+    validate_wgrad_launch_params(
+        block_m=bm,
+        block_n=bn,
+        block_k=bk,
+        grid=launch_grid,
+        max_grid=physical_cores,
+    )
     grad_out_T = grad_out.T.contiguous()       # [N, M], makes the a-tile contiguous
     orig_in_c = orig_in.contiguous()
     dev = grad_out.device
     split_size_cum_per_expert = split_size_cum_per_expert.to(dev)
     expert_counts = expert_counts.to(dev)
-    # kernel writes every (e,n,k) tile (0-token experts store a zero acc) -> empty
-    grad_w = torch.empty(E, N, K, dtype=grad_out.dtype, device=dev)
-    bm = WGRAD_BLOCK_M if block_m is None else block_m
-    bn = WGRAD_BLOCK_N if block_n is None else block_n
-    bk = WGRAD_BLOCK_K if block_k is None else block_k
+    grad_w = torch.zeros(E, N, K, dtype=grad_out.dtype, device=dev)
     num_tn = (N + bn - 1) // bn
     num_tk = (K + bk - 1) // bk
-    kernel_transposed_grouped_gemm[(ncore() if grid is None else grid, 1, 1)](
+    kernel_transposed_grouped_gemm[(launch_grid, 1, 1)](
         grad_out_T, orig_in_c, grad_w,
         split_size_cum_per_expert, expert_counts,
         N, K, E, num_tn, num_tk,

@@ -28,7 +28,6 @@ import os
 
 import torch
 import torch_npu  # noqa: F401
-import torch.distributed as dist
 
 from ._torch_forward import moe_forward
 from ..kernels import (
@@ -37,6 +36,7 @@ from ..kernels import (
     transposed_grouped_gemm_triton,
     combine_fc1_bwd_triton,
 )
+from ..kernels.common import ncore, validate_wgrad_launch_params
 
 
 def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
@@ -56,7 +56,7 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
     K = orig_in.shape[1]
     dtype = grad_out.dtype
     dev = grad_out.device
-    grad_w = torch.empty(E, N, K, dtype=dtype, device=dev)
+    grad_w = torch.zeros(E, N, K, dtype=dtype, device=dev)
     ec_list = expert_counts.cpu().tolist()  # one sync, avoid per-iter .item()
     start = 0
     for e in range(E):
@@ -72,12 +72,63 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
 # ============================================================================
 # 1.  5-op orchestrator
 # ============================================================================
-def moe_backward_triton(saved, dy, peer_mem):
+def _validated_wgrad_overrides(
+    stage, block_m, block_n, block_k, grid
+):
+    values = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "grid": grid,
+    }
+    validate_wgrad_launch_params(
+        **values,
+        max_grid=ncore() if grid is not None else None,
+        name_prefix=f"{stage}_wgrad_",
+    )
+    return {name: value for name, value in values.items() if value is not None}
+
+
+def moe_backward_triton(
+    saved,
+    dy,
+    peer_mem,
+    *,
+    fc2_wgrad_block_m=None,
+    fc2_wgrad_block_n=None,
+    fc2_wgrad_block_k=None,
+    fc2_wgrad_grid=None,
+    fc1_wgrad_block_m=None,
+    fc1_wgrad_block_n=None,
+    fc1_wgrad_block_k=None,
+    fc1_wgrad_grid=None,
+):
     """Run the 5 triton mega-ops end-to-end. peer_mem is ONE shared symmetric
     buffer at heap offset 0 (dl.symm_at only resolves correctly at offset 0 with
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching moe_backward_torch."""
+    fc2_wgrad = _validated_wgrad_overrides(
+        "fc2",
+        fc2_wgrad_block_m,
+        fc2_wgrad_block_n,
+        fc2_wgrad_block_k,
+        fc2_wgrad_grid,
+    )
+    fc1_wgrad = _validated_wgrad_overrides(
+        "fc1",
+        fc1_wgrad_block_m,
+        fc1_wgrad_block_n,
+        fc1_wgrad_block_k,
+        fc1_wgrad_grid,
+    )
+    fc2_torch = os.environ.get("MOE_FC2_WGRAD_TORCH") == "1"
+    fc1_torch = os.environ.get("MOE_FC1_WGRAD_TORCH") == "1"
+    if fc2_torch and fc2_wgrad:
+        raise ValueError("fc2 wgrad overrides cannot be used with the Torch fallback")
+    if fc1_torch and fc1_wgrad:
+        raise ValueError("fc1 wgrad overrides cannot be used with the Torch fallback")
+
     dy = dy.to(saved["fc1_1"].dtype)
     # step 1: dispatch + fc2 input-grad
     grad_swiglu, grad_fc2_out_sorted = dispatch_fc2_bwd_triton(saved, dy, peer_mem)
@@ -85,25 +136,25 @@ def moe_backward_triton(saved, dy, peer_mem):
     grad_fc1_output, grad_gate = swiglu_bwd_triton(grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
     # step 3: fc2 weight-grad. MOE_FC2_WGRAD_TORCH=1 falls back to torch (Kimi-K3
     # 8-card: triton wgrad is pathologically slow, see _grouped_wgrad_torch).
-    if os.environ.get("MOE_FC2_WGRAD_TORCH") == "1":
+    if fc2_torch:
         grad_fc2 = _grouped_wgrad_torch(
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"])
     else:
         grad_fc2 = transposed_grouped_gemm_triton(
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"],
-            saved["split_size_cum_per_expert"])
+            saved["split_size_cum_per_expert"], **fc2_wgrad)
     # step 4: combine + fc1 input-grad + gate-grad
     grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
         saved, grad_fc1_output, grad_gate, peer_mem)
     # step 5: fc1 weight-grad. MOE_FC1_WGRAD_TORCH=1 falls back to torch (same
     # pathology as step3 on Kimi-K3).
-    if os.environ.get("MOE_FC1_WGRAD_TORCH") == "1":
+    if fc1_torch:
         grad_fc1 = _grouped_wgrad_torch(
             grad_fc1_output, saved["recv_hidden_sorted"], saved["expert_counts"])
     else:
         grad_fc1 = transposed_grouped_gemm_triton(
             grad_fc1_output, saved["recv_hidden_sorted"], saved["expert_counts"],
-            saved["split_size_cum_per_expert"])
+            saved["split_size_cum_per_expert"], **fc1_wgrad)
     grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
     return dict(
         grad_hidden=grad_hidden, grad_routing_weights=grad_routing_weights,

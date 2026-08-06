@@ -32,20 +32,58 @@ WGRAD_BLOCK_K = 256
 
 
 def ncore():
-    """Physical AICore count — launch grids must not exceed it.
-
-    The count is READ from the device; a part with more cores than the one this was
-    developed on is not an error condition. The previous `assert n <= 24` encoded the
-    development part's core count as a correctness invariant, so on a larger part every
-    kernel routed through here raised AssertionError at launch — a crash, not a slowdown.
-    Measured 2026-08-06 on Ascend950DT_9582 (cube=32, vector=64): the assert fires and
-    nothing runs.
-
-    The docstring's actual invariant — "launch grids must not exceed it" — is satisfied
-    by returning the physical count, which is what callers use as their grid. Grids of
-    32 and 64 were exercised on that part with bit-identical results to grid 24.
-    """
+    """Return the device-reported physical AICore count."""
     return NPUUtils().get_aicore_num()
+
+
+def validate_wgrad_launch_params(
+    *,
+    block_m=None,
+    block_n=None,
+    block_k=None,
+    grid=None,
+    max_grid=None,
+    name_prefix="",
+):
+    """Validate universal wgrad tile constraints and an optional device grid bound."""
+    for name, value in (
+        ("block_m", block_m),
+        ("block_n", block_n),
+        ("block_k", block_k),
+    ):
+        if value is None:
+            continue
+        qualified_name = f"{name_prefix}{name}"
+        if type(value) is not int:
+            raise TypeError(f"{qualified_name} must be an integer, got {value!r}")
+        if value <= 0:
+            raise ValueError(f"{qualified_name} must be positive, got {value}")
+        if value < 16:
+            raise ValueError(
+                f"{qualified_name} must be at least 16, got {value}"
+            )
+        if value & (value - 1):
+            raise ValueError(
+                f"{qualified_name} must be a power of two, got {value}"
+            )
+
+    if grid is not None:
+        qualified_name = f"{name_prefix}grid"
+        if type(grid) is not int:
+            raise TypeError(f"{qualified_name} must be an integer, got {grid!r}")
+        if grid <= 0:
+            raise ValueError(f"{qualified_name} must be positive, got {grid}")
+
+    if max_grid is not None:
+        if type(max_grid) is not int or max_grid <= 0:
+            raise RuntimeError(
+                f"physical AICore count must be a positive integer, got {max_grid!r}"
+            )
+        if grid is not None and grid > max_grid:
+            raise ValueError(
+                f"{name_prefix}grid={grid} must not exceed physical AICore count "
+                f"{max_grid}"
+            )
 
 
 def all_gather_list(t, group):
