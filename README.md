@@ -76,7 +76,6 @@ python -m pytest \
 
 ### 性能测试（benchmark）
 
-`RANK_SIZE`（2 或 8，默认 8）控制 world_size 与 Kimi-K3 变体：`=2`→Kimi-K3-small（缩小专家数，2 卡放得下），`=8`→完整 Kimi-K3（896 专家）。
 
 前向性能（`bench_full_forward.py`）：
 
@@ -98,7 +97,6 @@ python -m pytest -p tests.conftest \
   -m dist -v -s
 ```
 
-> 后向另可用 `MOE_PERF_CONFIGS`（`=1` 全部，或 `BACKWARD_SHAPES_PERF` 里的模型 label）指定 perf shape；显式 env 优先于 RANK_SIZE 默认。
 
 ## 现有性能结果
 
