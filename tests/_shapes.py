@@ -4,10 +4,10 @@
 One dataclass describes every forward/backward test shape so the two sides
 share field names and ordering. The field order follows the backward test's
 historical tuple ``(name, ntokens, hidden, ffn, topk, num_experts)``:
-``num_experts`` is explicit (the backward convention). Forward's world-size
-scaling configs set ``experts_per_rank`` instead, which
-:meth:`resolved_num_experts` expands by ``world_size``; DSV4 sets
-``global_tokens`` so :meth:`resolved_tokens_per_rank` divides it across ranks.
+``num_experts`` is explicit and now used by both forward and backward shapes.
+``experts_per_rank`` remains supported for world-size scaling but is unused by
+the current shape lists; DSV4 sets ``global_tokens`` so
+:meth:`resolved_tokens_per_rank` divides it across ranks.
 """
 
 from dataclasses import dataclass, field
@@ -40,22 +40,35 @@ class MoETestShape:
 
 
 # ---------------------------------------------------------------------------
-# Forward correctness shapes (S/M/L/S-drop/EPR4 scale by experts_per_rank;
-# DSV4-smoke uses explicit num_experts + global_tokens).
+# Forward correctness shapes — all use explicit num_experts (unified with the
+# backward convention). DSV4-smoke additionally sets global_tokens.
 # ---------------------------------------------------------------------------
 
 FORWARD_SHAPES = [
-    MoETestShape("S", 128, 256, 512, 2, experts_per_rank=2),
-    MoETestShape("M", 256, 512, 1024, 2, experts_per_rank=2),
-    MoETestShape("L", 512, 1024, 2048, 2, experts_per_rank=2),
-    MoETestShape("S-drop", 128, 256, 512, 2, experts_per_rank=2, drop_frac=0.3),
-    MoETestShape("EPR4", 256, 512, 1024, 2, experts_per_rank=4),
+    MoETestShape("S", 128, 256, 512, 2, num_experts=8),
+    MoETestShape("M", 256, 512, 1024, 2, num_experts=8),
+    MoETestShape("L", 512, 1024, 2048, 2, num_experts=8),
+    MoETestShape("S-drop", 128, 256, 512, 2, num_experts=8, drop_frac=0.3),
+    MoETestShape("EPR4", 256, 512, 1024, 2, num_experts=16),
     # DeepSeek-V4-Pro routed-expert shape from the sibling NVIDIA dsv4 case:
     # H=7168, F=3072, K=6, E=384. This BF16 correctness smoke excludes the
     # shared-expert branch and the model's FP4 expert format. It deliberately
     # keeps a smaller global-token count; the performance benchmark owns the
     # exact 2K/8K/32K/128K per-rank workloads.
     MoETestShape("DSV4-smoke", 0, 7168, 3072, 6, num_experts=384, global_tokens=1024),
+    # Kimi-K3 architecture (H=3584, F=3072, top-k=16), reduced to a 128-expert
+    # "small" variant so it stays a light correctness smoke. The full 896-expert
+    # model lives in FORWARD_SHAPES_KIMI (opt-in via MOE_KIMI=1, mirroring the
+    # backward test), since it needs >=4 cards to fit comfortably.
+    MoETestShape("Kimi-K3-small", 2048, 3584, 3072, 16, num_experts=128),
+]
+
+
+# Full Kimi-K3 (896 experts) correctness shapes, opt-in via MOE_KIMI=1 in
+# tests/layer/test_moe_forward.py (mirrors BACKWARD_SHAPES_KIMI). Too heavy for
+# the default 2-rank smoke; run at >=4 ranks.
+FORWARD_SHAPES_KIMI = [
+    MoETestShape("Kimi-K3", 2048, 3584, 3072, 16, num_experts=896),
 ]
 
 
