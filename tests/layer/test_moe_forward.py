@@ -584,7 +584,7 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
 #  Configs & worker
 # ---------------------------------------------------------------------------
 
-from tests._shapes import FORWARD_SHAPES as CONFIGS
+from tests._shapes import FORWARD_SHAPES as CONFIGS, FORWARD_SHAPES_KIMI
 
 
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
@@ -717,8 +717,14 @@ def run_test(rank, world_size):
     all_passed = True
 
     only_config = os.environ.get("MOE_FUSED_TEST_CONFIG")
+    # FORWARD_SHAPES is the light default smoke (incl. Kimi-K3-small). The full
+    # 896-expert Kimi-K3 (FORWARD_SHAPES_KIMI) is opt-in via MOE_KIMI=1, mirroring
+    # the backward test; it needs >=4 cards, so it is off for 2-rank runs.
+    base_configs = CONFIGS + (
+        FORWARD_SHAPES_KIMI if os.environ.get("MOE_KIMI") == "1" else []
+    )
     configs = [
-        config for config in CONFIGS
+        config for config in base_configs
         if only_config in (None, config.label)
     ]
 
