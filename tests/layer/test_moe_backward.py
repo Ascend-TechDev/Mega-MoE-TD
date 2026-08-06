@@ -44,10 +44,10 @@ from tests._moe_dist_utils import (
     make_peer_mem,
 )
 from tests._numeric import cmp_grad
-from tests._shapes import (
+from config import (
     BACKWARD_SHAPES_KIMI,
-    BACKWARD_SHAPES_PERF,
     BACKWARD_SHAPES_SMALL,
+    select_perf_shapes,
 )
 
 g_ash_size = get_ash_size_bytes(default_gb=2)
@@ -137,14 +137,14 @@ def run_test(rank, world_size):
     ep_group = dist.group.WORLD
     init_aclshmem(rank, world_size, g_ash_size)
 
-    # Configs are MoETestShape instances (see tests/_shapes.py).
-    # MOE_PERF_CONFIGS=1 selects real model shapes from the mega_kernel paper
-    # (ntokens=4096), EP-sharded across all cards so each fits in the ~13 GB HBM
-    # left after leaked-memory. The small default set is a fast regression smoke.
+    # Configs are MoETestShape instances (see config/_shapes.py).
+    # MOE_PERF_CONFIGS selects real model shapes: "1" runs all, or a model label
+    # (e.g. Kimi-K3) runs just that model (see select_perf_shapes). The small
+    # default set is a fast regression smoke.
     if os.environ.get("MOE_KIMI") == "1":
         test_configs = BACKWARD_SHAPES_KIMI
-    elif os.environ.get("MOE_PERF_CONFIGS") == "1":
-        test_configs = BACKWARD_SHAPES_PERF
+    elif (perf := os.environ.get("MOE_PERF_CONFIGS")):
+        test_configs = select_perf_shapes(perf)
     else:
         test_configs = BACKWARD_SHAPES_SMALL
 

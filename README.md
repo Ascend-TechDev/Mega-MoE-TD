@@ -25,6 +25,9 @@ python -m pip install -e . --no-deps
 ## 目录结构
 
 ```text
+config/
+└── _shapes.py                # 所有模型/shape 配置（MoETestShape + 各 shape 列表 + MODEL_PROFILES）
+
 src/mega_moe/
 ├── config.py                 # 前向配置与调度参数校验
 ├── ops/
@@ -40,9 +43,7 @@ tests/
 ├── conftest.py               # @pytest.mark.dist 多进程 HCCL 启动夹具
 ├── _moe_dist_utils.py        # 多卡测试/基准共享工具（ACLSHMEM、peer_mem 等）
 ├── _numeric.py               # 数值比较阈值与判定
-├── _shapes.py                # 共享测试 shape 定义
 ├── _goldens/                 # torch golden 参考实现（backward）
-├── function/                 # autograd.Function 测试
 ├── layer/                    # 完整前向/反向流程测试
 └── kernel/{forward,backward}/  # kernel 级单测（占位）
 
@@ -75,30 +76,25 @@ python -m pytest \
 
 ### 性能测试（benchmark）
 
-benchmark 在 `benchmark/layer/` 下，由 pytest fixture 起多进程，**不要再套 `torchrun`**；因为它们位于 `tests/` 之外，需加 `-p tests.conftest` 来加载 `dist` marker 与 `dist_test` fixture。
 
-前向性能（`bench_full_forward.py`，Kimi-K3 为主目标，对照 Torch-NPU grouped-GEMM baseline）：
+前向性能（`bench_full_forward.py`）：
 
 ```bash
-source ./run.sh   # 配置 Ascend / Triton-Ascend 运行环境与 PATH
-MOE_FULL_BENCH_CONFIG=kimi_k3_4k,kimi_k3_8k,kimi_k3_16k \
+MOE_FULL_BENCH_CONFIG=kimi_k3_4k \
 python -m pytest -p tests.conftest \
   benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3_8ranks \
   -m dist -v -s
 ```
 
-后向性能（`bench_backward.py`，triton 5-mega-op vs 手写 torch+HCCL golden）：
+后向性能（`bench_backward.py`）：
 
 ```bash
-MOE_PERF_CONFIGS=1 \
+# MOE_PERF_CONFIGS: =1 跑全部 perf shape；给模型 label（大小写不敏感、逗号分隔）只跑该模型
+MOE_PERF_CONFIGS=Kimi-K3 \
 python -m pytest -p tests.conftest \
   benchmark/layer/bench_backward.py::test_bench_backward_2ranks \
   -m dist -v -s
 ```
-
-- 前向 shape 由 `MOE_FULL_BENCH_CONFIG`（Kimi-K3）/ `MOE_DSV4_BENCH_CONFIG`（DSV4）选；后向 shape 由 `MOE_KIMI=1`（Kimi-K3）/ `MOE_PERF_CONFIGS=1`（真模型 shape）/ 默认 small smoke 选。
-- 前向另有 `test_bench_full_forward_kimi_k3_4ranks`，后向另有 `test_bench_backward_8ranks`。
-- 调度 A/B、tile、路由模式等更多开关见各 benchmark 文件头部（`MOE_FUSED_*`、`MOE_FULL_BENCH_*`）。
 
 ## 现有性能结果
 

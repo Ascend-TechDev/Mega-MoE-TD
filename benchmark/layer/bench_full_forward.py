@@ -81,6 +81,7 @@ except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from mega_moe import FusedMoEForward, MoEForwardConfig
+from config import MODEL_PROFILES
 
 
 ACTIVATION_DTYPE = torch.bfloat16
@@ -88,55 +89,6 @@ ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-transport-v2"
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
-
-MODEL_PROFILES = {
-    "QWEN": {
-        "hidden": 2048,
-        "ffn_dim": 768,
-        "topk": 8,
-        "num_experts": 128,
-        "capacity": 1.25,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("2K", 2048),
-            ("8K", 8192),
-            ("16K", 16384),
-            ("32K", 32768),
-        ],
-    },
-    # Uses the CASE_SET=dsv4 model dimensions from the sibling NVIDIA benchmark
-    # launcher, with token counts interpreted per rank for the Ascend workload.
-    # This is the routed-expert BF16 shape only: it excludes the shared-expert
-    # branch and does not model the model's FP4 expert format.
-    "DSV4": {
-        "hidden": 7168,
-        "ffn_dim": 3072,
-        "topk": 6,
-        "num_experts": 384,
-        "capacity": 4.0,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("dsv4_pro_2k", 2048),
-            ("dsv4_pro_4k", 4096),
-            ("dsv4_pro_8k", 8192),
-            ("dsv4_pro_32k", 32768),
-            ("dsv4_pro_128k", 131072),
-        ],
-    },
-    "KIMI-K3": {
-        "hidden": 3584,
-        "ffn_dim": 3072,
-        "topk": 16,
-        "num_experts": 896,
-        "capacity": 1.25,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("kimi_k3_4k", 4096),
-            ("kimi_k3_8k", 8192),
-            ("kimi_k3_16k", 16384),
-        ],
-    },
-}
 
 # This is the published protocol.  Keep debug/short runs under a differently
 # named script so their output cannot be mistaken for 5/50 evidence.

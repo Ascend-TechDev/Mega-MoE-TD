@@ -7,9 +7,11 @@
 #  and the triton/torch speedup, mirroring benchmark/layer/bench_full_forward.py
 #  (pytest + dist_test entry; correctness lives in tests/layer/test_moe_backward.py).
 #
-#  Config selection reuses tests/_shapes.py:
+#  Config selection reuses config/_shapes.py:
 #    MOE_KIMI=1            -> BACKWARD_SHAPES_KIMI
-#    MOE_PERF_CONFIGS=1    -> BACKWARD_SHAPES_PERF (real model shapes)
+#    MOE_PERF_CONFIGS=1    -> BACKWARD_SHAPES_PERF (all real model shapes)
+#    MOE_PERF_CONFIGS=lbl  -> only perf shapes whose model label matches
+#                             (comma-separated, case-insensitive; see select_perf_shapes)
 #    (otherwise)           -> BACKWARD_SHAPES_SMALL (regression smoke)
 #
 #  The triton wgrad kernels are pathologically slow on some shapes; set
@@ -47,10 +49,10 @@ from tests._moe_dist_utils import (
     init_aclshmem,
     make_peer_mem,
 )
-from tests._shapes import (
+from config import (
     BACKWARD_SHAPES_KIMI,
-    BACKWARD_SHAPES_PERF,
     BACKWARD_SHAPES_SMALL,
+    select_perf_shapes,
 )
 
 g_ash_size = get_ash_size_bytes(default_gb=2)
@@ -111,8 +113,8 @@ def build_backward_saved(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_gro
 def _select_shapes():
     if os.environ.get("MOE_KIMI") == "1":
         return BACKWARD_SHAPES_KIMI
-    if os.environ.get("MOE_PERF_CONFIGS") == "1":
-        return BACKWARD_SHAPES_PERF
+    if (perf := os.environ.get("MOE_PERF_CONFIGS")):
+        return select_perf_shapes(perf)
     return BACKWARD_SHAPES_SMALL
 
 
