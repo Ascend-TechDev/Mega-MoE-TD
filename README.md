@@ -37,66 +37,47 @@ src/mega_moe/
 └── kernels/                  # Triton JIT kernels 及 launcher
 
 tests/
-├── function/                 # autograd Function 测试
+├── conftest.py               # @pytest.mark.dist 多进程 HCCL 启动夹具
+├── _moe_dist_utils.py        # 多卡测试/基准共享工具（ACLSHMEM、peer_mem 等）
+├── _numeric.py               # 数值比较阈值与判定
+├── _shapes.py                # 共享测试 shape 定义
+├── _goldens/                 # torch golden 参考实现（backward）
+├── function/                 # autograd.Function 测试
 ├── layer/                    # 完整前向/反向流程测试
-└── kernel/{forward,backward}/
+└── kernel/{forward,backward}/  # kernel 级单测（占位）
 
-benchmark/layer/              # 完整前向性能入口与结果汇总
-results/forward/              # 正式 forward benchmark JSON
+benchmark/layer/              # 前向/反向 benchmark 入口与结果汇总
 ```
 
 ## How to start
 
-先运行不需要多卡的公开接口和配置测试：
+基础环境依赖配置测试：
 
 ```bash
 python -m pytest tests/layer/test_moe_forward.py -m "not dist" -v
 ```
 
-forward pytest fixture 会自行建立多进程环境，不要再套 `torchrun`：
-
+前向两卡用例：
 ```bash
 python -m pytest \
   tests/layer/test_moe_forward.py::test_forward_2ranks \
   -m dist -v -s
 ```
 
-backward 五阶段和 autograd 测试使用 `torchrun`：
-
+后向两卡用例
 ```bash
-# legacy torch golden：手写 backward 与 autograd 交叉验证
-torchrun --nproc-per-node=2 -m tests._goldens.backward
-
-# 五阶段 Triton backward 与 torch golden
-torchrun --nproc-per-node=2 tests/layer/test_moe_backward.py
-
-# MegaMoEBackwardFunction autograd 接口
-torchrun --nproc-per-node=2 tests/function/test_moe_backward_function.py
+python -m pytest \
+  tests/layer/test_moe_backward.py::test_backward_2ranks \
+  -m dist -v -s
 ```
 
 ## 现有性能结果
 
-### Backward
-
-最后一列按已有数据计算为 `torch(ms) / triton(ms)`，大于 1 表示 Triton 更快。
-
-| 模型 | tokens | torch/ms | triton/ms | Triton speedup |
-|---|---:|---:|---:|---:|
-| Qwen3-30B-A3B | 4096 | 45.1 | 28.7 | **1.57x** |
-| Qwen3-30B-A3B | 8192 | 56.6 | 111.6 | 0.51x |
-| Qwen3-30B-A3B | 16384 | 83.8 | 224.1 | 0.37x |
-| DeepSeek-MoE-16B | 4096 | 27.9 | 29.8 | 0.94x |
-| Qwen3-235B-A22B | 4096 | 63.4 | 79.6 | 0.80x |
-| Qwen3-Next-80B | 4096 | 136.4 | 31.4 | **4.34x** |
-| Qwen3-Omni-30B | 4096 | 37.7 | 12.4 | **3.04x** |
-| **平均** | | | | **1.65x** |
-
 ### Forward
 
-#### Kimi-K3 W8
+#### Kimi-K3
 
-Kimi-K3 W8 测试已完成，全部正确性 gate 通过，未发生 OOM。完整 post-routing
-forward 的加速比为 `Grouped golden / Ascend candidate`：
+完整*八卡* post-routing forward 的加速比为 `Grouped golden / Ascend candidate`：
 
 | tokens/rank | Ascend full | Grouped golden | 加速比 | 观测 HBM/卡 |
 |---:|---:|---:|---:|---:|
@@ -117,9 +98,6 @@ forward 的加速比为 `Grouped golden / Ascend candidate`：
 | 8K | 5.764 | 33.973 | 4.465 | 30.961 |
 | 16K | 6.970 | 64.385 | 8.888 | 59.042 |
 
-阶段中位数来自独立采样，不能严格相加。当前最明显的性能短板仍是 dispatch+FC1：
-8K、16K 相对 golden 分别仅为 1.058x、1.052x。
-
 与 Megatron mean latency 的对比如下：
 
 | tokens/rank | Megatron mean | Triton mean | Megatron / Triton |
@@ -132,10 +110,18 @@ forward 的加速比为 `Grouped golden / Ascend candidate`：
 - 8K：Megatron 快约 8.8%。
 - 16K：Megatron 快约 7.8%。
 
-为支持 Kimi-K3 的 896 experts，本次修复了 1024-bin routing metadata 路径：
+### Backward
 
-- 使用排序结果的向量化 lower-bound，绕过 910B1 无法正常完成的 1024-bin histogram。
-- 在 masked load 前将 inactive lane 地址钳制到合法下标。
-- all-drop 时提供有效哨兵地址，避免后端“无条件 load 后 select”造成越界。
-- DSV4 的 512-bin histogram 路径保持不变。
-- 只修改 Triton Python，没有修改 NPU-IR。
+两卡后向的计算加速比 `torch(ms) / triton(ms)`
+
+| 模型 | tokens | torch/ms | triton/ms | Triton speedup |
+|---|---:|---:|---:|---:|
+| Qwen3-30B-A3B | 4096 | 45.1 | 28.7 | **1.57x** |
+| Qwen3-30B-A3B | 8192 | 56.6 | 111.6 | 0.51x |
+| Qwen3-30B-A3B | 16384 | 83.8 | 224.1 | 0.37x |
+| DeepSeek-MoE-16B | 4096 | 27.9 | 29.8 | 0.94x |
+| Qwen3-235B-A22B | 4096 | 63.4 | 79.6 | 0.80x |
+| Qwen3-Next-80B | 4096 | 136.4 | 31.4 | **4.34x** |
+| Qwen3-Omni-30B | 4096 | 37.7 | 12.4 | **3.04x** |
+| **平均** | | | | **1.65x** |
+
