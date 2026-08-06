@@ -32,7 +32,7 @@ import shmem as ash
 import torch.distributed as dist
 
 from mega_moe import moe_backward_triton
-from mega_moe.ops._torch_forward import moe_forward
+from mega_moe.runtime._torch_forward_for_backward import moe_forward
 from tests._goldens.backward import moe_backward_torch
 from tests._moe_dist_utils import (
     BOLD,

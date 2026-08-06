@@ -11,7 +11,7 @@ Two things live here:
    the GPU ``TritonDistFusedEpMoeFunction``: its ``forward`` runs the (torch)
    EP-MoE forward and stashes the saved intermediates + the shared symmetric
    buffer; its ``backward`` runs the 5 triton mega-ops. The forward reuses the
-   differentiable torch forward in :mod:`mega_moe.ops._torch_forward`; only the
+   differentiable torch forward in :mod:`mega_moe.runtime._torch_forward_for_backward`; only the
    backward is the fused triton path (the Ascend tutorial only ships a triton
    backward — forward is the torch reference).
 
@@ -30,7 +30,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from ._torch_forward import moe_forward
+from mega_moe.runtime._torch_forward_for_backward import moe_forward
 from ..kernels import (
     dispatch_fc2_bwd_triton,
     swiglu_bwd_triton,
