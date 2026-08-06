@@ -32,25 +32,70 @@ import shmem as ash
 import torch.distributed as dist
 
 from mega_moe import moe_backward_triton
+from mega_moe.ops._torch_forward import moe_forward
 from tests._goldens.backward import moe_backward_torch
 from tests._moe_dist_utils import (
     BOLD,
     GREEN,
     RED,
     RESET,
-    build_backward_saved,
     get_ash_size_bytes,
     init_aclshmem,
     make_peer_mem,
 )
 from tests._numeric import cmp_grad
-from tests._shapes import (
+from config import (
     BACKWARD_SHAPES_KIMI,
-    BACKWARD_SHAPES_PERF,
     BACKWARD_SHAPES_SMALL,
+    select_perf_shapes,
 )
 
 g_ash_size = get_ash_size_bytes(default_gb=2)
+
+
+# ----------------------------------------------------------------------------
+# Per-rank input generation (bf16, on NPU)
+# ----------------------------------------------------------------------------
+
+def make_backward_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):
+    """Build rank-distinct bf16 MoE backward inputs.
+
+    Returns ``(hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device)``.
+    The shared expert routing table (``gw``) is broadcast from rank 0 so every
+    rank derives the same per-token expert assignment; weights and activations
+    stay rank-distinct for realistic asymmetric load.
+    """
+    pe = dist.get_rank(ep_group)
+    world_size = dist.get_world_size(ep_group)
+    epr = num_experts // world_size
+    dtype = torch.bfloat16
+    device = f"npu:{pe}"
+    torch.manual_seed(seed + pe * 1000)
+    hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
+    gw = torch.randn(num_experts, hidden_dim, dtype=dtype, device=device)
+    fc1_1 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc1_2 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc2 = torch.randn(epr, hidden_dim, ffn_dim, dtype=dtype, device=device)
+    dist.broadcast(gw, src=0, group=ep_group)
+    logits = hs.float() @ gw.float().T
+    rw = torch.softmax(logits, dim=-1).to(dtype)
+    topk_w, topk_idx = torch.topk(rw, topk, dim=-1)
+    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+    dy = torch.randn_like(hs)
+    return hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device
+
+
+def build_backward_saved(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):
+    """Like :func:`make_backward_inputs` but also runs the torch forward to
+    produce the ``saved`` intermediates consumed by the backward.
+
+    Returns ``(saved, dy, dtype, device)``.
+    """
+    hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = make_backward_inputs(
+        ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed)
+    with torch.no_grad():
+        _, saved = moe_forward(hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, ep_group, topk, return_saved=True)
+    return saved, dy, dtype, device
 
 
 def run_one(name, ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
@@ -92,14 +137,14 @@ def run_test(rank, world_size):
     ep_group = dist.group.WORLD
     init_aclshmem(rank, world_size, g_ash_size)
 
-    # Configs are MoETestShape instances (see tests/_shapes.py).
-    # MOE_PERF_CONFIGS=1 selects real model shapes from the mega_kernel paper
-    # (ntokens=4096), EP-sharded across all cards so each fits in the ~13 GB HBM
-    # left after leaked-memory. The small default set is a fast regression smoke.
+    # Configs are MoETestShape instances (see config/_shapes.py).
+    # MOE_PERF_CONFIGS selects real model shapes: "1" runs all, or a model label
+    # (e.g. Kimi-K3) runs just that model (see select_perf_shapes). The small
+    # default set is a fast regression smoke.
     if os.environ.get("MOE_KIMI") == "1":
         test_configs = BACKWARD_SHAPES_KIMI
-    elif os.environ.get("MOE_PERF_CONFIGS") == "1":
-        test_configs = BACKWARD_SHAPES_PERF
+    elif (perf := os.environ.get("MOE_PERF_CONFIGS")):
+        test_configs = select_perf_shapes(perf)
     else:
         test_configs = BACKWARD_SHAPES_SMALL
 

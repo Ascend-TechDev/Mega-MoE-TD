@@ -25,6 +25,9 @@ python -m pip install -e . --no-deps
 ## 目录结构
 
 ```text
+config/
+└── _shapes.py                # 所有模型/shape 配置（MoETestShape + 各 shape 列表 + MODEL_PROFILES）
+
 src/mega_moe/
 ├── config.py                 # 前向配置与调度参数校验
 ├── ops/
@@ -40,9 +43,7 @@ tests/
 ├── conftest.py               # @pytest.mark.dist 多进程 HCCL 启动夹具
 ├── _moe_dist_utils.py        # 多卡测试/基准共享工具（ACLSHMEM、peer_mem 等）
 ├── _numeric.py               # 数值比较阈值与判定
-├── _shapes.py                # 共享测试 shape 定义
 ├── _goldens/                 # torch golden 参考实现（backward）
-├── function/                 # autograd.Function 测试
 ├── layer/                    # 完整前向/反向流程测试
 └── kernel/{forward,backward}/  # kernel 级单测（占位）
 
@@ -50,6 +51,8 @@ benchmark/layer/              # 前向/反向 benchmark 入口与结果汇总
 ```
 
 ## How to start
+
+### 正确性测试
 
 基础环境依赖配置测试：
 
@@ -64,10 +67,32 @@ python -m pytest \
   -m dist -v -s
 ```
 
-后向两卡用例
+后向两卡用例：
 ```bash
 python -m pytest \
   tests/layer/test_moe_backward.py::test_backward_2ranks \
+  -m dist -v -s
+```
+
+### 性能测试（benchmark）
+
+
+前向性能（`bench_full_forward.py`）：
+
+```bash
+MOE_FULL_BENCH_CONFIG=kimi_k3_4k \
+python -m pytest -p tests.conftest \
+  benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3_8ranks \
+  -m dist -v -s
+```
+
+后向性能（`bench_backward.py`）：
+
+```bash
+# MOE_PERF_CONFIGS: =1 跑全部 perf shape；给模型 label（大小写不敏感、逗号分隔）只跑该模型
+MOE_PERF_CONFIGS=Kimi-K3 \
+python -m pytest -p tests.conftest \
+  benchmark/layer/bench_backward.py::test_bench_backward_2ranks \
   -m dist -v -s
 ```
 

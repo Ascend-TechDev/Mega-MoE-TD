@@ -584,7 +584,7 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
 #  Configs & worker
 # ---------------------------------------------------------------------------
 
-from tests._shapes import FORWARD_SHAPES as CONFIGS, FORWARD_SHAPES_KIMI
+from config import FORWARD_SHAPES as CONFIGS, FORWARD_SHAPES_KIMI
 
 
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
