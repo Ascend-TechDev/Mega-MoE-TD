@@ -20,6 +20,7 @@ Two kinds of config live here:
   ``benchmark/layer/bench_full_forward.py`` via ``_activate_model_profile``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -97,6 +98,16 @@ BACKWARD_SHAPES_KIMI = [
     MoETestShape("Kimi-K3", 8192, 3584, 3072, 16, num_experts=896),
 ]
 
+# Kimi-K3 architecture scaled to 16 experts (the minimum: topk=16 requires
+# E >= topk). Default backward benchmark shape when RANK_SIZE=2 (see rank_size /
+# bench_backward): at 2 cards epr=8, within the backward kernel's launch-grid
+# limit (<= physical aicore num); E=128 (epr=64) would be skipped on 2 cards.
+BACKWARD_SHAPES_KIMI_SMALL = [
+    MoETestShape("Kimi-K3-small", 2048, 3584, 3072, 16, num_experts=16),
+    MoETestShape("Kimi-K3-small", 4096, 3584, 3072, 16, num_experts=16),
+    MoETestShape("Kimi-K3-small", 8192, 3584, 3072, 16, num_experts=16),
+]
+
 BACKWARD_SHAPES_PERF = [
     MoETestShape("Qwen3-30B-A3B",    4096, 2048,  768,  8, num_experts=128),
     MoETestShape("Qwen3-30B-A3B",    8192, 2048,  768,  8, num_experts=128),
@@ -166,6 +177,21 @@ MODEL_PROFILES = {
             ("kimi_k3_16k", 16384),
         ],
     },
+    # Kimi-K3 architecture scaled to 128 experts so it fits on 2 cards.
+    # Selected by test_bench_full_forward_kimi_k3 when RANK_SIZE=2.
+    "KIMI-K3-SMALL": {
+        "hidden": 3584,
+        "ffn_dim": 3072,
+        "topk": 16,
+        "num_experts": 128,
+        "capacity": 1.25,
+        "tiling_overrides": {},
+        "bench_configs": [
+            ("kimi_k3_small_4k", 4096),
+            ("kimi_k3_small_8k", 8192),
+            ("kimi_k3_small_16k", 16384),
+        ],
+    },
 }
 
 
@@ -189,3 +215,16 @@ def select_perf_shapes(spec):
             f"available labels: {available}"
         )
     return selected
+
+
+def rank_size(default: int = 8) -> int:
+    """Read the ``RANK_SIZE`` env (must be 2 or 8) for the perf benchmarks.
+
+    The Kimi-K3 benchmarks use this to pick world_size and, by extension, the
+    model variant: ``2`` -> Kimi-K3-small (forward 128 experts / backward 16
+    experts, fits on 2 cards); ``8`` -> full Kimi-K3 (896 experts).
+    """
+    rs = int(os.environ.get("RANK_SIZE", str(default)))
+    if rs not in (2, 8):
+        raise ValueError(f"RANK_SIZE must be 2 or 8, got {rs}")
+    return rs

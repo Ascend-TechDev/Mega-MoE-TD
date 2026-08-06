@@ -76,25 +76,29 @@ python -m pytest \
 
 ### 性能测试（benchmark）
 
+`RANK_SIZE`（2 或 8，默认 8）控制 world_size 与 Kimi-K3 变体：`=2`→Kimi-K3-small（128 专家，2 卡放得下），`=8`→完整 Kimi-K3（896 专家）。
 
 前向性能（`bench_full_forward.py`）：
 
 ```bash
-MOE_FULL_BENCH_CONFIG=kimi_k3_4k \
+# RANK_SIZE=2 跑 KIMI-K3-SMALL；MOE_FULL_BENCH_CONFIG 可限定 token 档位（如 kimi_k3_small_4k）
+RANK_SIZE=2 MOE_FULL_BENCH_CONFIG=kimi_k3_small_4k \
 python -m pytest -p tests.conftest \
-  benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3_8ranks \
+  benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3 \
   -m dist -v -s
 ```
 
 后向性能（`bench_backward.py`）：
 
 ```bash
-# MOE_PERF_CONFIGS: =1 跑全部 perf shape；给模型 label（大小写不敏感、逗号分隔）只跑该模型
-MOE_PERF_CONFIGS=Kimi-K3 \
+# RANK_SIZE=2 默认跑 Kimi-K3-small；=8 默认完整 Kimi-K3
+RANK_SIZE=2 \
 python -m pytest -p tests.conftest \
-  benchmark/layer/bench_backward.py::test_bench_backward_2ranks \
+  benchmark/layer/bench_backward.py::test_bench_backward \
   -m dist -v -s
 ```
+
+> 后向另可用 `MOE_PERF_CONFIGS`（`=1` 全部，或 `BACKWARD_SHAPES_PERF` 里的模型 label）指定 perf shape；显式 env 优先于 RANK_SIZE 默认。
 
 ## 现有性能结果
 
