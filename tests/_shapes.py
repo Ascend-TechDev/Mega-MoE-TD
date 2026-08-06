@@ -98,10 +98,3 @@ BACKWARD_SHAPES_PERF = [
     MoETestShape("Kimi-K3",          8192, 3584, 3072, 16, num_experts=896),
     MoETestShape("Kimi-K3",         16384, 3584, 3072, 16, num_experts=896),
 ]
-
-# MegaMoEBackwardFunction autograd shapes (fixed num_experts=128).
-BACKWARD_FUNCTION_SHAPES = [
-    MoETestShape("fn", 512, 512, 256, 4, num_experts=128),
-    MoETestShape("fn", 1024, 512, 256, 4, num_experts=128),
-    MoETestShape("fn", 512, 1024, 512, 8, num_experts=128),
-]

@@ -35,6 +35,7 @@ import shmem as ash
 import torch.distributed as dist
 
 from mega_moe import moe_backward_triton
+from mega_moe.ops._torch_forward import moe_forward
 from tests._goldens.backward import moe_backward_torch
 from tests._moe_dist_utils import (
     BOLD,
@@ -42,7 +43,6 @@ from tests._moe_dist_utils import (
     RED,
     RESET,
     bench,
-    build_backward_saved,
     get_ash_size_bytes,
     init_aclshmem,
     make_peer_mem,
@@ -61,6 +61,51 @@ BENCH_ITERS = 20
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = Path(os.environ.get(
     "MOE_BACKWARD_BENCH_RESULTS_DIR", str(PROJECT_ROOT / "results" / "backward")))
+
+
+# ----------------------------------------------------------------------------
+# Per-rank input generation (bf16, on NPU)
+# ----------------------------------------------------------------------------
+
+def make_backward_inputs(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):
+    """Build rank-distinct bf16 MoE backward inputs.
+
+    Returns ``(hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device)``.
+    The shared expert routing table (``gw``) is broadcast from rank 0 so every
+    rank derives the same per-token expert assignment; weights and activations
+    stay rank-distinct for realistic asymmetric load.
+    """
+    pe = dist.get_rank(ep_group)
+    world_size = dist.get_world_size(ep_group)
+    epr = num_experts // world_size
+    dtype = torch.bfloat16
+    device = f"npu:{pe}"
+    torch.manual_seed(seed + pe * 1000)
+    hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
+    gw = torch.randn(num_experts, hidden_dim, dtype=dtype, device=device)
+    fc1_1 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc1_2 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc2 = torch.randn(epr, hidden_dim, ffn_dim, dtype=dtype, device=device)
+    dist.broadcast(gw, src=0, group=ep_group)
+    logits = hs.float() @ gw.float().T
+    rw = torch.softmax(logits, dim=-1).to(dtype)
+    topk_w, topk_idx = torch.topk(rw, topk, dim=-1)
+    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+    dy = torch.randn_like(hs)
+    return hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device
+
+
+def build_backward_saved(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42):
+    """Like :func:`make_backward_inputs` but also runs the torch forward to
+    produce the ``saved`` intermediates consumed by the backward.
+
+    Returns ``(saved, dy, dtype, device)``.
+    """
+    hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = make_backward_inputs(
+        ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed)
+    with torch.no_grad():
+        _, saved = moe_forward(hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, ep_group, topk, return_saved=True)
+    return saved, dy, dtype, device
 
 
 def _select_shapes():
