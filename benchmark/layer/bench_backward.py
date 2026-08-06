@@ -51,7 +51,9 @@ from tests._moe_dist_utils import (
 )
 from config import (
     BACKWARD_SHAPES_KIMI,
+    BACKWARD_SHAPES_KIMI_SMALL,
     BACKWARD_SHAPES_SMALL,
+    rank_size,
     select_perf_shapes,
 )
 
@@ -115,6 +117,10 @@ def _select_shapes():
         return BACKWARD_SHAPES_KIMI
     if (perf := os.environ.get("MOE_PERF_CONFIGS")):
         return select_perf_shapes(perf)
+    # When RANK_SIZE is set, default to the matching Kimi-K3 variant
+    # (small at 2 cards, full at 8); otherwise keep the tiny smoke default.
+    if "RANK_SIZE" in os.environ:
+        return BACKWARD_SHAPES_KIMI_SMALL if rank_size() == 2 else BACKWARD_SHAPES_KIMI
     return BACKWARD_SHAPES_SMALL
 
 
@@ -218,6 +224,13 @@ def test_bench_backward_2ranks(dist_test):
 @pytest.mark.dist
 def test_bench_backward_8ranks(dist_test):
     dist_test(run_benchmark, world_size=8)
+
+
+@pytest.mark.dist
+def test_bench_backward(dist_test):
+    # RANK_SIZE (2 or 8, default 8) sets world_size; _select_shapes then defaults
+    # to Kimi-K3-small (2 cards, 128 experts) or full Kimi-K3 (8 cards, 896).
+    dist_test(run_benchmark, world_size=rank_size())
 
 
 if __name__ == "__main__":

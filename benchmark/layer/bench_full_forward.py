@@ -81,7 +81,7 @@ except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from mega_moe import FusedMoEForward, MoEForwardConfig
-from config import MODEL_PROFILES
+from config import MODEL_PROFILES, rank_size
 
 
 ACTIVATION_DTYPE = torch.bfloat16
@@ -1520,6 +1520,15 @@ def test_bench_full_forward_kimi_k3_4ranks(dist_test):
 @pytest.mark.dist
 def test_bench_full_forward_kimi_k3_8ranks(dist_test):
     dist_test(run_benchmark, world_size=8, args=("KIMI-K3", ))
+
+
+@pytest.mark.dist
+def test_bench_full_forward_kimi_k3(dist_test):
+    # RANK_SIZE (2 or 8, default 8) sets world_size and the model variant:
+    # 2 -> KIMI-K3-SMALL (128 experts, fits on 2 cards); 8 -> full KIMI-K3.
+    rs = rank_size()
+    model = "KIMI-K3-SMALL" if rs == 2 else "KIMI-K3"
+    dist_test(run_benchmark, world_size=rs, args=(model, ))
 
 
 if __name__ == "__main__":

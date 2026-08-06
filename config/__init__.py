@@ -7,12 +7,14 @@ write ``from config import MoETestShape, FORWARD_SHAPES, MODEL_PROFILES, ...``.
 
 from config._shapes import (
     BACKWARD_SHAPES_KIMI,
+    BACKWARD_SHAPES_KIMI_SMALL,
     BACKWARD_SHAPES_PERF,
     BACKWARD_SHAPES_SMALL,
     FORWARD_SHAPES,
     FORWARD_SHAPES_KIMI,
     MODEL_PROFILES,
     MoETestShape,
+    rank_size,
     select_perf_shapes,
 )
 
@@ -22,7 +24,9 @@ __all__ = [
     "FORWARD_SHAPES_KIMI",
     "BACKWARD_SHAPES_SMALL",
     "BACKWARD_SHAPES_KIMI",
+    "BACKWARD_SHAPES_KIMI_SMALL",
     "BACKWARD_SHAPES_PERF",
     "MODEL_PROFILES",
     "select_perf_shapes",
+    "rank_size",
 ]
