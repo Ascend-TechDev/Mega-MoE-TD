@@ -32,10 +32,20 @@ WGRAD_BLOCK_K = 256
 
 
 def ncore():
-    """Physical AICore count — launch grids must not exceed it."""
-    n = NPUUtils().get_aicore_num()
-    assert n <= 24, "launch grid must not exceed physical aicore num"
-    return n
+    """Physical AICore count — launch grids must not exceed it.
+
+    The count is READ from the device; a part with more cores than the one this was
+    developed on is not an error condition. The previous `assert n <= 24` encoded the
+    development part's core count as a correctness invariant, so on a larger part every
+    kernel routed through here raised AssertionError at launch — a crash, not a slowdown.
+    Measured 2026-08-06 on Ascend950DT_9582 (cube=32, vector=64): the assert fires and
+    nothing runs.
+
+    The docstring's actual invariant — "launch grids must not exceed it" — is satisfied
+    by returning the physical count, which is what callers use as their grid. Grids of
+    32 and 64 were exercised on that part with bit-identical results to grid 24.
+    """
+    return NPUUtils().get_aicore_num()
 
 
 def all_gather_list(t, group):
