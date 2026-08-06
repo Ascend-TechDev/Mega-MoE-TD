@@ -76,7 +76,7 @@ python -m pytest \
 
 ### 性能测试（benchmark）
 
-`RANK_SIZE`（2 或 8，默认 8）控制 world_size 与 Kimi-K3 变体：`=2`→Kimi-K3-small（128 专家，2 卡放得下），`=8`→完整 Kimi-K3（896 专家）。
+`RANK_SIZE`（2 或 8，默认 8）控制 world_size 与 Kimi-K3 变体：`=2`→Kimi-K3-small（缩小专家数，2 卡放得下），`=8`→完整 Kimi-K3（896 专家）。
 
 前向性能（`bench_full_forward.py`）：
 
@@ -91,8 +91,8 @@ python -m pytest -p tests.conftest \
 后向性能（`bench_backward.py`）：
 
 ```bash
-# RANK_SIZE=2 默认跑 Kimi-K3-small；=8 默认完整 Kimi-K3
-RANK_SIZE=2 \
+# RANK_SIZE=2 默认跑 Kimi-K3-small；MOE_BACKWARD_BENCH_CONFIG 限定 token 档（如 4096）
+RANK_SIZE=2 MOE_BACKWARD_BENCH_CONFIG=4096 \
 python -m pytest -p tests.conftest \
   benchmark/layer/bench_backward.py::test_bench_backward \
   -m dist -v -s

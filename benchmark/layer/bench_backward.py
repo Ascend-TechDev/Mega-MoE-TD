@@ -12,6 +12,12 @@
 #    MOE_PERF_CONFIGS=1    -> BACKWARD_SHAPES_PERF (all real model shapes)
 #    MOE_PERF_CONFIGS=lbl  -> only perf shapes whose model label matches
 #                             (comma-separated, case-insensitive; see select_perf_shapes)
+#    RANK_SIZE=2|8         -> world_size + default shape (Kimi-K3-small at 2 cards,
+#                             full Kimi-K3 at 8); see test_bench_backward / rank_size()
+#    MOE_BACKWARD_BENCH_CONFIG=tokens
+#                          -> keep only shapes with the given per-rank token count(s),
+#                             e.g. 4096 or 4096,8192 (mirrors the forward's
+#                             MOE_FULL_BENCH_CONFIG slug selection)
 #    (otherwise)           -> BACKWARD_SHAPES_SMALL (regression smoke)
 #
 #  The triton wgrad kernels are pathologically slow on some shapes; set
@@ -114,14 +120,27 @@ def build_backward_saved(ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_gro
 
 def _select_shapes():
     if os.environ.get("MOE_KIMI") == "1":
-        return BACKWARD_SHAPES_KIMI
-    if (perf := os.environ.get("MOE_PERF_CONFIGS")):
-        return select_perf_shapes(perf)
-    # When RANK_SIZE is set, default to the matching Kimi-K3 variant
-    # (small at 2 cards, full at 8); otherwise keep the tiny smoke default.
-    if "RANK_SIZE" in os.environ:
-        return BACKWARD_SHAPES_KIMI_SMALL if rank_size() == 2 else BACKWARD_SHAPES_KIMI
-    return BACKWARD_SHAPES_SMALL
+        shapes = BACKWARD_SHAPES_KIMI
+    elif (perf := os.environ.get("MOE_PERF_CONFIGS")):
+        shapes = select_perf_shapes(perf)
+    elif "RANK_SIZE" in os.environ:
+        # RANK_SIZE set: default to the matching Kimi-K3 variant (small at 2
+        # cards, full at 8).
+        shapes = BACKWARD_SHAPES_KIMI_SMALL if rank_size() == 2 else BACKWARD_SHAPES_KIMI
+    else:
+        shapes = BACKWARD_SHAPES_SMALL
+    # Optional per-rank token filter, mirroring MOE_FULL_BENCH_CONFIG granularity.
+    cfg = os.environ.get("MOE_BACKWARD_BENCH_CONFIG")
+    if cfg:
+        wanted = {int(x) for x in cfg.split(",") if x.strip()}
+        filtered = [s for s in shapes if s.tokens in wanted]
+        if not filtered:
+            raise ValueError(
+                f"MOE_BACKWARD_BENCH_CONFIG={cfg!r} matched no shape; "
+                f"available tokens: {sorted({s.tokens for s in shapes})}"
+            )
+        shapes = filtered
+    return shapes
 
 
 def run_one_bench(shape, ep_group):
