@@ -18,9 +18,9 @@ from ..kernels.fc2_combine import (
     launch_fc2_combine,
     prepare_fc2_combine_metadata,
 )
-from ..kernels.weighted_swiglu import weighted_swiglu_forward
 from ..runtime.routing import MoERoutingPlan, build_routing_plan
 from ..runtime.workspace import create_moe_forward_context
+from ..kernels.weighted_swiglu import weighted_swiglu_forward
 
 
 @dataclass
@@ -37,10 +37,9 @@ class DispatchFC1Result:
 class FusedMoEForward(torch.nn.Module):
     """Optimized fused EP All-to-All + grouped GEMM MoE op for Ascend NPU.
 
-    Dispatch and FC1 overlap through readiness signals.  The default path uses
-    expert-major merged-M windows; retained alternatives cover Qwen,
-    DeepSeek/DSV4, and Kimi shapes until same-snapshot A/B data proves them
-    redundant. ``dispatch_fc1_weighted_swiglu`` extends the supported path
+    Dispatch and FC1 overlap through per-source-tile readiness signals in the
+    fixed all-core expert/N-tile pipeline.
+    ``dispatch_fc1_weighted_swiglu`` extends the supported path
     through weighted SwiGLU. FC2, route transport, route restoration, and
     top-k reduction then run in the dedicated combine kernels.
     """
@@ -58,8 +57,8 @@ class FusedMoEForward(torch.nn.Module):
         """Create one BF16-only post-routing MoE forward instance.
 
         ``ep_group`` must match the complete ACLSHMEM world.  The optional
-        config contains only stage-specific capacity, schedule, and tiling
-        controls; activation and expert-weight dtypes are fixed to BF16.
+        config contains only stage-specific capacity and tiling controls;
+        activation and expert-weight dtypes are fixed to BF16.
         """
         super().__init__()
         if max_tokens_per_rank <= 0:
@@ -93,18 +92,16 @@ class FusedMoEForward(torch.nn.Module):
             self.config.resolved_receive_capacity_factor(self.world_size)
         )
         self.num_aicore_programs = self.config.num_aicore_programs
-        self.dispatch_producer_cores = (
-            self.config.resolved_dispatch_producer_cores()
-        )
-        self.dispatch_readiness = self.config.dispatch_readiness
+        # Keep the public metadata value for provenance; the implementation is
+        # fixed to this validated default and no longer branches on it.
         self.dispatch_fc1_schedule = self.config.dispatch_fc1_schedule
+        # Preserve the target repository optional SiTU-GLU activation.
         self.activation = self.config.activation
         self.situ_beta = self.config.situ_beta
         self.situ_linear_beta = self.config.situ_linear_beta
 
-        # Tile SET slots and expert ADD counters use disjoint signal regions.
+        # Tile SET slots publish per-source-tile readiness for the Cube consumer.
         self._tile_signal_epoch = 1
-        self._expert_signal_epoch = 1
         self.context = create_moe_forward_context(
             max_tokens_per_rank=max_tokens_per_rank,
             hidden_size=hidden_size,
@@ -120,17 +117,11 @@ class FusedMoEForward(torch.nn.Module):
         # dispatch-only stage tests do not pay their memory cost.
         self._combine_fc2_buf = None
         self._route_to_send = None
-        self._fc2_tile_expert = None
-        self._fc2_tile_row_start = None
-        self._fc2_tile_row_count = None
-        self._reverse_tile_rank = None
-        self._reverse_tile_src_start = None
-        self._reverse_tile_dst_start = None
-        self._reverse_tile_row_count = None
-        self._max_fc2_tile_slots = 0
-        self._max_reverse_tile_slots = 0
-        self._dispatch_send_staging = None
-        self._dispatch_route_staging = None
+        self._pull_tile_rank = None
+        self._pull_tile_src_start = None
+        self._pull_tile_dst_start = None
+        self._pull_tile_row_count = None
+        self._max_pull_tile_slots = 0
         self._routing_weights_keepalive = None
 
         # All ranks must observe zeroed symmetric buffers before first use.
@@ -142,18 +133,13 @@ class FusedMoEForward(torch.nn.Module):
         torch.npu.synchronize()
 
     def finalize(self):
-        self._dispatch_send_staging = None
-        self._dispatch_route_staging = None
         self._routing_weights_keepalive = None
         self._combine_fc2_buf = None
         self._route_to_send = None
-        self._fc2_tile_expert = None
-        self._fc2_tile_row_start = None
-        self._fc2_tile_row_count = None
-        self._reverse_tile_rank = None
-        self._reverse_tile_src_start = None
-        self._reverse_tile_dst_start = None
-        self._reverse_tile_row_count = None
+        self._pull_tile_rank = None
+        self._pull_tile_src_start = None
+        self._pull_tile_dst_start = None
+        self._pull_tile_row_count = None
         self.context.finalize()
 
     def _ensure_combine_buffers(self):
@@ -161,26 +147,15 @@ class FusedMoEForward(torch.nn.Module):
         if self._combine_fc2_buf is not None:
             return
 
-        max_recv = self.context.peer_mem.numel() // self.hidden_size
         max_send = self.max_tokens_per_rank * self.top_k
         block_m = self.config.fc2_combine_block_size_m
-        max_m_tiles = (max_recv + block_m - 1) // block_m
-        self._max_fc2_tile_slots = max_m_tiles + self.experts_per_rank
-        if self.config.fc2_combine_transport == "direct_pull":
-            max_transport_tiles = (max_send + block_m - 1) // block_m
-        else:
-            max_transport_tiles = max_m_tiles
-        self._max_reverse_tile_slots = (
-            max_transport_tiles + self.world_size * self.experts_per_rank
-        )
-        combine_rows = (
-            max_send
-            if self.config.fc2_combine_transport == "direct_pull"
-            else max_recv
+        max_send_tiles = (max_send + block_m - 1) // block_m
+        self._max_pull_tile_slots = (
+            max_send_tiles + self.world_size * self.experts_per_rank
         )
         device = self.context.peer_mem.device
         self._combine_fc2_buf = torch.empty(
-            (combine_rows, self.hidden_size),
+            (max_send, self.hidden_size),
             dtype=self.activation_dtype,
             device=device,
         )
@@ -190,13 +165,10 @@ class FusedMoEForward(torch.nn.Module):
         def make_int_workspace(size):
             return torch.empty(size, dtype=torch.int32, device=device)
 
-        self._fc2_tile_expert = make_int_workspace(self._max_fc2_tile_slots)
-        self._fc2_tile_row_start = make_int_workspace(self._max_fc2_tile_slots)
-        self._fc2_tile_row_count = make_int_workspace(self._max_fc2_tile_slots)
-        self._reverse_tile_rank = make_int_workspace(self._max_reverse_tile_slots)
-        self._reverse_tile_src_start = make_int_workspace(self._max_reverse_tile_slots)
-        self._reverse_tile_dst_start = make_int_workspace(self._max_reverse_tile_slots)
-        self._reverse_tile_row_count = make_int_workspace(self._max_reverse_tile_slots)
+        self._pull_tile_rank = make_int_workspace(self._max_pull_tile_slots)
+        self._pull_tile_src_start = make_int_workspace(self._max_pull_tile_slots)
+        self._pull_tile_dst_start = make_int_workspace(self._max_pull_tile_slots)
+        self._pull_tile_row_count = make_int_workspace(self._max_pull_tile_slots)
 
     def _validate_topk_indices(self, selected_experts: torch.Tensor):
         if selected_experts.ndim != 2:
@@ -280,54 +252,31 @@ class FusedMoEForward(torch.nn.Module):
         build_route_to_send(send_route_indices, route_to_send)
 
         block_m = self.config.fc2_combine_block_size_m
-        m_tiles = (plan.num_received_routes + block_m - 1) // block_m
-        num_fc2_slots = m_tiles + self.experts_per_rank
-        direct_pull = self.config.fc2_combine_transport == "direct_pull"
-        if direct_pull:
-            # Sum(ceil(bucket_count / block_m)) is bounded by
-            # ceil(num_sent / block_m) + num_global_experts - 1.
-            sent_tiles = (plan.num_sent_routes + block_m - 1) // block_m
-            num_reverse_slots = (
-                sent_tiles + self.world_size * self.experts_per_rank
-            )
-        else:
-            num_reverse_slots = (
-                m_tiles + self.world_size * self.experts_per_rank
-            )
-        if num_fc2_slots > self._max_fc2_tile_slots:
-            raise ValueError("FC2 tile metadata exceeds its configured workspace")
-        if num_reverse_slots > self._max_reverse_tile_slots:
-            raise ValueError("reverse-A2A tile metadata exceeds its configured workspace")
+        # Sum(ceil(bucket_count / block_m)) is bounded by
+        # ceil(num_sent / block_m) + num_global_experts - 1.
+        sent_tiles = (plan.num_sent_routes + block_m - 1) // block_m
+        num_pull_slots = sent_tiles + self.world_size * self.experts_per_rank
+        if num_pull_slots > self._max_pull_tile_slots:
+            raise ValueError("direct-pull tile metadata exceeds its configured workspace")
 
         prepare_fc2_combine_metadata(
-            plan.receive_counts_by_source_expert,
-            plan.received_expert_offsets,
             self.context.metadata_counts_mem,
             plan.send_bucket_starts,
             plan.send_bucket_receive_offsets,
-            self._fc2_tile_expert,
-            self._fc2_tile_row_start,
-            self._fc2_tile_row_count,
-            self._reverse_tile_rank,
-            self._reverse_tile_src_start,
-            self._reverse_tile_dst_start,
-            self._reverse_tile_row_count,
-            num_fc2_slots,
-            num_reverse_slots,
+            self._pull_tile_rank,
+            self._pull_tile_src_start,
+            self._pull_tile_dst_start,
+            self._pull_tile_row_count,
+            num_pull_slots,
             local_rank=self.rank,
             world_size=self.world_size,
             experts_per_rank=self.experts_per_rank,
             num_bins_pad=self.context.metadata_num_bins,
             block_m=block_m,
-            direct_pull=direct_pull,
-            build_fc2_tiles=(
-                self.config.fc2_gemm_schedule == "tile_n_major"
-            ),
         )
         return {
             "route_to_send": route_to_send,
-            "num_fc2_slots": num_fc2_slots,
-            "num_reverse_slots": num_reverse_slots,
+            "num_pull_slots": num_pull_slots,
         }
 
     # ===================== dispatch + FC1 ===========================
@@ -405,39 +354,6 @@ class FusedMoEForward(torch.nn.Module):
         ].to(torch.int32).contiguous()
 
         num_received_routes = routing_plan.num_received_routes
-        direct_bucket_schedule = self.dispatch_fc1_schedule in (
-            "allcore_expert",
-            "allcore_expert_mn",
-            "allcore_expert_n",
-        )
-        if direct_bucket_schedule:
-            staging_rows = selected_experts.numel()
-            if (
-                self._dispatch_send_staging is None
-                or self._dispatch_send_staging.shape[0] < staging_rows
-            ):
-                self._dispatch_send_staging = torch.empty(
-                    (staging_rows, hidden_size),
-                    dtype=self.activation_dtype,
-                    device=device,
-                )
-                self._dispatch_route_staging = torch.empty(
-                    staging_rows, dtype=torch.float32, device=device
-                )
-            num_sent_routes = routing_plan.num_sent_routes
-            torch.index_select(
-                hidden_states,
-                0,
-                routing_plan.send_token_indices,
-                out=self._dispatch_send_staging[:num_sent_routes],
-            )
-            torch.index_select(
-                routing_weights.view(-1),
-                0,
-                send_route_indices,
-                out=self._dispatch_route_staging[:num_sent_routes],
-            )
-
         # Present a logical [expert, N, K] view without materializing a second
         # multi-GiB weight table.  N remains contiguous in the physical KN
         # model-load layout.
@@ -479,20 +395,11 @@ class FusedMoEForward(torch.nn.Module):
         dispatched_tokens = self.context.peer_mem[
             :num_received_routes * hidden_size
         ].view(num_received_routes, hidden_size)
-        tile_readiness = self.dispatch_readiness == "tile"
-        signal_epoch = (
-            self._tile_signal_epoch if tile_readiness else self._expert_signal_epoch
-        )
+        signal_epoch = self._tile_signal_epoch
         _kernel_dispatch_fc1[self.num_aicore_programs, 1, 1](
             hidden_states,
-            self._dispatch_send_staging
-            if direct_bucket_schedule
-            else hidden_states,
             self.context.peer_mem,
             routing_weights,
-            self._dispatch_route_staging
-            if direct_bucket_schedule
-            else routing_weights,
             self.context.routing_weight_mem,
             self.context.signal_mem,
             weight_for_gemm,
@@ -516,40 +423,17 @@ class FusedMoEForward(torch.nn.Module):
             weight_for_gemm.stride(2),
             output.stride(0),
             output.stride(1),
-            N_DISPATCH_CORES=self.dispatch_producer_cores,
-            NUM_CONSUMER_CORES=(
-                self.num_aicore_programs - self.dispatch_producer_cores
-            ),
             NUM_PROGRAM_CORES=self.num_aicore_programs,
             LOCAL_RANK=self.rank,
             WORLD_SIZE=self.world_size,
             EXPERTS_PER_RANK=self.experts_per_rank,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
-            TILE_READINESS=tile_readiness,
-            COUNT_DERIVED_SCHEDULE=self.dispatch_fc1_schedule == "count",
-            ALL_CORE_PIPELINE=self.dispatch_fc1_schedule
-            in (
-                "allcore",
-                "allcore_expert",
-                "allcore_expert_mn",
-                "allcore_expert_n",
-                "allcore_expert_n_tile",
-            ),
-            DIRECT_EXPERT_DISPATCH=direct_bucket_schedule,
-            EXPERT_N_TILE_CONSUMER=(
-                self.dispatch_fc1_schedule == "allcore_expert_n_tile"
-            ),
-            MN_TILE_FC1=self.dispatch_fc1_schedule == "allcore_expert_mn",
-            N_TILE_FC1=self.dispatch_fc1_schedule == "allcore_expert_n",
             FINAL_BARRIER=final_barrier,
             BLOCK_SIZE_M=block_m,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
         )
-        if tile_readiness:
-            self._tile_signal_epoch += 1
-        else:
-            self._expert_signal_epoch += 1
+        self._tile_signal_epoch += 1
 
         received_routing_weights = self.context.routing_weight_mem[
             :num_received_routes
@@ -571,9 +455,8 @@ class FusedMoEForward(torch.nn.Module):
     ) -> torch.Tensor:
         """Apply the configured gated activation and route scaling in FP32.
 
-        ``self.activation`` selects between SwiGLU (``"swiglu"``) and SiTU-GLU
-        (``"situglu"``); ``self.situ_beta`` / ``self.situ_linear_beta`` configure
-        the SiTU-GLU branch and are ignored for SwiGLU.
+        self.activation selects SwiGLU or SiTU-GLU.  The activation
+        parameters are ignored for the default SwiGLU path.
         """
         return weighted_swiglu_forward(
             dispatch_result.fc1_output,
@@ -730,14 +613,9 @@ class FusedMoEForward(torch.nn.Module):
                 "FC2 block_n and block_k must divide the output and reduction dimensions"
             )
         combine_metadata = self._prepare_combine_metadata(dispatch_result)
-        direct_pull = self.config.fc2_combine_transport == "direct_pull"
-        # Reverse push uses this buffer for local FC2 rows.  Direct pull writes
-        # FC2 to peer_mem, then pulls remote bucket segments into this ordinary
-        # local workspace in stable-send order before the top-k reduction.
-        workspace_rows = (
-            plan.num_sent_routes if direct_pull else num_received_routes
-        )
-        fc2_workspace = self._combine_fc2_buf[:workspace_rows]
+        # FC2 writes symmetric rows, then direct pull restores them into this
+        # ordinary local workspace in stable-send order before top-k reduction.
+        fc2_workspace = self._combine_fc2_buf[:plan.num_sent_routes]
         launch_fc2_combine(
             weighted_activation,
             down_weight,
@@ -747,30 +625,18 @@ class FusedMoEForward(torch.nn.Module):
             output,
             plan.received_routes_per_expert,
             plan.received_expert_offsets,
-            self._fc2_tile_expert,
-            self._fc2_tile_row_start,
-            self._fc2_tile_row_count,
-            self._reverse_tile_rank,
-            self._reverse_tile_src_start,
-            self._reverse_tile_dst_start,
-            self._reverse_tile_row_count,
-            combine_metadata["num_fc2_slots"],
-            combine_metadata["num_reverse_slots"],
+            self._pull_tile_rank,
+            self._pull_tile_src_start,
+            self._pull_tile_dst_start,
+            self._pull_tile_row_count,
+            combine_metadata["num_pull_slots"],
             plan.num_sent_routes,
             topk=self.top_k,
-            num_cores=self.num_aicore_programs,
+            num_program_cores=self.num_aicore_programs,
             block_m=self.config.fc2_combine_block_size_m,
             block_n=block_n,
             block_k=block_k,
             world_size=self.world_size,
-            expert_n_persistent=(
-                self.config.fc2_gemm_schedule == "expert_n_persistent"
-            ),
-            direct_pull=direct_pull,
-            reverse_vector_workers=(
-                self.config.fc2_reverse_vector_workers
-            ),
-            reduce_vector_workers=self.config.fc2_reduce_vector_workers,
         )
         return output
 

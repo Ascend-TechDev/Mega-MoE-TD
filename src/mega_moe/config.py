@@ -6,55 +6,38 @@ from typing import Optional
 
 
 _DISPATCH_FC1_SCHEDULES = (
-    "static",
-    "count",
-    "allcore",
-    "allcore_expert",
-    "allcore_expert_mn",
-    "allcore_expert_n",
     "allcore_expert_n_tile",
 )
 
-_FC2_GEMM_SCHEDULES = (
-    "tile_n_major",
-    "expert_n_persistent",
-)
 
-_FC2_COMBINE_TRANSPORTS = (
-    "reverse_push",
-    "direct_pull",
-)
-
-# Supported post-FC1 gated activations.  ``swiglu`` is ``silu(gate) * up``;
-# ``situglu`` is ``beta * tanh(gate / beta) * sigmoid(gate) * up`` (with an
-# optional ``linear_beta * tanh(up / linear_beta)`` transform on ``up``).
+# Supported post-FC1 gated activations.  swiglu is silu(gate) * up;
+# situglu is beta * tanh(gate / beta) * sigmoid(gate) * up (with an
+# optional linear_beta * tanh(up / linear_beta) transform on up).
 _ACTIVATIONS = (
     "swiglu",
     "situglu",
 )
 
+
 @dataclass(frozen=True)
 class MoEForwardConfig:
     """Stage-specific launch and tiling parameters.
 
-    Defaults select the current Kimi-K3 best path, while the retained schedule
-    controls cover Qwen, DeepSeek/DSV4, and Kimi shapes that do not yet have a
-    same-snapshot cross-profile A/B result.  FC1 and FC2 tiles are deliberately
-    independent because they have different shapes and data-movement paths.
+    FC1 uses the fixed all-core expert/N-tile pipeline.  FC1 and FC2 tiles
+    remain independent because they have different shapes and data-movement
+    paths.
 
     ``dispatch_fc1_block_size_m`` controls both dispatch readiness slots and
     FC1 dot rows; ``fc1_gemm_block_size_{n,k}`` control the other FC1 dot axes.
-    Likewise, ``fc2_combine_block_size_m`` controls FC2/reverse-A2A row tiles, while
-    ``fc2_gemm_block_size_{n,k}`` control only FC2 dot tiles.
-    ``fc2_gemm_schedule`` selects the original N-major tile pool or the
-    expert-N persistent implementation.  ``fc2_combine_transport`` selects
-    reverse push or direct pull, which leaves FC2 rows in symmetric memory.
-    ``fc2_reverse_vector_workers`` and ``fc2_reduce_vector_workers``
-    independently select one or both Vector sub-cores per AI Core for the
-    reverse-A2A and final token-reduction A/B experiments.
-    ``dispatch_producer_cores`` is used by the split-role ``static`` and
-    ``count`` schedules.  All-core schedules still receive the resolved value
-    as a compile-time argument, but do not assign fixed producer-only cores.
+    Likewise, ``fc2_combine_block_size_m`` controls FC2/direct-pull row tiles,
+    while ``fc2_gemm_block_size_{n,k}`` control only FC2 dot tiles.  FC2 uses
+    the measured persistent expert-N GEMM, direct-pull transport, and both
+    Vector sub-cores for reduction; dominated A/B controls are not public
+    configuration fields.  The post-FC1 activation remains selectable for
+    compatibility with the target repository SiTU-GLU path.
+
+    activation selects SwiGLU or SiTU-GLU; situ_beta and situ_linear_beta
+    configure the latter and are ignored for SwiGLU.
     """
 
     num_aicore_programs: int = 24
@@ -65,20 +48,10 @@ class MoEForwardConfig:
     fc2_combine_block_size_m: int = 128
     fc2_gemm_block_size_n: int = 256
     fc2_gemm_block_size_k: int = 128
-    fc2_gemm_schedule: str = "expert_n_persistent"
-    fc2_combine_transport: str = "direct_pull"
-    fc2_reverse_vector_workers: int = 1
-    fc2_reduce_vector_workers: int = 2
-    dispatch_producer_cores: Optional[int] = None
-    dispatch_readiness: str = "tile"
     dispatch_fc1_schedule: str = "allcore_expert_n_tile"
 
-    # Post-FC1 gated activation.  ``swiglu`` (default) preserves the original
-    # ``silu(gate) * up`` path; ``situglu`` selects SiTU-GLU
-    # (``beta * tanh(gate / beta) * sigmoid(gate) * up``).  ``situ_beta`` is the
-    # gate tanh width; ``situ_linear_beta`` optionally applies
-    # ``linear_beta * tanh(up / linear_beta)`` to the up projection (None leaves
-    # ``up`` unchanged).  Both are ignored when ``activation == "swiglu"``.
+    # Post-FC1 gated activation.  swiglu (default) preserves the original
+    # silu(gate) * up path; situglu selects SiTU-GLU.
     activation: str = "swiglu"
     situ_beta: float = 1.0
     situ_linear_beta: Optional[float] = None
@@ -100,30 +73,6 @@ class MoEForwardConfig:
 
         if self.receive_capacity_factor is not None and self.receive_capacity_factor < 1.0:
             raise ValueError("receive_capacity_factor must be at least 1")
-        if self.fc2_gemm_schedule not in _FC2_GEMM_SCHEDULES:
-            raise ValueError(
-                "fc2_gemm_schedule must be one of "
-                + ", ".join(repr(value) for value in _FC2_GEMM_SCHEDULES)
-            )
-        if self.fc2_combine_transport not in _FC2_COMBINE_TRANSPORTS:
-            raise ValueError(
-                "fc2_combine_transport must be one of "
-                + ", ".join(
-                    repr(value) for value in _FC2_COMBINE_TRANSPORTS
-                )
-            )
-        if (
-            type(self.fc2_reverse_vector_workers) is not int
-            or self.fc2_reverse_vector_workers not in (1, 2)
-        ):
-            raise ValueError("fc2_reverse_vector_workers must be 1 or 2")
-        if (
-            type(self.fc2_reduce_vector_workers) is not int
-            or self.fc2_reduce_vector_workers not in (1, 2)
-        ):
-            raise ValueError("fc2_reduce_vector_workers must be 1 or 2")
-        if self.dispatch_readiness not in ("expert", "tile"):
-            raise ValueError("dispatch_readiness must be 'expert' or 'tile'")
         if self.activation not in _ACTIVATIONS:
             raise ValueError(
                 "activation must be one of "
@@ -146,37 +95,12 @@ class MoEForwardConfig:
                 "dispatch_fc1_schedule must be one of "
                 + ", ".join(repr(value) for value in _DISPATCH_FC1_SCHEDULES)
             )
-        expert_schedules = {
-            "allcore_expert",
-            "allcore_expert_mn",
-            "allcore_expert_n",
-        }
-        if self.dispatch_fc1_schedule in expert_schedules and self.dispatch_readiness != "expert":
-            raise ValueError(
-                f"{self.dispatch_fc1_schedule} requires dispatch_readiness='expert'"
-            )
-        tile_schedules = {"count", "allcore", "allcore_expert_n_tile"}
-        if self.dispatch_fc1_schedule in tile_schedules and self.dispatch_readiness != "tile":
-            raise ValueError(
-                f"{self.dispatch_fc1_schedule} requires dispatch_readiness='tile'"
-            )
-        producer_cores = self.dispatch_producer_cores
-        if producer_cores is not None and not 0 < producer_cores < self.num_aicore_programs:
-            raise ValueError(
-                "dispatch_producer_cores must be in [1, num_aicore_programs)"
-            )
 
     def resolved_receive_capacity_factor(self, world_size: int) -> float:
         """Return the configured capacity, or the worst-case-safe default."""
         if self.receive_capacity_factor is None:
             return float(world_size)
         return float(self.receive_capacity_factor)
-
-    def resolved_dispatch_producer_cores(self) -> int:
-        """Return the producer-core count used by split-role schedules."""
-        if self.dispatch_producer_cores is not None:
-            return self.dispatch_producer_cores
-        return max(1, min(self.num_aicore_programs - 1, self.num_aicore_programs // 5))
 
 
 __all__ = ["MoEForwardConfig"]
