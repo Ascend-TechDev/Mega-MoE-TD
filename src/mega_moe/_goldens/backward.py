@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # ============================================================================
-#  tests/_goldens/backward.py
+#  src/mega_moe/_goldens/backward.py
 #
 #  Pure torch + hccl MoE backward golden reference.
 #
@@ -24,12 +24,12 @@
 #  autograd (output.backward(dy)) on every grad tensor.
 #
 #  The forward and grouped-matmul primitives live in
-#  ``mega_moe.runtime._torch_forward_for_backward`` (the production differentiable forward reused
+#  ``mega_moe._goldens._torch_forward_for_backward`` (the production differentiable forward reused
 #  by ``MegaMoEBackwardFunction``); this module imports them so the golden and
 #  the production path share one source of truth.
 #
 #  Usage:
-#    torchrun --nproc-per-node=2 -m tests._goldens.backward
+#    torchrun --nproc-per-node=2 -m mega_moe._goldens.backward
 # ============================================================================
 
 import os
@@ -37,7 +37,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from mega_moe.runtime._torch_forward_for_backward import (
+from mega_moe._goldens._torch_forward_for_backward import (
     grouped_matmul,
     grouped_transposed_matmul,
     moe_forward,
