@@ -32,18 +32,19 @@ src/mega_moe/
 ├── config.py                 # 前向配置与调度参数校验
 ├── ops/
 │   ├── forward.py            # 完整前向编排与输入校验
-│   ├── backward.py           # 五阶段反向编排及 autograd.Function
-│   └── _torch_forward.py     # 可微 torch 前向（被 backward 复用）
+│   └── backward.py           # 五阶段反向编排及 autograd.Function
 ├── runtime/
 │   ├── workspace.py          # ACLSHMEM 对称内存及 workspace 生命周期
 │   └── routing.py            # 路由过滤、排序、计数交换和 offset
-└── kernels/                  # Triton JIT kernels 及 launcher
+├── kernels/                  # Triton JIT kernels 及 launcher
+└── _goldens/                 # torch golden 参考实现（前向 moe_forward + 后向 moe_backward_torch）
+    ├── _torch_forward_for_backward.py  # 可微 torch 前向（被 backward 复用）
+    └── backward.py
 
 tests/
 ├── conftest.py               # @pytest.mark.dist 多进程 HCCL 启动夹具
 ├── _moe_dist_utils.py        # 多卡测试/基准共享工具（ACLSHMEM、peer_mem 等）
 ├── _numeric.py               # 数值比较阈值与判定
-├── _goldens/                 # torch golden 参考实现（backward）
 ├── layer/                    # 完整前向/反向流程测试
 └── kernel/{forward,backward}/  # kernel 级单测（占位）
 
