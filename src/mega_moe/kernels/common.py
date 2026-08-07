@@ -32,10 +32,33 @@ WGRAD_BLOCK_K = 256
 
 
 def ncore():
-    """Physical AICore count — launch grids must not exceed it."""
-    n = NPUUtils().get_aicore_num()
-    assert n <= 24, "launch grid must not exceed physical aicore num"
-    return n
+    """Return the device-reported physical AICore count."""
+    return validate_physical_aicore_count(NPUUtils().get_aicore_num())
+
+
+def validate_physical_aicore_count(value):
+    """Require an exact positive device-reported physical AICore count.
+
+    This replaces `assert n <= 24`. That bound could not be satisfied by any
+    Ascend950 part actually in service: CANN 9.1.0's platform table lists
+    950PR 957b/9579/957c/957d = 28, 950PR 9589/958b = 32, 950DT 958x = 32,
+    950DT 959x/95Ax = 36; the only <= 24 entry is 950PR_950z = 4, which is not
+    deployed. Measured on Ascend950DT_9582: get_aicore_num() = 32.
+
+    The failure was silent rather than loud. `ncore()` is called only from the
+    backward kernels, so every backward shape raised, `run_benchmark` caught the
+    exception per shape and printed `[skip]`, and the benchmark still exited 0
+    with `"configs": []` -- a green run that measured nothing. The forward path
+    is unaffected because it uses `config.num_aicore_programs` instead.
+
+    What is still checked: the value must be an exact positive int. A bool, a
+    float, 0 or a negative would previously have flowed into a launch grid.
+    """
+    if type(value) is not int or value <= 0:
+        raise RuntimeError(
+            f"physical AICore count must be a positive integer, got {value!r}"
+        )
+    return value
 
 
 def all_gather_list(t, group):
