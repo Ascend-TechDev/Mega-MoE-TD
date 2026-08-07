@@ -12,21 +12,54 @@ from .common import ncore, WGRAD_BLOCK_M, WGRAD_BLOCK_N, WGRAD_BLOCK_K
 
 
 # grad_weight[e][n][k] = sum_m grad_out[m,n] * orig_in[m,k] = grad_out^T @ orig_in
-# tl.dot has no trans_a on this build. Loading grad_out as a transposed
-# [BLOCK_N, BLOCK_M] tile directly from [M,N] is a stride-N gather per vector
-# (non-contiguous), which triggers a UB bus error on Ascend. Instead we
-# pre-transpose grad_out -> grad_out_T [N,M] contiguous in Python, so each
-# tile-row (fixed n) reads contiguous m (stride 1). Then a=[BLOCK_N,BLOCK_M]
-# (contig) @ b=[BLOCK_M,BLOCK_K] (contig) -> acc [BLOCK_N, BLOCK_K]. Tiles
-# (e, n, k) are unique and non-overlapping -> no atomics.
+#
+# grad_out is read in its NATURAL [M, N] layout and transposed inside the tile.
+#
+# The previous version materialised grad_out^T as an [N, M] tensor in Python. Its
+# comment justified that by a real constraint -- loading a [BLOCK_N, BLOCK_M] tile
+# *directly* out of [M, N] is a stride-N gather per vector and faults on Ascend --
+# and that constraint still holds. What is done here is a different operation and
+# does not hit it: the tile is loaded along its natural axes as [BLOCK_M, BLOCK_N]
+# (contiguous in n) and then transposed in-register with tl.trans, so no strided
+# gather is ever issued.
+#
+# WHY IT MATTERS, measured (Ascend950DT_9582, single card, non-bytecode path, grid
+# pinned 24, Qwen3-30B-A3B shapes, 64 experts/rank, bf16):
+#
+#   the [N, M] layout made the a-tile's BLOCK_N rows `stride = M` apart, so the
+#   tile's address span GREW WITH THE TOKEN COUNT: 64 KB at M=32768, 128 KB at
+#   M=65536. Time per unit work was flat up to M=32768 and then collapsed.
+#
+#     tokens 16384 (M=65536)   step 3  6.878 ms -> 1.502 ms   4.58x
+#                              step 5 13.813 ms -> 2.900 ms   4.76x
+#     tokens 4096 / 8192       1.00-1.01x  (no regression, and no gain -- these
+#                              shapes were never collapsing)
+#     outputs bit-identical at every shape (max |diff| = 0.000e+00)
+#
+#   Controls behind those numbers: an A/A negative control in the same runs read
+#   1.0008-1.0023, so the effects are far above what the harness can confuse; the
+#   cause was isolated to M rather than to the m-loop trip count (M fixed + trips
+#   doubled = 0.97x; trips fixed + M doubled = 4.53x) and to footprint rather than
+#   stride aliasing (padding the physical row stride changed nothing).
+#
+#   Reading grad_out[m, n] directly fixes the a-tile row stride at N, independent
+#   of M, which is what removes the growth term. Tile sizes are untouched -- this
+#   is not a retune, and tile tuning cannot substitute for it.
+#
+# ⚠️ Not established: the effect on end-to-end backward (steps 1 and 4 are
+# comm-fused and were not measured), and the numbers above are this part's; A3 has
+# different cache geometry so the threshold and magnitude will differ there, though
+# the mechanism (stride grows with M) is layout-determined and structural.
+#
+# Tiles (e, n, k) are unique and non-overlapping -> no atomics.
 @triton.jit
 def kernel_transposed_grouped_gemm(
-    grad_out_T_ptr,           # [N, M] contiguous (grad_out transposed)
+    grad_out_ptr,             # [M, N] contiguous (natural layout, NOT transposed)
     orig_in_ptr,              # [M, K] contiguous
     grad_w_ptr,               # [E, N, K]
     split_size_cum_per_expert_ptr, expert_counts_ptr,
     N: tl.constexpr, K: tl.constexpr, E, num_tiles_n: tl.constexpr, num_tiles_k: tl.constexpr,
-    stride_tn, stride_tm,     # grad_out_T: (M, 1)
+    stride_gm, stride_gn,     # grad_out:  (N, 1) -- row stride independent of M
     stride_om, stride_ok,     # orig_in:   (K, 1)
     stride_we, stride_wn, stride_wk,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -52,9 +85,11 @@ def kernel_transposed_grouped_gemm(
         for m in range(0, split_size, BLOCK_M):
             mm = m + offs_m
             mmask = mm < split_size
-            # a[n, m] = grad_out_T[n, split_begin+m]  (contiguous in m)
-            a_off = (n_start + offs_n[:, None]) * stride_tn + (split_begin + mm[None, :]) * stride_tm
-            a = tl.load(grad_out_T_ptr + a_off, mask=nmask[:, None] & mmask[None, :], other=0.0)
+            # a_raw[m, n] = grad_out[split_begin+m, n_start+n]  (contiguous in n; rows
+            # stride_gm = N apart, i.e. independent of how many tokens there are)
+            a_off = (split_begin + mm[:, None]) * stride_gm + (n_start + offs_n[None, :]) * stride_gn
+            a_raw = tl.load(grad_out_ptr + a_off, mask=mmask[:, None] & nmask[None, :], other=0.0)
+            a = tl.trans(a_raw)          # -> [BLOCK_N, BLOCK_M], no strided gather issued
             # b[m, k] = orig_in[split_begin+m, k_start+k]  (contiguous in k)
             b_off = (split_begin + mm[:, None]) * stride_om + (k_start + offs_k[None, :]) * stride_ok
             b = tl.load(orig_in_ptr + b_off, mask=mmask[:, None] & kmask[None, :], other=0.0)
@@ -70,7 +105,9 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     M, N = grad_out.shape
     K = orig_in.shape[1]
     E = int(expert_counts.shape[0])
-    grad_out_T = grad_out.T.contiguous()       # [N, M], makes the a-tile contiguous
+    # No .T.contiguous() here: materialising [N, M] is what made the a-tile's row
+    # stride grow with the token count. See the kernel header for the measurements.
+    grad_out_c = grad_out.contiguous()
     orig_in_c = orig_in.contiguous()
     dev = grad_out.device
     split_size_cum_per_expert = split_size_cum_per_expert.to(dev)
@@ -80,10 +117,10 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     num_tn = (N + WGRAD_BLOCK_N - 1) // WGRAD_BLOCK_N
     num_tk = (K + WGRAD_BLOCK_K - 1) // WGRAD_BLOCK_K
     kernel_transposed_grouped_gemm[(ncore(), 1, 1)](
-        grad_out_T, orig_in_c, grad_w,
+        grad_out_c, orig_in_c, grad_w,
         split_size_cum_per_expert, expert_counts,
         N, K, E, num_tn, num_tk,
-        grad_out_T.stride(0), grad_out_T.stride(1), orig_in_c.stride(0), orig_in_c.stride(1),
+        grad_out_c.stride(0), grad_out_c.stride(1), orig_in_c.stride(0), orig_in_c.stride(1),
         grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
         BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K, num_warps=8,
         use_bytecode=True)
