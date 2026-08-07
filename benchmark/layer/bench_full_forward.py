@@ -44,13 +44,6 @@ Environment:
     MOE_FULL_BENCH_ACTIVE_EXPERTS=16       # optional sparse mode override;
                                            # must be >= top-k and divisible by W
     MOE_FUSED_NUM_AICORE_PROGRAMS=24      # 910B1 default; override for other devices
-    MOE_FUSED_DISPATCH_PRODUCER_CORES=4   # static/count schedules only
-    MOE_FUSED_DISPATCH_READINESS=tile|expert
-    MOE_FUSED_DISPATCH_FC1_SCHEDULE=static|count|allcore|allcore_expert|allcore_expert_mn|allcore_expert_n|allcore_expert_n_tile
-    MOE_FUSED_FC2_GEMM_SCHEDULE=tile_n_major|expert_n_persistent
-    MOE_FUSED_FC2_COMBINE_TRANSPORT=reverse_push|direct_pull
-    MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS=1|2  # reverse_push only
-    MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS=1|2
     MOE_FULL_BENCH_RESULTS_DIR=/tmp/...   # optional experimental output directory
     MOE_FULL_BENCH_CAPACITY=1.25          # optional active-profile override;
                                            # use 4.0 or unset for default DSV4
@@ -217,10 +210,7 @@ def _required_ash_bytes(tokens_per_rank, world_size):
     max_source_tiles = (
         tokens_per_rank * TOPK + dispatch_tile_m - 1
     ) // dispatch_tile_m
-    signal_slots = (
-        world_size * experts_per_rank * max_source_tiles
-        + experts_per_rank
-    )
+    signal_slots = world_size * experts_per_rank * max_source_tiles
     signal_bytes = signal_slots * 16 * torch.int32.itemsize
     metadata_bins = 1 << (NUM_EXPERTS - 1).bit_length()
     metadata_bytes = world_size * metadata_bins * torch.int32.itemsize
@@ -250,33 +240,6 @@ def _layer_tiling_overrides():
             raise ValueError(f"{env_name} must be a positive power of two")
         overrides[parameter_name] = value
 
-    return overrides
-
-
-def _layer_schedule_overrides():
-    """Read explicit A/B schedule controls; production defaults stay in config."""
-    overrides = {}
-    for env_name, parameter_name in (
-        ("MOE_FUSED_DISPATCH_READINESS", "dispatch_readiness"),
-        ("MOE_FUSED_DISPATCH_FC1_SCHEDULE", "dispatch_fc1_schedule"),
-        ("MOE_FUSED_FC2_GEMM_SCHEDULE", "fc2_gemm_schedule"),
-        ("MOE_FUSED_FC2_COMBINE_TRANSPORT", "fc2_combine_transport"),
-    ):
-        if env_name in os.environ:
-            overrides[parameter_name] = os.environ[env_name]
-    for env_name, parameter_name in (
-        ("MOE_FUSED_DISPATCH_PRODUCER_CORES", "dispatch_producer_cores"),
-        (
-            "MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS",
-            "fc2_reverse_vector_workers",
-        ),
-        (
-            "MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS",
-            "fc2_reduce_vector_workers",
-        ),
-    ):
-        if env_name in os.environ:
-            overrides[parameter_name] = int(os.environ[env_name])
     return overrides
 
 
@@ -1190,21 +1153,14 @@ def _make_entry(
             "benchmark_iters": BENCH_ITERS,
             "sample_rank_reduction": "MAX before statistics",
             "receive_capacity_factor": CAPACITY,
-            "dispatch_readiness": op.config.dispatch_readiness,
+            "dispatch_readiness": "tile",
             "dispatch_fc1_schedule": op.config.dispatch_fc1_schedule,
-            "dispatch_producer_cores": (
-                op.dispatch_producer_cores
-                if op.config.dispatch_fc1_schedule in {"static", "count"}
-                else None
-            ),
-            "fc2_gemm_schedule": op.config.fc2_gemm_schedule,
-            "fc2_combine_transport": op.config.fc2_combine_transport,
-            "fc2_reverse_vector_workers": (
-                op.config.fc2_reverse_vector_workers
-                if op.config.fc2_combine_transport == "reverse_push"
-                else None
-            ),
-            "fc2_reduce_vector_workers": op.config.fc2_reduce_vector_workers,
+            "dispatch_producer_cores": None,
+            "fc2_gemm_schedule": "expert_n_persistent",
+            "fc2_combine_transport": "direct_pull",
+            "fc2_reverse_vector_workers": None,
+            "fc2_reduce_vector_workers": 2,
+            "fc2_reduce_programs": op.num_aicore_programs * 2,
             "tiles": {
                 "dispatch_fc1_m": op.config.dispatch_fc1_block_size_m,
                 "fc1_gemm_n": op.config.fc1_gemm_block_size_n,
@@ -1362,7 +1318,6 @@ def run_benchmark(rank, world_size, model_name=None):
         os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
     )
     tiling_overrides = _layer_tiling_overrides()
-    schedule_overrides = _layer_schedule_overrides()
     entries = []
 
     if rank == 0:
@@ -1383,7 +1338,6 @@ def run_benchmark(rank, world_size, model_name=None):
                 num_aicore_programs=num_aicore_programs,
                 receive_capacity_factor=CAPACITY,
                 **tiling_overrides,
-                **schedule_overrides,
             )
             op = FusedMoEForward(
                 ep_group,

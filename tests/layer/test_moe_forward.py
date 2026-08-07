@@ -21,6 +21,7 @@ negative or out-of-range expert ids are dropped.  Empty-receive and all-drop ran
 still enter every collective, so asymmetric routing cannot deadlock the golden.
 
 Usage:
+    source /home/w00845909/distribution/Triton-distributed-ascend/run.sh
     python -m pytest tests/layer/test_moe_forward.py -m dist -v -s
 """
 
@@ -30,8 +31,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import shmem as ash
 import torch.distributed as dist
+import shmem as ash
 
 from mega_moe import FusedMoEForward, MoEForwardConfig, pack_gate_up_weights
 import mega_moe.kernels.dispatch_fc1 as dispatch_fc1_module
@@ -459,12 +460,19 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
         msgs.append(f"expert shape kernel={tuple(kernel_exp.shape)} golden={tuple(golden_exp.shape)}")
     if ok:
         try:
-            torch.testing.assert_close(kernel_exp, golden_exp, rtol=LAYOUT_RTOL, atol=LAYOUT_ATOL)
+            torch.testing.assert_close(
+                kernel_exp, golden_exp, rtol=LAYOUT_RTOL, atol=LAYOUT_ATOL
+            )
         except AssertionError as exc:
             ok = False
             msgs.append(f"expert layout mismatch: {str(exc).splitlines()[0]}")
         try:
-            torch.testing.assert_close(kernel_out.float(), golden_out.float(), rtol=APPROX_RTOL, atol=APPROX_ATOL)
+            torch.testing.assert_close(
+                kernel_out.float(),
+                golden_out.float(),
+                rtol=APPROX_RTOL,
+                atol=APPROX_ATOL,
+            )
         except AssertionError:
             ok = False
             diff = (kernel_out.float() - golden_out.float()).abs()
@@ -483,7 +491,12 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
                             f"mean={expert_diff.mean().item():.4f}"
                         )
         try:
-            torch.testing.assert_close(kernel_dispatch.float(), golden_dispatch.float(), rtol=LAYOUT_RTOL, atol=LAYOUT_ATOL)
+            torch.testing.assert_close(
+                kernel_dispatch.float(),
+                golden_dispatch.float(),
+                rtol=LAYOUT_RTOL,
+                atol=LAYOUT_ATOL,
+            )
         except AssertionError:
             ok = False
             diff = (kernel_dispatch.float() - golden_dispatch.float()).abs()
@@ -558,7 +571,12 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
             ok = False
             msgs.append("kernel output contains non-finite values")
         try:
-            torch.testing.assert_close(actual_fp32, expected_fp32, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+            torch.testing.assert_close(
+                actual_fp32,
+                expected_fp32,
+                rtol=OUTPUT_RTOL,
+                atol=OUTPUT_ATOL,
+            )
         except AssertionError:
             ok = False
             diff = (actual_fp32 - expected_fp32).abs()
@@ -584,7 +602,7 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
 #  Configs & worker
 # ---------------------------------------------------------------------------
 
-from config import FORWARD_SHAPES as CONFIGS, FORWARD_SHAPES_KIMI
+from config import FORWARD_SHAPES, FORWARD_SHAPES_KIMI
 
 
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
@@ -717,16 +735,10 @@ def run_test(rank, world_size):
     all_passed = True
 
     only_config = os.environ.get("MOE_FUSED_TEST_CONFIG")
-    # FORWARD_SHAPES is the light default smoke (incl. Kimi-K3-small). The full
-    # 896-expert Kimi-K3 (FORWARD_SHAPES_KIMI) is opt-in via MOE_KIMI=1, mirroring
-    # the backward test; it needs >=4 cards, so it is off for 2-rank runs.
-    base_configs = CONFIGS + (
-        FORWARD_SHAPES_KIMI if os.environ.get("MOE_KIMI") == "1" else []
-    )
-    configs = [
-        config for config in base_configs
-        if only_config in (None, config.label)
-    ]
+    base_configs = list(FORWARD_SHAPES)
+    if os.environ.get("MOE_KIMI") == "1":
+        base_configs.extend(FORWARD_SHAPES_KIMI)
+    configs = [config for config in base_configs if only_config in (None, config.label)]
 
     for config in configs:
         label = config.label
@@ -755,35 +767,12 @@ def run_test(rank, world_size):
         ):
             if env_name in os.environ:
                 tiling_overrides[parameter_name] = int(os.environ[env_name])
-        schedule_overrides = {}
-        for env_name, parameter_name in (
-            ("MOE_FUSED_DISPATCH_READINESS", "dispatch_readiness"),
-            ("MOE_FUSED_DISPATCH_FC1_SCHEDULE", "dispatch_fc1_schedule"),
-            ("MOE_FUSED_FC2_GEMM_SCHEDULE", "fc2_gemm_schedule"),
-            ("MOE_FUSED_FC2_COMBINE_TRANSPORT", "fc2_combine_transport"),
-        ):
-            if env_name in os.environ:
-                schedule_overrides[parameter_name] = os.environ[env_name]
-        for env_name, parameter_name in (
-            ("MOE_FUSED_DISPATCH_PRODUCER_CORES", "dispatch_producer_cores"),
-            (
-                "MOE_FUSED_FC2_REVERSE_VECTOR_WORKERS",
-                "fc2_reverse_vector_workers",
-            ),
-            (
-                "MOE_FUSED_FC2_REDUCE_VECTOR_WORKERS",
-                "fc2_reduce_vector_workers",
-            ),
-        ):
-            if env_name in os.environ:
-                schedule_overrides[parameter_name] = int(os.environ[env_name])
         forward_config = MoEForwardConfig(
             num_aicore_programs=int(
                 os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
             ),
             receive_capacity_factor=float(world_size),
             **tiling_overrides,
-            **schedule_overrides,
         )
         optimized_op = FusedMoEForward(
             None,
@@ -986,7 +975,7 @@ def test_public_api_has_only_bf16_and_current_combine_arguments():
     assert "gemm_BLOCK_SIZE_N" not in combine_parameters
 
 
-def test_config_keeps_multi_profile_candidates_and_best_defaults():
+def test_config_keeps_fixed_fc1_schedule_and_best_defaults():
     config = MoEForwardConfig()
     assert config.num_aicore_programs == 24
     assert config.dispatch_fc1_block_size_m == 128
@@ -995,12 +984,7 @@ def test_config_keeps_multi_profile_candidates_and_best_defaults():
     assert config.fc2_combine_block_size_m == 128
     assert config.fc2_gemm_block_size_n == 256
     assert config.fc2_gemm_block_size_k == 128
-    assert config.dispatch_readiness == "tile"
     assert config.dispatch_fc1_schedule == "allcore_expert_n_tile"
-    assert config.fc2_gemm_schedule == "expert_n_persistent"
-    assert config.fc2_combine_transport == "direct_pull"
-    assert config.fc2_reverse_vector_workers == 1
-    assert config.fc2_reduce_vector_workers == 2
     assert config.resolved_receive_capacity_factor(8) == 8.0
 
     parameters = inspect.signature(MoEForwardConfig).parameters
@@ -1013,44 +997,31 @@ def test_config_keeps_multi_profile_candidates_and_best_defaults():
         "fc2_combine_block_size_m",
         "fc2_gemm_block_size_n",
         "fc2_gemm_block_size_k",
-        "dispatch_producer_cores",
-        "dispatch_readiness",
         "dispatch_fc1_schedule",
-        "fc2_gemm_schedule",
-        "fc2_combine_transport",
-        "fc2_reverse_vector_workers",
-        "fc2_reduce_vector_workers",
         "activation",
         "situ_beta",
         "situ_linear_beta",
     }
 
-    assert config.activation == "swiglu"
-    assert config.situ_beta == 1.0
-    assert config.situ_linear_beta is None
+    assert MoEForwardConfig(
+        dispatch_fc1_schedule="allcore_expert_n_tile"
+    ).dispatch_fc1_schedule == "allcore_expert_n_tile"
+    with pytest.raises(ValueError, match="dispatch_fc1_schedule must be one of"):
+        MoEForwardConfig(dispatch_fc1_schedule="unsupported")
 
+    # Target-only activation extension remains available on top of the
+    # source-pruned forward schedule/config surface.
+    assert config.activation == "swiglu"
+    situglu = MoEForwardConfig(
+        activation="situglu", situ_beta=2.0, situ_linear_beta=1.5
+    )
+    assert situglu.activation == "situglu"
+    assert situglu.situ_beta == 2.0
+    assert situglu.situ_linear_beta == 1.5
     with pytest.raises(ValueError, match="activation must be one of"):
         MoEForwardConfig(activation="relu")
-    situglu_cfg = MoEForwardConfig(
-        activation="situglu", situ_beta=2.0, situ_linear_beta=1.5)
-    assert situglu_cfg.activation == "situglu"
-    assert situglu_cfg.situ_beta == 2.0
-    assert situglu_cfg.situ_linear_beta == 1.5
     with pytest.raises(ValueError, match="situ_beta must be positive"):
-        MoEForwardConfig(activation="situglu", situ_beta=0.0)
-    with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
-        MoEForwardConfig(activation="situglu", situ_linear_beta=-1.0)
-
-    with pytest.raises(ValueError, match="requires dispatch_readiness='expert'"):
-        MoEForwardConfig(
-            dispatch_fc1_schedule="allcore_expert_n",
-            dispatch_readiness="tile",
-        )
-    with pytest.raises(ValueError, match="requires dispatch_readiness='tile'"):
-        MoEForwardConfig(
-            dispatch_fc1_schedule="allcore_expert_n_tile",
-            dispatch_readiness="expert",
-        )
+        MoEForwardConfig(situ_beta=0.0)
 
 
 def test_direct_pull_workspace_is_sized_by_sent_routes_only():
@@ -1071,48 +1042,42 @@ def test_direct_pull_workspace_is_sized_by_sent_routes_only():
 
     assert op._combine_fc2_buf.shape == (16, 4)
     assert op._route_to_send.shape == (16,)
-    assert op._max_reverse_tile_slots == 1 + 8 * 112
-    assert op._reverse_tile_rank.shape == (1 + 8 * 112,)
+    assert op._max_pull_tile_slots == 1 + 8 * 112
+    assert op._pull_tile_rank.shape == (1 + 8 * 112,)
 
 
-def test_dispatch_kernel_keeps_candidates_without_optional_weight_branch():
-    # Brittle source-string contract: these asserts grep the kernel/launcher
-    # source to guard against silently dropping a schedule branch or the packed
-    # gate/up layout. Update the expected strings on rename, not the contract.
+def test_dispatch_kernel_keeps_default_only_pipeline():
     launch_source = inspect.getsource(FusedMoEForward.dispatch_fc1)
     kernel_source = inspect.getsource(dispatch_fc1_module._kernel_dispatch_fc1.fn)
     consumer_source = inspect.getsource(
         dispatch_fc1_module._triton_grouped_gemm_expert_n_merged_tiles_wait.fn
     )
-    direct_dispatch_source = inspect.getsource(
-        dispatch_fc1_module._dispatch_direct_expert_buckets.fn
-    )
     tile_dispatch_source = inspect.getsource(
         dispatch_fc1_module._dispatch_one_source_tile_task.fn
     )
 
-    assert "ALL_CORE_PIPELINE" in kernel_source
-    assert "DIRECT_EXPERT_DISPATCH" in kernel_source
-    assert "COUNT_DERIVED_SCHEDULE" in kernel_source
     assert "_triton_grouped_gemm_expert_n_merged_tiles_wait(" in kernel_source
+    assert "_dispatch_count_derived_source_tiles(" in kernel_source
     assert "if sub_vec_id() == 0:" in kernel_source
     assert "FINAL_BARRIER" in kernel_source
+    assert "DIRECT_EXPERT_DISPATCH" not in kernel_source
+    assert "EXPERT_N_TILE_CONSUMER" not in kernel_source
+    assert "MN_TILE_FC1" not in kernel_source
+    assert "send_staging_ptr" not in kernel_source
+    assert "routing_staging_ptr" not in kernel_source
     assert "source_id" in consumer_source
     assert "overlap_start" in consumer_source
-    assert "self.dispatch_fc1_schedule" in launch_source
-    assert "N_DISPATCH_CORES" in launch_source
-    assert "TILE_READINESS" in launch_source
+    assert "self.dispatch_fc1_schedule" not in launch_source
+    assert "NUM_PROGRAM_CORES=self.num_aicore_programs" in launch_source
+    assert "DIRECT_EXPERT_DISPATCH" not in launch_source
+    assert "EXPERT_N_TILE_CONSUMER" not in launch_source
+    assert "MN_TILE_FC1" not in launch_source
     assert "HAS_ROUTING_WEIGHT" not in launch_source
     assert "HAS_ROUTING_WEIGHT" not in kernel_source
-    assert "hidden * 2" in kernel_source
     assert "hidden * 2" in tile_dispatch_source
-    assert "task_count * hidden * 2" in direct_dispatch_source
-    assert "task_count * 4" in direct_dispatch_source
 
 
 def test_routing_metadata_keeps_width_specific_910b1_lowering():
-    # Brittle source-string contract: guards the 910B1 width-specific routing
-    # metadata lowering (1024-bin lower-bound path + NUM_BINS_PAD layout).
     histogram_source = inspect.getsource(
         routing_metadata_module._kernel_build_routing_metadata.fn
     )
@@ -1133,12 +1098,12 @@ def test_routing_metadata_keeps_width_specific_910b1_lowering():
     assert "NUM_BINS_PAD * 4" in metadata_helper_source
 
 
-def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
+def test_fc2_launch_uses_persistent_pull_and_dynamic_reduce_grid(monkeypatch):
     fc2_launches = []
     transport_launches = []
     reduce_launches = []
     fc2_kernel_source = inspect.getsource(
-        fc2_combine_module._kernel_fc2_combine.fn
+        fc2_combine_module._kernel_fc2_expert_n_persistent.fn
     )
     transport_kernel_source = inspect.getsource(
         fc2_combine_module._kernel_direct_pull_transport.fn
@@ -1146,6 +1111,7 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
     reduce_kernel_source = inspect.getsource(
         fc2_combine_module._kernel_local_topk_reduce.fn
     )
+    launch_source = inspect.getsource(fc2_combine_module.launch_fc2_combine)
 
     class FakeKernel:
         def __init__(self, sink):
@@ -1159,7 +1125,7 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
 
     monkeypatch.setattr(
         fc2_combine_module,
-        "_kernel_fc2_combine",
+        "_kernel_fc2_expert_n_persistent",
         FakeKernel(fc2_launches),
     )
     monkeypatch.setattr(
@@ -1182,10 +1148,10 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
     received_routes_per_expert = torch.tensor([2, 3], dtype=torch.int32)
     received_expert_offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
     route_to_send = torch.arange(tokens * topk, dtype=torch.int32)
-    fc2_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
-    reverse_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
+    pull_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
     peer_mem = torch.empty(rows * hidden, dtype=torch.bfloat16)
     fc2_buf = torch.empty((rows, hidden), dtype=torch.bfloat16)
+    num_program_cores = 7
 
     output = fc2_combine_module.launch_fc2_combine(
         torch.zeros((rows, reduction), dtype=torch.bfloat16),
@@ -1196,52 +1162,35 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
         torch.empty((tokens, hidden), dtype=torch.bfloat16),
         received_routes_per_expert,
         received_expert_offsets,
-        *fc2_metadata,
-        *reverse_metadata,
-        num_fc2_slots=4,
-        num_reverse_slots=4,
+        *pull_metadata,
+        num_pull_slots=4,
         num_send=tokens * topk,
         topk=topk,
-        num_cores=24,
+        num_program_cores=num_program_cores,
         block_m=16,
         block_n=16,
         block_k=16,
         world_size=1,
-        expert_n_persistent=True,
-        direct_pull=True,
-        reverse_vector_workers=2,
-        reduce_vector_workers=2,
     )
 
     assert output.shape == (tokens, hidden)
     assert len(fc2_launches) == 1
     grid, args, kwargs = fc2_launches[0]
-    assert grid == (24, 1, 1)
-    assert args[3] is peer_mem
-    assert kwargs["FC2_EXPERT_N_PERSISTENT"] is True
-    assert kwargs["DIRECT_PULL"] is True
-    assert kwargs["TOPK"] == 1
-    assert kwargs["BLOCK_N_PUSH"] == 1
-    assert kwargs["BLOCK_N_REDUCE"] == 1
-    assert kwargs["REVERSE_VECTOR_WORKERS"] == 1
-    assert kwargs["REDUCE_VECTOR_WORKERS"] == 1
+    assert grid == (num_program_cores, 1, 1)
+    assert args[2] is peer_mem
+    assert kwargs["EXPERTS_PER_RANK"] == experts
     assert len(transport_launches) == 1
     transport_grid, transport_args, transport_kwargs = transport_launches[0]
-    assert transport_grid == (24, 1, 1)
+    assert transport_grid == (num_program_cores, 1, 1)
     assert transport_args[0] is fc2_buf
     assert transport_args[1] is peer_mem
     assert transport_kwargs["WORLD_SIZE"] == 1
     assert len(reduce_launches) == 1
     reduce_grid, reduce_args, _ = reduce_launches[0]
-    assert reduce_grid == (48, 1, 1)
+    assert reduce_grid == (num_program_cores * 2, 1, 1)
     assert reduce_args[0] is fc2_buf
     assert reduce_args[1] is route_to_send
     assert reduce_args[2] is output
-    # Brittle source-string contract (the launch-arg asserts above are
-    # behavioral via FakeKernel; these grep the kernel source to guard the
-    # persistent/direct-pull branch shapes against silent removal).
-    assert "if FC2_EXPERT_N_PERSISTENT:" in fc2_kernel_source
-    assert "if not DIRECT_PULL:" in fc2_kernel_source
     assert "_fc2_gemm_one_mn_tile(" in fc2_kernel_source
     assert transport_kernel_source.count("libshmem_device.barrier_all_vec()") == 2
     assert "libshmem_device.barrier_all()" not in transport_kernel_source
@@ -1252,13 +1201,11 @@ def test_fc2_launch_defaults_support_persistent_direct_pull(monkeypatch):
     assert "libshmem_device.getmem(" not in reduce_kernel_source
     assert "for token_id in range(pid, batch_size, ncore)" in reduce_kernel_source
     assert "reduce_sub_id = sub_vec_id" not in reduce_kernel_source
+    assert "num_program_cores * 2" in launch_source
 
 
-def test_persistent_fc2_skips_unused_tile_descriptor_build(monkeypatch):
-    # Mixed: behavioral launch-arg asserts via FakeKernel + brittle source-string
-    # contract on the BUILD_FC2_TILES branch and the tile_n_major schedule check.
+def test_fc2_metadata_builds_only_direct_pull_descriptors(monkeypatch):
     metadata_launches = []
-    fill_launches = []
     metadata_source = inspect.getsource(
         fc2_combine_module._prepare_fc2_combine_metadata_kernel.fn
     )
@@ -1267,88 +1214,42 @@ def test_persistent_fc2_skips_unused_tile_descriptor_build(monkeypatch):
     )
 
     class FakeKernel:
-        def __init__(self, sink):
-            self.sink = sink
-
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
-                self.sink.append((grid, args, kwargs))
+                metadata_launches.append((grid, args, kwargs))
 
             return launch
 
     monkeypatch.setattr(
         fc2_combine_module,
         "_prepare_fc2_combine_metadata_kernel",
-        FakeKernel(metadata_launches),
-    )
-    monkeypatch.setattr(
-        fc2_combine_module,
-        "_fill_int_kernel",
-        FakeKernel(fill_launches),
+        FakeKernel(),
     )
 
-    recv_counts = torch.tensor([2, 3], dtype=torch.int32)
-    recv_offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
     counts_mem = torch.tensor([2, 3], dtype=torch.int32)
     send_starts = torch.tensor([0, 2], dtype=torch.int32)
     receive_starts = torch.tensor([0, 2], dtype=torch.int32)
-    fc2_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
-    reverse_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
+    pull_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
 
     fc2_combine_module.prepare_fc2_combine_metadata(
-        recv_counts,
-        recv_offsets,
         counts_mem,
         send_starts,
         receive_starts,
-        *fc2_metadata,
-        *reverse_metadata,
-        num_fc2_slots=4,
-        num_reverse_slots=4,
+        *pull_metadata,
+        num_pull_slots=4,
         local_rank=0,
         world_size=1,
         experts_per_rank=2,
         num_bins_pad=2,
         block_m=16,
-        direct_pull=True,
-        build_fc2_tiles=False,
     )
 
     assert len(metadata_launches) == 1
     grid, _, kwargs = metadata_launches[0]
     assert grid == (1, )
-    assert kwargs["BUILD_FC2_TILES"] is False
-    assert kwargs["multibuffer"] is True
-    assert len(fill_launches) == 1
-    assert fill_launches[0][1][0] is reverse_metadata[0]
-    assert "if BUILD_FC2_TILES:" in metadata_source
-    assert 'self.config.fc2_gemm_schedule == "tile_n_major"' in production_source
-
-    # Keep the standalone helper backward compatible for tile-N-major A/B
-    # harnesses that do not pass the new keyword explicitly.
-    fc2_combine_module.prepare_fc2_combine_metadata(
-        recv_counts,
-        recv_offsets,
-        counts_mem,
-        send_starts,
-        receive_starts,
-        *fc2_metadata,
-        *reverse_metadata,
-        num_fc2_slots=4,
-        num_reverse_slots=4,
-        local_rank=0,
-        world_size=1,
-        experts_per_rank=2,
-        num_bins_pad=2,
-        block_m=16,
-        direct_pull=True,
-    )
-
-    assert len(metadata_launches) == 2
-    assert metadata_launches[1][2]["BUILD_FC2_TILES"] is True
-    assert len(fill_launches) == 3
-    assert fill_launches[1][1][0] is fc2_metadata[0]
-    assert fill_launches[2][1][0] is reverse_metadata[0]
+    assert kwargs["BLOCK_M"] == 16
+    assert "pull_tile_rank_ptr" in metadata_source
+    assert "self._pull_tile_rank" in production_source
 
 
 def test_pack_gate_up_weights_returns_contiguous_kn_layout():
@@ -1363,18 +1264,18 @@ def test_pack_gate_up_weights_returns_contiguous_kn_layout():
 
 
 def _situglu_torch_ref(fc1, rw, activation, beta, lin_beta):
-    """FP32 torch reference mirroring the weighted_swiglu kernel."""
-    d = fc1.shape[-1] // 2
-    gate = fc1[..., :d].float()
-    up = fc1[..., d:].float()
+    """Independent FP32 reference for the target activation extension."""
+    ffn_dim = fc1.shape[-1] // 2
+    gate = fc1[..., :ffn_dim].float()
+    up = fc1[..., ffn_dim:].float()
     if activation == "swiglu":
-        a = torch.nn.functional.silu(gate) * up
+        activated = torch.nn.functional.silu(gate) * up
     else:
-        a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+        activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
         if lin_beta is not None:
             up = lin_beta * torch.tanh(up / lin_beta)
-        a = a * up
-    return (a * rw.float().unsqueeze(-1)).to(fc1.dtype)
+        activated = activated * up
+    return (activated * rw.float().unsqueeze(-1)).to(fc1.dtype)
 
 
 @pytest.mark.skipif(
@@ -1382,43 +1283,47 @@ def _situglu_torch_ref(fc1, rw, activation, beta, lin_beta):
     reason="SiTU-GLU kernel correctness requires an NPU device",
 )
 def test_weighted_swiglu_kernel_supports_swiglu_and_situglu():
-    """The activation switch matches an independent torch reference on NPU.
-
-    Covers SwiGLU, SiTU-GLU (with/without ``linear_beta``), and the M=0 edge.
-    """
+    """The target-only SiTU-GLU switch remains correct after source sync."""
     device = "npu:0"
     torch.npu.set_device(0)
     torch.manual_seed(0)
-    M, F = 64, 256
-    fc1 = (torch.randn(M, 2 * F, dtype=torch.float32) * 0.5).to(torch.bfloat16).to(device)
-    rw = (torch.rand(M, dtype=torch.float32, device=device) + 0.1).contiguous()
-    num_cores = 24
-
-    cases = [
+    rows, ffn_dim = 64, 256
+    fc1 = (
+        (torch.randn(rows, 2 * ffn_dim, dtype=torch.float32) * 0.5)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    rw = (torch.rand(rows, dtype=torch.float32, device=device) + 0.1).contiguous()
+    cases = (
         ("swiglu", 1.0, None),
         ("situglu", 1.0, None),
         ("situglu", 1.5, None),
         ("situglu", 2.0, 1.0),
-        ("situglu", 0.5, 2.0),
-    ]
-    for activation, beta, lin_beta in cases:
-        out = weighted_swiglu_forward(
-            fc1, rw, num_cores,
-            activation=activation, situ_beta=beta, situ_linear_beta=lin_beta,
+    )
+    for activation, beta, linear_beta in cases:
+        actual = weighted_swiglu_forward(
+            fc1,
+            rw,
+            24,
+            activation=activation,
+            situ_beta=beta,
+            situ_linear_beta=linear_beta,
         )
-        ref = _situglu_torch_ref(fc1, rw, activation, beta, lin_beta)
+        expected = _situglu_torch_ref(fc1, rw, activation, beta, linear_beta)
         torch.testing.assert_close(
-            out.float(), ref.float(), rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+            actual.float(),
+            expected.float(),
+            rtol=OUTPUT_RTOL,
+            atol=OUTPUT_ATOL,
+        )
 
-    # M=0 must short-circuit and return an empty [0, F] tensor.
-    empty_out = weighted_swiglu_forward(
-        fc1[:0], rw[:0], num_cores, activation="situglu", situ_beta=1.0)
-    assert empty_out.shape == (0, F)
-    assert empty_out.dtype == torch.bfloat16
-
-    # Invalid activation name is rejected on the host.
+    empty = weighted_swiglu_forward(
+        fc1[:0], rw[:0], 24, activation="situglu", situ_beta=1.0
+    )
+    assert empty.shape == (0, ffn_dim)
+    assert empty.dtype == torch.bfloat16
     with pytest.raises(ValueError, match="activation must be 'swiglu' or 'situglu'"):
-        weighted_swiglu_forward(fc1, rw, num_cores, activation="relu")
+        weighted_swiglu_forward(fc1, rw, 24, activation="relu")
 
 
 def test_make_down_weights_returns_contiguous_nk_layout():
