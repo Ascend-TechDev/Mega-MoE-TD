@@ -31,6 +31,5 @@ from .dispatch_fc2_bwd import (  # noqa: F401
 )
 from .combine_fc1_bwd import (  # noqa: F401
     combine_fc1_bwd_triton,
-    kernel_fc1_input_grad_gemm,
-    kernel_combine_push_reduce,
+    kernel_combine_fc1_bwd,
 )

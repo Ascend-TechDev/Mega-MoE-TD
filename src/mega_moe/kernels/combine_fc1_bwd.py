@@ -11,106 +11,139 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
+import triton.language.extra.cann.extension as al
+from triton.language.extra.cann.extension import sub_vec_id
 
 from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
 
 
+# ONE FUSED KERNEL with three phases mirroring the forward _kernel_fc2_combine
+# (fc2_combine.py:246-461), which fuses the IDENTICAL structure (Cube GEMM ->
+# barrier_all -> Vector push -> barrier_all -> Vector reduce -> barrier_all) in a
+# single verified-working launch.
+#
+# step 4 is Cube-write(hidden_buf) -> barrier -> Vector-read, the direction that
+# hung in the old fused attempt. The forward proves the fix is the scope
+# discipline the old split kernels lacked: each phase wrapped in
+# `al.scope(core_mode=..., disable_auto_sync=True)`, and the SHMEM comm gated to
+# a single vector sub-core via `sub_vec_id() < WORKERS` so the Cube side cannot
+# duplicate the dl.symm_at stores (dispatch_fc1.py:187-191 documents exactly
+# this hazard). disable_auto_sync=True + the in-kernel barrier_all() is the
+# complete fence — no membar, no host sync.
+#
 # Phase 1 fc1 input-grad GEMM: acc[M,H] = grad_fc1_output @ fc1_combined[e]
-# barrier_all()
+#   -> local hidden_buf (cube scope)
+# libshmem_device.barrier_all()
 # Phase 2 reverse-A2A push (expert->home): hidden_buf[inv_local[out]] -> peer_mem
-#   AND grad_gate[inv_local[out]] -> peer_mem_gate   (06 Phase2 + gate channel)
-# barrier_all()
+#   (vector scope, sub_vec_id gated)
+# libshmem_device.barrier_all()
 # Phase 3 reduce: grad_hidden[b] = sum_j peer_mem[inv_sort[b*topk+j]]  (06 Phase3)
-#   AND grad_routing[b*topk+j] = peer_mem_gate[inv_sort[b*topk+j]]  (gather, no sum)
+#   (vector scope, sub_vec_id gated)
+# libshmem_device.barrier_all()
+# (gate channel stays host-side: _gate_bwd_host — dl.symm_at only resolves at
+#  heap offset 0, so no second symmetric buffer for the scalar gate.)
 @triton.jit
-def kernel_fc1_input_grad_gemm(
-    # ---- GEMM (fc1 input-grad) ----
+def kernel_combine_fc1_bwd(
+    # ---- Phase 1: fc1 input-grad GEMM (Cube) ----
     inp_ptr,                  # grad_fc1_output [M, 2*ffn]  (sorted)
     weight_ptr,               # fc1_combined [E, 2*ffn, H]  (K=2*ffn, N=H)
-    hidden_buf_ptr,           # grad_recv_hidden_sorted [M, H] out
+    hidden_buf_ptr,           # grad_recv_hidden_sorted [M, H] out (LOCAL workspace)
     meta_expert_ids_ptr, meta_split_cum_ptr, meta_tile_num_ptr, expert_counts_ptr,
     M, N, K, E, num_tiles_m, num_tiles_n,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    ncore = tl.num_programs(axis=0)
-    om = tl.arange(0, BLOCK_M)
-    on_ = tl.arange(0, BLOCK_N)
-    ok = tl.arange(0, BLOCK_K)
-    total_tasks = num_tiles_m * num_tiles_n
-    for task_id in range(pid, total_tasks, ncore):
-        tile_m = task_id % num_tiles_m
-        tile_n = task_id // num_tiles_m
-        expert_id = tl.load(meta_expert_ids_ptr + tile_m)
-        cum_before = tl.load(meta_split_cum_ptr + tile_m)
-        tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
-        row_start = cum_before + tile_in_exp * BLOCK_M
-        n_start = tile_n * BLOCK_N
-        cnt = tl.load(expert_counts_ptr + expert_id)
-        rem = cnt - tile_in_exp * BLOCK_M
-        mm = om < rem
-        mn = on_ < (N - n_start)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        wb = expert_id.to(tl.int64) * stride_we
-        for ks in range(0, K, BLOCK_K):
-            mk = ok < (K - ks)
-            ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
-            a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
-            bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-            b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
-            acc += tl.dot(a, b)
-        co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
-        tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty), mask=mm[:, None] & mn[None, :])
-
-
-# push + reduce (hidden) + gate channel. Split from the GEMM into its own launch:
-# in a single fused kernel the GEMM phase corrupted the push's read of hidden_buf
-# (barrier was fine, cause unclear — likely a codegen interaction). The GEMM-only
-# and push+reduce-only kernels are each verified correct, so we launch them
-# separately with a host sync between.
-@triton.jit
-def kernel_combine_push_reduce(
-    hidden_buf_ptr,           # grad_recv_hidden_sorted [M, H]  (GEMM output, in)
+    # ---- Phase 2: reverse-A2A push (Vector, expert->home) ----
     inv_local_sort_idxs_ptr, write_rank_ptr, write_off_ptr,
-    peer_mem_ptr,             # symmetric [total_send, H] at HEAP OFFSET 0 (symm_at+loaded rank needs offset 0)
+    peer_mem_ptr,             # symmetric [total_send, H] at HEAP OFFSET 0
     total_recv, H_push,
+    # ---- Phase 3: topk-sum reduce (Vector) ----
     inv_sort_idxs_ptr,        # int64 [total_send]
     output_ptr,               # grad_hidden [B, H]
     B, topk, total_send,
     stride_om, stride_on,
+    # ---- constexpr ----
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     BLOCK_N_PUSH: tl.constexpr,
+    REVERSE_VECTOR_WORKERS: tl.constexpr,
+    REDUCE_VECTOR_WORKERS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     ncore = tl.num_programs(axis=0)
-    ovp = tl.arange(0, BLOCK_N_PUSH)
 
-    # ===== Phase 2: reverse-A2A push (expert->home) for hidden — 06 Phase2 =====
-    for out_pos in range(pid, total_recv, ncore):
-        op64 = out_pos.to(tl.int64)
-        src_pos = tl.load(inv_local_sort_idxs_ptr + op64).to(tl.int64)
-        dst_rank = tl.load(write_rank_ptr + out_pos)
-        dst_off = tl.load(write_off_ptr + op64).to(tl.int64)
-        rp = dl.symm_at(peer_mem_ptr, dst_rank)
-        for ns in range(0, H_push, BLOCK_N_PUSH):
-            mask = ovp < (H_push - ns)
-            val = tl.load(hidden_buf_ptr + src_pos * H_push + (ns + ovp), mask=mask, other=0.0)
-            tl.store(rp + dst_off * H_push + (ns + ovp), val, mask=mask)
+    # ===== Phase 1: fc1 input-grad GEMM -> hidden_buf (PURE CUBE) =====
+    with al.scope(core_mode="cube", disable_auto_sync=True):
+        om = tl.arange(0, BLOCK_M)
+        on_ = tl.arange(0, BLOCK_N)
+        ok = tl.arange(0, BLOCK_K)
+        total_tasks = num_tiles_m * num_tiles_n
+        for task_id in range(pid, total_tasks, ncore):
+            tile_m = task_id % num_tiles_m
+            tile_n = task_id // num_tiles_m
+            expert_id = tl.load(meta_expert_ids_ptr + tile_m)
+            cum_before = tl.load(meta_split_cum_ptr + tile_m)
+            tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
+            row_start = cum_before + tile_in_exp * BLOCK_M
+            n_start = tile_n * BLOCK_N
+            cnt = tl.load(expert_counts_ptr + expert_id)
+            rem = cnt - tile_in_exp * BLOCK_M
+            mm = om < rem
+            mn = on_ < (N - n_start)
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            wb = expert_id.to(tl.int64) * stride_we
+            for ks in range(0, K, BLOCK_K):
+                mk = ok < (K - ks)
+                ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
+                a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+                bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+                b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+                acc += tl.dot(a, b)
+            co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
+            tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty), mask=mm[:, None] & mn[None, :])
 
     libshmem_device.barrier_all()
 
-    # ===== Phase 3: topk sum (hidden) — 06 Phase3 =====
-    for ti in range(pid, B, ncore):
-        ti64 = ti.to(tl.int64)
-        for ns in range(0, H_push, BLOCK_N_PUSH):
-            mask = ovp < (H_push - ns)
-            acc = tl.zeros((BLOCK_N_PUSH,), dtype=tl.float32)
-            for j in range(topk):
-                fi = ti * topk + j
-                sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
-                acc += tl.load(peer_mem_ptr + sp * H_push + (ns + ovp), mask=mask, other=0.0)
-            oo = ti64 * stride_om + (ns + ovp) * stride_on
-            tl.store(output_ptr + oo, acc.to(output_ptr.dtype.element_ty), mask=mask)
+    # ===== Phase 2: reverse-A2A push (expert->home): hidden_buf -> peer_mem (VECTOR) =====
+    # REVERSE_VECTOR_WORKERS=1 -> push_worker_id=pid, num_push_workers=ncore: identical
+    # work distribution to the proven split push kernel, now scope-wrapped + single
+    # sub-vec-owned so the cube side cannot duplicate the SHMEM stores.
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        push_sub_id = sub_vec_id().to(tl.int32)
+        if push_sub_id < REVERSE_VECTOR_WORKERS:
+            push_worker_id = pid * REVERSE_VECTOR_WORKERS + push_sub_id
+            num_push_workers = ncore * REVERSE_VECTOR_WORKERS
+            ovp = tl.arange(0, BLOCK_N_PUSH)
+            for out_pos in range(push_worker_id, total_recv, num_push_workers):
+                op64 = out_pos.to(tl.int64)
+                src_pos = tl.load(inv_local_sort_idxs_ptr + op64).to(tl.int64)
+                dst_rank = tl.load(write_rank_ptr + out_pos)
+                dst_off = tl.load(write_off_ptr + op64).to(tl.int64)
+                rp = dl.symm_at(peer_mem_ptr, dst_rank)
+                for ns in range(0, H_push, BLOCK_N_PUSH):
+                    mask = ovp < (H_push - ns)
+                    val = tl.load(hidden_buf_ptr + src_pos * H_push + (ns + ovp), mask=mask, other=0.0)
+                    tl.store(rp + dst_off * H_push + (ns + ovp), val, mask=mask)
+
+    libshmem_device.barrier_all()
+
+    # ===== Phase 3: topk-sum reduce: peer_mem -> grad_hidden (VECTOR) =====
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        reduce_sub_id = sub_vec_id().to(tl.int32)
+        if reduce_sub_id < REDUCE_VECTOR_WORKERS:
+            reduce_worker_id = pid * REDUCE_VECTOR_WORKERS + reduce_sub_id
+            num_reduce_workers = ncore * REDUCE_VECTOR_WORKERS
+            ovr = tl.arange(0, BLOCK_N_PUSH)
+            for ti in range(reduce_worker_id, B, num_reduce_workers):
+                ti64 = ti.to(tl.int64)
+                for ns in range(0, H_push, BLOCK_N_PUSH):
+                    mask = ovr < (H_push - ns)
+                    acc = tl.zeros((BLOCK_N_PUSH,), dtype=tl.float32)
+                    for j in range(topk):
+                        fi = ti * topk + j
+                        sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
+                        acc += tl.load(peer_mem_ptr + sp * H_push + (ns + ovr), mask=mask, other=0.0)
+                    oo = ti64 * stride_om + (ns + ovr) * stride_on
+                    tl.store(output_ptr + oo, acc.to(output_ptr.dtype.element_ty), mask=mask)
+
+    libshmem_device.barrier_all()
 
 
 def _combine_static_maps(saved):
@@ -192,27 +225,25 @@ def _gate_bwd_host(saved, grad_gate):
 
 
 def _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output):
-    # Launch 1: fc1 input-grad GEMM -> hidden_buf
-    kernel_fc1_input_grad_gemm[(ncore(), 1, 1)](
+    # Single fused launch: fc1 input-grad GEMM (cube) + reverse-A2A push (vector)
+    # + topk reduce (vector), fenced by the three in-kernel barrier_all() — the
+    # first fences the local Cube->Vector handoff (hidden_buf), the second the
+    # cross-rank push->reduce handoff (peer_mem), the trailing one quiesces
+    # peer_mem before the next forward reuses it. No host sync.
+    kernel_combine_fc1_bwd[(ncore(), 1, 1)](
         prep["inp"], prep["weight"], hidden_buf,
         prep["meta_expert_ids"], prep["meta_split_cum"], prep["meta_tile_num"], prep["expert_counts"],
         prep["M"], prep["N"], prep["K"], prep["E"], prep["num_tm"], prep["num_tn"],
         prep["inp_stride_im"], prep["inp_stride_ik"], prep["we"], prep["wk"], prep["wn"],
-        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, num_warps=8,
-        use_bytecode=True)
-    # No host sync needed: the push kernel reads local hidden_buf, and the two
-    # launches are ordered on the same stream. The push kernel's device barrier_all
-    # syncs the cross-rank push->reduce phase. (The sync was a workaround for a
-    # long-since-removed fused kernel; with separate launches it is pure overhead.)
-    # Launch 2: reverse-A2A push + topk reduce (hidden)
-    kernel_combine_push_reduce[(ncore(), 1, 1)](
-        hidden_buf,
         prep["inv_local"], prep["write_rank"], prep["write_off"], peer_mem,
         prep["total_recv"], prep["H"],
         prep["inv_sort"], output,
         prep["B"], prep["topk"], prep["total_send"],
         prep["stride_om"], prep["stride_on"],
-        BLOCK_N_PUSH=512, num_warps=8, use_bytecode=True)
+        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
+        BLOCK_N_PUSH=512,
+        REVERSE_VECTOR_WORKERS=1, REDUCE_VECTOR_WORKERS=1,
+        num_warps=8)
     return output
 
 
@@ -222,12 +253,13 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     which has finished by now). The gate grad is computed on the host (all_to_all).
     If return_hidden, also returns hidden_buf (=grad_recv_hidden_sorted)."""
     prep = _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate)
-    # GEMM writes every hidden_buf tile (meta covers all tokens); push_reduce
-    # writes every output row -> empty, no zero-fill needed.
+    # GEMM writes every hidden_buf tile (meta covers all tokens); reduce
+    # writes every output row -> empty, no zero-fill needed. hidden_buf is a plain
+    # (non-symmetric) local workspace; peer_mem is the only symmetric buffer.
     hidden_buf = torch.empty(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     output = torch.empty(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     # peer_mem is fully overwritten by the push phase (every row read by the
-    # reduce was written by some rank's push); the push kernel's barrier_all
+    # reduce was written by some rank's push); the fused kernel's barrier_all
     # handles cross-rank sync, so no host zero/barrier is needed.
     _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output)
     grad_routing_weights = _gate_bwd_host(saved, grad_gate)

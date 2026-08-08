@@ -79,10 +79,19 @@ def moe_backward_triton(saved, dy, peer_mem):
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching moe_backward_torch."""
     dy = dy.to(saved["fc1_1"].dtype)
+    _trace = bool(os.environ.get("MOE_BWD_TRACE"))
+    _r = saved["ep_rank"]
+    def _t(tag):
+        if _trace:
+            torch.npu.synchronize()
+            print(f"[r{_r}] TRACE-BWD {tag}", flush=True)
+    _t("step1-dispatch_fc2 start")
     # step 1: dispatch + fc2 input-grad
     grad_swiglu, grad_fc2_out_sorted = dispatch_fc2_bwd_triton(saved, dy, peer_mem)
+    _t("step1-dispatch_fc2 done")
     # step 2: swiglu backward
     grad_fc1_output, grad_gate = swiglu_bwd_triton(grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
+    _t("step2-swiglu done")
     # step 3: fc2 weight-grad. MOE_FC2_WGRAD_TORCH=1 falls back to torch (Kimi-K3
     # 8-card: triton wgrad is pathologically slow, see _grouped_wgrad_torch).
     if os.environ.get("MOE_FC2_WGRAD_TORCH") == "1":
@@ -92,9 +101,11 @@ def moe_backward_triton(saved, dy, peer_mem):
         grad_fc2 = transposed_grouped_gemm_triton(
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"],
             saved["split_size_cum_per_expert"])
+    _t("step3-fc2_wgrad done")
     # step 4: combine + fc1 input-grad + gate-grad
     grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
         saved, grad_fc1_output, grad_gate, peer_mem)
+    _t("step4-combine_fc1 done")
     # step 5: fc1 weight-grad. MOE_FC1_WGRAD_TORCH=1 falls back to torch (same
     # pathology as step3 on Kimi-K3).
     if os.environ.get("MOE_FC1_WGRAD_TORCH") == "1":
