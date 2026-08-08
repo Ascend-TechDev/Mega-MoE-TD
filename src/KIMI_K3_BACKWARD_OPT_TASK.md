@@ -31,19 +31,17 @@ triton 在 step1/2/4 (comm+GEMM+swiglu) 仍比 torch 快 ~24ms，torch 在两个
 PATH=/home/z00905891/triton_dist/AscendNPU-IR/build/bin:$PATH \
 TRITON_CACHE_DIR=/tmp/triton_mb \
 MOE_KIMI=1 MOE_ASH_GB=1 \
-MOE_FC1_WGRAD_TORCH=1 MOE_FC2_WGRAD_TORCH=1 \
 torchrun --nproc-per-node=8 --master_port=29514 debug/prof_backward.py
 
 # 8卡端到端正确性+性能（Kimi only，2048 tokens 能放下双路径内存）
 PATH=/home/z00905891/triton_dist/AscendNPU-IR/build/bin:$PATH \
 TRITON_CACHE_DIR=/tmp/triton_mb \
 MOE_KIMI=1 MOE_ASH_GB=1 \
-MOE_FC1_WGRAD_TORCH=1 MOE_FC2_WGRAD_TORCH=1 \
 torchrun --nproc-per-node=8 --master_port=29515 tests/layer/test_moe_backward.py
 ```
 
 环境开关：
-- `MOE_FC1_WGRAD_TORCH=1` / `MOE_FC2_WGRAD_TORCH=1`：step5/step3 wgrad 用 torch 替代 triton（Kimi 必开）。
+- `MOE_WGRAD_TRITON=1`：step5/step3 wgrad 用 triton kernel（默认 torch wgrad，Kimi 不要开）。
 - `MOE_ASH_GB`：对称内存堆 GB（8卡默认 2GB×8=16GB 超驱动上限，Kimi 用 1GB；4096 peer_mem 0.61GB 够）。
 - `MOE_KIMI=1`：只跑 Kimi 配置。
 
@@ -87,7 +85,7 @@ wgrad tile 数 = E·ntn·ntk = 112·48·14 = 75264（Qwen 的 12x），24核 per
 ## 当前工作树改动（未提交）
 
 - `src/mega_moe/ops/backward.py`：新增 `_grouped_wgrad_torch`（torch 逐专家 wgrad），
-  step3/step5 用 `MOE_FC2_WGRAD_TORCH` / `MOE_FC1_WGRAD_TORCH` 开关切换 torch fallback（默认关）。
+  step3/step5 默认用 torch wgrad；`MOE_WGRAD_TRITON=1` 切到 triton kernel。
 - `tests/layer/test_moe_backward.py`：`MOE_ASH_GB` 调对称堆；Kimi 配置加 2048（双路径内存能放下）；
   config 循环 skip-on-fail（8192/16384 peer_mem 超堆时跳过不崩）。
 

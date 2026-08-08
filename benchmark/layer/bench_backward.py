@@ -20,9 +20,10 @@
 #                             MOE_FULL_BENCH_CONFIG slug selection; see shape_slug)
 #    (otherwise)           -> BACKWARD_SHAPES_SMALL (regression smoke)
 #
-#  The triton wgrad kernels are pathologically slow on some shapes; set
-#    MOE_FC1_WGRAD_TORCH=1 MOE_FC2_WGRAD_TORCH=1
-#  to fall back to torch wgrad (see src/mega_moe/ops/backward.py).
+#  wgrad defaults to torch (stable); set
+#    MOE_WGRAD_TRITON=1
+#  to use the fused triton wgrad kernel (faster on most shapes, pathological on
+#  some e.g. Kimi-K3 8-card; see src/mega_moe/ops/backward.py).
 #
 #  Usage:
 #    python -m pytest benchmark/layer/bench_backward.py::test_bench_backward_2ranks \
@@ -184,8 +185,7 @@ def _save_results(entries, world_size):
         "world_size": world_size,
         "warmup": BENCH_WARMUP,
         "iters": BENCH_ITERS,
-        "wgrad_torch_fallback": bool(
-            os.environ.get("MOE_FC1_WGRAD_TORCH") or os.environ.get("MOE_FC2_WGRAD_TORCH")),
+        "wgrad_triton": os.environ.get("MOE_WGRAD_TRITON") == "1",
         "configs": [
             {"label": label, "torch_ms": t_ms, "triton_ms": r_ms, "triton_over_torch": sp}
             for label, t_ms, r_ms, sp in entries

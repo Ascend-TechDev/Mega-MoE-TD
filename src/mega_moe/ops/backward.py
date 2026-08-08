@@ -48,8 +48,9 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
     cube peak) and torch's per-expert matmul is ~260x faster.
 
     Per-expert matmul, no M-padding (within bf16 tolerance vs the padded golden).
-    Gated by MOE_FC2_WGRAD_TORCH (step3) / MOE_FC1_WGRAD_TORCH (step5); default
-    off so Qwen/other shapes keep the faster triton path.
+    This is the DEFAULT wgrad path for step3 (fc2) and step5 (fc1); set
+    MOE_WGRAD_TRITON=1 to use the fused triton ``transposed_grouped_gemm``
+    kernel instead (faster on most shapes, but pathological on Kimi-K3 8-card).
     """
     E = int(expert_counts.shape[0])
     N = grad_out.shape[1]
@@ -79,31 +80,43 @@ def moe_backward_triton(saved, dy, peer_mem):
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching moe_backward_torch."""
     dy = dy.to(saved["fc1_1"].dtype)
+    use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
+    _trace = bool(os.environ.get("MOE_BWD_TRACE"))
+    _r = saved["ep_rank"]
+    def _t(tag):
+        if _trace:
+            torch.npu.synchronize()
+            print(f"[r{_r}] TRACE-BWD {tag}", flush=True)
+    _t("step1-dispatch_fc2 start")
     # step 1: dispatch + fc2 input-grad
     grad_swiglu, grad_fc2_out_sorted = dispatch_fc2_bwd_triton(saved, dy, peer_mem)
+    _t("step1-dispatch_fc2 done")
     # step 2: swiglu backward
     grad_fc1_output, grad_gate = swiglu_bwd_triton(grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
-    # step 3: fc2 weight-grad. MOE_FC2_WGRAD_TORCH=1 falls back to torch (Kimi-K3
-    # 8-card: triton wgrad is pathologically slow, see _grouped_wgrad_torch).
-    if os.environ.get("MOE_FC2_WGRAD_TORCH") == "1":
-        grad_fc2 = _grouped_wgrad_torch(
-            grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"])
-    else:
+    _t("step2-swiglu done")
+    # step 3: fc2 weight-grad. Default torch (stable); MOE_WGRAD_TRITON=1 uses the
+    # fused triton kernel (faster on most shapes, pathological on Kimi-K3 8-card).
+    if use_triton_wgrad:
         grad_fc2 = transposed_grouped_gemm_triton(
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"],
             saved["split_size_cum_per_expert"])
+    else:
+        grad_fc2 = _grouped_wgrad_torch(
+            grad_fc2_out_sorted, saved["swiglu_out_weighted"], saved["expert_counts"])
+    _t("step3-fc2_wgrad done")
     # step 4: combine + fc1 input-grad + gate-grad
     grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
         saved, grad_fc1_output, grad_gate, peer_mem)
-    # step 5: fc1 weight-grad. MOE_FC1_WGRAD_TORCH=1 falls back to torch (same
-    # pathology as step3 on Kimi-K3).
-    if os.environ.get("MOE_FC1_WGRAD_TORCH") == "1":
-        grad_fc1 = _grouped_wgrad_torch(
-            grad_fc1_output, saved["recv_hidden_sorted"], saved["expert_counts"])
-    else:
+    _t("step4-combine_fc1 done")
+    # step 5: fc1 weight-grad. Default torch; MOE_WGRAD_TRITON=1 uses the fused
+    # triton kernel (same semantics as step3).
+    if use_triton_wgrad:
         grad_fc1 = transposed_grouped_gemm_triton(
             grad_fc1_output, saved["recv_hidden_sorted"], saved["expert_counts"],
             saved["split_size_cum_per_expert"])
+    else:
+        grad_fc1 = _grouped_wgrad_torch(
+            grad_fc1_output, saved["recv_hidden_sorted"], saved["expert_counts"])
     grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
     return dict(
         grad_hidden=grad_hidden, grad_routing_weights=grad_routing_weights,
