@@ -1,0 +1,3 @@
+[submodule "3rdparty/bigop"]
+	path = 3rdparty/bigop
+	url = https://gitcode.com/jzhoujg/bigop.git
