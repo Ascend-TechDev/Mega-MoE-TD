@@ -22,6 +22,16 @@ python -m pip install -e . --no-deps
 安装后，无论当前工作目录在哪里都应使用 `mega_moe` 包名，不再导入 `src`、
 `functions`、`kernels` 或 `benchmark`。
 
+### 测试期第三方依赖（bigop）
+
+后向的第二套 golden 参考实现依赖 [bigop](https://gitcode.com/jzhoujg/bigop.git)，
+以 `3rdparty/bigop` git submodule 接入（pin 到固定 commit，见 `.gitmodules`）。
+clone 仓库后执行一键脚本拉取并 editable 安装即可（torch / torch-npu 仍由环境提供，`--no-deps`）：
+
+```bash
+bash scripts/install_3rdparty.sh
+```
+
 ## 目录结构
 
 ```text
