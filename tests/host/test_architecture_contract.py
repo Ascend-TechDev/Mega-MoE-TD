@@ -140,7 +140,13 @@ def test_complete_schema_binds_full_plan_authorized_git_and_backward_trace():
     variables = schema["$defs"]["environment"]["properties"]["variables"]["const"]
     assert variables["MOE_BWD_TRACE"] == ""
     harness_required = set(schema["$defs"]["harness_identity"]["required"])
-    assert {"checkout_locator", "branch", "live_ref", "live_commit"} <= harness_required
+    assert {
+        "checkout_locator",
+        "branch",
+        "live_ref",
+        "live_commit",
+        "mount_identity",
+    } <= harness_required
     payload_required = set(schema["$defs"]["payload"]["required"])
     assert {"harness_identity", "sidecar_binding"} <= payload_required
 

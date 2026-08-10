@@ -156,6 +156,7 @@
         "commit",
         "tree",
         "parents",
+        "mount_identity",
         "product_base_commit",
         "product_base_tree",
         "changed_paths",
@@ -174,6 +175,18 @@
           "type": "array",
           "minItems": 1,
           "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        },
+        "mount_identity": {
+          "type": "object",
+          "required": ["mount_id", "parent_id", "device", "root", "mount_point"],
+          "additionalProperties": false,
+          "properties": {
+            "mount_id": {"type": "integer", "minimum": 1},
+            "parent_id": {"type": "integer", "minimum": 0},
+            "device": {"type": "string", "pattern": "^[0-9]+:[0-9]+$"},
+            "root": {"type": "string", "pattern": "^/"},
+            "mount_point": {"type": "string", "pattern": "^/"}
+          }
         },
         "product_base_commit": {"const": "2887022970f6ae5c7ab5be096680809591100c30"},
         "product_base_tree": {"const": "2b5c447da8ff9ff788125aae5eec644579df105d"},

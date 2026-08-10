@@ -90,16 +90,23 @@ DRY_RUN and COMPLETE validation accept an explicit physical Git checkout path,
 never a caller-supplied identity mapping. The locator must be absolute,
 lexically identical to its resolved path, non-symlink, and the exact checkout
 top-level with a physical in-tree `.git` directory. Sanitized local Git plumbing
-binds HEAD/tree/sole-parent, designated branch, product ancestry, clean state,
-and the cumulative ten-path delta. Local origin and remote-tracking refs are not
-authority: each validation performs a sanitized live `git ls-remote --heads`
-against the fixed GitCode URL and exact reviewed feature ref, requiring exactly
-one live ref equal to local HEAD. Both statuses persist that checkout locator,
-repository, branch, live ref/commit, and local object identity, and consumers
-rerun the same verifier. Raw receipt bytes must also equal the canonical
-serialization exactly; reformatting and rehashing the sidecar does not produce
-valid evidence. The portable schema declares every required plan field while
-the Python validator checks the full fixed plan values.
+freezes one immutable commit SHA; tree, sole-parent, product-ancestry, and
+cumulative ten-path queries name that SHA rather than mutable `HEAD`. The
+designated branch, index/worktree, locator, physical mount identity, HEAD/tree,
+and live ref are rechecked together at the terminal boundary. A locator or
+controlled harness path on an independent or bind mount is invalid. Local
+origin and remote-tracking refs are not authority: each validation runs `git
+ls-remote --heads` from the fixed physical non-repository root directory with
+caller Git configuration removed, system/global/local configuration disabled,
+and the fixed GitCode URL plus exact reviewed feature ref. Network failure has
+no local rewrite or fallback. Exactly one live ref must equal the frozen local
+commit. Both statuses persist that checkout locator, mount identity, repository,
+branch, live ref/commit, and local object identity, and consumers rerun the same
+verifier. The durable writer reruns it immediately before emitting either
+status, so terminal drift leaves no receipt. Raw receipt bytes must also equal
+the canonical serialization exactly; reformatting and rehashing the sidecar
+does not produce valid evidence. The portable schema declares every required
+plan field while the Python validator checks the full fixed plan values.
 
 ## 3. Validation rigor
 
@@ -112,7 +119,10 @@ harness path, a dirty checkout, route-variable drift, placeholder environment
 identity, live-ref drift, a self-signed checkout mapping, an incomplete plan,
 noncanonical raw JSON, missing live authority, path aliases, detached or locally
 forged repositories, dry-run identity omission, and sidecar tampering must
-independently turn their gates red.
+independently turn their gates red. Caller Git URL rewrites, live-network
+failure, a mid-verification HEAD switch, terminal pre-write drift, and
+independent mounts at the locator or any controlled path are also causal red
+arms.
 
 Device evidence is not accepted merely because the process exits zero. Every
 requested shape must appear, every precision result must be `PASS`, every arm

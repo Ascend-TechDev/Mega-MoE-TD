@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 
 CONTRACT_VERSION = "current-human-baseline/v1"
@@ -41,6 +41,7 @@ ROUTING_ENVIRONMENT = {
 }
 AUTHORIZED_HARNESS_BRANCH = "codex02/uniep-current-main-recovery-20260809"
 AUTHORIZED_LIVE_REF = f"refs/heads/{AUTHORIZED_HARNESS_BRANCH}"
+LIVE_AUTHORITY_CWD = "/"
 EXACT_HARNESS_PATHS = (
     "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
     "benchmark/contracts/current_human_baseline_v1.schema.json",
@@ -142,6 +143,16 @@ _NETWORK_ENVIRONMENT_NAMES = (
 
 class ContractError(ValueError):
     """Raised whenever evidence cannot satisfy the fixed contract."""
+
+
+class MountEntry(NamedTuple):
+    """The physical identity fields needed from one Linux mountinfo record."""
+
+    mount_id: int
+    parent_id: int
+    device: str
+    root: str
+    mount_point: str
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -351,7 +362,25 @@ def _run_git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[st
     )
 
 
+def _verify_live_authority_cwd() -> None:
+    live_cwd = Path(LIVE_AUTHORITY_CWD)
+    try:
+        mode = live_cwd.lstat().st_mode
+    except OSError as error:
+        raise ContractError(f"fixed live-authority cwd is unavailable: {error}") from error
+    _require(
+        live_cwd.is_absolute()
+        and str(live_cwd) == os.path.abspath(str(live_cwd)) == os.path.realpath(str(live_cwd))
+        and live_cwd.is_dir()
+        and not live_cwd.is_symlink()
+        and not (live_cwd / ".git").exists()
+        and mode != 0,
+        "fixed live-authority cwd is not a physical non-repository directory",
+    )
+
+
 def _read_live_branch() -> list[tuple[str, str]]:
+    _verify_live_authority_cwd()
     network_environment = dict(_SANITIZED_GIT_ENV)
     for name in _NETWORK_ENVIRONMENT_NAMES:
         value = os.environ.get(name)
@@ -363,6 +392,7 @@ def _read_live_branch() -> list[tuple[str, str]]:
             text=True,
             capture_output=True,
             check=False,
+            cwd=LIVE_AUTHORITY_CWD,
             env=network_environment,
             timeout=60,
         )
@@ -387,6 +417,157 @@ def _git(repo_root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def _unescape_mountinfo(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _read_mount_entries() -> list[MountEntry]:
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ContractError(f"mount identity source is unavailable: {error}") from error
+    entries: list[MountEntry] = []
+    for line in lines:
+        before_separator, separator, _after_separator = line.partition(" - ")
+        fields = before_separator.split()
+        _require(separator == " - " and len(fields) >= 6, "mount identity source malformed")
+        try:
+            entries.append(
+                MountEntry(
+                    mount_id=int(fields[0]),
+                    parent_id=int(fields[1]),
+                    device=fields[2],
+                    root=_unescape_mountinfo(fields[3]),
+                    mount_point=_unescape_mountinfo(fields[4]),
+                )
+            )
+        except ValueError as error:
+            raise ContractError("mount identity source malformed") from error
+    _require(bool(entries), "mount identity source is empty")
+    return entries
+
+
+def _mount_for(path: Path, entries: Iterable[MountEntry]) -> MountEntry:
+    lexical = str(path)
+    candidates = [
+        entry
+        for entry in entries
+        if lexical == entry.mount_point
+        or lexical.startswith(entry.mount_point.rstrip("/") + "/")
+    ]
+    _require(bool(candidates), f"mount identity missing for controlled path: {lexical}")
+    return max(candidates, key=lambda entry: len(Path(entry.mount_point).parts))
+
+
+def _controlled_mount_identity(root: Path) -> dict[str, Any]:
+    entries = _read_mount_entries()
+    controlled = [root, root / ".git", *(root / relative for relative in EXACT_HARNESS_PATHS)]
+    missing = [str(path.relative_to(root)) for path in controlled[2:] if not path.is_file()]
+    _require(not missing, f"exact harness path missing: {missing}")
+    root_entry = _mount_for(root, entries)
+    _require(
+        root_entry.mount_point != str(root),
+        "authorized checkout locator has independent mount identity",
+    )
+    for path in controlled:
+        lexical = str(path)
+        _require(
+            lexical == os.path.abspath(lexical) == os.path.realpath(lexical)
+            and not path.is_symlink(),
+            f"controlled path is not physical and non-symlink: {lexical}",
+        )
+        entry = _mount_for(path, entries)
+        try:
+            stat_result = path.stat()
+        except OSError as error:
+            raise ContractError(f"controlled path is unavailable: {lexical}: {error}") from error
+        stat_device = f"{os.major(stat_result.st_dev)}:{os.minor(stat_result.st_dev)}"
+        _require(
+            entry == root_entry
+            and entry.mount_point != lexical
+            and stat_device == root_entry.device,
+            f"controlled path has independent mount identity: {lexical}",
+        )
+    return {
+        "mount_id": root_entry.mount_id,
+        "parent_id": root_entry.parent_id,
+        "device": root_entry.device,
+        "root": root_entry.root,
+        "mount_point": root_entry.mount_point,
+    }
+
+
+def _checkout_snapshot(root: Path, lexical: str, frozen_commit: str) -> dict[str, Any]:
+    _require(
+        lexical == os.path.abspath(lexical) == os.path.realpath(lexical)
+        and root.is_dir()
+        and not root.is_symlink(),
+        "physical checkout locator moved during verification",
+    )
+    mount_identity = _controlled_mount_identity(root)
+    _require(
+        _git(root, "rev-parse", "--show-toplevel") == lexical,
+        "authorized checkout root mismatch",
+    )
+    _require(
+        _git(root, "rev-parse", "--is-inside-work-tree") == "true",
+        "authorized checkout is not a Git worktree",
+    )
+    git_directory = _git(root, "rev-parse", "--absolute-git-dir")
+    _require(
+        git_directory == str(root / ".git")
+        and (root / ".git").is_dir()
+        and not (root / ".git").is_symlink(),
+        "physical checkout Git directory mismatch",
+    )
+    origin_urls = _git(root, "config", "--local", "--get-all", "remote.origin.url").splitlines()
+    _require(origin_urls == [REPOSITORY_URL], "repository locator origin substitution")
+    branch_result = _run_git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    branch = branch_result.stdout.strip()
+    _require(
+        branch_result.returncode == 0 and branch == AUTHORIZED_HARNESS_BRANCH,
+        "authorized checkout branch mismatch",
+    )
+    head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    _require(head == frozen_commit, "checkout changed during verification")
+    tree = _git(root, "rev-parse", "--verify", f"{frozen_commit}^{{tree}}")
+    tracked_dirty = (
+        _run_git(root, "diff-files", "--quiet").returncode != 0
+        or _run_git(
+            root,
+            "diff-index",
+            "--cached",
+            "--quiet",
+            frozen_commit,
+            "--",
+        ).returncode
+        != 0
+    )
+    untracked = _git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+    final_head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    final_branch_result = _run_git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    _require(
+        final_head == frozen_commit
+        and final_branch_result.returncode == 0
+        and final_branch_result.stdout.strip() == branch
+        and _controlled_mount_identity(root) == mount_identity,
+        "checkout changed during verification",
+    )
+    return {
+        "checkout_locator": lexical,
+        "git_directory": git_directory,
+        "branch": branch,
+        "head": head,
+        "tree": tree,
+        "mount_identity": mount_identity,
+        "clean": not tracked_dirty and not untracked,
+    }
+
+
 def recompute_trusted_checkout(
     repo_root: Path | str, *, require_clean: bool = True
 ) -> dict[str, Any]:
@@ -401,37 +582,9 @@ def recompute_trusted_checkout(
     )
     root = Path(lexical)
     _require(root.is_dir() and not root.is_symlink(), "physical checkout locator is not a directory")
-    _require(
-        _git(root, "rev-parse", "--show-toplevel") == lexical,
-        "authorized checkout root mismatch",
-    )
-    _require(
-        _git(root, "rev-parse", "--is-inside-work-tree") == "true",
-        "authorized checkout is not a Git worktree",
-    )
-    git_directory = _git(root, "rev-parse", "--absolute-git-dir")
-    expected_git_directory = str(root / ".git")
-    _require(
-        git_directory == expected_git_directory
-        and (root / ".git").is_dir()
-        and not (root / ".git").is_symlink(),
-        "physical checkout Git directory mismatch",
-    )
-    origin_urls = _git(root, "config", "--local", "--get-all", "remote.origin.url").splitlines()
-    _require(origin_urls == [REPOSITORY_URL], "repository locator origin substitution")
-    branch_result = _run_git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
-    branch = branch_result.stdout.strip()
-    _require(
-        branch_result.returncode == 0 and branch == AUTHORIZED_HARNESS_BRANCH,
-        "authorized checkout branch mismatch",
-    )
     head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
-    tree = _git(root, "rev-parse", "--verify", "HEAD^{tree}")
-    live_records = _read_live_branch()
-    _require(
-        live_records == [(head, AUTHORIZED_LIVE_REF)],
-        "live remote authority must contain exactly the authorized branch at local HEAD",
-    )
+    initial_snapshot = _checkout_snapshot(root, lexical, head)
+    tree = _git(root, "rev-parse", "--verify", f"{head}^{{tree}}")
     _require(
         _git(root, "rev-parse", f"{REPOSITORY_COMMIT}^{{tree}}") == REPOSITORY_TREE,
         "product base tree mismatch",
@@ -440,7 +593,7 @@ def recompute_trusted_checkout(
         _git(root, "rev-parse", f"{REPOSITORY_COMMIT}:3rdparty/bigop") == BIGOP_COMMIT,
         "bigop gitlink mismatch",
     )
-    result = _run_git(root, "merge-base", "--is-ancestor", REPOSITORY_COMMIT, "HEAD")
+    result = _run_git(root, "merge-base", "--is-ancestor", REPOSITORY_COMMIT, head)
     _require(result.returncode == 0, "product base is not an ancestor of harness checkout")
     changed = tuple(
         line
@@ -451,7 +604,7 @@ def recompute_trusted_checkout(
             "--name-only",
             "-r",
             REPOSITORY_COMMIT,
-            "HEAD",
+            head,
         ).splitlines()
         if line
     )
@@ -459,19 +612,21 @@ def recompute_trusted_checkout(
         set(changed) == set(EXACT_HARNESS_PATHS) and len(changed) == len(EXACT_HARNESS_PATHS),
         "checkout differs from exact harness path contract",
     )
-    missing_paths = [relative for relative in EXACT_HARNESS_PATHS if not (root / relative).is_file()]
-    _require(not missing_paths, f"exact harness path missing: {missing_paths}")
-    tracked_dirty = (
-        _run_git(root, "diff-files", "--quiet").returncode != 0
-        or _run_git(root, "diff-index", "--cached", "--quiet", "HEAD", "--").returncode != 0
-    )
-    untracked = _git(root, "ls-files", "--others", "--exclude-standard").splitlines()
-    clean = not tracked_dirty and not untracked
-    if require_clean:
-        _require(clean, "execution checkout is dirty")
-    commit_object = _git(root, "cat-file", "-p", "HEAD")
+    commit_object = _git(root, "cat-file", "-p", head)
     parents = [line.removeprefix("parent ") for line in commit_object.splitlines() if line.startswith("parent ")]
     _require(len(parents) == 1, "authorized checkout commit must have exactly one parent")
+    before_live = _checkout_snapshot(root, lexical, head)
+    _require(before_live == initial_snapshot, "checkout changed during verification")
+    live_records = _read_live_branch()
+    after_live = _checkout_snapshot(root, lexical, head)
+    _require(after_live == before_live, "checkout changed during verification")
+    _require(
+        live_records == [(head, AUTHORIZED_LIVE_REF)],
+        "live remote authority must contain exactly the authorized branch at local HEAD",
+    )
+    clean = after_live["clean"]
+    if require_clean:
+        _require(clean, "execution checkout is dirty")
     identity = {
         "repository_url": REPOSITORY_URL,
         "checkout_locator": lexical,
@@ -481,6 +636,7 @@ def recompute_trusted_checkout(
         "commit": head,
         "tree": tree,
         "parents": parents,
+        "mount_identity": dict(after_live["mount_identity"]),
         "product_base_commit": REPOSITORY_COMMIT,
         "product_base_tree": REPOSITORY_TREE,
         "changed_paths": list(EXACT_HARNESS_PATHS),
@@ -500,6 +656,7 @@ def validate_harness_identity(identity: Mapping[str, Any]) -> None:
         "commit",
         "tree",
         "parents",
+        "mount_identity",
         "product_base_commit",
         "product_base_tree",
         "changed_paths",
@@ -529,6 +686,22 @@ def validate_harness_identity(identity: Mapping[str, Any]) -> None:
         and len(parents) == 1
         and bool(_COMMIT.fullmatch(str(parents[0]))),
         "harness identity sole parent invalid",
+    )
+    mount_identity = identity.get("mount_identity")
+    _require(
+        isinstance(mount_identity, Mapping)
+        and set(mount_identity)
+        == {"mount_id", "parent_id", "device", "root", "mount_point"}
+        and isinstance(mount_identity.get("mount_id"), int)
+        and mount_identity.get("mount_id", 0) > 0
+        and isinstance(mount_identity.get("parent_id"), int)
+        and mount_identity.get("parent_id", -1) >= 0
+        and bool(re.fullmatch(r"[0-9]+:[0-9]+", str(mount_identity.get("device", ""))))
+        and isinstance(mount_identity.get("root"), str)
+        and str(mount_identity.get("root", "")).startswith("/")
+        and isinstance(mount_identity.get("mount_point"), str)
+        and str(mount_identity.get("mount_point", "")).startswith("/"),
+        "harness identity mount identity invalid",
     )
     _require(
         identity.get("product_base_commit") == REPOSITORY_COMMIT
@@ -656,10 +829,22 @@ def read_verified_envelope(
     return value
 
 
-def write_envelope(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
-    value = envelope(payload)
-    raw = canonical_bytes(value)
+def write_envelope(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    authorized_checkout: Path | str,
+) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
+    value = envelope(payload)
+    status = payload.get("status")
+    if status == "COMPLETE":
+        validate_execution_envelope(value, authorized_checkout=authorized_checkout)
+    elif status == "DRY_RUN_VALIDATED":
+        validate_dry_run_envelope(value, authorized_checkout=authorized_checkout)
+    else:
+        raise ContractError("durable status is not authorized")
+    raw = canonical_bytes(value)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(raw)
     os.replace(temporary, path)

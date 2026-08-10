@@ -72,6 +72,13 @@ def _fake_checkout():
         "commit": "b" * 40,
         "tree": "c" * 40,
         "parents": ["d" * 40],
+        "mount_identity": {
+            "mount_id": 1,
+            "parent_id": 0,
+            "device": "8:1",
+            "root": "/",
+            "mount_point": "/",
+        },
         "product_base_commit": contract.REPOSITORY_COMMIT,
         "product_base_tree": contract.REPOSITORY_TREE,
         "changed_paths": list(contract.EXACT_HARNESS_PATHS),
@@ -299,6 +306,7 @@ def test_live_remote_reader_uses_fixed_ref_and_sanitized_environment(monkeypatch
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured["environment"] = kwargs["env"]
+        captured["cwd"] = kwargs["cwd"]
         return subprocess.CompletedProcess(
             command,
             0,
@@ -307,18 +315,172 @@ def test_live_remote_reader_uses_fixed_ref_and_sanitized_environment(monkeypatch
         )
 
     monkeypatch.setattr(contract, "_read_live_branch", REAL_LIVE_READER)
+    monkeypatch.setenv("HOME", "/tmp/attacker-home")
+    monkeypatch.setenv("GIT_DIR", "/tmp/attacker-repo/.git")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.file:///tmp/forged.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", contract.REPOSITORY_URL)
     monkeypatch.setattr(contract.subprocess, "run", fake_run)
     assert contract._read_live_branch() == [(LOCAL_HEAD, contract.AUTHORIZED_LIVE_REF)]
-    assert captured["command"] == [
+    assert captured["command"][-5:] == [
         "git",
         "ls-remote",
         "--heads",
         contract.REPOSITORY_URL,
         contract.AUTHORIZED_LIVE_REF,
     ]
+    assert captured["cwd"] == contract.LIVE_AUTHORITY_CWD
+    assert Path(captured["cwd"]).is_absolute()
+    assert Path(captured["cwd"]).resolve() == Path(captured["cwd"])
+    assert not (Path(captured["cwd"]) / ".git").exists()
     assert "HOME" not in captured["environment"]
     assert "GIT_DIR" not in captured["environment"]
+    assert "GIT_CONFIG_COUNT" not in captured["environment"]
+    assert "GIT_CONFIG_KEY_0" not in captured["environment"]
+    assert "GIT_CONFIG_VALUE_0" not in captured["environment"]
     assert captured["environment"]["GIT_CONFIG_GLOBAL"] == contract.os.devnull
+
+
+def test_live_remote_network_failure_has_no_local_rewrite_or_fallback(monkeypatch):
+    calls = []
+
+    def fail_network(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            128,
+            stdout="",
+            stderr="fatal: unable to access fixed authority",
+        )
+
+    monkeypatch.setattr(contract, "_read_live_branch", REAL_LIVE_READER)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.file:///tmp/forged.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", contract.REPOSITORY_URL)
+    monkeypatch.setattr(contract.subprocess, "run", fail_network)
+    with pytest.raises(contract.ContractError, match="live remote authority"):
+        contract._read_live_branch()
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[-2:] == [contract.REPOSITORY_URL, contract.AUTHORIZED_LIVE_REF]
+    assert kwargs["cwd"] == contract.LIVE_AUTHORITY_CWD
+    assert "GIT_CONFIG_COUNT" not in kwargs["env"]
+
+
+def test_authorized_checkout_detects_head_switch_and_never_emits_mixed_identity(
+    tmp_path, monkeypatch
+):
+    authorized = _authorized_checkout(tmp_path, "head-switch")
+    subprocess.run(
+        ["git", "-C", str(authorized), "config", "user.name", "host-test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(authorized),
+            "config",
+            "user.email",
+            "host-test@example.invalid",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(authorized), "switch", "--quiet", "-c", "drift-child"],
+        check=True,
+    )
+    design = authorized / contract.EXACT_HARNESS_PATHS[0]
+    design.write_text(design.read_text(encoding="utf-8") + "\ndrift child\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(authorized), "add", str(design)], check=True)
+    subprocess.run(
+        ["git", "-C", str(authorized), "commit", "--quiet", "-m", "drift child"],
+        check=True,
+    )
+    drift_commit = subprocess.run(
+        ["git", "-C", str(authorized), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(authorized),
+            "switch",
+            "--quiet",
+            contract.AUTHORIZED_HARNESS_BRANCH,
+        ],
+        check=True,
+    )
+
+    real_git = contract._git
+    switched = False
+
+    def switch_after_frozen_head(repo_root, *args):
+        nonlocal switched
+        value = real_git(repo_root, *args)
+        if not switched and args == ("rev-parse", "--verify", "HEAD^{commit}"):
+            switched = True
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(authorized),
+                    "update-ref",
+                    f"refs/heads/{contract.AUTHORIZED_HARNESS_BRANCH}",
+                    drift_commit,
+                ],
+                check=True,
+            )
+        return value
+
+    monkeypatch.setattr(contract, "_git", switch_after_frozen_head)
+    with pytest.raises(contract.ContractError, match="checkout changed during verification"):
+        contract.recompute_trusted_checkout(authorized)
+
+
+@pytest.mark.parametrize("controlled_path", [None, ".git", 0, -1])
+def test_authorized_checkout_rejects_independent_or_bind_mount_identity(
+    tmp_path, monkeypatch, controlled_path
+):
+    authorized = _authorized_checkout(tmp_path, f"mount-{controlled_path}")
+    real_entries = contract._read_mount_entries()
+    if controlled_path is None:
+        target = authorized
+    elif controlled_path == ".git":
+        target = authorized / ".git"
+    else:
+        target = authorized / contract.EXACT_HARNESS_PATHS[controlled_path]
+    forged = contract.MountEntry(
+        mount_id=max(entry.mount_id for entry in real_entries) + 1000,
+        parent_id=1,
+        device="0:999",
+        root=str(target),
+        mount_point=str(target),
+    )
+    monkeypatch.setattr(contract, "_read_mount_entries", lambda: [*real_entries, forged])
+    with pytest.raises(contract.ContractError, match="independent mount"):
+        contract.recompute_trusted_checkout(authorized)
+
+
+def test_durable_write_rechecks_checkout_and_leaves_no_status_on_drift(
+    tmp_path, monkeypatch
+):
+    authorized = _authorized_checkout(tmp_path, "write-drift")
+    identity = contract.recompute_trusted_checkout(authorized)
+    payload = _complete_payload(identity)
+    path = tmp_path / "must-not-exist.json"
+
+    def drift(_authorized_checkout):
+        raise contract.ContractError("checkout changed during verification")
+
+    monkeypatch.setattr(contract, "recompute_trusted_checkout", drift)
+    with pytest.raises(contract.ContractError, match="checkout changed during verification"):
+        contract.write_envelope(path, payload, authorized_checkout=authorized)
+    assert not path.exists()
+    assert not path.with_suffix(path.suffix + ".sha256").exists()
 
 
 def test_authorized_checkout_rejects_alias_detached_fake_and_origin_substitution(tmp_path):
@@ -393,7 +555,7 @@ def test_verified_sidecar_api_rejects_missing_and_tampered_sidecar(tmp_path):
     identity = contract.recompute_trusted_checkout(authorized)
     payload = _complete_payload(identity)
     path = tmp_path / "receipt.json"
-    contract.write_envelope(path, payload)
+    contract.write_envelope(path, payload, authorized_checkout=authorized)
     contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
 
     sidecar = path.with_suffix(path.suffix + ".sha256")
@@ -401,7 +563,7 @@ def test_verified_sidecar_api_rejects_missing_and_tampered_sidecar(tmp_path):
     with pytest.raises(contract.ContractError, match="sidecar"):
         contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
 
-    contract.write_envelope(path, payload)
+    contract.write_envelope(path, payload, authorized_checkout=authorized)
     sidecar.write_text("0" * 64 + "\n", encoding="utf-8")
     with pytest.raises(contract.ContractError, match="sidecar"):
         contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
@@ -411,7 +573,9 @@ def test_verified_reader_rejects_noncanonical_raw_bytes_with_recomputed_sidecar(
     authorized = _authorized_checkout(tmp_path)
     identity = contract.recompute_trusted_checkout(authorized)
     path = tmp_path / "pretty.json"
-    contract.write_envelope(path, _complete_payload(identity))
+    contract.write_envelope(
+        path, _complete_payload(identity), authorized_checkout=authorized
+    )
     parsed = json.loads(path.read_bytes())
     pretty = (json.dumps(parsed, indent=2, sort_keys=True) + "\n").encode("utf-8")
     path.write_bytes(pretty)

@@ -438,7 +438,7 @@ def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
     value = envelope(payload)
     validate_execution_envelope(value, authorized_checkout=PROJECT_ROOT)
     path = receipt_dir / "current_human_baseline_execution.json"
-    write_envelope(path, payload)
+    write_envelope(path, payload, authorized_checkout=PROJECT_ROOT)
     read_verified_envelope(path, require_complete=True, authorized_checkout=PROJECT_ROOT)
     return path
 
@@ -461,7 +461,7 @@ def _dry_run(receipt_dir: Path) -> Path:
     }
     path = receipt_dir / "current_human_baseline_dry_run.json"
     validate_dry_run_envelope(envelope(payload), authorized_checkout=PROJECT_ROOT)
-    write_envelope(path, payload)
+    write_envelope(path, payload, authorized_checkout=PROJECT_ROOT)
     return path
 
 

@@ -135,7 +135,13 @@ def lint(root: Path) -> list[str]:
             if variables != EXPECTED_ROUTING_ENVIRONMENT:
                 findings.append("schema routing environment drift")
             harness_required = set(schema["$defs"]["harness_identity"]["required"])
-            if not {"checkout_locator", "branch", "live_ref", "live_commit"} <= harness_required:
+            if not {
+                "checkout_locator",
+                "branch",
+                "live_ref",
+                "live_commit",
+                "mount_identity",
+            } <= harness_required:
                 findings.append("schema authorized Git identity drift")
             payload_required = set(schema["$defs"]["payload"]["required"])
             if not {"harness_identity", "sidecar_binding"} <= payload_required:
@@ -160,8 +166,15 @@ def lint(root: Path) -> list[str]:
                 findings.append("COMPLETE validator authorized checkout API drift")
             dry_parameters = inspect.signature(contract.validate_dry_run_envelope).parameters
             reader_parameters = inspect.signature(contract.read_verified_envelope).parameters
-            if "authorized_checkout" not in dry_parameters or "authorized_checkout" not in reader_parameters:
+            writer_parameters = inspect.signature(contract.write_envelope).parameters
+            if (
+                "authorized_checkout" not in dry_parameters
+                or "authorized_checkout" not in reader_parameters
+                or "authorized_checkout" not in writer_parameters
+            ):
                 findings.append("shared durable-status authorized checkout API drift")
+            if contract.LIVE_AUTHORITY_CWD != "/":
+                findings.append("fixed non-repository live authority cwd drift")
             expected_live_ref = (
                 "refs/heads/codex02/uniep-current-main-recovery-20260809"
             )
