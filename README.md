@@ -22,92 +22,73 @@ python -m pip install -e . --no-deps
 安装后，无论当前工作目录在哪里都应使用 `mega_moe` 包名，不再导入 `src`、
 `functions`、`kernels` 或 `benchmark`。
 
-### 测试期第三方依赖（bigop）
-
-后向的第二套 golden 参考实现依赖 [bigop](https://gitcode.com/jzhoujg/bigop.git)，
-以 `3rdparty/bigop` git submodule 接入（pin 到固定 commit，见 `.gitmodules`）。
-clone 仓库后执行一键脚本拉取并 editable 安装即可（torch / torch-npu 仍由环境提供，`--no-deps`）：
-
-```bash
-bash scripts/install_3rdparty.sh
-```
-
 ## 目录结构
 
 ```text
 config/
-└── _shapes.py                # 所有模型/shape 配置（MoETestShape + 各 shape 列表 + MODEL_PROFILES）
+└── _shapes.py                # CaseGroup table + expanded CaseSpec registry
 
 src/mega_moe/
 ├── config.py                 # 前向配置与调度参数校验
 ├── ops/
 │   ├── forward.py            # 完整前向编排与输入校验
-│   └── backward.py           # 五阶段反向编排及 autograd.Function
+│   ├── backward.py           # 五阶段反向编排及 autograd.Function
+│   └── _torch_forward.py     # backward 使用的私有可微 Torch 前向
 ├── runtime/
 │   ├── workspace.py          # ACLSHMEM 对称内存及 workspace 生命周期
 │   └── routing.py            # 路由过滤、排序、计数交换和 offset
 ├── kernels/                  # Triton JIT kernels 及 launcher
-└── _goldens/                 # torch golden 参考实现（前向 moe_forward + 后向 moe_backward_torch）
-    ├── _torch_forward_for_backward.py  # 可微 torch 前向（被 backward 复用）
-    └── backward.py
+
+conftest.py                   # @pytest.mark.dist 多进程 HCCL 启动夹具
 
 tests/
-├── conftest.py               # @pytest.mark.dist 多进程 HCCL 启动夹具
-├── _moe_dist_utils.py        # 多卡测试/基准共享工具（ACLSHMEM、peer_mem 等）
+├── _moe_testkit.py           # ACLSHMEM 生命周期、peer memory、计时协议
+├── _moe_baselines.py         # 独立 functional oracle 与 hand-written backward baseline
 ├── _numeric.py               # 数值比较阈值与判定
-├── layer/                    # 完整前向/反向流程测试
+├── layer/test_moe_suite.py   # 参数化 functional forward/backward suite
 └── kernel/{forward,backward}/  # kernel 级单测（占位）
 
-benchmark/layer/              # 前向/反向 benchmark 入口与结果汇总
+benchmark/layer/              # 前向/反向 benchmark、profiler 与结果汇总
+├── bench_moe_suite.py        # 参数化 performance forward/backward suite
+├── _grouped_forward_baseline.py # Torch-NPU grouped-GEMM + HCCL performance baseline
+└── summarize_results.py
 ```
 
 ## How to start
 
 ### 正确性测试
 
-基础环境依赖配置测试：
+功能 suite 的入口是同一个参数化文件；可用 `-k` 或 node id 选择 case：
 
-```bash
-python -m pytest tests/layer/test_moe_forward.py -m "not dist" -v
-```
-
-前向两卡用例：
 ```bash
 python -m pytest \
-  tests/layer/test_moe_forward.py::test_forward_2ranks \
+  tests/layer/test_moe_suite.py -k 'forward and smoke' \
   -m dist -v -s
-```
-
-后向两卡用例：
-```bash
 python -m pytest \
-  tests/layer/test_moe_backward.py::test_backward_2ranks \
+  tests/layer/test_moe_suite.py -k 'backward and smoke' \
   -m dist -v -s
 ```
 
 ### 性能测试（benchmark）
 
 
-前向性能（`bench_full_forward.py`）：
+性能 suite（`bench_moe_suite.py`）：
 
 ```bash
-# RANK_SIZE=2 跑 KIMI-K3-SMALL；MOE_FULL_BENCH_CONFIG 可限定 token 档位（如 kimi_k3_small_4k）
-RANK_SIZE=2 MOE_FULL_BENCH_CONFIG=kimi_k3_small_4k \
-python -m pytest -p tests.conftest \
-  benchmark/layer/bench_full_forward.py::test_bench_full_forward_kimi_k3 \
+# 先查看显式的 model/world/tokens-per-rank node id，再选择一个 case
+python -m pytest --collect-only -q benchmark/layer/bench_moe_suite.py
+python -m pytest \
+  'benchmark/layer/bench_moe_suite.py::test_bench_forward_case[performance-fwd-qwen-w8-t8k]' \
   -m dist -v -s
 ```
 
-后向性能（`bench_backward.py`）：
+后向性能：
 
 ```bash
-# RANK_SIZE=2 默认跑 Kimi-K3-small；MOE_BACKWARD_BENCH_CONFIG 用 slug 限定（如 kimi_k3_small_4k）
-RANK_SIZE=2 MOE_BACKWARD_BENCH_CONFIG=kimi_k3_small_4k \
-python -m pytest -p tests.conftest \
-  benchmark/layer/bench_backward.py::test_bench_backward \
+python -m pytest \
+  'benchmark/layer/bench_moe_suite.py::test_bench_backward_case[performance-bwd-kimi-k3-w4-t4k]' \
   -m dist -v -s
 ```
-
 
 ## 现有性能结果
 
@@ -115,9 +96,9 @@ python -m pytest -p tests.conftest \
 
 #### Kimi-K3
 
-完整*八卡* post-routing forward 的加速比为 `Grouped golden / Ascend candidate`：
+完整*八卡* post-routing forward 的加速比为 `Grouped baseline / Ascend candidate`：
 
-| tokens/rank | Ascend full | Grouped golden | 加速比 | 观测 HBM/卡 |
+| tokens/rank | Ascend full | Grouped baseline | 加速比 | 观测 HBM/卡 |
 |---:|---:|---:|---:|---:|
 | 2K  | 27.525 ms | 43.207 ms | **1.570x** | — |
 | 4K  | 44.709 ms | 80.422 ms | **1.799x** | ≈22.4 GiB |
@@ -166,10 +147,8 @@ python -m pytest -p tests.conftest \
 
 #### Kimi-K3（八卡）
 
-完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL golden）加速比 `torch(ms) / triton(ms)`：
+完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL baseline）加速比 `torch(ms) / triton(ms)`：
 
 | tokens/rank | torch/ms | triton/ms | triton/torch |
 |---:|---:|---:|---:|
 | 2K | 166.237 | 107.475 | **1.55x** |
-
-

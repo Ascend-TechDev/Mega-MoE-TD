@@ -1,34 +1,20 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Central model / shape configuration package.
-
-Re-exports the public config surface from :mod:`config._shapes` so callers can
-write ``from config import MoETestShape, FORWARD_SHAPES, MODEL_PROFILES, ...``.
-"""
+"""Public case-registry API for tests and benchmarks."""
 
 from config._shapes import (
-    BACKWARD_SHAPES_KIMI,
-    BACKWARD_SHAPES_KIMI_SMALL,
-    BACKWARD_SHAPES_PERF,
-    BACKWARD_SHAPES_SMALL,
-    FORWARD_SHAPES,
-    FORWARD_SHAPES_KIMI,
-    MODEL_PROFILES,
-    MoETestShape,
-    rank_size,
-    select_perf_shapes,
-    shape_slug,
+    CASE_REGISTRY,
+    CaseGroup,
+    CaseSpec,
+    case_dict,
+    resolve_case,
+    select_cases,
 )
 
 __all__ = [
-    "MoETestShape",
-    "FORWARD_SHAPES",
-    "FORWARD_SHAPES_KIMI",
-    "BACKWARD_SHAPES_SMALL",
-    "BACKWARD_SHAPES_KIMI",
-    "BACKWARD_SHAPES_KIMI_SMALL",
-    "BACKWARD_SHAPES_PERF",
-    "MODEL_PROFILES",
-    "select_perf_shapes",
-    "rank_size",
-    "shape_slug",
+    "CaseGroup",
+    "CaseSpec",
+    "CASE_REGISTRY",
+    "select_cases",
+    "resolve_case",
+    "case_dict",
 ]
