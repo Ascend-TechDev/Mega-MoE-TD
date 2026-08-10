@@ -200,7 +200,7 @@ def _launch_dispatch_fc2_bwd(prep, peer_mem, out):
         prep["fc2"].stride(0), prep["fc2"].stride(1), prep["fc2"].stride(2),
         out,
         BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-        BLOCK_H_PUSH=512, PUSH_VECTOR_WORKERS=1, num_warps=8)
+        BLOCK_H_PUSH=1024, PUSH_VECTOR_WORKERS=2, num_warps=8)
     return out
 
 
