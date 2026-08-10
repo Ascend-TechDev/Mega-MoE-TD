@@ -76,13 +76,23 @@ from mega_moe import FusedMoEForward, MoEForwardConfig
 from config import CaseSpec, select_cases
 from benchmark.layer._grouped_forward_baseline import GroupedForwardBaseline
 from tests import _moe_testkit as kit
-from tests._moe_baselines import backward_torch_baseline, build_backward_saved
+from tests._moe_baselines import (
+    backward_torch_baseline,
+    build_backward_saved,
+    compare_backward_gradients,
+)
 
 
 ACTIVATION_DTYPE = torch.bfloat16
 ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-transport-v2"
+BACKWARD_RESULT_CONTRACT = "backward-wgrad-explicit-paired-v1"
+BACKWARD_PRODUCTION_SOURCES = (
+    "src/mega_moe/ops/backward.py",
+    "src/mega_moe/kernels/transposed_grouped_gemm.py",
+    "src/mega_moe/kernels/common.py",
+)
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
 
 # This is the published protocol.  Keep debug/short runs under a differently
@@ -103,7 +113,7 @@ if G_ASH_SIZE_GB <= 0:
 G_ASH_SIZE = G_ASH_SIZE_GB * 1024 * 1024 * 1024
 
 
-def _benchmark_provenance():
+def _benchmark_provenance(result_contract=RESULT_CONTRACT):
     """Return enough immutable context to distinguish new results from old JSON."""
     with open(__file__, "rb") as source_file:
         source_sha256 = hashlib.sha256(source_file.read()).hexdigest()
@@ -123,12 +133,22 @@ def _benchmark_provenance():
                 hashlib.sha256(source_file.read()).hexdigest()
             )
     return {
-        "result_contract": RESULT_CONTRACT,
+        "result_contract": result_contract,
         "benchmark_source": os.path.abspath(__file__),
         "benchmark_source_sha256": source_sha256,
         "forward_source_sha256": forward_source_sha256,
         "command": shlex.join(sys.argv),
     }
+
+
+def _backward_benchmark_provenance():
+    provenance = _benchmark_provenance(BACKWARD_RESULT_CONTRACT)
+    source_hashes = {}
+    for relative_path in BACKWARD_PRODUCTION_SOURCES:
+        with (PROJECT_ROOT / relative_path).open("rb") as source_file:
+            source_hashes[relative_path] = hashlib.sha256(source_file.read()).hexdigest()
+    provenance["backward_source_sha256"] = source_hashes
+    return provenance
 
 
 def _get_ash_ip_port():
@@ -872,18 +892,42 @@ def _backward_gate(saved, dy, peer_mem):
 
     with torch.no_grad():
         torch_result = backward_torch_baseline(saved, dy)
-        triton_result = moe_backward_triton(saved, dy, peer_mem)
-    keys = ("grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2")
-    for key in keys:
-        if key not in torch_result or key not in triton_result:
-            raise AssertionError(f"backward result is missing {key}")
-        if torch_result[key].shape != triton_result[key].shape:
-            raise AssertionError(f"backward gate shape mismatch for {key}")
-        if not bool(torch.isfinite(torch_result[key].float()).all()):
-            raise AssertionError(f"backward baseline has non-finite {key}")
-        if not bool(torch.isfinite(triton_result[key].float()).all()):
-            raise AssertionError(f"backward candidate has non-finite {key}")
-    return torch_result, triton_result
+        candidates = {
+            "torch_wgrad": moe_backward_triton(
+                saved, dy, peer_mem, use_triton_wgrad=False
+            ),
+            "triton_wgrad": moe_backward_triton(
+                saved, dy, peer_mem, use_triton_wgrad=True
+            ),
+        }
+
+    details_by_arm = {}
+    for arm_name, result in candidates.items():
+        all_ok, details = compare_backward_gradients(result, torch_result)
+        local_ok = torch.tensor(
+            [1 if all_ok else 0], dtype=torch.int32, device=dy.device
+        )
+        dist.all_reduce(local_ok, op=dist.ReduceOp.MIN, group=saved["ep_group"])
+        details_by_arm[arm_name] = details
+        if not bool(local_ok.item()):
+            raise AssertionError(
+                f"backward five-gradient gate failed for {arm_name}: {details}"
+            )
+    return details_by_arm
+
+
+def _validate_backward_benchmark_environment():
+    """Reject ambient knobs that could change or obscure the paired arms."""
+    forbidden = {
+        name: os.environ[name]
+        for name in ("MOE_WGRAD_TRITON", "MOE_BWD_TRACE")
+        if os.environ.get(name)
+    }
+    if forbidden:
+        names = ", ".join(sorted(forbidden))
+        raise RuntimeError(
+            f"backward benchmark requires explicit quiet wgrad arms; unset {names}"
+        )
 
 
 def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
@@ -895,6 +939,7 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
         raise ValueError(f"worker world size does not match {case.case_id}")
     if torch_npu is None or kit.ash is None:
         raise RuntimeError("this benchmark requires torch_npu and ACLSHMEM")
+    _validate_backward_benchmark_environment()
 
     from mega_moe import moe_backward_triton
     ep_group = dist.group.WORLD
@@ -904,29 +949,53 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
         )
         peer_mem = kit.make_peer_mem(saved, dtype, rank)
         try:
-            torch_gate_result, _ = _backward_gate(
-                saved, dy, peer_mem
-            )
+            gradient_details = _backward_gate(saved, dy, peer_mem)
 
             def _triton():
                 with torch.no_grad():
-                    moe_backward_triton(saved, dy, peer_mem)
+                    moe_backward_triton(
+                        saved, dy, peer_mem, use_triton_wgrad=True
+                    )
 
             def _torch():
-                backward_torch_baseline(saved, dy)
+                with torch.no_grad():
+                    moe_backward_triton(
+                        saved, dy, peer_mem, use_triton_wgrad=False
+                    )
 
-            triton_timing, torch_timing = kit.PerformanceRunner(
+            paired = kit.PerformanceRunner(
                 _triton,
                 _torch,
                 BACKWARD_TIMING,
                 device=device,
                 ep_group=ep_group,
-            ).run()
-            triton_ms = triton_timing.stats["median_ms"]
-            torch_ms = torch_timing.stats["median_ms"]
-            speedup = torch_ms / triton_ms if triton_ms > 0 else float("inf")
+            ).run_paired()
+            order_speedups = {}
+            raw_samples_ms = {}
+            order_stats = {}
+            for order_name, results in paired.items():
+                triton_result = results["candidate"]
+                torch_result = results["baseline"]
+                triton_ms = triton_result.median_ms
+                torch_ms = torch_result.median_ms
+                if triton_ms <= 0 or torch_ms <= 0:
+                    raise RuntimeError(
+                        f"non-positive paired timing in {order_name}: "
+                        f"triton={triton_ms}, torch={torch_ms}"
+                    )
+                order_speedups[order_name] = torch_ms / triton_ms
+                raw_samples_ms[order_name] = {
+                    "triton_wgrad": list(triton_result.samples_ms),
+                    "torch_wgrad": list(torch_result.samples_ms),
+                }
+                order_stats[order_name] = {
+                    "triton_wgrad": triton_result.stats,
+                    "torch_wgrad": torch_result.stats,
+                }
+            minimum_speedup = min(order_speedups.values())
+            target_speedup = 1.5
             entry = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "direction": "backward",
                 "case_id": case.case_id,
                 "model": case.model,
@@ -938,20 +1007,43 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "topk": case.topk,
                     "num_experts": case.num_experts,
                 },
-                "protocol": BACKWARD_TIMING.as_dict(),
+                "protocol": {
+                    **BACKWARD_TIMING.as_dict(),
+                    "paired_orders": [
+                        "triton_wgrad_then_torch_wgrad",
+                        "torch_wgrad_then_triton_wgrad",
+                    ],
+                    "samples_per_arm_per_order": BACKWARD_TIMING.iterations,
+                    "comparison_boundary": (
+                        "same five-stage backward; only step3/step5 wgrad "
+                        "implementation differs"
+                    ),
+                },
                 "correctness_gate": {
                     "status": "passed_before_timing",
-                    "kind": "structure/shape/dtype/finite/no-exception",
+                    "kind": "independent Torch oracle; five numeric gradients",
+                    "arms": ["torch_wgrad", "triton_wgrad"],
                 },
                 "metrics": {
-                    "torch_ms": torch_ms,
-                    "triton_ms": triton_ms,
-                    "triton_over_torch": speedup,
+                    "raw_samples_ms": raw_samples_ms,
+                    "order_stats": order_stats,
+                    "speedup_by_order": order_speedups,
+                    "minimum_speedup": minimum_speedup,
+                    "target_speedup": 1.5,
+                    "target_met": minimum_speedup >= target_speedup,
                 },
                 "gradient_gate": {
-                    "keys": sorted(torch_gate_result),
-                    "comparison": "untimed structure gate",
+                    "keys": [
+                        "grad_hidden",
+                        "grad_routing_weights",
+                        "grad_fc1_1",
+                        "grad_fc1_2",
+                        "grad_fc2",
+                    ],
+                    "comparison": "untimed numeric gate for both wgrad arms",
+                    "details": gradient_details,
                 },
+                "provenance": _backward_benchmark_provenance(),
             }
             if rank == 0:
                 _upsert_result(

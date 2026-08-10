@@ -162,13 +162,18 @@ class TimingResult:
             raise ValueError("a timing result needs at least one sample")
 
     @property
+    def median_ms(self) -> float:
+        """Unrounded median used for threshold decisions."""
+        return float(statistics.median(self.samples_ms))
+
+    @property
     def stats(self) -> dict[str, float]:
         values = tuple(float(value) for value in self.samples_ms)
         return {
             "min_ms": round(min(values), 3),
             "max_ms": round(max(values), 3),
             "mean_ms": round(statistics.fmean(values), 3),
-            "median_ms": round(statistics.median(values), 3),
+            "median_ms": round(self.median_ms, 3),
         }
 
 
@@ -191,10 +196,63 @@ class PerformanceRunner:
     def run(self) -> tuple[TimingResult, TimingResult]:
         return self.measure(self.candidate), self.measure(self.baseline)
 
+    def run_paired(self) -> dict[str, dict[str, TimingResult]]:
+        """Measure both arms in both orders and retain every rank-MAX sample.
+
+        A fixed candidate-then-baseline order can turn thermal or allocator
+        drift into an apparent speedup.  The wgrad decision therefore uses two
+        explicit orders in the same process/session.  Each order receives its
+        own warmup, and every measured invocation is synchronized and reduced
+        across ranks before the next arm starts.
+        """
+        orders = (
+            ("candidate_then_baseline", (
+                ("candidate", self.candidate),
+                ("baseline", self.baseline),
+            )),
+            ("baseline_then_candidate", (
+                ("baseline", self.baseline),
+                ("candidate", self.candidate),
+            )),
+        )
+        results = {}
+        for order_name, arms in orders:
+            for _ in range(self.timing.warmup):
+                for _, fn in arms:
+                    fn()
+            samples = {label: [] for label, _ in arms}
+            for _ in range(self.timing.iterations):
+                for label, fn in arms:
+                    samples[label].append(self._measure_single(fn))
+            results[order_name] = {
+                label: TimingResult(tuple(values))
+                for label, values in samples.items()
+            }
+        return results
+
     def measure(self, fn) -> TimingResult:
         if self.timing.clock == "host_wall":
             return self._measure_host_wall(fn)
         return self._measure_npu_events(fn)
+
+    def _measure_single(self, fn) -> float:
+        """Measure one invocation with the configured clock and rank MAX."""
+        self._synchronize_ranks()
+        if self.timing.clock == "host_wall":
+            start = time.perf_counter()
+            fn()
+            torch.npu.synchronize(self.device)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return self._rank_max(elapsed_ms)
+
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        stream = torch.npu.current_stream(self.device)
+        start.record(stream)
+        fn()
+        end.record(stream)
+        end.synchronize()
+        return self._rank_max(start.elapsed_time(end))
 
     def _synchronize_ranks(self):
         torch.npu.synchronize(self.device)

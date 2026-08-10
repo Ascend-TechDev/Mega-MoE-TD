@@ -200,15 +200,35 @@ def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
         peer_mem = kit.make_peer_mem(saved, dtype, rank)
         try:
             torch_result = backward_torch_baseline(saved, dy)
-            with torch.no_grad():
-                triton_result = moe_backward_triton(saved, dy, peer_mem)
-            all_ok, details = compare_backward_gradients(triton_result, torch_result)
-            flag = torch.tensor([1 if all_ok else 0], dtype=torch.int32, device=device)
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
-            if rank == 0 and not bool(flag.item()):
-                print(f"backward gradient details for {case.case_id}: {details}", flush=True)
-            if not bool(flag.item()):
-                raise AssertionError(f"functional backward case failed: {case.case_id}")
+            for mode_name, use_triton_wgrad in (
+                ("torch-wgrad", False),
+                ("triton-wgrad", True),
+            ):
+                with torch.no_grad():
+                    candidate_result = moe_backward_triton(
+                        saved,
+                        dy,
+                        peer_mem,
+                        use_triton_wgrad=use_triton_wgrad,
+                    )
+                all_ok, details = compare_backward_gradients(
+                    candidate_result, torch_result
+                )
+                flag = torch.tensor(
+                    [1 if all_ok else 0], dtype=torch.int32, device=device
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+                if rank == 0 and not bool(flag.item()):
+                    print(
+                        f"backward gradient details for {case.case_id} "
+                        f"{mode_name}: {details}",
+                        flush=True,
+                    )
+                if not bool(flag.item()):
+                    raise AssertionError(
+                        f"functional backward case failed: {case.case_id} "
+                        f"{mode_name}"
+                    )
         finally:
             kit.ash.aclshmem_free_tensor(peer_mem)
 

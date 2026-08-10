@@ -28,7 +28,6 @@ import os
 
 import torch
 import torch_npu  # noqa: F401
-import torch.distributed as dist
 
 from ._torch_forward import moe_forward
 from ..kernels import (
@@ -57,7 +56,10 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
     K = orig_in.shape[1]
     dtype = grad_out.dtype
     dev = grad_out.device
-    grad_w = torch.empty(E, N, K, dtype=dtype, device=dev)
+    # A zero-token expert has an exact zero weight gradient.  ``empty`` left
+    # those slices uninitialized and the old structure-only benchmark gate did
+    # not compare their values.
+    grad_w = torch.zeros(E, N, K, dtype=dtype, device=dev)
     ec_list = expert_counts.cpu().tolist()  # one sync, avoid per-iter .item()
     start = 0
     for e in range(E):
@@ -73,14 +75,19 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
 # ============================================================================
 # 1.  5-op orchestrator
 # ============================================================================
-def moe_backward_triton(saved, dy, peer_mem):
+def moe_backward_triton(
+    saved, dy, peer_mem, *, use_triton_wgrad: bool | None = None
+):
     """Run the 5 triton mega-ops end-to-end. peer_mem is ONE shared symmetric
     buffer at heap offset 0 (dl.symm_at only resolves correctly at offset 0 with
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching the hand-written test baseline."""
     dy = dy.to(saved["fc1_1"].dtype)
-    use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
+    if use_triton_wgrad is None:
+        use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
+    elif type(use_triton_wgrad) is not bool:
+        raise TypeError("use_triton_wgrad must be bool or None")
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
     _r = saved["ep_rank"]
     def _t(tag):
