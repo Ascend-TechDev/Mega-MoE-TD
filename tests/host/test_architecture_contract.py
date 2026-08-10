@@ -110,3 +110,50 @@ def test_complete_schema_requires_harness_and_sidecar_binding():
     complete = schema["$defs"]["payload"]["allOf"][0]["then"]["required"]
     assert "harness_identity" in complete
     assert "sidecar_binding" in complete
+
+
+def test_complete_schema_binds_full_plan_authorized_git_and_backward_trace():
+    schema_path = ROOT / "benchmark" / "contracts" / "current_human_baseline_v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert schema["$defs"]["payload"]["properties"]["plan"] == {
+        "$ref": "#/$defs/plan"
+    }
+    required_plan = set(schema["$defs"]["plan"]["required"])
+    assert required_plan == {
+        "contract_version",
+        "repository",
+        "submodules",
+        "model",
+        "parallel",
+        "tokens_per_rank",
+        "fixture_seed",
+        "routing_environment",
+        "timing",
+        "arms",
+        "arm_operations",
+        "fusion_switches",
+        "legal_comparisons",
+        "precision",
+        "providers",
+        "raw_receipt",
+    }
+    variables = schema["$defs"]["environment"]["properties"]["variables"]["const"]
+    assert variables["MOE_BWD_TRACE"] == ""
+    harness_required = set(schema["$defs"]["harness_identity"]["required"])
+    assert {"branch", "remote_ref", "remote_commit"} <= harness_required
+
+
+def test_lint_rejects_incomplete_portable_plan_contract(tmp_path):
+    candidate = tmp_path / "repo"
+    shutil.copytree(
+        ROOT,
+        candidate,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+    )
+    schema_path = candidate / "benchmark" / "contracts" / "current_human_baseline_v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["$defs"]["plan"]["required"].remove("providers")
+    schema_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
+    result = _run_lint(candidate)
+    assert result.returncode == 1
+    assert "full plan contract" in result.stdout

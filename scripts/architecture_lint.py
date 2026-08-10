@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -34,6 +35,29 @@ EXPECTED_ARMS = (
 )
 EXPECTED_SHAPES = (4096, 8192, 16384)
 DEVICE_IMPORTS = {"torch", "torch_npu", "triton", "shmem"}
+EXPECTED_ROUTING_ENVIRONMENT = {
+    "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
+    "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+    "MOE_BWD_TRACE": "",
+}
+EXPECTED_PLAN_FIELDS = {
+    "contract_version",
+    "repository",
+    "submodules",
+    "model",
+    "parallel",
+    "tokens_per_rank",
+    "fixture_seed",
+    "routing_environment",
+    "timing",
+    "arms",
+    "arm_operations",
+    "fusion_switches",
+    "legal_comparisons",
+    "precision",
+    "providers",
+    "raw_receipt",
+}
 
 
 def _load_contract(root: Path):
@@ -103,6 +127,16 @@ def lint(root: Path) -> list[str]:
                 findings.append("schema four-arm set drift")
             if shapes != EXPECTED_SHAPES:
                 findings.append("schema shape set drift")
+            payload_plan = schema["$defs"]["payload"]["properties"]["plan"]
+            plan = schema["$defs"]["plan"]
+            if payload_plan != {"$ref": "#/$defs/plan"} or set(plan["required"]) != EXPECTED_PLAN_FIELDS:
+                findings.append("schema full plan contract drift")
+            variables = schema["$defs"]["environment"]["properties"]["variables"]["const"]
+            if variables != EXPECTED_ROUTING_ENVIRONMENT:
+                findings.append("schema routing environment drift")
+            harness_required = set(schema["$defs"]["harness_identity"]["required"])
+            if not {"branch", "remote_ref", "remote_commit"} <= harness_required:
+                findings.append("schema authorized Git identity drift")
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             findings.append(f"schema is not inspectable: {error}")
 
@@ -116,6 +150,11 @@ def lint(root: Path) -> list[str]:
                 findings.append("contract shape set drift")
             if tuple(contract.EXACT_HARNESS_PATHS) != REQUIRED_PATHS:
                 findings.append("exact ten-path harness contract drift")
+            if contract.ROUTING_ENVIRONMENT != EXPECTED_ROUTING_ENVIRONMENT:
+                findings.append("contract routing environment drift")
+            execution_parameters = inspect.signature(contract.validate_execution_envelope).parameters
+            if "authorized_checkout" not in execution_parameters or "trusted_checkout" in execution_parameters:
+                findings.append("COMPLETE validator authorized checkout API drift")
             committed_paths = _committed_harness_paths(root, contract.REPOSITORY_COMMIT)
             if committed_paths is not None and set(committed_paths) != set(REQUIRED_PATHS):
                 findings.append(

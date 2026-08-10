@@ -33,7 +33,9 @@ layer for historical metrics.
   any timing;
 - canonical JSON payload and file hashes with full sample arrays.
 - exact `MOE_FULL_BENCH_ROUTE_MODE=dense_random` and
-  `MOE_FULL_BENCH_ACTIVE_EXPERTS=8` bindings in the plan, environment, and
+  `MOE_FULL_BENCH_ACTIVE_EXPERTS=8` bindings plus explicit
+  `MOE_BWD_TRACE=""` (the exact trace-disabled value used by current-main's
+  `bool(os.environ.get("MOE_BWD_TRACE"))`) in the plan, environment, and
   execution receipt.
 
 Any missing or conflicting field is invalid evidence. The Python validator is
@@ -57,6 +59,8 @@ versions, source files or gitlink, and hashes. The recomputed environment must
 equal the receipt before device selection, process-group initialization, or
 fixture construction. CANN identity must come from a version file beneath the
 active toolkit root; bigop identity is the fixed product-base gitlink.
+The routing environment is checked again immediately before each backward
+fixture so trace drift cannot enter backward correctness or timing.
 
 ### 2.3 Providers
 
@@ -82,6 +86,16 @@ and exact ten-path delta) plus the required sidecar algorithm/suffix. Consumers
 must use the sidecar-verifying read API; a missing or tampered sidecar is not a
 receipt.
 
+COMPLETE validation accepts an explicit authorized Git checkout path, never a
+caller-supplied identity mapping. It executes sanitized Git plumbing internally
+and binds the exact origin URL, designated branch/upstream remote ref, remote
+commit, HEAD/tree/parents, product ancestry, clean state, and cumulative
+ten-path delta. The receipt identity must equal that recomputation. Raw receipt
+bytes must also equal the canonical serialization exactly; reformatting and
+rehashing the sidecar does not produce valid evidence. The portable schema
+declares every required plan field while the Python validator checks the full
+fixed plan values.
+
 ## 3. Validation rigor
 
 Host tests are causal: mutations to the canonical sections or four-arm schema
@@ -90,7 +104,9 @@ must fail; missing gradients or a truncated sample array must fail; and dry-run
 must prove that no Torch, torch-npu, Triton, or ACLSHMEM module was imported.
 Duplicate canonical documents or runners, an eleventh provider, a deleted
 harness path, a dirty checkout, route-variable drift, placeholder environment
-identity, and sidecar tampering must independently turn their gates red.
+identity, remote-ref drift, a self-signed checkout mapping, an incomplete plan,
+noncanonical raw JSON, and sidecar tampering must independently turn their
+gates red.
 
 Device evidence is not accepted merely because the process exits zero. Every
 requested shape must appear, every precision result must be `PASS`, every arm

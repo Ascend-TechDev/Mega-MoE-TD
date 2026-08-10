@@ -37,7 +37,10 @@ SAMPLES = 50
 ROUTING_ENVIRONMENT = {
     "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
     "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+    "MOE_BWD_TRACE": "",
 }
+AUTHORIZED_HARNESS_BRANCH = "codex02/uniep-current-main-recovery-20260809"
+AUTHORIZED_REMOTE_REF = f"refs/remotes/origin/{AUTHORIZED_HARNESS_BRANCH}"
 EXACT_HARNESS_PATHS = (
     "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
     "benchmark/contracts/current_human_baseline_v1.schema.json",
@@ -116,6 +119,17 @@ FUSION_SWITCHES = {
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _PLACEHOLDER = re.compile(r"(?:placeholder|identity[-_ ]?bound|unknown|todo|n/?a)", re.IGNORECASE)
+_SANITIZED_GIT_ENV = {
+    "PATH": os.defpath,
+    "LANG": "C",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_EXTERNAL_DIFF": "",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 
 
 class ContractError(ValueError):
@@ -308,13 +322,29 @@ def compare_environment(expected: Mapping[str, Any], actual: Mapping[str, Any]) 
     _require(dict(expected) == dict(actual), "runtime environment mismatch")
 
 
-def _git(repo_root: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), *arguments],
+def _run_git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "diff.external=",
+            "-C",
+            str(repo_root),
+            *arguments,
+        ],
         text=True,
         capture_output=True,
         check=False,
+        env=_SANITIZED_GIT_ENV,
     )
+
+
+def _git(repo_root: Path, *arguments: str) -> str:
+    result = _run_git(repo_root, *arguments)
     if result.returncode != 0:
         raise ContractError(
             f"git identity command failed: {' '.join(arguments)}: {result.stderr.strip()}"
@@ -323,10 +353,33 @@ def _git(repo_root: Path, *arguments: str) -> str:
 
 
 def recompute_trusted_checkout(
-    repo_root: Path, *, require_clean: bool = True
+    repo_root: Path | str, *, require_clean: bool = True
 ) -> dict[str, Any]:
-    root = repo_root.resolve()
-    _require(_git(root, "remote", "get-url", "origin") == REPOSITORY_URL, "origin URL mismatch")
+    _require(isinstance(repo_root, (str, os.PathLike)), "authorized checkout path missing")
+    root = Path(repo_root).resolve()
+    _require(
+        Path(_git(root, "rev-parse", "--show-toplevel")).resolve() == root,
+        "authorized checkout root mismatch",
+    )
+    _require(
+        _git(root, "rev-parse", "--is-inside-work-tree") == "true",
+        "authorized checkout is not a Git worktree",
+    )
+    origin_urls = _git(root, "config", "--local", "--get-all", "remote.origin.url").splitlines()
+    _require(origin_urls == [REPOSITORY_URL], "remote authority URL mismatch")
+    branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    _require(branch == AUTHORIZED_HARNESS_BRANCH, "remote authority branch mismatch")
+    upstream = _git(
+        root,
+        "for-each-ref",
+        "--format=%(upstream)",
+        f"refs/heads/{AUTHORIZED_HARNESS_BRANCH}",
+    )
+    _require(upstream == AUTHORIZED_REMOTE_REF, "remote authority upstream mismatch")
+    head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    tree = _git(root, "rev-parse", "--verify", "HEAD^{tree}")
+    remote_commit = _git(root, "rev-parse", "--verify", f"{AUTHORIZED_REMOTE_REF}^{{commit}}")
+    _require(remote_commit == head, "remote authority commit mismatch")
     _require(
         _git(root, "rev-parse", f"{REPOSITORY_COMMIT}^{{tree}}") == REPOSITORY_TREE,
         "product base tree mismatch",
@@ -335,15 +388,19 @@ def recompute_trusted_checkout(
         _git(root, "rev-parse", f"{REPOSITORY_COMMIT}:3rdparty/bigop") == BIGOP_COMMIT,
         "bigop gitlink mismatch",
     )
-    result = subprocess.run(
-        ["git", "-C", str(root), "merge-base", "--is-ancestor", REPOSITORY_COMMIT, "HEAD"],
-        capture_output=True,
-        check=False,
-    )
+    result = _run_git(root, "merge-base", "--is-ancestor", REPOSITORY_COMMIT, "HEAD")
     _require(result.returncode == 0, "product base is not an ancestor of harness checkout")
     changed = tuple(
         line
-        for line in _git(root, "diff", "--name-only", REPOSITORY_COMMIT, "HEAD").splitlines()
+        for line in _git(
+            root,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            REPOSITORY_COMMIT,
+            "HEAD",
+        ).splitlines()
         if line
     )
     _require(
@@ -352,14 +409,23 @@ def recompute_trusted_checkout(
     )
     missing_paths = [relative for relative in EXACT_HARNESS_PATHS if not (root / relative).is_file()]
     _require(not missing_paths, f"exact harness path missing: {missing_paths}")
-    clean = not bool(_git(root, "status", "--porcelain=v1", "--untracked-files=all"))
+    tracked_dirty = (
+        _run_git(root, "diff-files", "--quiet").returncode != 0
+        or _run_git(root, "diff-index", "--cached", "--quiet", "HEAD", "--").returncode != 0
+    )
+    untracked = _git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+    clean = not tracked_dirty and not untracked
     if require_clean:
         _require(clean, "execution checkout is dirty")
-    parents = _git(root, "show", "-s", "--format=%P", "HEAD").split()
+    commit_object = _git(root, "cat-file", "-p", "HEAD")
+    parents = [line.removeprefix("parent ") for line in commit_object.splitlines() if line.startswith("parent ")]
     identity = {
         "repository_url": REPOSITORY_URL,
-        "commit": _git(root, "rev-parse", "HEAD"),
-        "tree": _git(root, "rev-parse", "HEAD^{tree}"),
+        "branch": AUTHORIZED_HARNESS_BRANCH,
+        "remote_ref": AUTHORIZED_REMOTE_REF,
+        "remote_commit": remote_commit,
+        "commit": head,
+        "tree": tree,
         "parents": parents,
         "product_base_commit": REPOSITORY_COMMIT,
         "product_base_tree": REPOSITORY_TREE,
@@ -373,6 +439,9 @@ def recompute_trusted_checkout(
 def validate_harness_identity(identity: Mapping[str, Any]) -> None:
     required = {
         "repository_url",
+        "branch",
+        "remote_ref",
+        "remote_commit",
         "commit",
         "tree",
         "parents",
@@ -383,6 +452,13 @@ def validate_harness_identity(identity: Mapping[str, Any]) -> None:
     }
     _require(isinstance(identity, Mapping) and set(identity) == required, "harness identity malformed")
     _require(identity.get("repository_url") == REPOSITORY_URL, "harness identity repository mismatch")
+    _require(identity.get("branch") == AUTHORIZED_HARNESS_BRANCH, "harness identity branch mismatch")
+    _require(identity.get("remote_ref") == AUTHORIZED_REMOTE_REF, "harness identity remote ref mismatch")
+    _require(
+        bool(_COMMIT.fullmatch(str(identity.get("remote_commit", "")))
+        and identity.get("remote_commit") == identity.get("commit")),
+        "harness identity remote commit mismatch",
+    )
     _require(bool(_COMMIT.fullmatch(str(identity.get("commit", "")))), "harness identity commit invalid")
     _require(bool(_COMMIT.fullmatch(str(identity.get("tree", "")))), "harness identity tree invalid")
     parents = identity.get("parents")
@@ -431,7 +507,7 @@ def _validate_correctness(operation: str, correctness: Mapping[str, Any]) -> Non
 
 
 def validate_execution_envelope(
-    value: Mapping[str, Any], *, trusted_checkout: Mapping[str, Any] | None = None
+    value: Mapping[str, Any], *, authorized_checkout: Path | str
 ) -> None:
     payload = _verify_envelope(value)
     _require(payload.get("contract_version") == CONTRACT_VERSION, "contract version mismatch")
@@ -441,9 +517,11 @@ def validate_execution_envelope(
     harness_identity = payload.get("harness_identity")
     _require(isinstance(harness_identity, Mapping), "harness identity missing")
     validate_harness_identity(harness_identity)
-    _require(trusted_checkout is not None, "trusted checkout recomputation missing")
-    validate_harness_identity(trusted_checkout)
-    _require(dict(harness_identity) == dict(trusted_checkout), "trusted checkout mismatch")
+    trusted_identity = recompute_trusted_checkout(authorized_checkout)
+    _require(
+        dict(harness_identity) == trusted_identity,
+        "authorized checkout identity mismatch",
+    )
     _exact_mapping(payload.get("sidecar_binding", {}), SIDECAR_BINDING, "sidecar binding")
     arms = payload.get("arms")
     _require(isinstance(arms, list) and tuple(arm.get("arm_id") for arm in arms) == ARM_IDS, "execution four-arm set mismatch")
@@ -480,7 +558,7 @@ def read_verified_envelope(
     path: Path,
     *,
     require_complete: bool = False,
-    trusted_checkout: Mapping[str, Any] | None = None,
+    authorized_checkout: Path | str | None = None,
 ) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
@@ -495,9 +573,11 @@ def read_verified_envelope(
     except json.JSONDecodeError as error:
         raise ContractError(f"invalid JSON receipt {path}: {error}") from error
     _require(isinstance(value, dict), "receipt envelope malformed")
+    _require(raw == canonical_bytes(value), "receipt raw bytes are not canonical")
     payload = _verify_envelope(value)
     if require_complete or payload.get("status") == "COMPLETE":
-        validate_execution_envelope(value, trusted_checkout=trusted_checkout)
+        _require(authorized_checkout is not None, "authorized checkout path missing")
+        validate_execution_envelope(value, authorized_checkout=authorized_checkout)
     else:
         validate_dry_run_envelope(value)
     return value

@@ -101,28 +101,57 @@ def test_execute_route_environment_is_explicit_not_defaulted(tmp_path):
     }
     environment_path = tmp_path / "environment.json"
     environment_path.write_text(json.dumps(environment), encoding="utf-8")
-    process_environment = dict(os.environ)
-    process_environment.pop("MOE_FULL_BENCH_ROUTE_MODE", None)
-    process_environment.pop("MOE_FULL_BENCH_ACTIVE_EXPERTS", None)
+    assert contract.ROUTING_ENVIRONMENT == {
+        "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
+        "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+        "MOE_BWD_TRACE": "",
+    }
+    for missing in contract.ROUTING_ENVIRONMENT:
+        process_environment = dict(os.environ)
+        process_environment.update(contract.ROUTING_ENVIRONMENT)
+        process_environment.pop(missing)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--execute",
+                "--receipt-dir",
+                str(tmp_path / f"receipt-{missing}"),
+                "--environment-receipt",
+                str(environment_path),
+            ],
+            cwd=ROOT,
+            env=process_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "routing environment" in result.stderr
+        assert "runtime component import" not in result.stderr
+
+    trace_drift = dict(os.environ)
+    trace_drift.update(contract.ROUTING_ENVIRONMENT)
+    trace_drift["MOE_BWD_TRACE"] = "1"
     result = subprocess.run(
         [
             sys.executable,
             str(RUNNER),
             "--execute",
             "--receipt-dir",
-            str(tmp_path / "receipt"),
+            str(tmp_path / "receipt-trace-drift"),
             "--environment-receipt",
             str(environment_path),
         ],
         cwd=ROOT,
-        env=process_environment,
+        env=trace_drift,
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 2
     assert "routing environment" in result.stderr
-    assert "torch" not in result.stderr.lower()
+    assert "runtime component import" not in result.stderr
 
 
 def test_runtime_environment_is_recomputed_from_real_sources_without_device_import(

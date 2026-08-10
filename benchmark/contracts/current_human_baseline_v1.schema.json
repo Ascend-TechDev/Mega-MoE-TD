@@ -117,7 +117,8 @@
         "variables": {
           "const": {
             "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
-            "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8"
+            "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+            "MOE_BWD_TRACE": ""
           }
         },
         "components": {
@@ -148,6 +149,9 @@
       "type": "object",
       "required": [
         "repository_url",
+        "branch",
+        "remote_ref",
+        "remote_commit",
         "commit",
         "tree",
         "parents",
@@ -159,6 +163,9 @@
       "additionalProperties": false,
       "properties": {
         "repository_url": {"const": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"},
+        "branch": {"const": "codex02/uniep-current-main-recovery-20260809"},
+        "remote_ref": {"const": "refs/remotes/origin/codex02/uniep-current-main-recovery-20260809"},
+        "remote_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "parents": {
@@ -190,6 +197,170 @@
         "algorithm": "sha256",
         "suffix": ".sha256",
         "required": true
+      }
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "contract_version",
+        "repository",
+        "submodules",
+        "model",
+        "parallel",
+        "tokens_per_rank",
+        "fixture_seed",
+        "routing_environment",
+        "timing",
+        "arms",
+        "arm_operations",
+        "fusion_switches",
+        "legal_comparisons",
+        "precision",
+        "providers",
+        "raw_receipt"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {"const": "current-human-baseline/v1"},
+        "repository": {"$ref": "#/$defs/repository"},
+        "submodules": {
+          "const": [
+            {"path": "3rdparty/bigop", "commit": "68ca4cb68dca41ca8960e6aedc38bd224b08a2af"}
+          ]
+        },
+        "model": {"$ref": "#/$defs/model"},
+        "parallel": {"const": {"expert_parallel_world_size": 2}},
+        "tokens_per_rank": {"const": [4096, 8192, 16384]},
+        "fixture_seed": {"const": 42},
+        "routing_environment": {
+          "const": {
+            "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
+            "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+            "MOE_BWD_TRACE": ""
+          }
+        },
+        "timing": {
+          "const": {
+            "warmup": 5,
+            "samples": 50,
+            "boundary": "synchronized full provider call; host wall-clock; per-sample rank MAX"
+          }
+        },
+        "arms": {
+          "const": [
+            "unfused_grouped_hccl_forward",
+            "fused_current_main_forward",
+            "backward_default_torch_wgrad",
+            "backward_optin_triton_wgrad"
+          ]
+        },
+        "arm_operations": {
+          "const": {
+            "unfused_grouped_hccl_forward": "forward",
+            "fused_current_main_forward": "forward",
+            "backward_default_torch_wgrad": "backward",
+            "backward_optin_triton_wgrad": "backward"
+          }
+        },
+        "fusion_switches": {
+          "const": {
+            "unfused_grouped_hccl_forward": {
+              "forward": "unfused_torch_npu_grouped_gemm_plus_hccl",
+              "wgrad": "not_applicable"
+            },
+            "fused_current_main_forward": {
+              "forward": "current_main_dispatch_fc1_weighted_swiglu_fc2_combine",
+              "wgrad": "not_applicable"
+            },
+            "backward_default_torch_wgrad": {
+              "forward": "not_timed",
+              "wgrad": "torch_per_expert_default"
+            },
+            "backward_optin_triton_wgrad": {
+              "forward": "not_timed",
+              "wgrad": "triton_transposed_grouped_gemm_optin"
+            }
+          }
+        },
+        "legal_comparisons": {
+          "const": [
+            {
+              "comparison_id": "forward_grouped_hccl_vs_fused",
+              "baseline_arm": "unfused_grouped_hccl_forward",
+              "candidate_arm": "fused_current_main_forward",
+              "operation": "forward"
+            },
+            {
+              "comparison_id": "backward_default_vs_triton_wgrad",
+              "baseline_arm": "backward_default_torch_wgrad",
+              "candidate_arm": "backward_optin_triton_wgrad",
+              "operation": "backward"
+            }
+          ]
+        },
+        "precision": {
+          "const": {
+            "forward": ["full output"],
+            "backward": [
+              "grad_hidden",
+              "grad_routing_weights",
+              "grad_fc1_1",
+              "grad_fc1_2",
+              "grad_fc2"
+            ],
+            "timing_requires_precision_pass": true
+          }
+        },
+        "providers": {
+          "const": [
+            {
+              "provider_id": "current-main-grouped-hccl",
+              "test_only": false,
+              "arms": ["unfused_grouped_hccl_forward"],
+              "source": {
+                "repository_url": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git",
+                "commit": "2887022970f6ae5c7ab5be096680809591100c30",
+                "tree": "2b5c447da8ff9ff788125aae5eec644579df105d",
+                "paths": ["benchmark/layer/bench_full_forward.py"]
+              },
+              "entrypoint": "providers.grouped_hccl.execute_forward"
+            },
+            {
+              "provider_id": "current-main-production",
+              "test_only": false,
+              "arms": [
+                "fused_current_main_forward",
+                "backward_default_torch_wgrad",
+                "backward_optin_triton_wgrad"
+              ],
+              "source": {
+                "repository_url": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git",
+                "commit": "2887022970f6ae5c7ab5be096680809591100c30",
+                "tree": "2b5c447da8ff9ff788125aae5eec644579df105d",
+                "paths": [
+                  "src/mega_moe/ops/forward.py",
+                  "src/mega_moe/ops/backward.py",
+                  "src/mega_moe/kernels/dispatch_fc1.py",
+                  "src/mega_moe/kernels/weighted_swiglu.py",
+                  "src/mega_moe/kernels/fc2_combine.py"
+                ]
+              },
+              "entrypoints": {
+                "fused_current_main_forward": "providers.current_main.execute_forward",
+                "backward_default_torch_wgrad": "providers.current_main.execute_backward",
+                "backward_optin_triton_wgrad": "providers.current_main.execute_backward"
+              }
+            }
+          ]
+        },
+        "raw_receipt": {
+          "const": {
+            "canonical_json": true,
+            "full_sample_arrays": true,
+            "payload_sha256": true,
+            "file_sha256_sidecar": true
+          }
+        }
       }
     },
     "model": {
@@ -301,7 +472,7 @@
           ]
         },
         "plan": {
-          "type": "object"
+          "$ref": "#/$defs/plan"
         },
         "environment": {
           "$ref": "#/$defs/environment"

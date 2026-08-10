@@ -1,7 +1,9 @@
 import copy
+import hashlib
+import json
 from pathlib import Path
+import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -43,9 +45,12 @@ def _environment():
     }
 
 
-def _trusted_checkout():
+def _fake_checkout():
     return {
         "repository_url": contract.REPOSITORY_URL,
+        "branch": "codex02/uniep-current-main-recovery-20260809",
+        "remote_ref": "refs/remotes/origin/codex02/uniep-current-main-recovery-20260809",
+        "remote_commit": "b" * 40,
         "commit": "b" * 40,
         "tree": "c" * 40,
         "parents": ["d" * 40],
@@ -56,7 +61,32 @@ def _trusted_checkout():
     }
 
 
-def _complete_payload():
+def _authorized_checkout(tmp_path, name="authorized"):
+    target = tmp_path / name
+    branch = "codex02/uniep-current-main-recovery-20260809"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--shared", "--branch", branch, str(ROOT), str(target)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "remote", "set-url", "origin", contract.REPOSITORY_URL],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "update-ref",
+            f"refs/remotes/origin/{branch}",
+            "HEAD",
+        ],
+        check=True,
+    )
+    return target
+
+
+def _complete_payload(harness_identity=None):
     plan = contract.build_plan(_descriptions())
     arms = []
     for arm_id in contract.ARM_IDS:
@@ -84,17 +114,19 @@ def _complete_payload():
         "status": "COMPLETE",
         "plan": plan,
         "environment": _environment(),
-        "harness_identity": _trusted_checkout(),
+        "harness_identity": harness_identity or _fake_checkout(),
         "sidecar_binding": dict(contract.SIDECAR_BINDING),
         "arms": arms,
     }
 
 
-def test_fixed_plan_and_complete_receipt_validate():
+def test_fixed_plan_and_complete_receipt_validate(tmp_path):
     plan = contract.build_plan(_descriptions())
     contract.validate_plan(plan)
-    envelope = contract.envelope(_complete_payload())
-    contract.validate_execution_envelope(envelope, trusted_checkout=_trusted_checkout())
+    authorized = _authorized_checkout(tmp_path)
+    identity = contract.recompute_trusted_checkout(authorized)
+    value = contract.envelope(_complete_payload(identity))
+    contract.validate_execution_envelope(value, authorized_checkout=authorized)
 
 
 @pytest.mark.parametrize(
@@ -113,22 +145,20 @@ def test_plan_identity_and_scope_fail_closed(mutation, expected):
         contract.validate_plan(plan)
 
 
-def test_execution_rejects_missing_gradient_and_truncated_samples():
-    payload = _complete_payload()
+def test_execution_rejects_missing_gradient_and_truncated_samples(tmp_path):
+    authorized = _authorized_checkout(tmp_path)
+    identity = contract.recompute_trusted_checkout(authorized)
+    payload = _complete_payload(identity)
     backward = next(arm for arm in payload["arms"] if arm["operation"] == "backward")
     backward["shapes"][0]["correctness"].pop(contract.BACKWARD_GRADIENTS[-1])
     backward["shapes"][1]["samples_ms"].pop()
     with pytest.raises(contract.ContractError, match="five-gradient correctness"):
-        contract.validate_execution_envelope(
-            contract.envelope(payload), trusted_checkout=_trusted_checkout()
-        )
+        contract.validate_execution_envelope(contract.envelope(payload), authorized_checkout=authorized)
 
-    payload = _complete_payload()
+    payload = _complete_payload(identity)
     payload["arms"][0]["shapes"][0]["samples_ms"].pop()
     with pytest.raises(contract.ContractError, match="full sample array"):
-        contract.validate_execution_envelope(
-            contract.envelope(payload), trusted_checkout=_trusted_checkout()
-        )
+        contract.validate_execution_envelope(contract.envelope(payload), authorized_checkout=authorized)
 
 
 def test_environment_receipt_requires_every_bound_component():
@@ -170,9 +200,10 @@ def test_live_environment_comparison_rejects_nonmatching_identity():
     contract.compare_environment(expected, copy.deepcopy(expected))
 
 
-def test_plan_binds_exact_route_mode_and_active_experts():
+def test_plan_binds_exact_route_and_backward_trace_environment():
     plan = contract.build_plan(_descriptions())
     assert plan["routing_environment"] == contract.ROUTING_ENVIRONMENT
+    assert contract.ROUTING_ENVIRONMENT["MOE_BWD_TRACE"] == ""
     for name in contract.ROUTING_ENVIRONMENT:
         mutated = copy.deepcopy(plan)
         mutated["routing_environment"].pop(name)
@@ -180,100 +211,100 @@ def test_plan_binds_exact_route_mode_and_active_experts():
             contract.validate_plan(mutated)
 
 
-def test_complete_requires_exact_trusted_harness_identity():
-    payload = _complete_payload()
-    trusted = _trusted_checkout()
-    contract.validate_execution_envelope(contract.envelope(payload), trusted_checkout=trusted)
+def test_complete_recomputes_authorized_checkout_and_rejects_self_signed_mapping(tmp_path):
+    authorized = _authorized_checkout(tmp_path)
+    trusted = contract.recompute_trusted_checkout(authorized)
+    payload = _complete_payload(trusted)
+    contract.validate_execution_envelope(
+        contract.envelope(payload), authorized_checkout=authorized
+    )
 
     missing = copy.deepcopy(payload)
     missing.pop("harness_identity")
     with pytest.raises(contract.ContractError, match="harness identity"):
-        contract.validate_execution_envelope(contract.envelope(missing), trusted_checkout=trusted)
-
-    tampered = copy.deepcopy(payload)
-    tampered["harness_identity"]["tree"] = "e" * 40
-    with pytest.raises(contract.ContractError, match="trusted checkout"):
-        contract.validate_execution_envelope(contract.envelope(tampered), trusted_checkout=trusted)
-
-    ambient_moved = copy.deepcopy(trusted)
-    ambient_moved["commit"] = "f" * 40
-    with pytest.raises(contract.ContractError, match="trusted checkout"):
         contract.validate_execution_envelope(
-            contract.envelope(payload), trusted_checkout=ambient_moved
+            contract.envelope(missing), authorized_checkout=authorized
+        )
+
+    self_signed = _complete_payload(_fake_checkout())
+    with pytest.raises(contract.ContractError, match="authorized checkout"):
+        contract.validate_execution_envelope(
+            contract.envelope(self_signed), authorized_checkout=authorized
+        )
+
+    empty_plan = copy.deepcopy(payload)
+    empty_plan["plan"] = {}
+    with pytest.raises(contract.ContractError, match="contract version"):
+        contract.validate_execution_envelope(
+            contract.envelope(empty_plan), authorized_checkout=authorized
         )
 
 
-def _mock_checkout(monkeypatch, *, changed_paths=None, status="", head="b" * 40):
-    changed_paths = changed_paths or contract.EXACT_HARNESS_PATHS
-
-    def fake_git(_root, *arguments):
-        lookup = {
-            ("remote", "get-url", "origin"): contract.REPOSITORY_URL,
-            ("rev-parse", f"{contract.REPOSITORY_COMMIT}^{{tree}}"): contract.REPOSITORY_TREE,
-            ("rev-parse", f"{contract.REPOSITORY_COMMIT}:3rdparty/bigop"): contract.BIGOP_COMMIT,
-            ("diff", "--name-only", contract.REPOSITORY_COMMIT, "HEAD"): "\n".join(changed_paths),
-            ("status", "--porcelain=v1", "--untracked-files=all"): status,
-            ("show", "-s", "--format=%P", "HEAD"): "d" * 40,
-            ("rev-parse", "HEAD"): head,
-            ("rev-parse", "HEAD^{tree}"): "c" * 40,
-        }
-        return lookup[arguments]
-
-    monkeypatch.setattr(contract, "_git", fake_git)
-    monkeypatch.setattr(
-        contract.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-    )
-
-
-def test_trusted_checkout_recomputation_rejects_deleted_path_and_dirty_mutation(
-    tmp_path, monkeypatch
+def test_authorized_checkout_recomputation_rejects_remote_drift_deletion_and_dirty(
+    tmp_path,
 ):
-    for relative in contract.EXACT_HARNESS_PATHS:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("identity\n", encoding="utf-8")
-    _mock_checkout(monkeypatch)
-    trusted = contract.recompute_trusted_checkout(tmp_path)
-    assert trusted == _trusted_checkout()
-
-    deleted = tmp_path / contract.EXACT_HARNESS_PATHS[-1]
+    deleted_checkout = _authorized_checkout(tmp_path, "deleted")
+    contract.recompute_trusted_checkout(deleted_checkout)
+    deleted = deleted_checkout / contract.EXACT_HARNESS_PATHS[-1]
     deleted.unlink()
     with pytest.raises(contract.ContractError, match="harness path missing"):
-        contract.recompute_trusted_checkout(tmp_path)
-    deleted.write_text("identity\n", encoding="utf-8")
+        contract.recompute_trusted_checkout(deleted_checkout)
 
-    _mock_checkout(monkeypatch, status=" M benchmark/baseline_contract.py")
+    dirty_checkout = _authorized_checkout(tmp_path, "dirty")
+    (dirty_checkout / "benchmark" / "baseline_contract.py").write_text(
+        "dirty\n", encoding="utf-8"
+    )
     with pytest.raises(contract.ContractError, match="dirty"):
-        contract.recompute_trusted_checkout(tmp_path)
+        contract.recompute_trusted_checkout(dirty_checkout)
+
+    remote_checkout = _authorized_checkout(tmp_path, "remote")
+    remote_ref = f"refs/remotes/origin/{contract.AUTHORIZED_HARNESS_BRANCH}"
+    subprocess.run(
+        ["git", "-C", str(remote_checkout), "update-ref", remote_ref, "HEAD^"], check=True
+    )
+    with pytest.raises(contract.ContractError, match="remote authority"):
+        contract.recompute_trusted_checkout(remote_checkout)
 
 
-def test_envelope_hash_detects_mutation():
-    envelope = contract.envelope(_complete_payload())
+def test_envelope_hash_detects_mutation(tmp_path):
+    authorized = _authorized_checkout(tmp_path)
+    identity = contract.recompute_trusted_checkout(authorized)
+    envelope = contract.envelope(_complete_payload(identity))
     envelope["payload"]["status"] = "MUTATED"
     with pytest.raises(contract.ContractError, match="payload hash"):
-        contract.validate_execution_envelope(envelope, trusted_checkout=_trusted_checkout())
+        contract.validate_execution_envelope(envelope, authorized_checkout=authorized)
 
 
 def test_verified_sidecar_api_rejects_missing_and_tampered_sidecar(tmp_path):
-    payload = _complete_payload()
+    authorized = _authorized_checkout(tmp_path)
+    identity = contract.recompute_trusted_checkout(authorized)
+    payload = _complete_payload(identity)
     path = tmp_path / "receipt.json"
     contract.write_envelope(path, payload)
-    contract.read_verified_envelope(
-        path, require_complete=True, trusted_checkout=_trusted_checkout()
-    )
+    contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
 
     sidecar = path.with_suffix(path.suffix + ".sha256")
     sidecar.unlink()
     with pytest.raises(contract.ContractError, match="sidecar"):
-        contract.read_verified_envelope(
-            path, require_complete=True, trusted_checkout=_trusted_checkout()
-        )
+        contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
 
     contract.write_envelope(path, payload)
     sidecar.write_text("0" * 64 + "\n", encoding="utf-8")
     with pytest.raises(contract.ContractError, match="sidecar"):
+        contract.read_verified_envelope(path, require_complete=True, authorized_checkout=authorized)
+
+
+def test_verified_reader_rejects_noncanonical_raw_bytes_with_recomputed_sidecar(tmp_path):
+    authorized = _authorized_checkout(tmp_path)
+    identity = contract.recompute_trusted_checkout(authorized)
+    path = tmp_path / "pretty.json"
+    contract.write_envelope(path, _complete_payload(identity))
+    parsed = json.loads(path.read_bytes())
+    pretty = (json.dumps(parsed, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    path.write_bytes(pretty)
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    sidecar.write_text(hashlib.sha256(pretty).hexdigest() + "\n", encoding="utf-8")
+    with pytest.raises(contract.ContractError, match="canonical"):
         contract.read_verified_envelope(
-            path, require_complete=True, trusted_checkout=_trusted_checkout()
+            path, require_complete=True, authorized_checkout=authorized
         )

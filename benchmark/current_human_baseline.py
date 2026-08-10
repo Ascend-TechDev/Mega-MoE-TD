@@ -85,6 +85,14 @@ def _require_equal(actual: Any, expected: Any, label: str) -> None:
         raise ContractError(f"{label} mismatch: expected {expected!r}, got {actual!r}")
 
 
+def _validate_routing_environment() -> None:
+    ambient = {name: os.environ.get(name) for name in ROUTING_ENVIRONMENT}
+    if ambient != ROUTING_ENVIRONMENT:
+        raise ContractError(
+            f"routing environment mismatch: expected {ROUTING_ENVIRONMENT!r}, got {ambient!r}"
+        )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -280,12 +288,7 @@ def _backward_fixture(tokens: int, rank: int, ep_group, bb, utils):
 
 def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
     validate_environment(environment)
-    ambient_routing = {name: os.environ.get(name) for name in ROUTING_ENVIRONMENT}
-    if ambient_routing != ROUTING_ENVIRONMENT:
-        raise ContractError(
-            f"routing environment mismatch: expected {ROUTING_ENVIRONMENT!r}, "
-            f"got {ambient_routing!r}"
-        )
+    _validate_routing_environment()
     receipt_dir = _validate_receipt_dir(receipt_dir)
     harness_identity = recompute_trusted_checkout(PROJECT_ROOT)
 
@@ -364,6 +367,7 @@ def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
             finally:
                 forward["op"].finalize()
 
+            _validate_routing_environment()
             backward = _backward_fixture(tokens, rank, ep_group, bb, utils)
             try:
                 golden = golden_module.moe_backward_torch(backward["saved"], backward["dy"])
@@ -432,10 +436,10 @@ def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
         "arms": [results[arm_id] for arm_id in ARM_IDS],
     }
     value = envelope(payload)
-    validate_execution_envelope(value, trusted_checkout=harness_identity)
+    validate_execution_envelope(value, authorized_checkout=PROJECT_ROOT)
     path = receipt_dir / "current_human_baseline_execution.json"
     write_envelope(path, payload)
-    read_verified_envelope(path, require_complete=True, trusted_checkout=harness_identity)
+    read_verified_envelope(path, require_complete=True, authorized_checkout=PROJECT_ROOT)
     return path
 
 
