@@ -241,8 +241,8 @@ def _launch_combine_fc1_bwd(prep, peer_mem, hidden_buf, output):
         prep["B"], prep["topk"], prep["total_send"],
         prep["stride_om"], prep["stride_on"],
         BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-        BLOCK_N_PUSH=512,
-        REVERSE_VECTOR_WORKERS=1, REDUCE_VECTOR_WORKERS=1,
+        BLOCK_N_PUSH=1024,
+        REVERSE_VECTOR_WORKERS=2, REDUCE_VECTOR_WORKERS=2,
         num_warps=8)
     return output
 
