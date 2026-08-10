@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mega-moe-td:current-human-baseline:v1",
+  "title": "Mega-MoE-TD current-human baseline receipt",
+  "type": "object",
+  "required": [
+    "payload",
+    "payload_sha256"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "payload": {
+      "$ref": "#/$defs/payload"
+    },
+    "payload_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "arm_id": {
+      "type": "string",
+      "enum": [
+        "unfused_grouped_hccl_forward",
+        "fused_current_main_forward",
+        "backward_default_torch_wgrad",
+        "backward_optin_triton_wgrad"
+      ]
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "url",
+        "commit",
+        "tree"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "const": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
+        },
+        "commit": {
+          "const": "2887022970f6ae5c7ab5be096680809591100c30"
+        },
+        "tree": {
+          "const": "2b5c447da8ff9ff788125aae5eec644579df105d"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "name",
+        "activation_dtype",
+        "hidden",
+        "ffn",
+        "topk",
+        "num_experts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "const": "Qwen3-30B-A3B"
+        },
+        "activation_dtype": {
+          "const": "bfloat16"
+        },
+        "hidden": {
+          "const": 2048
+        },
+        "ffn": {
+          "const": 768
+        },
+        "topk": {
+          "const": 8
+        },
+        "num_experts": {
+          "const": 128
+        }
+      }
+    },
+    "shape_result": {
+      "type": "object",
+      "required": [
+        "tokens_per_rank",
+        "correctness",
+        "samples_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tokens_per_rank": {
+          "enum": [
+            4096,
+            8192,
+            16384
+          ]
+        },
+        "correctness": {
+          "type": "object"
+        },
+        "samples_ms": {
+          "type": "array",
+          "minItems": 50,
+          "maxItems": 50,
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
+    "arm_result": {
+      "type": "object",
+      "required": [
+        "arm_id",
+        "operation",
+        "shapes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "arm_id": {
+          "$ref": "#/$defs/arm_id"
+        },
+        "operation": {
+          "enum": [
+            "forward",
+            "backward"
+          ]
+        },
+        "shapes": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/shape_result"
+          }
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "contract_version",
+        "status",
+        "plan"
+      ],
+      "properties": {
+        "contract_version": {
+          "const": "current-human-baseline/v1"
+        },
+        "status": {
+          "enum": [
+            "DRY_RUN_VALIDATED",
+            "COMPLETE"
+          ]
+        },
+        "plan": {
+          "type": "object"
+        },
+        "environment": {
+          "type": "object"
+        },
+        "arms": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/arm_result"
+          }
+        },
+        "device_modules_loaded": {
+          "type": "array",
+          "maxItems": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "COMPLETE"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "environment",
+              "arms"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "DRY_RUN_VALIDATED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "device_modules_loaded"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
