@@ -26,8 +26,7 @@ from .transposed_grouped_gemm import (  # noqa: F401
 )
 from .dispatch_fc2_bwd import (  # noqa: F401
     dispatch_fc2_bwd_triton,
-    kernel_dispatch_push,
-    kernel_fc2_input_grad_gemm,
+    kernel_dispatch_fc2_bwd,
 )
 from .combine_fc1_bwd import (  # noqa: F401
     combine_fc1_bwd_triton,
