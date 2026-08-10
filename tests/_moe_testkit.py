@@ -10,6 +10,7 @@ shipped by the ``mega_moe`` package.
 """
 
 import contextlib
+import importlib
 import os
 import statistics
 import time
@@ -19,15 +20,11 @@ from typing import Iterator
 import torch
 import torch.distributed as dist
 
-try:  # Keep registry/collection checks usable on a CPU-only Python install.
-    import torch_npu  # noqa: F401
-except ImportError:  # pragma: no cover - exercised only outside Ascend.
-    torch_npu = None
-
-try:
-    import shmem as ash
-except ImportError:  # pragma: no cover - exercised only outside Ascend.
-    ash = None
+# Device modules are loaded explicitly by a device runner only after its
+# checkout/environment provenance gate.  Merely importing this host contract
+# must not initialize or even probe an NPU runtime.
+torch_npu = None
+ash = None
 
 
 __all__ = [
@@ -42,11 +39,50 @@ __all__ = [
     "get_ash_size_bytes",
     "get_ash_ip_port",
     "init_aclshmem",
+    "load_device_runtime",
     "make_peer_mem",
     "make_pytest_params",
     "validate_timing_spec",
+    "validate_finite_backward_gradients",
     "ash",
 ]
+
+_BACKWARD_GRADIENT_KEYS = (
+    "grad_hidden",
+    "grad_routing_weights",
+    "grad_fc1_1",
+    "grad_fc1_2",
+    "grad_fc2",
+)
+
+
+def load_device_runtime() -> None:
+    """Load NPU-only modules after the caller's provenance gate has passed."""
+    global torch_npu, ash
+    if torch_npu is None:
+        torch_npu = importlib.import_module("torch_npu")
+    if ash is None:
+        ash = importlib.import_module("shmem")
+
+
+def validate_finite_backward_gradients(candidates, oracle) -> None:
+    """Reject NaN/Inf in either candidate arm or the independent oracle."""
+    if not isinstance(candidates, dict) or not candidates:
+        raise AssertionError("backward candidates must be a non-empty mapping")
+    sources = (("oracle", oracle), *tuple(candidates.items()))
+    for source_name, gradients in sources:
+        if not isinstance(gradients, dict):
+            raise AssertionError(f"{source_name} gradients must be a mapping")
+        for gradient_name in _BACKWARD_GRADIENT_KEYS:
+            tensor = gradients.get(gradient_name)
+            if not isinstance(tensor, torch.Tensor):
+                raise AssertionError(
+                    f"{source_name} gradient {gradient_name} must be a tensor"
+                )
+            if not bool(torch.isfinite(tensor).all().item()):
+                raise AssertionError(
+                    f"non-finite {source_name} gradient {gradient_name}"
+                )
 
 # ----------------------------------------------------------------------------
 # ANSI colors (disabled under NO_COLOR for CI logs)

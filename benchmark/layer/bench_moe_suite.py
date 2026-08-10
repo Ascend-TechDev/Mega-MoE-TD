@@ -54,9 +54,13 @@ The remaining environment variables are runtime knobs only:
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import shlex
+import stat
+import subprocess
 import sys
 from collections import OrderedDict
 
@@ -65,22 +69,21 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-try:
-    import torch_npu
-except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-npu
-    torch_npu = None
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-from mega_moe import FusedMoEForward, MoEForwardConfig
 from config import CaseSpec, select_cases
-from benchmark.layer._grouped_forward_baseline import GroupedForwardBaseline
 from tests import _moe_testkit as kit
-from tests._moe_baselines import (
-    backward_torch_baseline,
-    build_backward_saved,
-    compare_backward_gradients,
-)
+
+
+# Device-only dependencies are loaded explicitly by the runner after the
+# immutable checkout and environment receipt have been verified.
+torch_npu = None
+FusedMoEForward = None
+MoEForwardConfig = None
+GroupedForwardBaseline = None
+backward_torch_baseline = None
+build_backward_saved = None
+compare_backward_gradients = None
 
 
 ACTIVATION_DTYPE = torch.bfloat16
@@ -88,11 +91,27 @@ ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-transport-v2"
 BACKWARD_RESULT_CONTRACT = "backward-wgrad-explicit-paired-v1"
-BACKWARD_PRODUCTION_SOURCES = (
+BACKWARD_EVIDENCE_SOURCES = (
     "src/mega_moe/ops/backward.py",
     "src/mega_moe/kernels/transposed_grouped_gemm.py",
     "src/mega_moe/kernels/common.py",
+    "tests/_moe_testkit.py",
+    "tests/_moe_baselines.py",
+    "tests/_numeric.py",
+    "config/_shapes.py",
 )
+BACKWARD_ENVIRONMENT_COMPONENTS = frozenset(
+    {"python", "torch", "torch_npu", "triton", "cann", "aclshmem", "bigop"}
+)
+BACKWARD_TARGET_MODEL = "Qwen3-30B-A3B"
+BACKWARD_TARGET_WORLD_SIZE = 2
+BACKWARD_TARGET_SPEEDUP = 1.5
+BACKWARD_RAW_ORDERS = (
+    "candidate_then_baseline",
+    "baseline_then_candidate",
+)
+BACKWARD_RAW_ARMS = ("triton_wgrad", "torch_wgrad")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
 
 # This is the published protocol.  Keep debug/short runs under a differently
@@ -141,13 +160,155 @@ def _benchmark_provenance(result_contract=RESULT_CONTRACT):
     }
 
 
+def _git_output(project_root: Path, *args: str) -> str:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    process = subprocess.run(
+        ["git", "-C", str(project_root), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    if process.returncode:
+        raise RuntimeError(f"git checkout identity command failed: {' '.join(args)}")
+    return process.stdout.strip()
+
+
+def _checkout_identity(project_root: Path = PROJECT_ROOT) -> dict:
+    """Bind one clean, single-parent checkout without trusting ambient Git env."""
+    project_root = Path(project_root)
+    if not project_root.is_absolute():
+        raise RuntimeError("benchmark checkout must be an absolute path")
+    resolved_root = project_root.resolve(strict=True)
+    top_level = Path(_git_output(resolved_root, "rev-parse", "--show-toplevel"))
+    if top_level.resolve(strict=True) != resolved_root:
+        raise RuntimeError("benchmark checkout is not the Git top-level")
+
+    commit = _git_output(resolved_root, "rev-parse", "HEAD^{commit}")
+    tree = _git_output(resolved_root, "rev-parse", f"{commit}^{{tree}}")
+    ancestry = _git_output(resolved_root, "rev-list", "--parents", "-n", "1", commit)
+    ancestry_fields = ancestry.split()
+    if len(ancestry_fields) != 2 or ancestry_fields[0] != commit:
+        raise RuntimeError("benchmark checkout must bind one sole-parent commit")
+    status_before = _git_output(
+        resolved_root, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    commit_after = _git_output(resolved_root, "rev-parse", "HEAD^{commit}")
+    status_after = _git_output(
+        resolved_root, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    if status_before or status_after:
+        raise RuntimeError("benchmark evidence requires a clean checkout")
+    if commit_after != commit:
+        raise RuntimeError("benchmark checkout changed during identity verification")
+    return {
+        "commit": commit,
+        "tree": tree,
+        "sole_parent": ancestry_fields[1],
+        "clean": True,
+    }
+
+
+def _environment_receipt_identity() -> dict:
+    """Validate and bind the external environment receipt without its locator."""
+    locator = os.environ.get("MOE_BENCH_ENVIRONMENT_RECEIPT")
+    if not locator:
+        raise RuntimeError("MOE_BENCH_ENVIRONMENT_RECEIPT is required")
+    path = Path(locator)
+    if not path.is_absolute() or path != path.resolve(strict=True):
+        raise RuntimeError("environment receipt must be an absolute non-symlink path")
+    try:
+        path.relative_to(PROJECT_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("environment receipt must be repo-external")
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RuntimeError("environment receipt must be a single-link regular file")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError("environment receipt mode must be 0600")
+
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("environment receipt must be valid JSON") from error
+    canonical = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if raw != canonical:
+        raise ValueError("environment receipt bytes must be canonical JSON")
+    if not isinstance(payload, dict):
+        raise ValueError("environment receipt must be a JSON object")
+    if payload.get("schema") != "uniep.environment-receipt.v1":
+        raise ValueError("environment receipt schema is invalid")
+    if payload.get("status") != "VALIDATED":
+        raise ValueError("environment receipt status must be VALIDATED")
+    components = payload.get("components")
+    if not isinstance(components, dict) or set(components) != BACKWARD_ENVIRONMENT_COMPONENTS:
+        raise ValueError("environment receipt component denominator is invalid")
+    for component_name in sorted(BACKWARD_ENVIRONMENT_COMPONENTS):
+        component = components[component_name]
+        if not isinstance(component, dict):
+            raise ValueError(f"{component_name} component must be an object")
+        identity = component.get("identity")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ValueError(f"{component_name} identity is required")
+        source_sha256 = component.get("source_sha256")
+        if not isinstance(source_sha256, str) or not _SHA256_PATTERN.fullmatch(
+            source_sha256
+        ):
+            raise ValueError(f"{component_name} source_sha256 is invalid")
+    return {
+        "schema": payload["schema"],
+        "status": payload["status"],
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "components": sorted(components),
+    }
+
+
+def _load_benchmark_device_runtime() -> None:
+    """Import device/runtime code only after provenance verification succeeds."""
+    global torch_npu
+    global FusedMoEForward, MoEForwardConfig, GroupedForwardBaseline
+    global backward_torch_baseline, build_backward_saved, compare_backward_gradients
+
+    kit.load_device_runtime()
+    torch_npu = kit.torch_npu
+    from mega_moe import FusedMoEForward as _FusedMoEForward
+    from mega_moe import MoEForwardConfig as _MoEForwardConfig
+    from benchmark.layer._grouped_forward_baseline import (
+        GroupedForwardBaseline as _GroupedForwardBaseline,
+    )
+    from tests._moe_baselines import backward_torch_baseline as _backward_torch_baseline
+    from tests._moe_baselines import build_backward_saved as _build_backward_saved
+    from tests._moe_baselines import (
+        compare_backward_gradients as _compare_backward_gradients,
+    )
+
+    FusedMoEForward = _FusedMoEForward
+    MoEForwardConfig = _MoEForwardConfig
+    GroupedForwardBaseline = _GroupedForwardBaseline
+    backward_torch_baseline = _backward_torch_baseline
+    build_backward_saved = _build_backward_saved
+    compare_backward_gradients = _compare_backward_gradients
+
+
 def _backward_benchmark_provenance():
     provenance = _benchmark_provenance(BACKWARD_RESULT_CONTRACT)
     source_hashes = {}
-    for relative_path in BACKWARD_PRODUCTION_SOURCES:
+    for relative_path in BACKWARD_EVIDENCE_SOURCES:
         with (PROJECT_ROOT / relative_path).open("rb") as source_file:
             source_hashes[relative_path] = hashlib.sha256(source_file.read()).hexdigest()
     provenance["backward_source_sha256"] = source_hashes
+    provenance["checkout_identity"] = _checkout_identity()
+    provenance["environment_receipt"] = _environment_receipt_identity()
     return provenance
 
 
@@ -746,6 +907,188 @@ def _print_entry(entry):
     )
 
 
+def _backward_target_cases(world_size: int) -> tuple[CaseSpec, ...]:
+    if world_size != BACKWARD_TARGET_WORLD_SIZE:
+        return ()
+    cases = tuple(
+        case
+        for case in select_cases(direction="backward", tags={"performance"})
+        if case.model == BACKWARD_TARGET_MODEL and case.world_size == world_size
+    )
+    if [case.tokens for case in cases] != [4096, 8192, 16384]:
+        raise RuntimeError("Qwen3 EP2 target denominator drifted from 4K/8K/16K")
+    return cases
+
+
+def _finite_positive_number(value, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError(f"{label} must be finite and positive")
+    return numeric
+
+
+def _validate_backward_target_entry(entry: dict, expected: CaseSpec) -> None:
+    if not isinstance(entry, dict):
+        raise ValueError("backward target case must be an object")
+    expected_identity = {
+        "case_id": expected.case_id,
+        "model": BACKWARD_TARGET_MODEL,
+        "world_size": BACKWARD_TARGET_WORLD_SIZE,
+        "tokens_per_rank": expected.tokens,
+    }
+    for field, value in expected_identity.items():
+        if entry.get(field) != value:
+            raise ValueError(f"{expected.case_id}: {field} identity drift")
+    if entry.get("shape") != {
+        "hidden": expected.hidden,
+        "ffn": expected.ffn,
+        "topk": expected.topk,
+        "num_experts": expected.num_experts,
+    }:
+        raise ValueError(f"{expected.case_id}: shape identity drift")
+
+    protocol = entry.get("protocol")
+    expected_protocol_fields = {
+        "warmup": BACKWARD_TIMING.warmup,
+        "iterations": BACKWARD_TIMING.iterations,
+        "clock": BACKWARD_TIMING.clock,
+        "rank_reduction": "MAX",
+        "paired_orders": [
+            "triton_wgrad_then_torch_wgrad",
+            "torch_wgrad_then_triton_wgrad",
+        ],
+        "samples_per_arm_per_order": BACKWARD_TIMING.iterations,
+    }
+    if not isinstance(protocol, dict):
+        raise ValueError(f"{expected.case_id}: protocol must be an object")
+    for field, value in expected_protocol_fields.items():
+        if protocol.get(field) != value:
+            raise ValueError(f"{expected.case_id}: protocol {field} drift")
+
+    correctness = entry.get("correctness_gate")
+    if not isinstance(correctness, dict):
+        raise ValueError(f"{expected.case_id}: correctness gate is missing")
+    if correctness.get("status") != "passed_before_timing" or set(
+        correctness.get("arms", ())
+    ) != set(BACKWARD_RAW_ARMS):
+        raise ValueError(f"{expected.case_id}: correctness gate is incomplete")
+
+    metrics = entry.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError(f"{expected.case_id}: metrics must be an object")
+    if "target_met" in metrics:
+        raise ValueError(f"{expected.case_id}: target_met is finalizer-owned")
+    raw_samples = metrics.get("raw_samples_ms")
+    if not isinstance(raw_samples, dict) or set(raw_samples) != set(
+        BACKWARD_RAW_ORDERS
+    ):
+        raise ValueError(f"{expected.case_id}: paired order denominator is invalid")
+    for order_name in BACKWARD_RAW_ORDERS:
+        arms = raw_samples[order_name]
+        if not isinstance(arms, dict) or set(arms) != set(BACKWARD_RAW_ARMS):
+            raise ValueError(f"{expected.case_id}: {order_name} arm denominator is invalid")
+        for arm_name in BACKWARD_RAW_ARMS:
+            samples = arms[arm_name]
+            if not isinstance(samples, list) or len(samples) != BACKWARD_TIMING.iterations:
+                raise ValueError(
+                    f"{expected.case_id}: {order_name}/{arm_name} must have "
+                    f"exactly {BACKWARD_TIMING.iterations} samples"
+                )
+            for index, sample in enumerate(samples):
+                _finite_positive_number(
+                    sample, f"{expected.case_id}:{order_name}/{arm_name}[{index}]"
+                )
+
+    speedups = metrics.get("speedup_by_order")
+    if not isinstance(speedups, dict) or set(speedups) != set(BACKWARD_RAW_ORDERS):
+        raise ValueError(f"{expected.case_id}: speedup order denominator is invalid")
+    normalized_speedups = {
+        order_name: _finite_positive_number(
+            speedups[order_name], f"{expected.case_id}:{order_name} speedup"
+        )
+        for order_name in BACKWARD_RAW_ORDERS
+    }
+    minimum_speedup = _finite_positive_number(
+        metrics.get("minimum_speedup"), f"{expected.case_id}:minimum_speedup"
+    )
+    if not math.isclose(
+        minimum_speedup,
+        min(normalized_speedups.values()),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(f"{expected.case_id}: minimum speedup is not the paired minimum")
+    if metrics.get("target_speedup") != BACKWARD_TARGET_SPEEDUP:
+        raise ValueError(f"{expected.case_id}: target speedup drift")
+
+    provenance = entry.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError(f"{expected.case_id}: provenance is missing")
+    for field in (
+        "checkout_identity",
+        "environment_receipt",
+        "backward_source_sha256",
+    ):
+        if not isinstance(provenance.get(field), dict):
+            raise ValueError(f"{expected.case_id}: provenance {field} is missing")
+
+
+def _finalize_backward_target_payload(payload: dict) -> None:
+    expected_cases = _backward_target_cases(payload["world_size"])
+    if not expected_cases:
+        return
+    expected_by_id = {case.case_id: case for case in expected_cases}
+    cases = payload.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("backward target cases must be a list")
+    observed_ids = [item.get("case_id") for item in cases if isinstance(item, dict)]
+    if len(observed_ids) != len(cases) or len(set(observed_ids)) != len(observed_ids):
+        raise ValueError("backward target case ids must be unique strings")
+    extras = sorted(set(observed_ids) - set(expected_by_id))
+    if extras:
+        raise ValueError(f"unexpected backward target cases: {extras}")
+    for item in cases:
+        _validate_backward_target_entry(item, expected_by_id[item["case_id"]])
+
+    missing = [case.case_id for case in expected_cases if case.case_id not in observed_ids]
+    payload["denominator_complete"] = not missing
+    payload["missing_cases"] = missing
+    payload.pop("target_met", None)
+    for item in cases:
+        item["metrics"].pop("target_met", None)
+    if missing:
+        return
+
+    checkout_identities = {
+        json.dumps(item["provenance"]["checkout_identity"], sort_keys=True)
+        for item in cases
+    }
+    environment_identities = {
+        json.dumps(item["provenance"]["environment_receipt"], sort_keys=True)
+        for item in cases
+    }
+    source_identities = {
+        json.dumps(item["provenance"]["backward_source_sha256"], sort_keys=True)
+        for item in cases
+    }
+    if any(
+        len(identity_set) != 1
+        for identity_set in (
+            checkout_identities,
+            environment_identities,
+            source_identities,
+        )
+    ):
+        raise ValueError("backward target cases do not share one evidence identity")
+    for item in cases:
+        item["metrics"]["target_met"] = (
+            item["metrics"]["minimum_speedup"] >= BACKWARD_TARGET_SPEEDUP
+        )
+    payload["target_met"] = all(item["metrics"]["target_met"] for item in cases)
+
+
 def _upsert_result(path, direction, world_size, entry, protocol):
     """Atomically merge one pytest node into a direction/world envelope."""
     path = Path(path)
@@ -771,6 +1114,8 @@ def _upsert_result(path, direction, world_size, entry, protocol):
     cases = [item for item in payload.get("cases", []) if item.get("case_id") != entry["case_id"]]
     cases.append(entry)
     payload["cases"] = sorted(cases, key=lambda item: item["case_id"])
+    if direction == "backward":
+        _finalize_backward_target_payload(payload)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, indent=2)
@@ -780,6 +1125,7 @@ def _upsert_result(path, direction, world_size, entry, protocol):
 
 def run_forward_benchmark(rank: int, world_size: int, case: CaseSpec):
     """Run exactly the explicitly parameterized forward performance case."""
+    _load_benchmark_device_runtime()
     case = case.validate()
     if case.direction != "forward" or "performance" not in case.tags:
         raise ValueError(f"forward runner received non-performance case {case.case_id}")
@@ -902,6 +1248,22 @@ def _backward_gate(saved, dy, peer_mem):
         }
 
     details_by_arm = {}
+    finite_error = None
+    try:
+        kit.validate_finite_backward_gradients(candidates, torch_result)
+        finite_ok = True
+    except AssertionError as error:
+        finite_ok = False
+        finite_error = str(error)
+    finite_flag = torch.tensor(
+        [1 if finite_ok else 0], dtype=torch.int32, device=dy.device
+    )
+    dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN, group=saved["ep_group"])
+    if not bool(finite_flag.item()):
+        raise AssertionError(
+            "backward non-finite gradient gate failed: "
+            f"{finite_error or 'non-finite gradient observed on another rank'}"
+        )
     for arm_name, result in candidates.items():
         all_ok, details = compare_backward_gradients(result, torch_result)
         local_ok = torch.tensor(
@@ -930,6 +1292,25 @@ def _validate_backward_benchmark_environment():
         )
 
 
+def _backward_results_path(world_size: int) -> Path:
+    locator = os.environ.get("MOE_BACKWARD_BENCH_RESULTS_DIR")
+    if not locator:
+        raise RuntimeError(
+            "MOE_BACKWARD_BENCH_RESULTS_DIR must name a repo-external directory"
+        )
+    root = Path(locator)
+    if not root.is_absolute():
+        raise RuntimeError("backward result directory must be absolute")
+    resolved_root = root.resolve(strict=False)
+    try:
+        resolved_root.relative_to(PROJECT_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("backward result directory must be repo-external")
+    return resolved_root / f"bench_backward_suite_w{world_size}.json"
+
+
 def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
     """Run one explicit backward case with the published 5/50 host-wall protocol."""
     case = case.validate()
@@ -937,9 +1318,12 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
         raise ValueError(f"backward runner received non-performance case {case.case_id}")
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
+    _validate_backward_benchmark_environment()
+    provenance = _backward_benchmark_provenance()
+    result_path = _backward_results_path(world_size)
+    _load_benchmark_device_runtime()
     if torch_npu is None or kit.ash is None:
         raise RuntimeError("this benchmark requires torch_npu and ACLSHMEM")
-    _validate_backward_benchmark_environment()
 
     from mega_moe import moe_backward_triton
     ep_group = dist.group.WORLD
@@ -993,7 +1377,6 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "torch_wgrad": torch_result.stats,
                 }
             minimum_speedup = min(order_speedups.values())
-            target_speedup = 1.5
             entry = {
                 "schema_version": 2,
                 "direction": "backward",
@@ -1030,7 +1413,6 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "speedup_by_order": order_speedups,
                     "minimum_speedup": minimum_speedup,
                     "target_speedup": 1.5,
-                    "target_met": minimum_speedup >= target_speedup,
                 },
                 "gradient_gate": {
                     "keys": [
@@ -1043,14 +1425,11 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "comparison": "untimed numeric gate for both wgrad arms",
                     "details": gradient_details,
                 },
-                "provenance": _backward_benchmark_provenance(),
+                "provenance": provenance,
             }
             if rank == 0:
                 _upsert_result(
-                    Path(os.environ.get(
-                        "MOE_BACKWARD_BENCH_RESULTS_DIR",
-                        str(PROJECT_ROOT / "results" / "backward"),
-                    )) / f"bench_backward_suite_w{world_size}.json",
+                    result_path,
                     "backward",
                     world_size,
                     entry,

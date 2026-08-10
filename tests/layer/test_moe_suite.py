@@ -57,6 +57,7 @@ def _forward_config(case: CaseSpec) -> MoEForwardConfig:
 
 
 def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
+    kit.load_device_runtime()
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
     if kit.ash is None or kit.torch_npu is None:
@@ -181,6 +182,7 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
 
 
 def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
+    kit.load_device_runtime()
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
     if kit.ash is None or kit.torch_npu is None:
@@ -210,6 +212,25 @@ def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
                         dy,
                         peer_mem,
                         use_triton_wgrad=use_triton_wgrad,
+                    )
+                finite_error = None
+                try:
+                    kit.validate_finite_backward_gradients(
+                        {mode_name.replace("-", "_"): candidate_result}, torch_result
+                    )
+                    finite_ok = True
+                except AssertionError as error:
+                    finite_ok = False
+                    finite_error = str(error)
+                finite_flag = torch.tensor(
+                    [1 if finite_ok else 0], dtype=torch.int32, device=device
+                )
+                dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN, group=ep_group)
+                if not bool(finite_flag.item()):
+                    raise AssertionError(
+                        f"functional backward non-finite gate failed: {case.case_id} "
+                        f"{mode_name}: "
+                        f"{finite_error or 'non-finite gradient observed on another rank'}"
                     )
                 all_ok, details = compare_backward_gradients(
                     candidate_result, torch_result
