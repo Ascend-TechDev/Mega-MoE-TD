@@ -166,10 +166,18 @@ python -m pytest -p tests.conftest \
 
 #### Kimi-K3（八卡）
 
-完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL golden）加速比 `torch(ms) / triton(ms)`：
+完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL golden vs bigop npu 融合原语）
+三向性能对比（2026-08-10，RANK_SIZE=8，E=896，h=3584 ffn=3072 k=16）：
 
-| tokens/rank | torch/ms | triton/ms | triton/torch |
-|---:|---:|---:|---:|
-| 2K | 166.237 | 107.475 | **1.55x** |
+| tokens/rank | torch/ms | triton/ms | bigop/ms | tri/torch | tri/bigop |
+|---:|---:|---:|---:|---:|---:|
+| 2K  | 160.630 | 102.415 |  58.173 | **1.57x** | 0.57x |
+| 4K  | 200.162 | 180.835 |  88.392 | 1.11x | 0.49x |
+| 8K  | 300.094 | 322.896 | 147.195 | 0.93x ⚠️ | 0.46x |
+| 16K | — | — | — | skip（aclshmem OOM） | — |
+
+- **bigop 全面最快**：`tri/bigop≈0.5x`，npu 原生融合（`npu_grouped_matmul` + `npu_swiglu_backward`）比 triton mega-kernel 快约 2x。
+- **triton 大 shape 退化**：`tri/torch` 从 1.57x（2K）降到 **0.93x（8K）**——8K 时 triton 反而比朴素 torch 循环还慢，说明当前 mega-kernel 的大 shape 扩展性是主要瓶颈（与 dev_zjg 近期 `perf(backward)` 调优方向一致）。
+- 16K 因 8 卡 peer_mem（aclshmem）超 2GB 上限 OOM 跳过，非算法问题。
 
 

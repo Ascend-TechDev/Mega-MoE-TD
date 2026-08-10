@@ -34,6 +34,11 @@ import torch.distributed as dist
 from mega_moe import moe_backward_triton
 from mega_moe._goldens._torch_forward_for_backward import moe_forward
 from mega_moe._goldens.backward import moe_backward_torch
+try:
+    from mega_moe._goldens.bigop_ref import moe_backward_bigop  # 2nd golden: bigop compute
+    _HAS_BIGOP = True
+except Exception:  # bigop 3rdparty absent -> fall back to tri<->gold two-column
+    _HAS_BIGOP = False
 from tests._moe_dist_utils import (
     BOLD,
     GREEN,
@@ -107,29 +112,56 @@ def run_one(name, ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group):
     # shared symmetric buffer at heap offset 0 (reused by step1 & step4)
     peer_mem = make_peer_mem(saved, dtype, pe)
 
-    # ---- correctness: triton end-to-end vs golden (hand torch+hccl) ----
+    # ---- correctness: triton end-to-end vs golden(s) ----
+    # Phase 1 (access_bigop.md): when the bigop 2nd golden is available, run a
+    # three-way compare (tri/gold, tri/big, gold/big); gold/big all-green is the
+    # gate for bigop to become the primary Triton baseline (Phase 2). Without
+    # bigop, fall back to the original tri<->gold two-column check.
     print(f"[r{pe}] TRACE: moe_backward_torch (golden) start", flush=True)
     with torch.no_grad():
         gold = moe_backward_torch(saved, dy)
-    print(f"[r{pe}] TRACE: moe_backward_torch (golden) done", flush=True)
+        big = moe_backward_bigop(saved, dy) if _HAS_BIGOP else None
+    print(f"[r{pe}] TRACE: moe_backward_torch (golden) done"
+          + (f" + moe_backward_bigop done" if big is not None else ""), flush=True)
     with torch.no_grad():
         tri = moe_backward_triton(saved, dy, peer_mem)
     print(f"[r{pe}] TRACE: moe_backward_triton done", flush=True)
     ash.aclshmem_free_tensor(peer_mem)
 
     checks = ["grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2"]
+    # Phase 2 (access_bigop.md): bigop is now the PRIMARY Triton baseline — the
+    # torch golden is retired from the tri comparison (still kept as the autograd
+    # meta-oracle in backward.py::__main__::run_cross_check, and run here only as
+    # a printed cross-witness that does NOT gate pass/fail). Fall back to tri/gold
+    # only when the bigop 3rdparty is absent.
+    if big is not None:
+        pairs = [("tri/big", tri, big)]
+        witness = [("gold/big", gold, big)]   # printed, not gating
+    else:
+        pairs = [("tri/gold", tri, gold)]
+        witness = []
     all_ok = True
     detail = []
-    for n in checks:
-        ok, mx, rel, nbad = cmp_grad(n, tri[n], gold[n])
-        all_ok &= ok
-        detail.append(f"{n}:{GREEN}PASS{RESET}" if ok else f"{n}:{RED}FAIL{RESET}({nbad},mx={mx:.1e})")
+    for pname, a, b in pairs:                       # gating pairs (tri/big primary)
+        for n in checks:
+            ok, mx, rel, nbad = cmp_grad(f"{pname}/{n}", a[n], b[n])
+            all_ok &= ok
+            if not ok:
+                detail.append(f"{pname}/{n}:{RED}FAIL{RESET}({nbad},mx={mx:.1e})")
+    witness_detail = []
+    for pname, a, b in witness:                     # non-gating cross-witness (gold/big)
+        for n in checks:
+            ok, mx, rel, nbad = cmp_grad(f"{pname}/{n}", a[n], b[n])
+            witness_detail.append(f"{pname}/{n}:{'ok' if ok else 'DRIFT'}(rel={rel:.1e})")
 
     if pe == 0:
         cor = f"{GREEN}ALL PASS{RESET}" if all_ok else f"{RED}SOME FAIL{RESET}"
-        print(f"  {label}  | {cor}", flush=True)
+        cols = " [baseline=bigop]" if big is not None else ""
+        print(f"  {label}  | {cor}{cols}", flush=True)
         if not all_ok:
             print("    " + "  ".join(detail), flush=True)
+        if witness_detail:
+            print("    witness: " + "  ".join(witness_detail[:5]), flush=True)
     return label, all_ok
 
 

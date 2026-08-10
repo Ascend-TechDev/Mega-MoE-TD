@@ -46,6 +46,11 @@ import torch.distributed as dist
 from mega_moe import moe_backward_triton
 from mega_moe._goldens._torch_forward_for_backward import moe_forward
 from mega_moe._goldens.backward import moe_backward_torch
+try:
+    from mega_moe._goldens.bigop_ref import moe_backward_bigop  # 2nd golden: bigop compute
+    _HAS_BIGOP = True
+except Exception:  # bigop 3rdparty absent -> skip the bigop timing column
+    _HAS_BIGOP = False
 from tests._moe_dist_utils import (
     BOLD,
     GREEN,
@@ -161,18 +166,26 @@ def run_one_bench(shape, ep_group):
         with torch.no_grad():
             moe_backward_torch(saved, dy)
 
+    def _bigop():
+        with torch.no_grad():
+            moe_backward_bigop(saved, dy)
+
     tri_ms = bench(_triton, BENCH_WARMUP, BENCH_ITERS, ep_group)
     torch_ms = bench(_torch, BENCH_WARMUP, BENCH_ITERS, ep_group)
+    big_ms = bench(_bigop, BENCH_WARMUP, BENCH_ITERS, ep_group) if _HAS_BIGOP else None
     sp = torch_ms / tri_ms if tri_ms > 0 else float("inf")
+    sp_big = (big_ms / tri_ms) if (big_ms is not None and tri_ms > 0) else None
 
     ash.aclshmem_free_tensor(peer_mem)
 
     if pe == 0:
         faster = tri_ms <= torch_ms
         tag = f"{GREEN}triton faster{RESET}" if faster else f"{RED}torch faster{RESET}"
-        print(f"  {label}  | torch={torch_ms:7.3f}  triton={tri_ms:7.3f}ms  "
-              f"| triton/torch={sp:5.2f}x  | {tag}", flush=True)
-    return label, torch_ms, tri_ms, sp
+        big_str = f"  bigop={big_ms:7.3f}ms" if big_ms is not None else ""
+        big_ratio = f"  tri/bigop={sp_big:5.2f}x" if sp_big is not None else ""
+        print(f"  {label}  | torch={torch_ms:7.3f}  triton={tri_ms:7.3f}ms{big_str}  "
+              f"| tri/torch={sp:5.2f}x{big_ratio}  | {tag}", flush=True)
+    return label, torch_ms, tri_ms, sp, big_ms, sp_big
 
 
 def _save_results(entries, world_size):
@@ -187,8 +200,9 @@ def _save_results(entries, world_size):
         "iters": BENCH_ITERS,
         "wgrad_triton": os.environ.get("MOE_WGRAD_TRITON") == "1",
         "configs": [
-            {"label": label, "torch_ms": t_ms, "triton_ms": r_ms, "triton_over_torch": sp}
-            for label, t_ms, r_ms, sp in entries
+            {"label": label, "torch_ms": t_ms, "triton_ms": r_ms, "bigop_ms": b_ms,
+             "triton_over_torch": sp, "triton_over_bigop": sp_b}
+            for label, t_ms, r_ms, sp, b_ms, sp_b in entries
         ],
     }
     path = RESULTS_DIR / f"bench_backward_{tag}_w{world_size}.json"
@@ -218,14 +232,22 @@ def run_benchmark(rank, world_size):
             dist.barrier()
         dist.barrier()
         if rank == 0:
-            print(f"\n{BOLD}==== Summary: triton vs torch (MoE backward perf) ===={RESET}")
-            print(f"  {'config':52} {'torch(ms)':>9} {'triton(ms)':>10} {'triton/torch':>12}")
-            sps = []
-            for label, t_ms, r_ms, sp in entries:
+            print(f"\n{BOLD}==== Summary: triton vs torch & bigop (MoE backward perf) ===={RESET}")
+            print(f"  {'config':52} {'torch':>9} {'triton':>10} {'bigop':>10} {'tri/torch':>10} {'tri/bigop':>10}")
+            sps, sps_big = [], []
+            for label, t_ms, r_ms, sp, b_ms, sp_b in entries:
                 sps.append(sp)
-                print(f"  {label:52} {t_ms:>9.3f} {r_ms:>10.3f} {sp:>10.2f}x")
+                if sp_b is not None:
+                    sps_big.append(sp_b)
+                b_str = f"{b_ms:>10.3f}" if b_ms is not None else f"{'n/a':>10}"
+                sb_str = f"{sp_b:>9.2f}x" if sp_b is not None else f"{'n/a':>10}"
+                print(f"  {label:52} {t_ms:>9.3f} {r_ms:>10.3f} {b_str} {sp:>9.2f}x {sb_str}")
             if sps:
-                print(f"\n  avg triton/torch speedup: {sum(sps)/len(sps):.2f}x over {len(sps)} configs")
+                line = f"\n  avg: tri/torch={sum(sps)/len(sps):.2f}x"
+                if sps_big:
+                    line += f"  tri/bigop={sum(sps_big)/len(sps_big):.2f}x"
+                line += f" over {len(sps)} configs"
+                print(line)
             print(f"{BOLD}==== done ===={RESET}", flush=True)
         _save_results(entries, world_size)
     finally:
