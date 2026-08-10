@@ -149,9 +149,10 @@
       "type": "object",
       "required": [
         "repository_url",
+        "checkout_locator",
         "branch",
-        "remote_ref",
-        "remote_commit",
+        "live_ref",
+        "live_commit",
         "commit",
         "tree",
         "parents",
@@ -163,9 +164,10 @@
       "additionalProperties": false,
       "properties": {
         "repository_url": {"const": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"},
+        "checkout_locator": {"type": "string", "pattern": "^/"},
         "branch": {"const": "codex02/uniep-current-main-recovery-20260809"},
-        "remote_ref": {"const": "refs/remotes/origin/codex02/uniep-current-main-recovery-20260809"},
-        "remote_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "live_ref": {"const": "refs/heads/codex02/uniep-current-main-recovery-20260809"},
+        "live_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "parents": {
@@ -459,7 +461,9 @@
       "required": [
         "contract_version",
         "status",
-        "plan"
+        "plan",
+        "harness_identity",
+        "sidecar_binding"
       ],
       "properties": {
         "contract_version": {

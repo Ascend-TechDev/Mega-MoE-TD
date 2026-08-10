@@ -40,7 +40,7 @@ ROUTING_ENVIRONMENT = {
     "MOE_BWD_TRACE": "",
 }
 AUTHORIZED_HARNESS_BRANCH = "codex02/uniep-current-main-recovery-20260809"
-AUTHORIZED_REMOTE_REF = f"refs/remotes/origin/{AUTHORIZED_HARNESS_BRANCH}"
+AUTHORIZED_LIVE_REF = f"refs/heads/{AUTHORIZED_HARNESS_BRANCH}"
 EXACT_HARNESS_PATHS = (
     "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
     "benchmark/contracts/current_human_baseline_v1.schema.json",
@@ -130,6 +130,14 @@ _SANITIZED_GIT_ENV = {
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_TERMINAL_PROMPT": "0",
 }
+_NETWORK_ENVIRONMENT_NAMES = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+)
 
 
 class ContractError(ValueError):
@@ -343,6 +351,33 @@ def _run_git(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[st
     )
 
 
+def _read_live_branch() -> list[tuple[str, str]]:
+    network_environment = dict(_SANITIZED_GIT_ENV)
+    for name in _NETWORK_ENVIRONMENT_NAMES:
+        value = os.environ.get(name)
+        if value is not None:
+            network_environment[name] = value
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", REPOSITORY_URL, AUTHORIZED_LIVE_REF],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=network_environment,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ContractError("live remote authority read timed out") from error
+    if result.returncode != 0:
+        raise ContractError(f"live remote authority read failed: {result.stderr.strip()}")
+    records: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        _require(len(fields) == 2, "live remote authority response malformed")
+        records.append((fields[0], fields[1]))
+    return records
+
+
 def _git(repo_root: Path, *arguments: str) -> str:
     result = _run_git(repo_root, *arguments)
     if result.returncode != 0:
@@ -356,30 +391,47 @@ def recompute_trusted_checkout(
     repo_root: Path | str, *, require_clean: bool = True
 ) -> dict[str, Any]:
     _require(isinstance(repo_root, (str, os.PathLike)), "authorized checkout path missing")
-    root = Path(repo_root).resolve()
+    lexical = os.fspath(repo_root)
+    _require(os.path.isabs(lexical), "physical checkout locator must be absolute")
+    absolute = os.path.abspath(lexical)
+    resolved = os.path.realpath(lexical)
     _require(
-        Path(_git(root, "rev-parse", "--show-toplevel")).resolve() == root,
+        lexical == absolute == resolved,
+        "physical checkout locator must be lexical-exact and non-symlink",
+    )
+    root = Path(lexical)
+    _require(root.is_dir() and not root.is_symlink(), "physical checkout locator is not a directory")
+    _require(
+        _git(root, "rev-parse", "--show-toplevel") == lexical,
         "authorized checkout root mismatch",
     )
     _require(
         _git(root, "rev-parse", "--is-inside-work-tree") == "true",
         "authorized checkout is not a Git worktree",
     )
-    origin_urls = _git(root, "config", "--local", "--get-all", "remote.origin.url").splitlines()
-    _require(origin_urls == [REPOSITORY_URL], "remote authority URL mismatch")
-    branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
-    _require(branch == AUTHORIZED_HARNESS_BRANCH, "remote authority branch mismatch")
-    upstream = _git(
-        root,
-        "for-each-ref",
-        "--format=%(upstream)",
-        f"refs/heads/{AUTHORIZED_HARNESS_BRANCH}",
+    git_directory = _git(root, "rev-parse", "--absolute-git-dir")
+    expected_git_directory = str(root / ".git")
+    _require(
+        git_directory == expected_git_directory
+        and (root / ".git").is_dir()
+        and not (root / ".git").is_symlink(),
+        "physical checkout Git directory mismatch",
     )
-    _require(upstream == AUTHORIZED_REMOTE_REF, "remote authority upstream mismatch")
+    origin_urls = _git(root, "config", "--local", "--get-all", "remote.origin.url").splitlines()
+    _require(origin_urls == [REPOSITORY_URL], "repository locator origin substitution")
+    branch_result = _run_git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    branch = branch_result.stdout.strip()
+    _require(
+        branch_result.returncode == 0 and branch == AUTHORIZED_HARNESS_BRANCH,
+        "authorized checkout branch mismatch",
+    )
     head = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
     tree = _git(root, "rev-parse", "--verify", "HEAD^{tree}")
-    remote_commit = _git(root, "rev-parse", "--verify", f"{AUTHORIZED_REMOTE_REF}^{{commit}}")
-    _require(remote_commit == head, "remote authority commit mismatch")
+    live_records = _read_live_branch()
+    _require(
+        live_records == [(head, AUTHORIZED_LIVE_REF)],
+        "live remote authority must contain exactly the authorized branch at local HEAD",
+    )
     _require(
         _git(root, "rev-parse", f"{REPOSITORY_COMMIT}^{{tree}}") == REPOSITORY_TREE,
         "product base tree mismatch",
@@ -419,11 +471,13 @@ def recompute_trusted_checkout(
         _require(clean, "execution checkout is dirty")
     commit_object = _git(root, "cat-file", "-p", "HEAD")
     parents = [line.removeprefix("parent ") for line in commit_object.splitlines() if line.startswith("parent ")]
+    _require(len(parents) == 1, "authorized checkout commit must have exactly one parent")
     identity = {
         "repository_url": REPOSITORY_URL,
+        "checkout_locator": lexical,
         "branch": AUTHORIZED_HARNESS_BRANCH,
-        "remote_ref": AUTHORIZED_REMOTE_REF,
-        "remote_commit": remote_commit,
+        "live_ref": AUTHORIZED_LIVE_REF,
+        "live_commit": head,
         "commit": head,
         "tree": tree,
         "parents": parents,
@@ -439,9 +493,10 @@ def recompute_trusted_checkout(
 def validate_harness_identity(identity: Mapping[str, Any]) -> None:
     required = {
         "repository_url",
+        "checkout_locator",
         "branch",
-        "remote_ref",
-        "remote_commit",
+        "live_ref",
+        "live_commit",
         "commit",
         "tree",
         "parents",
@@ -452,19 +507,28 @@ def validate_harness_identity(identity: Mapping[str, Any]) -> None:
     }
     _require(isinstance(identity, Mapping) and set(identity) == required, "harness identity malformed")
     _require(identity.get("repository_url") == REPOSITORY_URL, "harness identity repository mismatch")
-    _require(identity.get("branch") == AUTHORIZED_HARNESS_BRANCH, "harness identity branch mismatch")
-    _require(identity.get("remote_ref") == AUTHORIZED_REMOTE_REF, "harness identity remote ref mismatch")
+    checkout_locator = identity.get("checkout_locator")
     _require(
-        bool(_COMMIT.fullmatch(str(identity.get("remote_commit", "")))
-        and identity.get("remote_commit") == identity.get("commit")),
-        "harness identity remote commit mismatch",
+        isinstance(checkout_locator, str)
+        and os.path.isabs(checkout_locator)
+        and checkout_locator == os.path.abspath(checkout_locator) == os.path.realpath(checkout_locator),
+        "harness identity checkout locator mismatch",
+    )
+    _require(identity.get("branch") == AUTHORIZED_HARNESS_BRANCH, "harness identity branch mismatch")
+    _require(identity.get("live_ref") == AUTHORIZED_LIVE_REF, "harness identity live ref mismatch")
+    _require(
+        bool(_COMMIT.fullmatch(str(identity.get("live_commit", "")))
+        and identity.get("live_commit") == identity.get("commit")),
+        "harness identity live commit mismatch",
     )
     _require(bool(_COMMIT.fullmatch(str(identity.get("commit", "")))), "harness identity commit invalid")
     _require(bool(_COMMIT.fullmatch(str(identity.get("tree", "")))), "harness identity tree invalid")
     parents = identity.get("parents")
     _require(
-        isinstance(parents, list) and parents and all(_COMMIT.fullmatch(str(parent)) for parent in parents),
-        "harness identity parents invalid",
+        isinstance(parents, list)
+        and len(parents) == 1
+        and bool(_COMMIT.fullmatch(str(parents[0]))),
+        "harness identity sole parent invalid",
     )
     _require(
         identity.get("product_base_commit") == REPOSITORY_COMMIT
@@ -487,11 +551,28 @@ def _verify_envelope(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-def validate_dry_run_envelope(value: Mapping[str, Any]) -> None:
+def _validate_authorized_identity(
+    payload: Mapping[str, Any], authorized_checkout: Path | str
+) -> None:
+    harness_identity = payload.get("harness_identity")
+    _require(isinstance(harness_identity, Mapping), "harness identity missing")
+    validate_harness_identity(harness_identity)
+    trusted_identity = recompute_trusted_checkout(authorized_checkout)
+    _require(
+        dict(harness_identity) == trusted_identity,
+        "authorized checkout identity mismatch",
+    )
+
+
+def validate_dry_run_envelope(
+    value: Mapping[str, Any], *, authorized_checkout: Path | str
+) -> None:
     payload = _verify_envelope(value)
     _require(payload.get("contract_version") == CONTRACT_VERSION, "contract version mismatch")
     _require(payload.get("status") == "DRY_RUN_VALIDATED", "dry-run status mismatch")
     validate_plan(payload.get("plan", {}))
+    _validate_authorized_identity(payload, authorized_checkout)
+    _exact_mapping(payload.get("sidecar_binding", {}), SIDECAR_BINDING, "sidecar binding")
     _require(payload.get("device_modules_loaded") == [], "host dry-run imported a device module")
 
 
@@ -514,14 +595,7 @@ def validate_execution_envelope(
     _require(payload.get("status") == "COMPLETE", "execution status is not COMPLETE")
     validate_plan(payload.get("plan", {}))
     validate_environment(payload.get("environment", {}))
-    harness_identity = payload.get("harness_identity")
-    _require(isinstance(harness_identity, Mapping), "harness identity missing")
-    validate_harness_identity(harness_identity)
-    trusted_identity = recompute_trusted_checkout(authorized_checkout)
-    _require(
-        dict(harness_identity) == trusted_identity,
-        "authorized checkout identity mismatch",
-    )
+    _validate_authorized_identity(payload, authorized_checkout)
     _exact_mapping(payload.get("sidecar_binding", {}), SIDECAR_BINDING, "sidecar binding")
     arms = payload.get("arms")
     _require(isinstance(arms, list) and tuple(arm.get("arm_id") for arm in arms) == ARM_IDS, "execution four-arm set mismatch")
@@ -558,7 +632,7 @@ def read_verified_envelope(
     path: Path,
     *,
     require_complete: bool = False,
-    authorized_checkout: Path | str | None = None,
+    authorized_checkout: Path | str,
 ) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
@@ -576,10 +650,9 @@ def read_verified_envelope(
     _require(raw == canonical_bytes(value), "receipt raw bytes are not canonical")
     payload = _verify_envelope(value)
     if require_complete or payload.get("status") == "COMPLETE":
-        _require(authorized_checkout is not None, "authorized checkout path missing")
         validate_execution_envelope(value, authorized_checkout=authorized_checkout)
     else:
-        validate_dry_run_envelope(value)
+        validate_dry_run_envelope(value, authorized_checkout=authorized_checkout)
     return value
 
 

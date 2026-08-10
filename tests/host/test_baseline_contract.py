@@ -14,6 +14,23 @@ sys.path.insert(0, str(ROOT / "benchmark"))
 import baseline_contract as contract  # noqa: E402
 from providers import current_main, grouped_hccl  # noqa: E402
 
+REAL_LIVE_READER = contract._read_live_branch
+LOCAL_HEAD = subprocess.run(
+    ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+    text=True,
+    capture_output=True,
+    check=True,
+).stdout.strip()
+
+
+@pytest.fixture(autouse=True)
+def _stable_live_authority(monkeypatch):
+    monkeypatch.setattr(
+        contract,
+        "_read_live_branch",
+        lambda: [(LOCAL_HEAD, contract.AUTHORIZED_LIVE_REF)],
+    )
+
 
 def _descriptions():
     return [grouped_hccl.describe(), current_main.describe()]
@@ -48,9 +65,10 @@ def _environment():
 def _fake_checkout():
     return {
         "repository_url": contract.REPOSITORY_URL,
+        "checkout_locator": "/opt/authorized/Mega-MoE-TD",
         "branch": "codex02/uniep-current-main-recovery-20260809",
-        "remote_ref": "refs/remotes/origin/codex02/uniep-current-main-recovery-20260809",
-        "remote_commit": "b" * 40,
+        "live_ref": "refs/heads/codex02/uniep-current-main-recovery-20260809",
+        "live_commit": "b" * 40,
         "commit": "b" * 40,
         "tree": "c" * 40,
         "parents": ["d" * 40],
@@ -240,9 +258,7 @@ def test_complete_recomputes_authorized_checkout_and_rejects_self_signed_mapping
         )
 
 
-def test_authorized_checkout_recomputation_rejects_remote_drift_deletion_and_dirty(
-    tmp_path,
-):
+def test_authorized_checkout_recomputation_rejects_deletion_and_dirty(tmp_path):
     deleted_checkout = _authorized_checkout(tmp_path, "deleted")
     contract.recompute_trusted_checkout(deleted_checkout)
     deleted = deleted_checkout / contract.EXACT_HARNESS_PATHS[-1]
@@ -257,13 +273,110 @@ def test_authorized_checkout_recomputation_rejects_remote_drift_deletion_and_dir
     with pytest.raises(contract.ContractError, match="dirty"):
         contract.recompute_trusted_checkout(dirty_checkout)
 
-    remote_checkout = _authorized_checkout(tmp_path, "remote")
-    remote_ref = f"refs/remotes/origin/{contract.AUTHORIZED_HARNESS_BRANCH}"
+def test_live_remote_authority_cannot_be_replaced_by_local_tracking(
+    tmp_path, monkeypatch
+):
+    authorized = _authorized_checkout(tmp_path)
     subprocess.run(
-        ["git", "-C", str(remote_checkout), "update-ref", remote_ref, "HEAD^"], check=True
+        [
+            "git",
+            "-C",
+            str(authorized),
+            "update-ref",
+            f"refs/remotes/origin/{contract.AUTHORIZED_HARNESS_BRANCH}",
+            "HEAD",
+        ],
+        check=True,
     )
-    with pytest.raises(contract.ContractError, match="remote authority"):
-        contract.recompute_trusted_checkout(remote_checkout)
+    monkeypatch.setattr(contract, "_read_live_branch", lambda: [])
+    with pytest.raises(contract.ContractError, match="live remote authority"):
+        contract.recompute_trusted_checkout(authorized)
+
+
+def test_live_remote_reader_uses_fixed_ref_and_sanitized_environment(monkeypatch):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=f"{LOCAL_HEAD}\t{contract.AUTHORIZED_LIVE_REF}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(contract, "_read_live_branch", REAL_LIVE_READER)
+    monkeypatch.setattr(contract.subprocess, "run", fake_run)
+    assert contract._read_live_branch() == [(LOCAL_HEAD, contract.AUTHORIZED_LIVE_REF)]
+    assert captured["command"] == [
+        "git",
+        "ls-remote",
+        "--heads",
+        contract.REPOSITORY_URL,
+        contract.AUTHORIZED_LIVE_REF,
+    ]
+    assert "HOME" not in captured["environment"]
+    assert "GIT_DIR" not in captured["environment"]
+    assert captured["environment"]["GIT_CONFIG_GLOBAL"] == contract.os.devnull
+
+
+def test_authorized_checkout_rejects_alias_detached_fake_and_origin_substitution(tmp_path):
+    authorized = _authorized_checkout(tmp_path, "physical")
+    with pytest.raises(contract.ContractError, match="physical checkout locator"):
+        contract.recompute_trusted_checkout(str(authorized) + "/.")
+
+    alias = tmp_path / "alias"
+    alias.symlink_to(authorized, target_is_directory=True)
+    with pytest.raises(contract.ContractError, match="physical checkout locator"):
+        contract.recompute_trusted_checkout(alias)
+
+    detached = _authorized_checkout(tmp_path, "detached")
+    subprocess.run(
+        ["git", "-C", str(detached), "switch", "--quiet", "--detach", "HEAD"], check=True
+    )
+    with pytest.raises(contract.ContractError, match="branch"):
+        contract.recompute_trusted_checkout(detached)
+
+    substituted = _authorized_checkout(tmp_path, "substituted")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(substituted),
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/fake.git",
+        ],
+        check=True,
+    )
+    with pytest.raises(contract.ContractError, match="repository locator"):
+        contract.recompute_trusted_checkout(substituted)
+
+    fake = _authorized_checkout(tmp_path, "fake")
+    subprocess.run(["git", "-C", str(fake), "config", "user.name", "host-test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(fake), "config", "user.email", "host-test@example.invalid"],
+        check=True,
+    )
+    design = fake / contract.EXACT_HARNESS_PATHS[0]
+    design.write_text(design.read_text(encoding="utf-8") + "\nlocal fake\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(fake), "add", str(design)], check=True)
+    subprocess.run(["git", "-C", str(fake), "commit", "--quiet", "-m", "local fake"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(fake),
+            "update-ref",
+            f"refs/remotes/origin/{contract.AUTHORIZED_HARNESS_BRANCH}",
+            "HEAD",
+        ],
+        check=True,
+    )
+    with pytest.raises(contract.ContractError, match="live remote authority"):
+        contract.recompute_trusted_checkout(fake)
 
 
 def test_envelope_hash_detects_mutation(tmp_path):

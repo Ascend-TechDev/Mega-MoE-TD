@@ -135,8 +135,11 @@ def lint(root: Path) -> list[str]:
             if variables != EXPECTED_ROUTING_ENVIRONMENT:
                 findings.append("schema routing environment drift")
             harness_required = set(schema["$defs"]["harness_identity"]["required"])
-            if not {"branch", "remote_ref", "remote_commit"} <= harness_required:
+            if not {"checkout_locator", "branch", "live_ref", "live_commit"} <= harness_required:
                 findings.append("schema authorized Git identity drift")
+            payload_required = set(schema["$defs"]["payload"]["required"])
+            if not {"harness_identity", "sidecar_binding"} <= payload_required:
+                findings.append("durable status identity requirement drift")
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             findings.append(f"schema is not inspectable: {error}")
 
@@ -155,6 +158,15 @@ def lint(root: Path) -> list[str]:
             execution_parameters = inspect.signature(contract.validate_execution_envelope).parameters
             if "authorized_checkout" not in execution_parameters or "trusted_checkout" in execution_parameters:
                 findings.append("COMPLETE validator authorized checkout API drift")
+            dry_parameters = inspect.signature(contract.validate_dry_run_envelope).parameters
+            reader_parameters = inspect.signature(contract.read_verified_envelope).parameters
+            if "authorized_checkout" not in dry_parameters or "authorized_checkout" not in reader_parameters:
+                findings.append("shared durable-status authorized checkout API drift")
+            expected_live_ref = (
+                "refs/heads/codex02/uniep-current-main-recovery-20260809"
+            )
+            if contract.AUTHORIZED_LIVE_REF != expected_live_ref:
+                findings.append("live GitCode branch authority drift")
             committed_paths = _committed_harness_paths(root, contract.REPOSITORY_COMMIT)
             if committed_paths is not None and set(committed_paths) != set(REQUIRED_PATHS):
                 findings.append(

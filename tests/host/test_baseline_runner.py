@@ -6,6 +6,8 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "benchmark" / "current_human_baseline.py"
@@ -15,27 +17,66 @@ import baseline_contract as contract  # noqa: E402
 import current_human_baseline as runner  # noqa: E402
 
 
-def test_host_dry_run_emits_identity_bound_canonical_receipt(tmp_path):
+def _authorized_checkout(tmp_path):
+    target = tmp_path / "authorized"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--shared",
+            "--branch",
+            contract.AUTHORIZED_HARNESS_BRANCH,
+            str(ROOT),
+            str(target),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "remote", "set-url", "origin", contract.REPOSITORY_URL],
+        check=True,
+    )
+    return target
+
+
+def test_host_dry_run_emits_live_identity_bound_canonical_receipt(tmp_path):
+    authorized = _authorized_checkout(tmp_path)
+    receipt_dir = tmp_path / "receipt"
+    code = (
+        "from pathlib import Path; import sys; "
+        f"sys.path.insert(0, {str(ROOT / 'benchmark')!r}); "
+        "import current_human_baseline as runner; "
+        f"runner.PROJECT_ROOT = Path({str(authorized)!r}); "
+        f"print(runner._dry_run(Path({str(receipt_dir)!r})))"
+    )
     result = subprocess.run(
-        [sys.executable, str(RUNNER), "--dry-run", "--receipt-dir", str(tmp_path)],
+        [sys.executable, "-c", code],
         cwd=ROOT,
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    receipt = tmp_path / "current_human_baseline_dry_run.json"
+    receipt = Path(result.stdout.strip())
     sidecar = receipt.with_suffix(receipt.suffix + ".sha256")
     assert receipt.is_file()
     assert sidecar.is_file()
     raw = receipt.read_bytes()
     assert sidecar.read_text(encoding="utf-8").strip() == hashlib.sha256(raw).hexdigest()
-    envelope = contract.read_verified_envelope(receipt)
-    contract.validate_dry_run_envelope(envelope)
+    envelope = contract.read_verified_envelope(receipt, authorized_checkout=authorized)
+    contract.validate_dry_run_envelope(envelope, authorized_checkout=authorized)
     payload = envelope["payload"]
     assert payload["device_modules_loaded"] == []
     assert tuple(payload["plan"]["arms"]) == contract.ARM_IDS
     assert tuple(payload["plan"]["tokens_per_rank"]) == contract.TOKENS_PER_RANK
+    assert payload["harness_identity"] == contract.recompute_trusted_checkout(authorized)
+
+    missing_identity = dict(payload)
+    missing_identity.pop("harness_identity")
+    with pytest.raises(contract.ContractError, match="harness identity"):
+        contract.validate_dry_run_envelope(
+            contract.envelope(missing_identity), authorized_checkout=authorized
+        )
 
 
 def test_execute_without_environment_receipt_fails_before_device_import(tmp_path):

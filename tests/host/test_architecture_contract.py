@@ -140,7 +140,9 @@ def test_complete_schema_binds_full_plan_authorized_git_and_backward_trace():
     variables = schema["$defs"]["environment"]["properties"]["variables"]["const"]
     assert variables["MOE_BWD_TRACE"] == ""
     harness_required = set(schema["$defs"]["harness_identity"]["required"])
-    assert {"branch", "remote_ref", "remote_commit"} <= harness_required
+    assert {"checkout_locator", "branch", "live_ref", "live_commit"} <= harness_required
+    payload_required = set(schema["$defs"]["payload"]["required"])
+    assert {"harness_identity", "sidecar_binding"} <= payload_required
 
 
 def test_lint_rejects_incomplete_portable_plan_contract(tmp_path):

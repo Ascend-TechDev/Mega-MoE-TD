@@ -86,15 +86,20 @@ and exact ten-path delta) plus the required sidecar algorithm/suffix. Consumers
 must use the sidecar-verifying read API; a missing or tampered sidecar is not a
 receipt.
 
-COMPLETE validation accepts an explicit authorized Git checkout path, never a
-caller-supplied identity mapping. It executes sanitized Git plumbing internally
-and binds the exact origin URL, designated branch/upstream remote ref, remote
-commit, HEAD/tree/parents, product ancestry, clean state, and cumulative
-ten-path delta. The receipt identity must equal that recomputation. Raw receipt
-bytes must also equal the canonical serialization exactly; reformatting and
-rehashing the sidecar does not produce valid evidence. The portable schema
-declares every required plan field while the Python validator checks the full
-fixed plan values.
+DRY_RUN and COMPLETE validation accept an explicit physical Git checkout path,
+never a caller-supplied identity mapping. The locator must be absolute,
+lexically identical to its resolved path, non-symlink, and the exact checkout
+top-level with a physical in-tree `.git` directory. Sanitized local Git plumbing
+binds HEAD/tree/sole-parent, designated branch, product ancestry, clean state,
+and the cumulative ten-path delta. Local origin and remote-tracking refs are not
+authority: each validation performs a sanitized live `git ls-remote --heads`
+against the fixed GitCode URL and exact reviewed feature ref, requiring exactly
+one live ref equal to local HEAD. Both statuses persist that checkout locator,
+repository, branch, live ref/commit, and local object identity, and consumers
+rerun the same verifier. Raw receipt bytes must also equal the canonical
+serialization exactly; reformatting and rehashing the sidecar does not produce
+valid evidence. The portable schema declares every required plan field while
+the Python validator checks the full fixed plan values.
 
 ## 3. Validation rigor
 
@@ -104,9 +109,10 @@ must fail; missing gradients or a truncated sample array must fail; and dry-run
 must prove that no Torch, torch-npu, Triton, or ACLSHMEM module was imported.
 Duplicate canonical documents or runners, an eleventh provider, a deleted
 harness path, a dirty checkout, route-variable drift, placeholder environment
-identity, remote-ref drift, a self-signed checkout mapping, an incomplete plan,
-noncanonical raw JSON, and sidecar tampering must independently turn their
-gates red.
+identity, live-ref drift, a self-signed checkout mapping, an incomplete plan,
+noncanonical raw JSON, missing live authority, path aliases, detached or locally
+forged repositories, dry-run identity omission, and sidecar tampering must
+independently turn their gates red.
 
 Device evidence is not accepted merely because the process exits zero. Every
 requested shape must appear, every precision result must be `PASS`, every arm

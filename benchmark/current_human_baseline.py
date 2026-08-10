@@ -445,6 +445,7 @@ def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
 
 def _dry_run(receipt_dir: Path) -> Path:
     receipt_dir = _validate_receipt_dir(receipt_dir)
+    harness_identity = recompute_trusted_checkout(PROJECT_ROOT)
     plan = _plan()
     validate_plan(plan)
     loaded = _device_modules_loaded()
@@ -454,10 +455,12 @@ def _dry_run(receipt_dir: Path) -> Path:
         "contract_version": CONTRACT_VERSION,
         "status": "DRY_RUN_VALIDATED",
         "plan": plan,
+        "harness_identity": harness_identity,
+        "sidecar_binding": dict(SIDECAR_BINDING),
         "device_modules_loaded": loaded,
     }
     path = receipt_dir / "current_human_baseline_dry_run.json"
-    validate_dry_run_envelope(envelope(payload))
+    validate_dry_run_envelope(envelope(payload), authorized_checkout=PROJECT_ROOT)
     write_envelope(path, payload)
     return path
 
