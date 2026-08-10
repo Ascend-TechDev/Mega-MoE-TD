@@ -57,3 +57,56 @@ def test_lint_causally_rejects_arm_set_drift(tmp_path):
     result = _run_lint(candidate)
     assert result.returncode == 1
     assert "four-arm set" in result.stdout
+
+
+def test_lint_rejects_duplicate_canonical_design(tmp_path):
+    candidate = tmp_path / "repo"
+    shutil.copytree(
+        ROOT,
+        candidate,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+    )
+    duplicate = candidate / "docs" / "design" / "DUPLICATE.md"
+    duplicate.write_text(
+        "<!-- CANONICAL_ARCHITECTURE_SOURCE: current-human-baseline-v1 -->\n",
+        encoding="utf-8",
+    )
+    result = _run_lint(candidate)
+    assert result.returncode == 1
+    assert "canonical architecture" in result.stdout
+
+
+def test_lint_rejects_duplicate_authoritative_runner(tmp_path):
+    candidate = tmp_path / "repo"
+    shutil.copytree(
+        ROOT,
+        candidate,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+    )
+    duplicate = candidate / "benchmark" / "duplicate_runner.py"
+    duplicate.write_text("AUTHORITATIVE_BASELINE_RUNNER = True\n", encoding="utf-8")
+    result = _run_lint(candidate)
+    assert result.returncode == 1
+    assert "authoritative runner" in result.stdout
+
+
+def test_lint_rejects_eleventh_provider_path(tmp_path):
+    candidate = tmp_path / "repo"
+    shutil.copytree(
+        ROOT,
+        candidate,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+    )
+    extra = candidate / "benchmark" / "providers" / "extra.py"
+    extra.write_text("def describe(): return {}\n", encoding="utf-8")
+    result = _run_lint(candidate)
+    assert result.returncode == 1
+    assert "provider path contract" in result.stdout
+
+
+def test_complete_schema_requires_harness_and_sidecar_binding():
+    schema_path = ROOT / "benchmark" / "contracts" / "current_human_baseline_v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    complete = schema["$defs"]["payload"]["allOf"][0]["then"]["required"]
+    assert "harness_identity" in complete
+    assert "sidecar_binding" in complete

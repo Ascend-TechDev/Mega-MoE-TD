@@ -32,6 +32,9 @@ layer for historical metrics.
 - forward full-output correctness and backward five-gradient correctness before
   any timing;
 - canonical JSON payload and file hashes with full sample arrays.
+- exact `MOE_FULL_BENCH_ROUTE_MODE=dense_random` and
+  `MOE_FULL_BENCH_ACTIVE_EXPERTS=8` bindings in the plan, environment, and
+  execution receipt.
 
 Any missing or conflicting field is invalid evidence. The Python validator is
 the executable authority; the JSON schema is the portable shape declaration.
@@ -47,6 +50,13 @@ Host `--dry-run` loads only the contract and provider descriptions. Device
 execution additionally requires an external environment receipt before any
 Torch/NPU import. The receipt must bind Python, Torch, torch-npu, Triton, CANN,
 ACLSHMEM, and bigop. Absence or mismatch is terminal `INVALID`.
+
+The runner first validates the expected receipt and explicit routing variables.
+It then imports only the runtime components needed to recompute their real
+versions, source files or gitlink, and hashes. The recomputed environment must
+equal the receipt before device selection, process-group initialization, or
+fixture construction. CANN identity must come from a version file beneath the
+active toolkit root; bigop identity is the fixed product-base gitlink.
 
 ### 2.3 Providers
 
@@ -66,7 +76,11 @@ The runner emits no result when an arm raises, a correctness gate fails, an
 identity is absent, or a sample array is incomplete. A complete receipt is a
 canonical envelope containing the payload hash, all four arms, every shape,
 every correctness gate, and all raw rank-MAX samples. A second sidecar hashes
-the exact serialized envelope bytes.
+the exact serialized envelope bytes. The COMPLETE payload binds a freshly
+recomputed clean checkout identity (origin, HEAD/tree/parents, product base,
+and exact ten-path delta) plus the required sidecar algorithm/suffix. Consumers
+must use the sidecar-verifying read API; a missing or tampered sidecar is not a
+receipt.
 
 ## 3. Validation rigor
 
@@ -74,6 +88,9 @@ Host tests are causal: mutations to the canonical sections or four-arm schema
 must turn strict lint red; missing commit/tree/provider/environment identity
 must fail; missing gradients or a truncated sample array must fail; and dry-run
 must prove that no Torch, torch-npu, Triton, or ACLSHMEM module was imported.
+Duplicate canonical documents or runners, an eleventh provider, a deleted
+harness path, a dirty checkout, route-variable drift, placeholder environment
+identity, and sidecar tampering must independently turn their gates red.
 
 Device evidence is not accepted merely because the process exits zero. Every
 requested shape must appear, every precision result must be `PASS`, every arm

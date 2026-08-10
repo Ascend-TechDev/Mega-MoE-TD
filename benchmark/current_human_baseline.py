@@ -8,10 +8,13 @@ identity-bound external environment receipt has passed validation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import importlib.metadata
 import os
 from pathlib import Path
-import subprocess
+import platform
+import re
 import sys
 import time
 from typing import Any, Callable, Mapping
@@ -26,15 +29,17 @@ from baseline_contract import (
     EP_WORLD_SIZE,
     FIXTURE_SEED,
     MODEL,
-    REPOSITORY_COMMIT,
-    REPOSITORY_TREE,
-    REPOSITORY_URL,
+    ROUTING_ENVIRONMENT,
     SAMPLES,
+    SIDECAR_BINDING,
     TOKENS_PER_RANK,
     WARMUP,
     build_plan,
+    compare_environment,
     envelope,
     read_json,
+    read_verified_envelope,
+    recompute_trusted_checkout,
     validate_dry_run_envelope,
     validate_environment,
     validate_execution_envelope,
@@ -46,19 +51,8 @@ from providers import current_main, grouped_hccl
 
 AUTHORITATIVE_BASELINE_RUNNER = True
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ALLOWED_HARNESS_PATHS = {
-    "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
-    "benchmark/contracts/current_human_baseline_v1.schema.json",
-    "benchmark/baseline_contract.py",
-    "benchmark/current_human_baseline.py",
-    "benchmark/providers/current_main.py",
-    "benchmark/providers/grouped_hccl.py",
-    "scripts/architecture_lint.py",
-    "tests/host/test_architecture_contract.py",
-    "tests/host/test_baseline_contract.py",
-    "tests/host/test_baseline_runner.py",
-}
 DEVICE_MODULE_ROOTS = ("torch", "torch_npu", "triton", "shmem")
+_CANN_VERSION_FILE_NAMES = {"version.info", "ascend_toolkit_install.info"}
 
 
 def _provider_descriptions() -> list[dict[str, Any]]:
@@ -86,48 +80,115 @@ def _device_modules_loaded() -> list[str]:
     return loaded
 
 
-def _git(*arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(PROJECT_ROOT), *arguments],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise ContractError(f"git identity command failed: {' '.join(arguments)}: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def _verify_source_checkout() -> dict[str, Any]:
-    _require_equal(_git("rev-parse", f"{REPOSITORY_COMMIT}^{{tree}}"), REPOSITORY_TREE, "source tree")
-    _require_equal(_git("remote", "get-url", "origin"), REPOSITORY_URL, "origin URL")
-    changed = {
-        line
-        for line in _git("diff", "--name-only", REPOSITORY_COMMIT, "HEAD").splitlines()
-        if line
-    }
-    if changed != ALLOWED_HARNESS_PATHS:
-        raise ContractError(
-            "checkout differs from the fixed product commit outside the exact harness scope: "
-            f"{sorted(changed ^ ALLOWED_HARNESS_PATHS)}"
-        )
-    status = _git("status", "--porcelain=v1", "--untracked-files=all")
-    if status:
-        raise ContractError("execution checkout is dirty")
-    gitlink = _git("rev-parse", f"{REPOSITORY_COMMIT}:3rdparty/bigop")
-    _require_equal(gitlink, BIGOP_COMMIT, "bigop gitlink")
-    return {
-        "harness_commit": _git("rev-parse", "HEAD"),
-        "harness_tree": _git("rev-parse", "HEAD^{tree}"),
-        "product_commit": REPOSITORY_COMMIT,
-        "product_tree": REPOSITORY_TREE,
-        "changed_paths": sorted(changed),
-    }
-
-
 def _require_equal(actual: Any, expected: Any, label: str) -> None:
     if actual != expected:
         raise ContractError(f"{label} mismatch: expected {expected!r}, got {actual!r}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ContractError(f"runtime identity file unreadable: {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def _runtime_file_identity(path: Path, version: str) -> dict[str, Any]:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"runtime identity source is unavailable: {path}: {error}") from error
+    if not resolved.is_file():
+        raise ContractError(f"runtime identity source is not a file: {resolved}")
+    return {
+        "version": version,
+        "source": {"kind": "runtime_file", "locator": str(resolved)},
+        "sha256": _sha256_file(resolved),
+    }
+
+
+def _module_version(module: Any, distribution: str) -> str:
+    version = getattr(module, "__version__", None)
+    if isinstance(version, str) and version:
+        return version
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        source = getattr(module, "__file__", None)
+        if not source:
+            raise ContractError(f"runtime component {distribution} has no version or source")
+        return "sha256:" + _sha256_file(Path(source).resolve())
+
+
+def _module_identity(module: Any, distribution: str) -> dict[str, Any]:
+    source = getattr(module, "__file__", None)
+    if not source:
+        raise ContractError(f"runtime component {distribution} has no source file")
+    return _runtime_file_identity(Path(source), _module_version(module, distribution))
+
+
+def _import_required_module(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except (ImportError, OSError) as error:
+        raise ContractError(f"runtime component import failed: {name}: {error}") from error
+
+
+def _cann_identity(expected: Mapping[str, Any]) -> dict[str, Any]:
+    source = expected.get("source")
+    if not isinstance(source, Mapping) or source.get("kind") != "runtime_file":
+        raise ContractError("CANN recoverable source must be a runtime version file")
+    try:
+        locator = Path(str(source.get("locator", ""))).resolve(strict=True)
+        roots = [
+            Path(value).resolve(strict=True)
+            for variable in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME")
+            if (value := os.environ.get(variable))
+        ]
+    except OSError as error:
+        raise ContractError(f"CANN runtime identity path is unavailable: {error}") from error
+    if not roots:
+        raise ContractError("CANN runtime root identity is unavailable")
+    if locator.name not in _CANN_VERSION_FILE_NAMES or not any(
+        locator.is_relative_to(root) for root in roots
+    ):
+        raise ContractError("CANN version source is outside the active runtime root")
+    try:
+        text = locator.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeError) as error:
+        raise ContractError(f"CANN version source is unreadable: {error}") from error
+    matches = re.findall(r"[0-9]+(?:\.[0-9A-Za-z_-]+)+", text)
+    if not matches:
+        raise ContractError("CANN version source has no recoverable version")
+    return _runtime_file_identity(locator, matches[0])
+
+
+def _capture_runtime_environment(
+    expected: Mapping[str, Any], *, torch: Any, torch_npu: Any, triton: Any, ash: Any
+) -> dict[str, Any]:
+    # The product-base gitlink is immutable and separately bound by the plan.
+    gitlink = BIGOP_COMMIT
+    components = {
+        "python": _runtime_file_identity(Path(sys.executable), platform.python_version()),
+        "torch": _module_identity(torch, "torch"),
+        "torch_npu": _module_identity(torch_npu, "torch-npu"),
+        "triton": _module_identity(triton, "triton"),
+        "cann": _cann_identity(expected["components"]["cann"]),
+        "aclshmem": _module_identity(ash, "aclshmem"),
+        "bigop": {
+            "version": gitlink,
+            "source": {"kind": "gitlink", "locator": "3rdparty/bigop"},
+            "sha256": hashlib.sha256(gitlink.encode("ascii")).hexdigest(),
+        },
+    }
+    return {
+        "repository": dict(expected["repository"]),
+        "variables": dict(ROUTING_ENVIRONMENT),
+        "components": components,
+    }
 
 
 def _collect_rank_max_samples(
@@ -219,20 +280,31 @@ def _backward_fixture(tokens: int, rank: int, ep_group, bb, utils):
 
 def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
     validate_environment(environment)
+    ambient_routing = {name: os.environ.get(name) for name in ROUTING_ENVIRONMENT}
+    if ambient_routing != ROUTING_ENVIRONMENT:
+        raise ContractError(
+            f"routing environment mismatch: expected {ROUTING_ENVIRONMENT!r}, "
+            f"got {ambient_routing!r}"
+        )
     receipt_dir = _validate_receipt_dir(receipt_dir)
-    harness_identity = _verify_source_checkout()
+    harness_identity = recompute_trusted_checkout(PROJECT_ROOT)
 
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    torch = importlib.import_module("torch")
-    dist = importlib.import_module("torch.distributed")
-    importlib.import_module("torch_npu")
-    ash = importlib.import_module("shmem")
-    mega_moe = importlib.import_module("mega_moe")
-    ff = importlib.import_module("benchmark.layer.bench_full_forward")
-    bb = importlib.import_module("benchmark.layer.bench_backward")
-    utils = importlib.import_module("tests._moe_dist_utils")
-    golden_module = importlib.import_module("mega_moe._goldens.backward")
+    torch = _import_required_module("torch")
+    dist = _import_required_module("torch.distributed")
+    torch_npu = _import_required_module("torch_npu")
+    triton = _import_required_module("triton")
+    ash = _import_required_module("shmem")
+    actual_environment = _capture_runtime_environment(
+        environment, torch=torch, torch_npu=torch_npu, triton=triton, ash=ash
+    )
+    compare_environment(environment, actual_environment)
+    mega_moe = _import_required_module("mega_moe")
+    ff = _import_required_module("benchmark.layer.bench_full_forward")
+    bb = _import_required_module("benchmark.layer.bench_backward")
+    utils = _import_required_module("tests._moe_dist_utils")
+    golden_module = _import_required_module("mega_moe._goldens.backward")
 
     created_process_group = not dist.is_initialized()
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
@@ -354,14 +426,17 @@ def _execute(environment: Mapping[str, Any], receipt_dir: Path) -> Path | None:
         "contract_version": CONTRACT_VERSION,
         "status": "COMPLETE",
         "plan": _plan(),
-        "environment": dict(environment),
+        "environment": actual_environment,
         "harness_identity": harness_identity,
+        "sidecar_binding": dict(SIDECAR_BINDING),
         "arms": [results[arm_id] for arm_id in ARM_IDS],
     }
     value = envelope(payload)
-    validate_execution_envelope(value)
-    write_envelope(receipt_dir / "current_human_baseline_execution.json", payload)
-    return receipt_dir / "current_human_baseline_execution.json"
+    validate_execution_envelope(value, trusted_checkout=harness_identity)
+    path = receipt_dir / "current_human_baseline_execution.json"
+    write_envelope(path, payload)
+    read_verified_envelope(path, require_complete=True, trusted_checkout=harness_identity)
+    return path
 
 
 def _dry_run(receipt_dir: Path) -> Path:

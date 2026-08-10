@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Iterable, Mapping
 
 
@@ -33,6 +34,23 @@ TOKENS_PER_RANK = (4096, 8192, 16384)
 FIXTURE_SEED = 42
 WARMUP = 5
 SAMPLES = 50
+ROUTING_ENVIRONMENT = {
+    "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
+    "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8",
+}
+EXACT_HARNESS_PATHS = (
+    "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
+    "benchmark/contracts/current_human_baseline_v1.schema.json",
+    "benchmark/baseline_contract.py",
+    "benchmark/current_human_baseline.py",
+    "benchmark/providers/current_main.py",
+    "benchmark/providers/grouped_hccl.py",
+    "scripts/architecture_lint.py",
+    "tests/host/test_architecture_contract.py",
+    "tests/host/test_baseline_contract.py",
+    "tests/host/test_baseline_runner.py",
+)
+SIDECAR_BINDING = {"algorithm": "sha256", "suffix": ".sha256", "required": True}
 
 ARM_IDS = (
     "unfused_grouped_hccl_forward",
@@ -97,6 +115,7 @@ FUSION_SWITCHES = {
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_PLACEHOLDER = re.compile(r"(?:placeholder|identity[-_ ]?bound|unknown|todo|n/?a)", re.IGNORECASE)
 
 
 class ContractError(ValueError):
@@ -145,6 +164,7 @@ def build_plan(provider_descriptions: Iterable[Mapping[str, Any]]) -> dict[str, 
         "parallel": {"expert_parallel_world_size": EP_WORLD_SIZE},
         "tokens_per_rank": list(TOKENS_PER_RANK),
         "fixture_seed": FIXTURE_SEED,
+        "routing_environment": dict(ROUTING_ENVIRONMENT),
         "timing": {
             "warmup": WARMUP,
             "samples": SAMPLES,
@@ -189,6 +209,11 @@ def validate_plan(plan: Mapping[str, Any]) -> None:
     )
     _require(tuple(plan.get("tokens_per_rank", ())) == TOKENS_PER_RANK, "shape set mismatch")
     _require(plan.get("fixture_seed") == FIXTURE_SEED, "fixture seed mismatch")
+    _exact_mapping(
+        plan.get("routing_environment", {}),
+        ROUTING_ENVIRONMENT,
+        "routing environment",
+    )
     timing = plan.get("timing", {})
     _require(
         timing.get("warmup") == WARMUP
@@ -244,15 +269,137 @@ def validate_environment(environment: Mapping[str, Any]) -> None:
         {"url": REPOSITORY_URL, "commit": REPOSITORY_COMMIT, "tree": REPOSITORY_TREE},
         "environment repository identity",
     )
+    _exact_mapping(
+        environment.get("variables", {}),
+        ROUTING_ENVIRONMENT,
+        "routing environment",
+    )
     components = environment.get("components")
     _require(isinstance(components, Mapping), "environment component set missing")
     _require(set(components) == set(REQUIRED_ENVIRONMENT_COMPONENTS), "environment component set mismatch")
     for name in REQUIRED_ENVIRONMENT_COMPONENTS:
         identity = components[name]
         _require(isinstance(identity, Mapping), f"environment component {name} malformed")
-        _require(isinstance(identity.get("version"), str) and identity["version"], f"environment component {name} version missing")
-        _require(isinstance(identity.get("source"), str) and identity["source"], f"environment component {name} source missing")
+        version = identity.get("version")
+        _require(isinstance(version, str) and version, f"environment component {name} version missing")
+        _require(not _PLACEHOLDER.search(version), f"environment component {name} placeholder version")
+        source = identity.get("source")
+        _require(isinstance(source, Mapping), f"environment component {name} recoverable source missing")
+        locator = source.get("locator")
+        source_is_recoverable = (
+            set(source) == {"kind", "locator"}
+            and isinstance(locator, str)
+            and (
+                (source.get("kind") == "runtime_file" and Path(locator).is_absolute())
+                or (
+                    source.get("kind") == "gitlink"
+                    and name == "bigop"
+                    and locator == "3rdparty/bigop"
+                )
+            )
+        )
+        _require(source_is_recoverable, f"environment component {name} recoverable source invalid")
         _require(bool(_SHA256.fullmatch(str(identity.get("sha256", "")))), f"environment component {name} sha256 invalid")
+
+
+def compare_environment(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> None:
+    validate_environment(expected)
+    validate_environment(actual)
+    _require(dict(expected) == dict(actual), "runtime environment mismatch")
+
+
+def _git(repo_root: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *arguments],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ContractError(
+            f"git identity command failed: {' '.join(arguments)}: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def recompute_trusted_checkout(
+    repo_root: Path, *, require_clean: bool = True
+) -> dict[str, Any]:
+    root = repo_root.resolve()
+    _require(_git(root, "remote", "get-url", "origin") == REPOSITORY_URL, "origin URL mismatch")
+    _require(
+        _git(root, "rev-parse", f"{REPOSITORY_COMMIT}^{{tree}}") == REPOSITORY_TREE,
+        "product base tree mismatch",
+    )
+    _require(
+        _git(root, "rev-parse", f"{REPOSITORY_COMMIT}:3rdparty/bigop") == BIGOP_COMMIT,
+        "bigop gitlink mismatch",
+    )
+    result = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", REPOSITORY_COMMIT, "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    _require(result.returncode == 0, "product base is not an ancestor of harness checkout")
+    changed = tuple(
+        line
+        for line in _git(root, "diff", "--name-only", REPOSITORY_COMMIT, "HEAD").splitlines()
+        if line
+    )
+    _require(
+        set(changed) == set(EXACT_HARNESS_PATHS) and len(changed) == len(EXACT_HARNESS_PATHS),
+        "checkout differs from exact harness path contract",
+    )
+    missing_paths = [relative for relative in EXACT_HARNESS_PATHS if not (root / relative).is_file()]
+    _require(not missing_paths, f"exact harness path missing: {missing_paths}")
+    clean = not bool(_git(root, "status", "--porcelain=v1", "--untracked-files=all"))
+    if require_clean:
+        _require(clean, "execution checkout is dirty")
+    parents = _git(root, "show", "-s", "--format=%P", "HEAD").split()
+    identity = {
+        "repository_url": REPOSITORY_URL,
+        "commit": _git(root, "rev-parse", "HEAD"),
+        "tree": _git(root, "rev-parse", "HEAD^{tree}"),
+        "parents": parents,
+        "product_base_commit": REPOSITORY_COMMIT,
+        "product_base_tree": REPOSITORY_TREE,
+        "changed_paths": list(EXACT_HARNESS_PATHS),
+        "clean": clean,
+    }
+    validate_harness_identity(identity)
+    return identity
+
+
+def validate_harness_identity(identity: Mapping[str, Any]) -> None:
+    required = {
+        "repository_url",
+        "commit",
+        "tree",
+        "parents",
+        "product_base_commit",
+        "product_base_tree",
+        "changed_paths",
+        "clean",
+    }
+    _require(isinstance(identity, Mapping) and set(identity) == required, "harness identity malformed")
+    _require(identity.get("repository_url") == REPOSITORY_URL, "harness identity repository mismatch")
+    _require(bool(_COMMIT.fullmatch(str(identity.get("commit", "")))), "harness identity commit invalid")
+    _require(bool(_COMMIT.fullmatch(str(identity.get("tree", "")))), "harness identity tree invalid")
+    parents = identity.get("parents")
+    _require(
+        isinstance(parents, list) and parents and all(_COMMIT.fullmatch(str(parent)) for parent in parents),
+        "harness identity parents invalid",
+    )
+    _require(
+        identity.get("product_base_commit") == REPOSITORY_COMMIT
+        and identity.get("product_base_tree") == REPOSITORY_TREE,
+        "harness identity product base mismatch",
+    )
+    _require(
+        identity.get("changed_paths") == list(EXACT_HARNESS_PATHS),
+        "harness identity path contract mismatch",
+    )
+    _require(identity.get("clean") is True, "harness identity checkout is not clean")
 
 
 def _verify_envelope(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -277,18 +424,27 @@ def _validate_correctness(operation: str, correctness: Mapping[str, Any]) -> Non
         _require(correctness == {"forward_output": "PASS"}, "forward correctness gate missing")
     else:
         _require(
-            tuple(correctness.keys()) == BACKWARD_GRADIENTS
+            set(correctness) == set(BACKWARD_GRADIENTS)
             and all(correctness[name] == "PASS" for name in BACKWARD_GRADIENTS),
             "five-gradient correctness gate missing",
         )
 
 
-def validate_execution_envelope(value: Mapping[str, Any]) -> None:
+def validate_execution_envelope(
+    value: Mapping[str, Any], *, trusted_checkout: Mapping[str, Any] | None = None
+) -> None:
     payload = _verify_envelope(value)
     _require(payload.get("contract_version") == CONTRACT_VERSION, "contract version mismatch")
     _require(payload.get("status") == "COMPLETE", "execution status is not COMPLETE")
     validate_plan(payload.get("plan", {}))
     validate_environment(payload.get("environment", {}))
+    harness_identity = payload.get("harness_identity")
+    _require(isinstance(harness_identity, Mapping), "harness identity missing")
+    validate_harness_identity(harness_identity)
+    _require(trusted_checkout is not None, "trusted checkout recomputation missing")
+    validate_harness_identity(trusted_checkout)
+    _require(dict(harness_identity) == dict(trusted_checkout), "trusted checkout mismatch")
+    _exact_mapping(payload.get("sidecar_binding", {}), SIDECAR_BINDING, "sidecar binding")
     arms = payload.get("arms")
     _require(isinstance(arms, list) and tuple(arm.get("arm_id") for arm in arms) == ARM_IDS, "execution four-arm set mismatch")
     for arm in arms:
@@ -318,6 +474,33 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ContractError(f"invalid JSON receipt {path}: {error}") from error
+
+
+def read_verified_envelope(
+    path: Path,
+    *,
+    require_complete: bool = False,
+    trusted_checkout: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        sidecar = path.with_suffix(path.suffix + SIDECAR_BINDING["suffix"])
+        sidecar_digest = sidecar.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ContractError(f"receipt sidecar missing or unreadable: {error}") from error
+    _require(bool(_SHA256.fullmatch(sidecar_digest)), "receipt sidecar hash invalid")
+    _require(sidecar_digest == hashlib.sha256(raw).hexdigest(), "receipt sidecar mismatch")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ContractError(f"invalid JSON receipt {path}: {error}") from error
+    _require(isinstance(value, dict), "receipt envelope malformed")
+    payload = _verify_envelope(value)
+    if require_complete or payload.get("status") == "COMPLETE":
+        validate_execution_envelope(value, trusted_checkout=trusted_checkout)
+    else:
+        validate_dry_run_envelope(value)
+    return value
 
 
 def write_envelope(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:

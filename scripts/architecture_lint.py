@@ -8,10 +8,12 @@ import ast
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
-CANONICAL_MARKER = "CANONICAL_ARCHITECTURE_SOURCE: current-human-baseline-v1"
+CANONICAL_MARKER = "CANONICAL_ARCHITECTURE_SOURCE:" + " current-human-baseline-v1"
+RUNNER_MARKER = "AUTHORITATIVE_BASELINE_RUNNER" + " = True"
 REQUIRED_PATHS = (
     "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
     "benchmark/contracts/current_human_baseline_v1.schema.json",
@@ -55,6 +57,20 @@ def _top_level_import_roots(path: Path) -> set[str]:
     return roots
 
 
+def _committed_harness_paths(root: Path, base_commit: str) -> tuple[str, ...] | None:
+    if not (root / ".git").exists():
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(root), "diff", "--name-only", base_commit, "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git diff failed")
+    return tuple(line for line in result.stdout.splitlines() if line)
+
+
 def lint(root: Path) -> list[str]:
     findings: list[str] = []
     for relative in REQUIRED_PATHS:
@@ -62,10 +78,17 @@ def lint(root: Path) -> list[str]:
             findings.append(f"required path missing: {relative}")
 
     architecture = root / REQUIRED_PATHS[0]
+    canonical_occurrences = []
+    for path in (root / "docs").rglob("*.md"):
+        count = path.read_text(encoding="utf-8").count(CANONICAL_MARKER)
+        canonical_occurrences.extend([path.relative_to(root).as_posix()] * count)
+    if canonical_occurrences != [REQUIRED_PATHS[0]]:
+        findings.append(
+            "canonical architecture marker must occur once in the canonical design: "
+            f"{canonical_occurrences}"
+        )
     if architecture.is_file():
         text = architecture.read_text(encoding="utf-8")
-        if text.count(CANONICAL_MARKER) != 1:
-            findings.append("canonical architecture marker must occur exactly once")
         for heading in ("## 2. Component boundaries", "## 4. Evidence principles"):
             if heading not in text:
                 findings.append(f"required section missing: {heading}")
@@ -91,14 +114,29 @@ def lint(root: Path) -> list[str]:
                 findings.append("contract four-arm set drift")
             if tuple(contract.TOKENS_PER_RANK) != EXPECTED_SHAPES:
                 findings.append("contract shape set drift")
+            if tuple(contract.EXACT_HARNESS_PATHS) != REQUIRED_PATHS:
+                findings.append("exact ten-path harness contract drift")
+            committed_paths = _committed_harness_paths(root, contract.REPOSITORY_COMMIT)
+            if committed_paths is not None and set(committed_paths) != set(REQUIRED_PATHS):
+                findings.append(
+                    "committed exact ten-path harness scope mismatch: "
+                    f"{sorted(set(committed_paths) ^ set(REQUIRED_PATHS))}"
+                )
         except (ImportError, AttributeError, RuntimeError, SyntaxError) as error:
             findings.append(f"contract import failed: {error}")
 
     runner = root / REQUIRED_PATHS[3]
+    runner_occurrences = []
+    for path in (root / "benchmark").rglob("*.py"):
+        count = path.read_text(encoding="utf-8").count(RUNNER_MARKER)
+        runner_occurrences.extend([path.relative_to(root).as_posix()] * count)
+    if runner_occurrences != [REQUIRED_PATHS[3]]:
+        findings.append(
+            "authoritative runner marker must occur once in the canonical runner: "
+            f"{runner_occurrences}"
+        )
     if runner.is_file():
         text = runner.read_text(encoding="utf-8")
-        if "AUTHORITATIVE_BASELINE_RUNNER = True" not in text:
-            findings.append("single authoritative runner marker missing")
         if "README.md" in text:
             findings.append("authoritative runner contains README fallback")
         if "except Exception" in text:
@@ -116,6 +154,17 @@ def lint(root: Path) -> list[str]:
             text = provider.read_text(encoding="utf-8")
             if '"test_only": False' not in text:
                 findings.append(f"provider real-source marker missing: {relative}")
+
+    provider_paths = {
+        path.relative_to(root).as_posix()
+        for path in (root / "benchmark" / "providers").glob("*.py")
+    }
+    expected_provider_paths = {REQUIRED_PATHS[4], REQUIRED_PATHS[5]}
+    if provider_paths != expected_provider_paths:
+        findings.append(
+            "provider path contract mismatch: "
+            f"{sorted(provider_paths ^ expected_provider_paths)}"
+        )
 
     return findings
 

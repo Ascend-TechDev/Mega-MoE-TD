@@ -50,6 +50,148 @@
         }
       }
     },
+    "source_identity": {
+      "type": "object",
+      "required": [
+        "kind",
+        "locator"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["runtime_file", "gitlink"]
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {"const": "runtime_file"},
+            "locator": {"pattern": "^/"}
+          }
+        },
+        {
+          "properties": {
+            "kind": {"const": "gitlink"},
+            "locator": {"const": "3rdparty/bigop"}
+          }
+        }
+      ]
+    },
+    "component_identity": {
+      "type": "object",
+      "required": [
+        "version",
+        "source",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "$ref": "#/$defs/source_identity"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "repository",
+        "variables",
+        "components"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "variables": {
+          "const": {
+            "MOE_FULL_BENCH_ROUTE_MODE": "dense_random",
+            "MOE_FULL_BENCH_ACTIVE_EXPERTS": "8"
+          }
+        },
+        "components": {
+          "type": "object",
+          "required": [
+            "python",
+            "torch",
+            "torch_npu",
+            "triton",
+            "cann",
+            "aclshmem",
+            "bigop"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "python": {"$ref": "#/$defs/component_identity"},
+            "torch": {"$ref": "#/$defs/component_identity"},
+            "torch_npu": {"$ref": "#/$defs/component_identity"},
+            "triton": {"$ref": "#/$defs/component_identity"},
+            "cann": {"$ref": "#/$defs/component_identity"},
+            "aclshmem": {"$ref": "#/$defs/component_identity"},
+            "bigop": {"$ref": "#/$defs/component_identity"}
+          }
+        }
+      }
+    },
+    "harness_identity": {
+      "type": "object",
+      "required": [
+        "repository_url",
+        "commit",
+        "tree",
+        "parents",
+        "product_base_commit",
+        "product_base_tree",
+        "changed_paths",
+        "clean"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repository_url": {"const": "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "parents": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        },
+        "product_base_commit": {"const": "2887022970f6ae5c7ab5be096680809591100c30"},
+        "product_base_tree": {"const": "2b5c447da8ff9ff788125aae5eec644579df105d"},
+        "changed_paths": {
+          "const": [
+            "docs/design/HARNESS_DESIGN_PHILOSOPHY.md",
+            "benchmark/contracts/current_human_baseline_v1.schema.json",
+            "benchmark/baseline_contract.py",
+            "benchmark/current_human_baseline.py",
+            "benchmark/providers/current_main.py",
+            "benchmark/providers/grouped_hccl.py",
+            "scripts/architecture_lint.py",
+            "tests/host/test_architecture_contract.py",
+            "tests/host/test_baseline_contract.py",
+            "tests/host/test_baseline_runner.py"
+          ]
+        },
+        "clean": {"const": true}
+      }
+    },
+    "sidecar_binding": {
+      "const": {
+        "algorithm": "sha256",
+        "suffix": ".sha256",
+        "required": true
+      }
+    },
     "model": {
       "type": "object",
       "required": [
@@ -142,6 +284,7 @@
     },
     "payload": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "contract_version",
         "status",
@@ -161,7 +304,13 @@
           "type": "object"
         },
         "environment": {
-          "type": "object"
+          "$ref": "#/$defs/environment"
+        },
+        "harness_identity": {
+          "$ref": "#/$defs/harness_identity"
+        },
+        "sidecar_binding": {
+          "$ref": "#/$defs/sidecar_binding"
         },
         "arms": {
           "type": "array",
@@ -188,6 +337,8 @@
           "then": {
             "required": [
               "environment",
+              "harness_identity",
+              "sidecar_binding",
               "arms"
             ]
           }
