@@ -1,45 +1,26 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""
-Correctness tests for the standalone Ascend Mega-MoE post-routing forward.
+"""Single test-side correctness/baseline hub.
 
-Validates ``FusedMoEForward`` against an independent PyTorch
-golden (``torch_dispatch_fc1_golden``) that performs its own host-side
-``all_to_all_single`` dispatch and per-expert ``torch.matmul``. The golden never
-touches the kernel's ``peer_mem``, so it catches dispatch-routing bugs (offset
-collisions, mis-routing, dropped tokens) — which a self-consistent reference
-reusing the kernel's dispatched buffers cannot.
-
-The optimized path additionally validates packed gate/up FC1 followed by weighted
-SwiGLU.  Its independent Torch golden accepts and transports FP32 routing weights
-with the same routes, computes gate/up projections separately, and checks
-raw FC1, unweighted SwiGLU, weighted SwiGLU, and the received routing-weight layout.
-
-The full-forward golden follows the NVIDIA reference stage order while remaining a
-pure Torch/HCCL implementation: dispatch, FC1, FP32 SwiGLU/routing multiplication,
-FC2, reverse all-to-all, route-order restoration, and top-k reduction.  Invalid
-negative or out-of-range expert ids are dropped.  Empty-receive and all-drop ranks
-still enter every collective, so asymmetric routing cannot deadlock the golden.
-
-Usage:
-    source /home/w00845909/distribution/Triton-distributed-ascend/run.sh
-    python -m pytest tests/layer/test_moe_forward.py -m dist -v -s
+The forward functions are independent per-expert Torch/HCCL correctness
+oracles; the hand-written backward implementation below is the only test-side
+backward reference.  The production differentiable forward it reuses lives in
+``mega_moe.ops._torch_forward``.  The grouped performance baseline is kept in
+``benchmark.layer._grouped_forward_baseline`` and is intentionally not copied
+here.  This module contains no pytest entry points.
 """
 
-import inspect
-import os
-from types import SimpleNamespace
+from __future__ import annotations
 
-import pytest
 import torch
 import torch.distributed as dist
-import shmem as ash
 
-from mega_moe import FusedMoEForward, MoEForwardConfig, pack_gate_up_weights
-import mega_moe.kernels.dispatch_fc1 as dispatch_fc1_module
-import mega_moe.kernels.fc2_combine as fc2_combine_module
 from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
-import mega_moe.runtime.routing as routing_metadata_module
-from tests._moe_dist_utils import get_ash_size_bytes, init_aclshmem
+from mega_moe.ops._torch_forward import (
+    grouped_matmul,
+    grouped_transposed_matmul,
+    moe_forward,
+)
+from tests._numeric import cmp_grad
 from tests._numeric import (
     APPROX_ATOL,
     APPROX_RTOL,
@@ -49,12 +30,208 @@ from tests._numeric import (
     OUTPUT_RTOL,
 )
 
-g_ash_size = get_ash_size_bytes(default_gb=1)
+
+__all__ = [
+    "backward_torch_baseline",
+    "moe_backward_torch",
+    "build_backward_saved",
+    "compare_backward_gradients",
+    "make_backward_inputs",
+    "make_down_weights",
+    "make_gate_up_weights",
+    "make_routing_weights",
+    "prepare_inputs",
+    "run_full_one",
+    "run_one",
+    "run_weighted_one",
+    "torch_dispatch_fc1_golden",
+    "torch_dispatch_fc1_weighted_swiglu_golden",
+    "torch_moe_fwd_golden",
+]
 
 
-# ---------------------------------------------------------------------------
-#  Independent golden — own host-side all_to_all dispatch + per-expert matmul
-# ---------------------------------------------------------------------------
+def make_backward_inputs(
+    ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42
+):
+    """Build the single shared backward input layout for tests and benchmarks."""
+    pe = dist.get_rank(ep_group)
+    world_size = dist.get_world_size(ep_group)
+    epr = num_experts // world_size
+    dtype = torch.bfloat16
+    device = f"npu:{pe}"
+    torch.manual_seed(seed + pe * 1000)
+    hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
+    gw = torch.randn(num_experts, hidden_dim, dtype=dtype, device=device)
+    fc1_1 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc1_2 = torch.randn(epr, ffn_dim, hidden_dim, dtype=dtype, device=device)
+    fc2 = torch.randn(epr, hidden_dim, ffn_dim, dtype=dtype, device=device)
+    dist.broadcast(gw, src=0, group=ep_group)
+    logits = hs.float() @ gw.float().T
+    rw = torch.softmax(logits, dim=-1).to(dtype)
+    topk_w, topk_idx = torch.topk(rw, topk, dim=-1)
+    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+    dy = torch.randn_like(hs)
+    return hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device
+
+
+def build_backward_saved(
+    ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed=42
+):
+    """Build the one canonical saved-state layout used by bwd tests/benchmarks."""
+    hs, topk_w, topk_idx, fc1_1, fc1_2, fc2, dy, dtype, device = make_backward_inputs(
+        ntokens, hidden_dim, ffn_dim, num_experts, topk, ep_group, seed
+    )
+    with torch.no_grad():
+        _, saved = moe_forward(
+            hs,
+            topk_w,
+            topk_idx,
+            fc1_1,
+            fc1_2,
+            fc2,
+            ep_group,
+            topk,
+            return_saved=True,
+        )
+    return saved, dy, dtype, device
+
+
+def combine_bwd_a2a(dy, saved):
+    """Step 1a: backward of (topk-sum + reverse-A2A + local-sort).
+    dy [B,H] -> grad_fc2_out_sorted [M,H] on the expert rank."""
+    B = saved["batch_size"]; H = saved["hidden_dim"]; topk = saved["topk"]
+    dtype = dy.dtype; device = dy.device
+    ep_group = saved["ep_group"]
+    # un-reduce: forward output = combined_full.view(B,topk,H).sum(1) => each topk copy gets dy
+    grad_combined_full = dy.repeat_interleave(topk, dim=0)               # [B*topk, H]
+    # forward: combined_full = combined_out_flat[inv_sort]  =>  grad_combined_out_flat = grad_combined_full[sort_idxs]
+    grad_combined_out_flat = grad_combined_full[saved["sort_idxs"]]       # [total_send, H]
+    # backward of reverse-A2A = forward dispatch-A2A (swap split roles)
+    grad_fc2_out_unsorted = torch.empty((saved["total_recv"], H), dtype=dtype, device=device)
+    dist.all_to_all_single(grad_fc2_out_unsorted, grad_combined_out_flat,
+                           output_split_sizes=saved["splits_recv_list"],
+                           input_split_sizes=saved["splits_send_list"], group=ep_group)
+    # forward: fc2_out_unsorted = fc2_out[inv_local]; recv_hidden_sorted = arrival[local_sort]
+    #   => grad_fc2_out_sorted = grad_fc2_out_unsorted[local_sort_idxs]
+    grad_fc2_out_sorted = grad_fc2_out_unsorted[saved["local_sort_idxs"]]
+    return grad_fc2_out_sorted
+
+
+def fc2_input_grad(grad_fc2_out_sorted, saved):
+    """Step 1b: grad_swiglu [M,ffn] = grad_fc2_out_sorted @ fc2[e]  (input-grad grouped gemm)."""
+    return grouped_matmul(grad_fc2_out_sorted, saved["fc2"], saved["expert_counts"], transpose=False)
+
+
+def swiglu_bwd(grad_swiglu, saved):
+    """Step 2: SwiGLU backward.
+    fwd: swiglu_out = silu(gate)*up ; swiglu_out_weighted = swiglu_out * scale (scale=recv_weights_sorted)
+      dGate = grad_swiglu * silu'(gate) * up * scale
+      dUp   = grad_swiglu * silu(gate)  * scale
+      dScale = sum(silu(gate)*up*grad_swiglu)  (per row)  => grad of recv_weights_sorted
+    Returns grad_fc1_output [M,2*ffn] (=cat[dGate,dUp]), grad_gate [M]."""
+    gate = saved["gate"].float()
+    up = saved["up"].float()
+    scale = saved["recv_weights_sorted"].float().unsqueeze(-1)
+    g = grad_swiglu.float()
+    sigmoid_g = torch.sigmoid(gate)
+    silu_g = gate * sigmoid_g
+    silu_prime = silu_g * (1 - sigmoid_g) + sigmoid_g          # d/dgate silu(gate)
+    dGate = g * silu_prime * up * scale
+    dUp = g * silu_g * scale
+    grad_fc1_output = torch.cat([dGate, dUp], dim=-1).to(grad_swiglu.dtype)
+    grad_gate = (silu_g * up * g).sum(dim=-1).to(grad_swiglu.dtype)   # dscale, [M]
+    return grad_fc1_output, grad_gate
+
+
+def fc2_weight_grad(grad_fc2_out_sorted, saved):
+    """Step 3: grad_fc2 [E,H,ffn] = grad_fc2_out_sorted^T @ swiglu_out_weighted."""
+    return grouped_transposed_matmul(grad_fc2_out_sorted, saved["swiglu_out_weighted"],
+                                     saved["expert_counts"])
+
+
+def fc1_input_grad(grad_fc1_output, saved):
+    """Step 4a: grad_recv_hidden_sorted [M,H] = grad_fc1_output @ fc1_combined[e]."""
+    return grouped_matmul(grad_fc1_output, saved["fc1_combined"], saved["expert_counts"], transpose=False)
+
+
+def dispatch_bwd(grad_recv_hidden_sorted, grad_gate, saved):
+    """Step 4b: reverse-A2A(expert->home) + topk sum => grad_hidden [B,H];
+    grad_gate -> reverse-A2A + gather => grad_routing_weights [B,topk]."""
+    B = saved["batch_size"]; H = saved["hidden_dim"]; topk = saved["topk"]
+    dtype = grad_recv_hidden_sorted.dtype; device = grad_recv_hidden_sorted.device
+    ep_group = saved["ep_group"]
+    # unsort to arrival order, then reverse-A2A (expert->home)
+    grad_recv_hidden_unsorted = grad_recv_hidden_sorted[saved["inv_local"]]   # [total_recv, H]
+    grad_combined_out_flat = torch.empty((saved["total_send"], H), dtype=dtype, device=device)
+    dist.all_to_all_single(grad_combined_out_flat, grad_recv_hidden_unsorted,
+                           output_split_sizes=saved["splits_send_list"],
+                           input_split_sizes=saved["splits_recv_list"], group=ep_group)
+    grad_combined_full = grad_combined_out_flat[saved["inv_sort"]]            # [B*topk, H]
+    grad_hidden = grad_combined_full.view(B, topk, H).sum(dim=1)              # plain sum (fwd was repeat_interleave)
+
+    # gate (dscale) is 1-to-1: reverse-A2A back to home, then gather by inv_sort (no sum)
+    grad_gate_unsorted = grad_gate[saved["inv_local"]]                        # [total_recv]
+    grad_sorted_weights = torch.empty((saved["total_send"],), dtype=dtype, device=device)
+    dist.all_to_all_single(grad_sorted_weights, grad_gate_unsorted,
+                           output_split_sizes=saved["splits_send_list"],
+                           input_split_sizes=saved["splits_recv_list"], group=ep_group)
+    grad_routing_flat = grad_sorted_weights[saved["inv_sort"]]                # [B*topk]
+    grad_routing_weights = grad_routing_flat.view(B, topk)
+    return grad_hidden, grad_routing_weights
+
+
+def fc1_weight_grad(grad_fc1_output, saved):
+    """Step 5: grad_fc1 [E,2*ffn,H] = grad_fc1_output^T @ recv_hidden_sorted; chunk into fc1_1/fc1_2."""
+    grad_fc1 = grouped_transposed_matmul(grad_fc1_output, saved["recv_hidden_sorted"],
+                                         saved["expert_counts"])
+    grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
+    return grad_fc1_1, grad_fc1_2, grad_fc1
+
+
+def moe_backward_torch(saved, dy):
+    """Run all 5 hand-written backward mega-ops. Returns a dict of grads."""
+    dy = dy.to(saved["output"].dtype)
+    grad_fc2_out_sorted = combine_bwd_a2a(dy, saved)                 # step 1a
+    grad_swiglu = fc2_input_grad(grad_fc2_out_sorted, saved)         # step 1b
+    grad_fc1_output, grad_gate = swiglu_bwd(grad_swiglu, saved)      # step 2
+    grad_fc2 = fc2_weight_grad(grad_fc2_out_sorted, saved)           # step 3
+    grad_recv_hidden_sorted = fc1_input_grad(grad_fc1_output, saved) # step 4a
+    grad_hidden, grad_routing_weights = dispatch_bwd(                # step 4b
+        grad_recv_hidden_sorted, grad_gate, saved)
+    grad_fc1_1, grad_fc1_2, grad_fc1 = fc1_weight_grad(grad_fc1_output, saved)  # step 5
+    return dict(
+        grad_hidden=grad_hidden, grad_routing_weights=grad_routing_weights,
+        grad_fc1_1=grad_fc1_1, grad_fc1_2=grad_fc1_2, grad_fc2=grad_fc2,
+        # intermediates exposed for per-mega-op triton correctness checks
+        grad_fc2_out_sorted=grad_fc2_out_sorted, grad_swiglu=grad_swiglu,
+        grad_fc1_output=grad_fc1_output, grad_gate=grad_gate,
+        grad_recv_hidden_sorted=grad_recv_hidden_sorted, grad_fc1=grad_fc1,
+    )
+
+
+def backward_torch_baseline(saved, dy):
+    """Run the single hand-written backward correctness baseline."""
+    with torch.no_grad():
+        return moe_backward_torch(saved, dy)
+
+
+def compare_backward_gradients(triton_result, torch_result):
+    """Return the five canonical gradient checks without printing or timing."""
+    checks = (
+        "grad_hidden",
+        "grad_routing_weights",
+        "grad_fc1_1",
+        "grad_fc1_2",
+        "grad_fc2",
+    )
+    rows = []
+    all_ok = True
+    for name in checks:
+        ok, max_abs, rel, nbad = cmp_grad(name, triton_result[name], torch_result[name])
+        rows.append({"name": name, "ok": bool(ok), "max_abs": max_abs, "relative": rel, "mismatches": nbad})
+        all_ok = all_ok and ok
+    return bool(all_ok), rows
+
 
 @torch.no_grad()
 def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, device,
@@ -128,7 +305,6 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
             continue
         out[mask] = (x_grouped[mask].float() @ w1_local[e_local].T.float()).to(dtype)
     return out, exp_grouped, x_grouped
-
 
 @torch.no_grad()
 def torch_dispatch_fc1_weighted_swiglu_golden(
@@ -232,7 +408,6 @@ def torch_dispatch_fc1_weighted_swiglu_golden(
         "local_expert_ids": exp_grouped,
         "dispatched_tokens": x_grouped,
     }
-
 
 @torch.no_grad()
 def torch_moe_fwd_golden(
@@ -381,11 +556,6 @@ def torch_moe_fwd_golden(
         output_fp32 += combined_routes[:, route_slot].float()
     return output_fp32.to(torch.bfloat16)
 
-
-# ---------------------------------------------------------------------------
-#  Data helpers
-# ---------------------------------------------------------------------------
-
 def make_w1(num_experts, hidden, inter, world_size, rank, dtype, device, seed):
     """Create this rank's deterministic BF16 expert slice without a global table.
 
@@ -401,7 +571,6 @@ def make_w1(num_experts, hidden, inter, world_size, rank, dtype, device, seed):
     ).mul_((1.0 / hidden) ** 0.5)
     return None, w1_local.contiguous()
 
-
 def make_gate_up_weights(num_experts, hidden, ffn_dim, world_size, rank, dtype, device):
     """Create distinct rank-local gate/up weights from rank-independent tables."""
     _, w_gate_local = make_w1(
@@ -410,20 +579,17 @@ def make_gate_up_weights(num_experts, hidden, ffn_dim, world_size, rank, dtype, 
         num_experts, hidden, ffn_dim, world_size, rank, dtype, device, seed=143)
     return w_gate_local, w_up_local
 
-
 def make_down_weights(num_experts, hidden, ffn_dim, world_size, rank, dtype, device):
     """Create rank-local W2 with layout ``[E_local, hidden, ffn_dim]``."""
     _, w2_local = make_w1(
         num_experts, ffn_dim, hidden, world_size, rank, dtype, device, seed=144)
     return w2_local
 
-
 def make_routing_weights(n, topk, device, seed):
     """Create FP32 per-route weights with distinct values across top-k slots."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     logits = torch.randn(n, topk, generator=g, dtype=torch.float32)
     return torch.softmax(logits, dim=-1).to(device).contiguous()
-
 
 def prepare_inputs(n, hidden, num_experts, topk, dtype, device, seed, drop_frac=0.0):
     """Per-rank hidden_states [n, hidden] and expert_index [n, topk] int32.
@@ -440,11 +606,6 @@ def prepare_inputs(n, hidden, num_experts, topk, dtype, device, seed, drop_frac=
         drop = (torch.rand(n, topk, generator=g) < drop_frac).to(device)
         expert_index = expert_index.masked_fill(drop, num_experts)
     return hs, expert_index
-
-
-# ---------------------------------------------------------------------------
-#  Exact grouped-layout comparison
-# ---------------------------------------------------------------------------
 
 def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
                            golden_out, golden_exp, golden_dispatch,
@@ -511,7 +672,6 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
         print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
     return ok
 
-
 def _compare_weighted_stage(kernel_values, golden_values, label, rank, device):
     """Compare every layout and numerical boundary of the weighted stage."""
     ok = True
@@ -552,7 +712,6 @@ def _compare_weighted_stage(kernel_values, golden_values, label, rank, device):
         suffix = "" if ok else "  |  " + "; ".join(msgs)
         print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
     return ok
-
 
 def _compare_full_output(actual, expected, label, rank, device, ep_group):
     """Compare a final ``[tokens, hidden]`` BF16 output on every EP rank."""
@@ -597,14 +756,6 @@ def _compare_full_output(actual, expected, label, rank, device, ep_group):
         print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
     return ok
 
-
-# ---------------------------------------------------------------------------
-#  Configs & worker
-# ---------------------------------------------------------------------------
-
-from config import FORWARD_SHAPES, FORWARD_SHAPES_KIMI
-
-
 def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
     """Run kernel dispatch+fc1 and compare against the independent golden."""
     routing_plan = layer.build_routing_plan(exp_idx)
@@ -637,7 +788,6 @@ def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
         dispatch_result.dispatched_tokens,
         g_out, g_exp, g_dispatch,
         layer.experts_per_rank, label, rank, device)
-
 
 def run_weighted_one(
     layer,
@@ -690,7 +840,6 @@ def run_weighted_one(
     )
     return _compare_weighted_stage(kernel_values, golden_values, label, rank, device)
 
-
 def run_full_one(
     layer,
     hidden_states,
@@ -724,636 +873,3 @@ def run_full_one(
         layer.ep_group,
     )
     return _compare_full_output(actual, expected, label, rank, device, layer.ep_group)
-
-
-def run_test(rank, world_size):
-    # ---- init aclshmem ----
-    init_aclshmem(rank, world_size, g_ash_size)
-
-    device = f"npu:{rank}"
-    dtype = torch.bfloat16
-    all_passed = True
-
-    only_config = os.environ.get("MOE_FUSED_TEST_CONFIG")
-    base_configs = list(FORWARD_SHAPES)
-    if os.environ.get("MOE_KIMI") == "1":
-        base_configs.extend(FORWARD_SHAPES_KIMI)
-    configs = [config for config in base_configs if only_config in (None, config.label)]
-
-    for config in configs:
-        label = config.label
-        hidden = config.hidden
-        inter = config.ffn
-        topk = config.topk
-        drop_frac = config.drop_frac
-        n_per_rank = config.resolved_tokens_per_rank(world_size)
-        num_experts = config.resolved_num_experts(world_size)
-        if num_experts % world_size != 0:
-            raise ValueError("expert count must be divisible by world_size")
-        tiling_overrides = {}
-        for env_name, parameter_name in (
-            (
-                "MOE_FUSED_DISPATCH_FC1_BLOCK_SIZE_M",
-                "dispatch_fc1_block_size_m",
-            ),
-            ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_N", "fc1_gemm_block_size_n"),
-            ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_K", "fc1_gemm_block_size_k"),
-            (
-                "MOE_FUSED_FC2_COMBINE_BLOCK_SIZE_M",
-                "fc2_combine_block_size_m",
-            ),
-            ("MOE_FUSED_FC2_GEMM_BLOCK_SIZE_N", "fc2_gemm_block_size_n"),
-            ("MOE_FUSED_FC2_GEMM_BLOCK_SIZE_K", "fc2_gemm_block_size_k"),
-        ):
-            if env_name in os.environ:
-                tiling_overrides[parameter_name] = int(os.environ[env_name])
-        forward_config = MoEForwardConfig(
-            num_aicore_programs=int(
-                os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
-            ),
-            receive_capacity_factor=float(world_size),
-            **tiling_overrides,
-        )
-        optimized_op = FusedMoEForward(
-            None,
-            max_tokens_per_rank=n_per_rank,
-            hidden_size=hidden,
-            top_k=topk,
-            num_experts=num_experts,
-            config=forward_config,
-        )
-        try:
-            # Build only rank-local expert tables. The standalone FC1 check can
-            # reuse the gate table; allocating a fourth DSV4-sized table adds no
-            # independent coverage.
-            w_gate_local, w_up_local = make_gate_up_weights(
-                num_experts, hidden, inter, world_size, rank, dtype, device)
-            # Pack once and reuse it across every candidate call.  Repacking a
-            # DSV4 W1 for each sub-check creates a 15.75 GiB transient and can
-            # exceed 910B1 HBM even though the production model stores one W1.
-            packed_w1 = pack_gate_up_weights(w_gate_local, w_up_local)
-            w1l = packed_w1
-            w2_local = make_down_weights(
-                num_experts, hidden, inter, world_size, rank, dtype, device)
-            # inputs are rank-distinct (seed varies with rank) for asymmetric load
-            hs, exp_idx = prepare_inputs(n_per_rank, hidden, num_experts, topk, dtype, device,
-                                         seed=43 + rank * 1000, drop_frac=drop_frac)
-            if label == "S-drop":
-                # Negative ids are dropped by the same [0, num_experts) rule.
-                exp_idx[0, 0] = -1
-            routing_weights = make_routing_weights(
-                n_per_rank, topk, device, seed=44 + rank * 1000)
-            dist.barrier()
-
-            ok = run_one(
-                optimized_op, hs, exp_idx, w1l, num_experts,
-                f"{label}-overlap", rank, device, dtype)
-            all_passed = all_passed and ok
-
-            ok_weighted = run_weighted_one(
-                optimized_op,
-                hs,
-                exp_idx,
-                routing_weights,
-                w_gate_local,
-                w_up_local,
-                packed_w1,
-                num_experts,
-                f"{label}-overlap-weighted-swiglu",
-                rank,
-                device,
-                dtype,
-            )
-            all_passed = all_passed and ok_weighted
-
-            # Full-forward coverage stays on the small S shapes.  S-drop also
-            # includes one negative id, so both invalid-id classes reach the
-            # complete dispatch/FC1/FC2/combine path.
-            if label in ("S", "S-drop", "DSV4-smoke"):
-                ok_full = run_full_one(
-                    optimized_op,
-                    hs,
-                    exp_idx,
-                    routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    w2_local,
-                    num_experts,
-                    f"{label}-full-forward",
-                    rank,
-                    device,
-                )
-                all_passed = all_passed and ok_full
-
-            # Every token goes to one destination/expert.  Other ranks are
-            # send-only and must still enter the fused kernel's tail barrier.
-            skew_idx = torch.full_like(exp_idx, world_size)
-            ok_skew = run_one(
-                optimized_op, hs, skew_idx, w1l, num_experts,
-                f"{label}-overlap-skew", rank, device, dtype)
-            all_passed = all_passed and ok_skew
-
-            if label == "S":
-                edge_routing_weights = torch.zeros_like(routing_weights)
-                edge_routing_weights[:, -1] = 1.0
-                ok_weighted_skew = run_weighted_one(
-                    optimized_op,
-                    hs,
-                    skew_idx,
-                    edge_routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    num_experts,
-                    f"{label}-overlap-weighted-swiglu-skew",
-                    rank,
-                    device,
-                    dtype,
-                )
-                all_passed = all_passed and ok_weighted_skew
-                ok_full_skew = run_full_one(
-                    optimized_op,
-                    hs,
-                    skew_idx,
-                    edge_routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    w2_local,
-                    num_experts,
-                    f"{label}-full-forward-zero-receive",
-                    rank,
-                    device,
-                )
-                all_passed = all_passed and ok_full_skew
-
-                # Exercise M_local == 0 and zero dispatch tasks on every rank.
-                all_drop_idx = torch.full_like(exp_idx, num_experts)
-                ok_all_drop = run_one(
-                    optimized_op, hs, all_drop_idx, w1l, num_experts,
-                    f"{label}-overlap-all-drop", rank, device, dtype)
-                all_passed = all_passed and ok_all_drop
-                ok_weighted_all_drop = run_weighted_one(
-                    optimized_op,
-                    hs,
-                    all_drop_idx,
-                    routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    num_experts,
-                    f"{label}-overlap-weighted-swiglu-all-drop",
-                    rank,
-                    device,
-                    dtype,
-                )
-                all_passed = all_passed and ok_weighted_all_drop
-                ok_full_all_drop = run_full_one(
-                    optimized_op,
-                    hs,
-                    all_drop_idx,
-                    routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    w2_local,
-                    num_experts,
-                    f"{label}-full-forward-all-drop",
-                    rank,
-                    device,
-                )
-                all_passed = all_passed and ok_full_all_drop
-
-                # Reuse the same slots with a later epoch; stale signal values
-                # must not satisfy the next overlap launch.
-                ok_repeat = run_one(
-                    optimized_op, hs, exp_idx, w1l, num_experts,
-                    f"{label}-overlap-epoch-reuse", rank, device, dtype)
-                all_passed = all_passed and ok_repeat
-                ok_full_repeat = run_full_one(
-                    optimized_op,
-                    hs,
-                    exp_idx,
-                    routing_weights,
-                    w_gate_local,
-                    w_up_local,
-                    packed_w1,
-                    w2_local,
-                    num_experts,
-                    f"{label}-full-forward-reuse-after-all-drop",
-                    rank,
-                    device,
-                )
-                all_passed = all_passed and ok_full_repeat
-
-        finally:
-            optimized_op.finalize()
-
-    _ = ash.aclshmem_finalize()
-
-    final_flag = torch.tensor([1 if all_passed else 0], dtype=torch.int32, device=device)
-    dist.all_reduce(final_flag, op=dist.ReduceOp.MIN)
-    if rank == 0:
-        print("ALL PASSED" if bool(final_flag.item()) else "SOME TESTS FAILED", flush=True)
-    if not bool(final_flag.item()):
-        raise AssertionError("Ascend post-routing MoE golden check failed.")
-
-
-# ---------------------------------------------------------------------------
-#  Pytest
-# ---------------------------------------------------------------------------
-
-def test_public_api_has_only_bf16_and_current_combine_arguments():
-    """The public API exposes neither dtype nor dead legacy combine knobs."""
-    constructor_parameters = inspect.signature(FusedMoEForward).parameters
-    assert "dtype" not in constructor_parameters
-    assert "config" in constructor_parameters
-
-    combine_parameters = inspect.signature(FusedMoEForward.fc2_combine).parameters
-    assert "gate_input" not in combine_parameters
-    assert "gemm_BLOCK_SIZE_N" not in combine_parameters
-
-
-def test_config_keeps_fixed_fc1_schedule_and_best_defaults():
-    config = MoEForwardConfig()
-    assert config.num_aicore_programs == 24
-    assert config.dispatch_fc1_block_size_m == 128
-    assert config.fc1_gemm_block_size_n == 256
-    assert config.fc1_gemm_block_size_k == 128
-    assert config.fc2_combine_block_size_m == 128
-    assert config.fc2_gemm_block_size_n == 256
-    assert config.fc2_gemm_block_size_k == 128
-    assert config.dispatch_fc1_schedule == "allcore_expert_n_tile"
-    assert config.resolved_receive_capacity_factor(8) == 8.0
-
-    parameters = inspect.signature(MoEForwardConfig).parameters
-    assert set(parameters) == {
-        "num_aicore_programs",
-        "receive_capacity_factor",
-        "dispatch_fc1_block_size_m",
-        "fc1_gemm_block_size_n",
-        "fc1_gemm_block_size_k",
-        "fc2_combine_block_size_m",
-        "fc2_gemm_block_size_n",
-        "fc2_gemm_block_size_k",
-        "dispatch_fc1_schedule",
-        "activation",
-        "situ_beta",
-        "situ_linear_beta",
-    }
-
-    assert MoEForwardConfig(
-        dispatch_fc1_schedule="allcore_expert_n_tile"
-    ).dispatch_fc1_schedule == "allcore_expert_n_tile"
-    with pytest.raises(ValueError, match="dispatch_fc1_schedule must be one of"):
-        MoEForwardConfig(dispatch_fc1_schedule="unsupported")
-
-    # Target-only activation extension remains available on top of the
-    # source-pruned forward schedule/config surface.
-    assert config.activation == "swiglu"
-    situglu = MoEForwardConfig(
-        activation="situglu", situ_beta=2.0, situ_linear_beta=1.5
-    )
-    assert situglu.activation == "situglu"
-    assert situglu.situ_beta == 2.0
-    assert situglu.situ_linear_beta == 1.5
-    with pytest.raises(ValueError, match="activation must be one of"):
-        MoEForwardConfig(activation="relu")
-    with pytest.raises(ValueError, match="situ_beta must be positive"):
-        MoEForwardConfig(situ_beta=0.0)
-
-
-def test_direct_pull_workspace_is_sized_by_sent_routes_only():
-    """The local FC2 staging buffer does not reserve receive-capacity rows."""
-    op = FusedMoEForward.__new__(FusedMoEForward)
-    torch.nn.Module.__init__(op)
-    op.max_tokens_per_rank = 8
-    op.hidden_size = 4
-    op.top_k = 2
-    op.world_size = 8
-    op.experts_per_rank = 112
-    op.activation_dtype = torch.bfloat16
-    op.config = MoEForwardConfig()
-    op.context = SimpleNamespace(peer_mem=torch.empty(4096, dtype=torch.bfloat16))
-    op._combine_fc2_buf = None
-
-    op._ensure_combine_buffers()
-
-    assert op._combine_fc2_buf.shape == (16, 4)
-    assert op._route_to_send.shape == (16,)
-    assert op._max_pull_tile_slots == 1 + 8 * 112
-    assert op._pull_tile_rank.shape == (1 + 8 * 112,)
-
-
-def test_dispatch_kernel_keeps_default_only_pipeline():
-    launch_source = inspect.getsource(FusedMoEForward.dispatch_fc1)
-    kernel_source = inspect.getsource(dispatch_fc1_module._kernel_dispatch_fc1.fn)
-    consumer_source = inspect.getsource(
-        dispatch_fc1_module._triton_grouped_gemm_expert_n_merged_tiles_wait.fn
-    )
-    tile_dispatch_source = inspect.getsource(
-        dispatch_fc1_module._dispatch_one_source_tile_task.fn
-    )
-
-    assert "_triton_grouped_gemm_expert_n_merged_tiles_wait(" in kernel_source
-    assert "_dispatch_count_derived_source_tiles(" in kernel_source
-    assert "if sub_vec_id() == 0:" in kernel_source
-    assert "FINAL_BARRIER" in kernel_source
-    assert "DIRECT_EXPERT_DISPATCH" not in kernel_source
-    assert "EXPERT_N_TILE_CONSUMER" not in kernel_source
-    assert "MN_TILE_FC1" not in kernel_source
-    assert "send_staging_ptr" not in kernel_source
-    assert "routing_staging_ptr" not in kernel_source
-    assert "source_id" in consumer_source
-    assert "overlap_start" in consumer_source
-    assert "self.dispatch_fc1_schedule" not in launch_source
-    assert "NUM_PROGRAM_CORES=self.num_aicore_programs" in launch_source
-    assert "DIRECT_EXPERT_DISPATCH" not in launch_source
-    assert "EXPERT_N_TILE_CONSUMER" not in launch_source
-    assert "MN_TILE_FC1" not in launch_source
-    assert "HAS_ROUTING_WEIGHT" not in launch_source
-    assert "HAS_ROUTING_WEIGHT" not in kernel_source
-    assert "hidden * 2" in tile_dispatch_source
-
-
-def test_routing_metadata_keeps_width_specific_910b1_lowering():
-    histogram_source = inspect.getsource(
-        routing_metadata_module._kernel_build_routing_metadata.fn
-    )
-    lower_bound_source = inspect.getsource(
-        routing_metadata_module._kernel_build_routing_metadata_lower_bound.fn
-    )
-    metadata_helper_source = inspect.getsource(
-        routing_metadata_module._publish_counts_and_build_metadata.fn
-    )
-    launch_source = inspect.getsource(routing_metadata_module.build_routing_plan)
-
-    assert "tl.histogram(route_keys, NUM_BINS_PAD)" in histogram_source
-    assert "left_safe_mid = tl.where(left_active, left_mid, 0)" in lower_bound_source
-    assert "if context.metadata_num_bins > 512" in launch_source
-    assert "if sub_vec_id() == 0:" in histogram_source
-    assert "if sub_vec_id() == 0:" in metadata_helper_source
-    assert "NUM_BINS_PAD * 4" in histogram_source
-    assert "NUM_BINS_PAD * 4" in metadata_helper_source
-
-
-def test_fc2_launch_uses_persistent_pull_and_dynamic_reduce_grid(monkeypatch):
-    fc2_launches = []
-    transport_launches = []
-    reduce_launches = []
-    fc2_kernel_source = inspect.getsource(
-        fc2_combine_module._kernel_fc2_expert_n_persistent.fn
-    )
-    transport_kernel_source = inspect.getsource(
-        fc2_combine_module._kernel_direct_pull_transport.fn
-    )
-    reduce_kernel_source = inspect.getsource(
-        fc2_combine_module._kernel_local_topk_reduce.fn
-    )
-    launch_source = inspect.getsource(fc2_combine_module.launch_fc2_combine)
-
-    class FakeKernel:
-        def __init__(self, sink):
-            self.sink = sink
-
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                self.sink.append((grid, args, kwargs))
-
-            return launch
-
-    monkeypatch.setattr(
-        fc2_combine_module,
-        "_kernel_fc2_expert_n_persistent",
-        FakeKernel(fc2_launches),
-    )
-    monkeypatch.setattr(
-        fc2_combine_module,
-        "_kernel_direct_pull_transport",
-        FakeKernel(transport_launches),
-    )
-    monkeypatch.setattr(
-        fc2_combine_module,
-        "_kernel_local_topk_reduce",
-        FakeKernel(reduce_launches),
-    )
-
-    experts = 2
-    rows = 5
-    reduction = 16
-    hidden = 16
-    tokens = 2
-    topk = 1
-    received_routes_per_expert = torch.tensor([2, 3], dtype=torch.int32)
-    received_expert_offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
-    route_to_send = torch.arange(tokens * topk, dtype=torch.int32)
-    pull_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
-    peer_mem = torch.empty(rows * hidden, dtype=torch.bfloat16)
-    fc2_buf = torch.empty((rows, hidden), dtype=torch.bfloat16)
-    num_program_cores = 7
-
-    output = fc2_combine_module.launch_fc2_combine(
-        torch.zeros((rows, reduction), dtype=torch.bfloat16),
-        torch.zeros((experts, hidden, reduction), dtype=torch.bfloat16),
-        fc2_buf,
-        peer_mem,
-        route_to_send,
-        torch.empty((tokens, hidden), dtype=torch.bfloat16),
-        received_routes_per_expert,
-        received_expert_offsets,
-        *pull_metadata,
-        num_pull_slots=4,
-        num_send=tokens * topk,
-        topk=topk,
-        num_program_cores=num_program_cores,
-        block_m=16,
-        block_n=16,
-        block_k=16,
-        world_size=1,
-    )
-
-    assert output.shape == (tokens, hidden)
-    assert len(fc2_launches) == 1
-    grid, args, kwargs = fc2_launches[0]
-    assert grid == (num_program_cores, 1, 1)
-    assert args[2] is peer_mem
-    assert kwargs["EXPERTS_PER_RANK"] == experts
-    assert len(transport_launches) == 1
-    transport_grid, transport_args, transport_kwargs = transport_launches[0]
-    assert transport_grid == (num_program_cores, 1, 1)
-    assert transport_args[0] is fc2_buf
-    assert transport_args[1] is peer_mem
-    assert transport_kwargs["WORLD_SIZE"] == 1
-    assert len(reduce_launches) == 1
-    reduce_grid, reduce_args, _ = reduce_launches[0]
-    assert reduce_grid == (num_program_cores * 2, 1, 1)
-    assert reduce_args[0] is fc2_buf
-    assert reduce_args[1] is route_to_send
-    assert reduce_args[2] is output
-    assert "_fc2_gemm_one_mn_tile(" in fc2_kernel_source
-    assert transport_kernel_source.count("libshmem_device.barrier_all_vec()") == 2
-    assert "libshmem_device.barrier_all()" not in transport_kernel_source
-    assert "row_count * N * 2" in transport_kernel_source
-    assert "if sub_vec_id() == 0:" in transport_kernel_source
-    assert "libshmem_device.getmem(" in transport_kernel_source
-    assert "peer_rank == peer_owner" in transport_kernel_source
-    assert "libshmem_device.getmem(" not in reduce_kernel_source
-    assert "for token_id in range(pid, batch_size, ncore)" in reduce_kernel_source
-    assert "reduce_sub_id = sub_vec_id" not in reduce_kernel_source
-    assert "num_program_cores * 2" in launch_source
-
-
-def test_fc2_metadata_builds_only_direct_pull_descriptors(monkeypatch):
-    metadata_launches = []
-    metadata_source = inspect.getsource(
-        fc2_combine_module._prepare_fc2_combine_metadata_kernel.fn
-    )
-    production_source = inspect.getsource(
-        FusedMoEForward._prepare_combine_metadata
-    )
-
-    class FakeKernel:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                metadata_launches.append((grid, args, kwargs))
-
-            return launch
-
-    monkeypatch.setattr(
-        fc2_combine_module,
-        "_prepare_fc2_combine_metadata_kernel",
-        FakeKernel(),
-    )
-
-    counts_mem = torch.tensor([2, 3], dtype=torch.int32)
-    send_starts = torch.tensor([0, 2], dtype=torch.int32)
-    receive_starts = torch.tensor([0, 2], dtype=torch.int32)
-    pull_metadata = [torch.zeros(4, dtype=torch.int32) for _ in range(4)]
-
-    fc2_combine_module.prepare_fc2_combine_metadata(
-        counts_mem,
-        send_starts,
-        receive_starts,
-        *pull_metadata,
-        num_pull_slots=4,
-        local_rank=0,
-        world_size=1,
-        experts_per_rank=2,
-        num_bins_pad=2,
-        block_m=16,
-    )
-
-    assert len(metadata_launches) == 1
-    grid, _, kwargs = metadata_launches[0]
-    assert grid == (1, )
-    assert kwargs["BLOCK_M"] == 16
-    assert "pull_tile_rank_ptr" in metadata_source
-    assert "self._pull_tile_rank" in production_source
-
-
-def test_pack_gate_up_weights_returns_contiguous_kn_layout():
-    gate = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
-    up = gate + 100
-    packed = pack_gate_up_weights(gate, up)
-
-    assert packed.shape == (2, 4, 6)
-    assert packed.is_contiguous()
-    torch.testing.assert_close(packed[:, :, :3], gate.transpose(1, 2))
-    torch.testing.assert_close(packed[:, :, 3:], up.transpose(1, 2))
-
-
-def _situglu_torch_ref(fc1, rw, activation, beta, lin_beta):
-    """Independent FP32 reference for the target activation extension."""
-    ffn_dim = fc1.shape[-1] // 2
-    gate = fc1[..., :ffn_dim].float()
-    up = fc1[..., ffn_dim:].float()
-    if activation == "swiglu":
-        activated = torch.nn.functional.silu(gate) * up
-    else:
-        activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-        if lin_beta is not None:
-            up = lin_beta * torch.tanh(up / lin_beta)
-        activated = activated * up
-    return (activated * rw.float().unsqueeze(-1)).to(fc1.dtype)
-
-
-@pytest.mark.skipif(
-    not torch.npu.is_available(),
-    reason="SiTU-GLU kernel correctness requires an NPU device",
-)
-def test_weighted_swiglu_kernel_supports_swiglu_and_situglu():
-    """The target-only SiTU-GLU switch remains correct after source sync."""
-    device = "npu:0"
-    torch.npu.set_device(0)
-    torch.manual_seed(0)
-    rows, ffn_dim = 64, 256
-    fc1 = (
-        (torch.randn(rows, 2 * ffn_dim, dtype=torch.float32) * 0.5)
-        .to(torch.bfloat16)
-        .to(device)
-    )
-    rw = (torch.rand(rows, dtype=torch.float32, device=device) + 0.1).contiguous()
-    cases = (
-        ("swiglu", 1.0, None),
-        ("situglu", 1.0, None),
-        ("situglu", 1.5, None),
-        ("situglu", 2.0, 1.0),
-    )
-    for activation, beta, linear_beta in cases:
-        actual = weighted_swiglu_forward(
-            fc1,
-            rw,
-            24,
-            activation=activation,
-            situ_beta=beta,
-            situ_linear_beta=linear_beta,
-        )
-        expected = _situglu_torch_ref(fc1, rw, activation, beta, linear_beta)
-        torch.testing.assert_close(
-            actual.float(),
-            expected.float(),
-            rtol=OUTPUT_RTOL,
-            atol=OUTPUT_ATOL,
-        )
-
-    empty = weighted_swiglu_forward(
-        fc1[:0], rw[:0], 24, activation="situglu", situ_beta=1.0
-    )
-    assert empty.shape == (0, ffn_dim)
-    assert empty.dtype == torch.bfloat16
-    with pytest.raises(ValueError, match="activation must be 'swiglu' or 'situglu'"):
-        weighted_swiglu_forward(fc1, rw, 24, activation="relu")
-
-
-def test_make_down_weights_returns_contiguous_nk_layout():
-    down = make_down_weights(
-        num_experts=4,
-        hidden=8,
-        ffn_dim=6,
-        world_size=2,
-        rank=0,
-        dtype=torch.bfloat16,
-        device="cpu",
-    )
-
-    assert down.shape == (2, 8, 6)
-    assert down.is_contiguous()
-    assert down.stride() == (48, 6, 1)
-    activation = torch.randn(3, 6, dtype=torch.float32)
-    assert (activation @ down[0].T.float()).shape == (3, 8)
-
-
-@pytest.mark.dist
-def test_forward_2ranks(dist_test):
-    dist_test(run_test, world_size=2)
-
-
-@pytest.mark.dist
-def test_forward_4ranks(dist_test):
-    dist_test(run_test, world_size=4)
-
-
-@pytest.mark.dist
-def test_forward_8ranks(dist_test):
-    dist_test(run_test, world_size=8)

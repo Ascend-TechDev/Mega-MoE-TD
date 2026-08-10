@@ -1,242 +1,280 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Central model / shape configuration for Mega-MoE tests and benchmarks.
+"""Declarative MoE cases shared by functional tests and benchmarks.
 
-Single source of truth consumed by both the correctness tests (tests/layer/*)
-and the performance benchmarks (benchmark/layer/*). Re-exported by
-``config/__init__`` so callers do ``from config import MoETestShape,
-FORWARD_SHAPES, MODEL_PROFILES, select_perf_shapes, ...``.
-
-Two kinds of config live here:
-
-* :class:`MoETestShape` plus the ``FORWARD_*`` / ``BACKWARD_*`` shape lists —
-  one dataclass instance per (model, token count). The field order follows the
-  backward test's historical tuple ``(name, ntokens, hidden, ffn, topk,
-  num_experts)``. ``num_experts`` is explicit (now used by both sides);
-  ``experts_per_rank`` remains supported for world-size scaling but is unused by
-  the current lists; DSV4-smoke sets ``global_tokens`` so
-  :meth:`resolved_tokens_per_rank` divides it across ranks.
-* :data:`MODEL_PROFILES` — forward-benchmark profiles (arch + capacity +
-  per-token ``bench_configs`` with env-selectable slugs), consumed by
-  ``benchmark/layer/bench_full_forward.py`` via ``_activate_model_profile``.
+``tokens`` is always the number of tokens owned by one rank.  The registry is
+deliberately static: selecting a direction or a tag is done by Python code
+(``select_cases``), never by mutating process-global shapes from environment
+variables.
 """
 
-import os
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import math
+from typing import Callable, Iterable
+
+
+_VALID_DIRECTIONS = frozenset({"forward", "backward"})
+Capacity = float | Callable[[int], float]
 
 
 @dataclass(frozen=True)
-class MoETestShape:
-    label: str
-    tokens: int                       # tokens_per_rank (used when global_tokens is None)
+class CaseSpec:
+    """One concrete test or benchmark execution."""
+
+    case_id: str
+    direction: str
+    model: str
+    tokens: int
+    world_size: int
     hidden: int
     ffn: int
     topk: int
-    num_experts: int = 0              # explicit (backward style); 0 => epr * world_size
-    experts_per_rank: int = 0         # forward epr scaling (mutually exclusive with num_experts)
+    num_experts: int
+    tags: frozenset[str]
+    capacity_factor: float = 1.0
     drop_frac: float = 0.0
-    global_tokens: Optional[int] = None  # DSV4 uses a global token count divided across ranks
 
-    def resolved_num_experts(self, world_size: int) -> int:
-        if self.num_experts:
-            return self.num_experts
-        return self.experts_per_rank * world_size
-
-    def resolved_tokens_per_rank(self, world_size: int) -> int:
-        if self.global_tokens is not None:
-            if self.global_tokens % world_size != 0:
-                raise ValueError("global token count must be divisible by world_size")
-            return self.global_tokens // world_size
+    @property
+    def tokens_per_rank(self) -> int:
+        """Explicit alias used by result serialization and human-readable labels."""
         return self.tokens
 
+    @property
+    def experts_per_rank(self) -> int:
+        if self.num_experts % self.world_size:
+            raise ValueError(
+                f"{self.case_id}: num_experts={self.num_experts} is not divisible "
+                f"by world_size={self.world_size}"
+            )
+        return self.num_experts // self.world_size
 
-# ---------------------------------------------------------------------------
-# Forward correctness shapes — all use explicit num_experts (unified with the
-# backward convention). DSV4-smoke additionally sets global_tokens.
-# ---------------------------------------------------------------------------
+    def validate(self) -> "CaseSpec":
+        normalized_id = self.case_id.lower()
+        model_id = normalized_id.replace("-", "_")
+        if _slug(self.model) not in model_id:
+            raise ValueError(f"{self.case_id}: case_id must contain the model slug")
+        direction_slug = "fwd" if self.direction == "forward" else "bwd"
+        if f"-{direction_slug}-" not in normalized_id:
+            raise ValueError(f"{self.case_id}: case_id must contain {direction_slug!r}")
+        if f"-w{self.world_size}-" not in normalized_id:
+            raise ValueError(f"{self.case_id}: case_id must contain the world size")
+        if f"-{_token_slug(self.tokens)}" not in normalized_id:
+            raise ValueError(f"{self.case_id}: case_id must contain the token slug")
+        if self.direction not in _VALID_DIRECTIONS:
+            raise ValueError(f"{self.case_id}: invalid direction {self.direction!r}")
+        if self.tokens <= 0:
+            raise ValueError(f"{self.case_id}: tokens must be positive")
+        if self.world_size <= 0:
+            raise ValueError(f"{self.case_id}: world_size must be positive")
+        if self.hidden <= 0 or self.ffn <= 0 or self.topk <= 0:
+            raise ValueError(f"{self.case_id}: dimensions and topk must be positive")
+        if self.num_experts < self.topk:
+            raise ValueError(f"{self.case_id}: num_experts must be >= topk")
+        _ = self.experts_per_rank
+        if not math.isfinite(self.capacity_factor) or self.capacity_factor < 1.0:
+            raise ValueError(f"{self.case_id}: capacity_factor must be >= 1")
+        if not math.isfinite(self.drop_frac) or not 0.0 <= self.drop_frac < 1.0:
+            raise ValueError(f"{self.case_id}: drop_frac must be in [0, 1)")
+        return self
 
-FORWARD_SHAPES = [
-    MoETestShape("S", 128, 256, 512, 2, num_experts=8),
-    MoETestShape("M", 256, 512, 1024, 2, num_experts=8),
-    MoETestShape("L", 512, 1024, 2048, 2, num_experts=8),
-    MoETestShape("S-drop", 128, 256, 512, 2, num_experts=8, drop_frac=0.3),
-    MoETestShape("EPR4", 256, 512, 1024, 2, num_experts=16),
-    # DeepSeek-V4-Pro routed-experts shape from the sibling NVIDIA dsv4 case:
-    # H=7168, F=3072, K=6, E=384. This BF16 correctness smoke excludes the
-    # shared-expert branch and the model's FP4 expert format. It deliberately
-    # keeps a smaller global-token count; the performance benchmark owns the
-    # exact 2K/8K/32K/128K per-rank workloads.
-    MoETestShape("DSV4-smoke", 0, 7168, 3072, 6, num_experts=384, global_tokens=1024),
-    # Kimi-K3 architecture (H=3584, F=3072, top-k=16), reduced to a 128-expert
-    # "small" variant so it stays a light correctness smoke. The full 896-expert
-    # model lives in FORWARD_SHAPES_KIMI (opt-in via MOE_KIMI=1, mirroring the
-    # backward test), since it needs >=4 cards to fit comfortably.
-    MoETestShape("Kimi-K3-small", 2048, 3584, 3072, 16, num_experts=128),
+    def as_dict(self) -> dict:
+        result = asdict(self)
+        result["tags"] = sorted(self.tags)
+        result["tokens_per_rank"] = self.tokens
+        return result
+
+
+@dataclass(frozen=True)
+class CaseGroup:
+    """A compact Cartesian-product description of related concrete cases."""
+
+    prefix: str
+    direction: str
+    model: str
+    tokens: tuple[int, ...]
+    worlds: tuple[int, ...]
+    hidden: int
+    ffn: int
+    topk: int
+    num_experts: int
+    tags: frozenset[str]
+    capacity_factor: Capacity = 1.0
+    drop_frac: float = 0.0
+
+
+def _token_slug(tokens: int) -> str:
+    if tokens % 1024 == 0:
+        return f"t{tokens // 1024}k"
+    return f"t{tokens}"
+
+
+def _slug(label: str) -> str:
+    return label.lower().replace("-", "_").replace(" ", "_")
+
+
+def _expand(group: CaseGroup) -> tuple[CaseSpec, ...]:
+    """Expand one group into its world/token Cartesian product."""
+    if group.direction not in _VALID_DIRECTIONS:
+        raise ValueError(f"{group.prefix}: invalid direction {group.direction!r}")
+    cases = []
+    for world_size in group.worlds:
+        for token_count in group.tokens:
+            capacity = (
+                group.capacity_factor(world_size)
+                if callable(group.capacity_factor)
+                else group.capacity_factor
+            )
+            case_id = f"{group.prefix}-w{world_size}-{_token_slug(token_count)}"
+            cases.append(
+                CaseSpec(
+                    case_id=case_id,
+                    direction=group.direction,
+                    model=group.model,
+                    tokens=token_count,
+                    world_size=world_size,
+                    hidden=group.hidden,
+                    ffn=group.ffn,
+                    topk=group.topk,
+                    num_experts=group.num_experts,
+                    tags=group.tags,
+                    capacity_factor=capacity,
+                    drop_frac=group.drop_frac,
+                ).validate()
+            )
+    return tuple(cases)
+
+
+def _functional_capacity(world_size: int) -> float:
+    """Keep smoke tests' historical world-size-specific receive capacity."""
+    return float(world_size)
+
+
+_CASE_GROUPS = (
+    # Functional forward: five representative shapes only.
+    CaseGroup(
+        prefix="functional-fwd-s", direction="forward", model="S",
+        tokens=(128,), worlds=(2, 4, 8), hidden=256, ffn=512, topk=2,
+        num_experts=8, tags=frozenset({"functional", "forward", "smoke"}),
+        capacity_factor=_functional_capacity,
+    ),
+    CaseGroup(
+        prefix="functional-fwd-m", direction="forward", model="M",
+        tokens=(256,), worlds=(2, 4, 8), hidden=512, ffn=1024, topk=2,
+        num_experts=8, tags=frozenset({"functional", "forward", "smoke"}),
+        capacity_factor=_functional_capacity,
+    ),
+    CaseGroup(
+        prefix="functional-fwd-l", direction="forward", model="L",
+        tokens=(512,), worlds=(2, 4, 8), hidden=1024, ffn=2048, topk=2,
+        num_experts=8, tags=frozenset({"functional", "forward", "smoke"}),
+        capacity_factor=_functional_capacity,
+    ),
+    CaseGroup(
+        prefix="functional-fwd-s-drop", direction="forward", model="S-drop",
+        tokens=(128,), worlds=(2, 4, 8), hidden=256, ffn=512, topk=2,
+        num_experts=8, tags=frozenset({"functional", "forward", "smoke"}),
+        capacity_factor=_functional_capacity, drop_frac=0.3,
+    ),
+    CaseGroup(
+        prefix="functional-fwd-epr4", direction="forward", model="EPR4",
+        tokens=(256,), worlds=(2, 4, 8), hidden=512, ffn=1024, topk=2,
+        num_experts=16, tags=frozenset({"functional", "forward", "smoke"}),
+        capacity_factor=_functional_capacity,
+    ),
+
+    # Functional backward: two small representative dimensions at all
+    # supported process counts.  Kimi's large functional cases are omitted;
+    # they duplicate coverage while making the default suite prohibitively
+    # expensive.
+    CaseGroup(
+        prefix="functional-bwd-small-h512-f256-k4", direction="backward", model="small",
+        tokens=(512,), worlds=(2, 4, 8), hidden=512, ffn=256, topk=4,
+        num_experts=128, tags=frozenset({"functional", "backward", "smoke"}),
+    ),
+    CaseGroup(
+        prefix="functional-bwd-small-h1024-f512-k8", direction="backward", model="small",
+        tokens=(512,), worlds=(2, 4, 8), hidden=1024, ffn=512, topk=8,
+        num_experts=128, tags=frozenset({"functional", "backward", "smoke"}),
+    ),
+
+    # Forward performance: all models use the same per-rank token sweep.
+    CaseGroup(
+        prefix="performance-fwd-qwen", direction="forward", model="QWEN",
+        tokens=(4096, 8192, 16384), worlds=(2, 4, 8), hidden=2048, ffn=768,
+        topk=8, num_experts=128, tags=frozenset({"performance", "forward", "slow"}),
+        capacity_factor=1.25,
+    ),
+    CaseGroup(
+        prefix="performance-fwd-dsv4", direction="forward", model="DSV4",
+        tokens=(4096, 8192, 16384), worlds=(2, 4, 8), hidden=7168, ffn=3072,
+        topk=6, num_experts=384,
+        tags=frozenset({"performance", "forward", "dsv4", "slow"}),
+        capacity_factor=4.0,
+    ),
+    CaseGroup(
+        prefix="performance-fwd-kimi-k3", direction="forward", model="KIMI-K3",
+        tokens=(4096, 8192, 16384), worlds=(4, 8), hidden=3584, ffn=3072,
+        topk=16, num_experts=896,
+        tags=frozenset({"performance", "forward", "kimi", "slow"}),
+        capacity_factor=1.25,
+    ),
+
+    # Backward performance has only validated profiles.  There is no DSV4
+    # backward profile yet, so it is intentionally not synthesized here.
+    CaseGroup(
+        prefix="performance-bwd-qwen3-30b-a3b", direction="backward",
+        model="Qwen3-30B-A3B", tokens=(4096, 8192, 16384), worlds=(2, 4, 8),
+        hidden=2048, ffn=768, topk=8, num_experts=128,
+        tags=frozenset({"performance", "backward", "slow"}),
+    ),
+    CaseGroup(
+        prefix="performance-bwd-kimi-k3", direction="backward", model="Kimi-K3",
+        tokens=(4096, 8192, 16384), worlds=(4, 8), hidden=3584, ffn=3072,
+        topk=16, num_experts=896,
+        tags=frozenset({"performance", "backward", "kimi", "slow"}),
+    ),
+)
+
+
+_CASES: list[CaseSpec] = []
+for group in _CASE_GROUPS:
+    _CASES.extend(_expand(group))
+
+CASE_REGISTRY = tuple(_CASES)
+_CASE_BY_ID = {case.case_id: case for case in CASE_REGISTRY}
+if len(_CASE_BY_ID) != len(CASE_REGISTRY):
+    raise ValueError("case_id values must be unique")
+
+
+def select_cases(*, direction: str, tags: Iterable[str] = ()) -> tuple[CaseSpec, ...]:
+    """Select cases by fixed code-level direction and tag predicates."""
+    if direction not in _VALID_DIRECTIONS:
+        raise ValueError(f"direction must be one of {sorted(_VALID_DIRECTIONS)}")
+    wanted = frozenset(tags)
+    return tuple(
+        case
+        for case in CASE_REGISTRY
+        if case.direction == direction and wanted.issubset(case.tags)
+    )
+
+
+def resolve_case(case_id: str) -> CaseSpec:
+    try:
+        return _CASE_BY_ID[case_id]
+    except KeyError as exc:
+        raise KeyError(f"unknown MoE case_id {case_id!r}") from exc
+
+
+def case_dict(case: CaseSpec) -> dict:
+    return case.as_dict()
+
+
+__all__ = [
+    "CaseGroup",
+    "CaseSpec",
+    "CASE_REGISTRY",
+    "select_cases",
+    "resolve_case",
+    "case_dict",
 ]
-
-
-# Full Kimi-K3 (896 experts) correctness shapes, opt-in via MOE_KIMI=1 in
-# tests/layer/test_moe_forward.py (mirrors BACKWARD_SHAPES_KIMI). Too heavy for
-# the default 2-rank smoke; run at >=4 ranks.
-FORWARD_SHAPES_KIMI = [
-    MoETestShape("Kimi-K3", 2048, 3584, 3072, 16, num_experts=896),
-]
-
-
-# Backward correctness shapes, selected by env in tests/layer/test_moe_backward.py
-# and benchmark/layer/bench_backward.py (see select_perf_shapes).
-BACKWARD_SHAPES_SMALL = [
-    MoETestShape("small", 512, 512, 256, 4, num_experts=128),
-    MoETestShape("small", 1024, 512, 256, 4, num_experts=128),
-    MoETestShape("small", 2048, 512, 256, 4, num_experts=128),
-    MoETestShape("small", 512, 1024, 512, 8, num_experts=128),
-]
-
-BACKWARD_SHAPES_KIMI = [
-    MoETestShape("Kimi-K3", 2048, 3584, 3072, 16, num_experts=896),
-    MoETestShape("Kimi-K3", 4096, 3584, 3072, 16, num_experts=896),
-    MoETestShape("Kimi-K3", 8192, 3584, 3072, 16, num_experts=896),
-]
-
-# Kimi-K3 architecture scaled to 16 experts (the minimum: topk=16 requires
-# E >= topk). Default backward benchmark shape when RANK_SIZE=2 (see rank_size /
-# bench_backward): at 2 cards epr=8, within the backward kernel's launch-grid
-# limit (<= physical aicore num); E=128 (epr=64) would be skipped on 2 cards.
-BACKWARD_SHAPES_KIMI_SMALL = [
-    MoETestShape("Kimi-K3-small", 2048, 3584, 3072, 16, num_experts=16),
-    MoETestShape("Kimi-K3-small", 4096, 3584, 3072, 16, num_experts=16),
-    MoETestShape("Kimi-K3-small", 8192, 3584, 3072, 16, num_experts=16),
-]
-
-BACKWARD_SHAPES_PERF = [
-    MoETestShape("Qwen3-30B-A3B",    4096, 2048,  768,  8, num_experts=128),
-    MoETestShape("Qwen3-30B-A3B",    8192, 2048,  768,  8, num_experts=128),
-    MoETestShape("Qwen3-30B-A3B",   16384, 2048,  768,  8, num_experts=128),
-    MoETestShape("DeepSeek-MoE-16B", 4096, 2048, 1408,  6, num_experts=64),
-    MoETestShape("Qwen3-235B-A22B",  4096, 4096, 1536,  8, num_experts=128),
-    MoETestShape("Qwen3-Next-80B",   4096, 2048,  512, 10, num_experts=512),
-    MoETestShape("Qwen3-Omni-30B",   4096, 1024,  384,  6, num_experts=128),
-    MoETestShape("Kimi-K3",          4096, 3584, 3072, 16, num_experts=896),
-    MoETestShape("Kimi-K3",          8192, 3584, 3072, 16, num_experts=896),
-    MoETestShape("Kimi-K3",         16384, 3584, 3072, 16, num_experts=896),
-]
-
-
-# ---------------------------------------------------------------------------
-# Forward benchmark profiles (benchmark/layer/bench_full_forward.py).
-# arch + receive-capacity + per-token bench configs as (slug, tokens_per_rank).
-# Consumed by _activate_model_profile; slugs are env-selectable via
-# MOE_FULL_BENCH_CONFIG (DSV4 via MOE_DSV4_BENCH_CONFIG). Tiling is env-driven
-# (_layer_tiling_overrides), so tiling_overrides stays {} here.
-# ---------------------------------------------------------------------------
-
-MODEL_PROFILES = {
-    "QWEN": {
-        "hidden": 2048,
-        "ffn_dim": 768,
-        "topk": 8,
-        "num_experts": 128,
-        "capacity": 1.25,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("2K", 2048),
-            ("8K", 8192),
-            ("16K", 16384),
-            ("32K", 32768),
-        ],
-    },
-    # Uses the CASE_SET=dsv4 model dimensions from the sibling NVIDIA benchmark
-    # launcher, with token counts interpreted per rank for the Ascend workload.
-    # This is the routed-expert BF16 shape only: it excludes the shared-expert
-    # branch and does not model the model's FP4 expert format.
-    "DSV4": {
-        "hidden": 7168,
-        "ffn_dim": 3072,
-        "topk": 6,
-        "num_experts": 384,
-        "capacity": 4.0,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("dsv4_pro_2k", 2048),
-            ("dsv4_pro_4k", 4096),
-            ("dsv4_pro_8k", 8192),
-            ("dsv4_pro_32k", 32768),
-            ("dsv4_pro_128k", 131072),
-        ],
-    },
-    "KIMI-K3": {
-        "hidden": 3584,
-        "ffn_dim": 3072,
-        "topk": 16,
-        "num_experts": 896,
-        "capacity": 1.25,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("kimi_k3_4k", 4096),
-            ("kimi_k3_8k", 8192),
-            ("kimi_k3_16k", 16384),
-        ],
-    },
-    # Kimi-K3 architecture scaled to 128 experts so it fits on 2 cards.
-    # Selected by test_bench_full_forward_kimi_k3 when RANK_SIZE=2.
-    "KIMI-K3-SMALL": {
-        "hidden": 3584,
-        "ffn_dim": 3072,
-        "topk": 16,
-        "num_experts": 128,
-        "capacity": 1.25,
-        "tiling_overrides": {},
-        "bench_configs": [
-            ("kimi_k3_small_4k", 4096),
-            ("kimi_k3_small_8k", 8192),
-            ("kimi_k3_small_16k", 16384),
-        ],
-    },
-}
-
-
-def select_perf_shapes(spec):
-    """Select backward perf shapes from the ``MOE_PERF_CONFIGS`` env value.
-
-    ``spec == "1"`` -> all of :data:`BACKWARD_SHAPES_PERF`; otherwise a
-    comma-separated list of model labels, matched case-insensitively against
-    each shape's ``label`` (e.g. ``"Kimi-K3"`` or
-    ``"Qwen3-30B-A3B,DeepSeek-MoE-16B"``). Raises :class:`ValueError` if no
-    label matches, listing the available labels.
-    """
-    if spec == "1":
-        return list(BACKWARD_SHAPES_PERF)
-    wanted = {part.strip().lower() for part in spec.split(",") if part.strip()}
-    selected = [s for s in BACKWARD_SHAPES_PERF if s.label.lower() in wanted]
-    if not selected:
-        available = sorted({s.label for s in BACKWARD_SHAPES_PERF})
-        raise ValueError(
-            f"MOE_PERF_CONFIGS={spec!r} matched no perf shape; "
-            f"available labels: {available}"
-        )
-    return selected
-
-
-def rank_size(default: int = 8) -> int:
-    """Read the ``RANK_SIZE`` env (must be 2 or 8) for the perf benchmarks.
-
-    The Kimi-K3 benchmarks use this to pick world_size and, by extension, the
-    model variant: ``2`` -> Kimi-K3-small (forward 128 experts / backward 16
-    experts, fits on 2 cards); ``8`` -> full Kimi-K3 (896 experts).
-    """
-    rs = int(os.environ.get("RANK_SIZE", str(default)))
-    if rs not in (2, 8):
-        raise ValueError(f"RANK_SIZE must be 2 or 8, got {rs}")
-    return rs
-
-
-def shape_slug(shape):
-    """Stable slug like ``kimi_k3_small_4k`` for a MoETestShape.
-
-    ``label`` lowercased with ``-`` -> ``_``, plus a ``<tokens/1024>k`` suffix.
-    Matches the forward benchmark's bench_config slug style (e.g. the
-    KIMI-K3-SMALL @4096 slug ``kimi_k3_small_4k``), so the two benchmarks share
-    one config-name vocabulary.
-    """
-    name = shape.label.lower().replace("-", "_")
-    return f"{name}_{shape.tokens // 1024}k"

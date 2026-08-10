@@ -11,9 +11,9 @@ Two things live here:
    the GPU ``TritonDistFusedEpMoeFunction``: its ``forward`` runs the (torch)
    EP-MoE forward and stashes the saved intermediates + the shared symmetric
    buffer; its ``backward`` runs the 5 triton mega-ops. The forward reuses the
-   differentiable torch forward in :mod:`mega_moe._goldens._torch_forward_for_backward`; only the
+   differentiable torch forward in :mod:`mega_moe.ops._torch_forward`; only the
    backward is the fused triton path (the Ascend tutorial only ships a triton
-   backward — forward is the torch reference).
+   backward — forward is the private differentiable Torch implementation).
 
 The 5 backward mega-ops (given dy [B,H]):
 
@@ -30,7 +30,7 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from mega_moe._goldens._torch_forward_for_backward import moe_forward
+from ._torch_forward import moe_forward
 from ..kernels import (
     dispatch_fc2_bwd_triton,
     swiglu_bwd_triton,
@@ -47,7 +47,7 @@ def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
     for Kimi-K3 8-card, where the triton kernel hits a codegen pathology (0.16%
     cube peak) and torch's per-expert matmul is ~260x faster.
 
-    Per-expert matmul, no M-padding (within bf16 tolerance vs the padded golden).
+    Per-expert matmul, no M-padding (within bf16 tolerance vs the padded Torch path).
     This is the DEFAULT wgrad path for step3 (fc2) and step5 (fc1); set
     MOE_WGRAD_TRITON=1 to use the fused triton ``transposed_grouped_gemm``
     kernel instead (faster on most shapes, but pathological on Kimi-K3 8-card).
@@ -78,7 +78,7 @@ def moe_backward_triton(saved, dy, peer_mem):
     buffer at heap offset 0 (dl.symm_at only resolves correctly at offset 0 with
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
-    matching moe_backward_torch."""
+    matching the hand-written test baseline."""
     dy = dy.to(saved["fc1_1"].dtype)
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
@@ -132,7 +132,7 @@ def moe_backward_triton(saved, dy, peer_mem):
 class MegaMoEBackwardFunction(torch.autograd.Function):
     """Fused EP-MoE with a triton mega-kernel backward.
 
-    forward : torch EP-MoE forward (golden, differentiable) — stashes the saved
+    forward : private differentiable Torch EP-MoE forward — stashes the saved
               intermediates and the shared symmetric buffer on the ctx.
     backward: the 5 triton mega-ops (``moe_backward_triton``).
 

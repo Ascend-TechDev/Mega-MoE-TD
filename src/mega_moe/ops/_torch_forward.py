@@ -1,12 +1,10 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Differentiable torch + HCCL EP-MoE forward, reused by the fused backward.
+"""Private differentiable torch + HCCL EP-MoE forward used by fused backward.
 
-This is *not* a legacy reference: ``MegaMoEBackwardFunction.forward`` runs this
-module's :func:`moe_forward` to produce the differentiable output and the
-``saved`` intermediates that the 5-op triton backward consumes. The hand-written
-torch backward golden (``tests/_goldens/backward.py``) reuses the same grouped
-matmul primitives and :func:`moe_forward` so that the golden and the production
-autograd path share one source of truth.
+``MegaMoEBackwardFunction.forward`` runs :func:`moe_forward` to produce the
+differentiable output and the ``saved`` intermediates consumed by the 5-op
+triton backward.  This is an autograd support implementation, not a test
+correctness baseline; test adapters live in :mod:`tests._moe_baselines`.
 
 Layout invariants (routing weights applied in SwiGLU; combine reduce is a plain
 sum over topk — no token dropping, matching the 06 tutorial):
@@ -22,9 +20,9 @@ import torch.distributed as dist
 
 # NPU bf16 torch.matmul is M-shape-dependent: rows not a multiple of the native
 # tile (256) select a different Cube kernel that re-rounds by ~1 ULP. Padding the
-# token (M) dimension of every grouped matmul to a multiple of 256 makes the
-# golden bit-stable and match the triton kernel's BLOCK_M=64 tiling (see 06).
-GOLDEN_MATMUL_M_TILE = 256
+# token (M) dimension of every grouped matmul to a multiple of 256 keeps NPU
+# matmul rows aligned with the triton kernel's BLOCK_M=64 tiling.
+MATMUL_M_TILE = 256
 
 # Tile width used by the metadata builder (ported from the 06 tutorial).
 BLOCK_SIZE_M = 64
@@ -35,8 +33,8 @@ BLOCK_SIZE_M = 64
 # ----------------------------------------------------------------------------
 
 def _pad_m(slc, cnt):
-    """Pad the row (M) dim of a [cnt, *] slice up to a multiple of GOLDEN_MATMUL_M_TILE."""
-    pad = (-cnt) % GOLDEN_MATMUL_M_TILE
+    """Pad the row (M) dim to a multiple of ``MATMUL_M_TILE``."""
+    pad = (-cnt) % MATMUL_M_TILE
     if pad:
         slc = torch.nn.functional.pad(slc, (0, 0) * (slc.dim() - 1) + (0, pad))
     return slc
@@ -50,7 +48,7 @@ def grouped_matmul(a, weight, expert_counts, transpose=True):
                           (transpose=False -> out[m,n] = sum_k a[m,k] * weight[e,k,n]  => a @ weight[e],   out [M, N])
     expert_counts : [E] int
 
-    Each expert slice is M-padded to 256 before the matmul (see GOLDEN_MATMUL_M_TILE).
+    Each expert slice is M-padded to 256 before the matmul (see ``MATMUL_M_TILE``).
     """
     out_parts = []
     start = 0
@@ -173,7 +171,7 @@ def _a2a(input, output_split_sizes, input_split_sizes, group):
 
 
 # ----------------------------------------------------------------------------
-# Gated activation (SwiGLU / SiTU-GLU), torch reference
+# Gated activation (SwiGLU / SiTU-GLU), differentiable Torch implementation
 # ----------------------------------------------------------------------------
 
 def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta):
@@ -208,7 +206,8 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
 
     Mirrors GPU torch_moe_fwd / 06 build_moe_fwd_inputs. No token dropping.
     When return_saved=True, also returns a dict of all intermediates needed by
-    the torch backward golden (detached under torch.no_grad() by the caller).
+    the hand-written test backward baseline (detached under ``torch.no_grad``
+    by the caller).
 
     ``activation`` selects the post-FC1 gated activation (``"swiglu"`` default
     or ``"situglu"``); ``situ_beta`` / ``situ_linear_beta`` configure SiTU-GLU
@@ -310,7 +309,7 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
 __all__ = [
     "AllToAll",
     "BLOCK_SIZE_M",
-    "GOLDEN_MATMUL_M_TILE",
+    "MATMUL_M_TILE",
     "grouped_matmul",
     "grouped_transposed_matmul",
     "moe_forward",

@@ -12,3 +12,17 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "dist: requires a multi-rank Ascend HCCL/ACLSHMEM run",
+    "npu: requires an Ascend NPU device",
+    "functional: functional correctness suite",
+    "performance: performance benchmark suite",
+    "forward: forward-direction case",
+    "backward: backward-direction case",
+    "smoke: small/quick representative case",
+    "slow: large or otherwise expensive case",
+    "kimi: Kimi model case",
+    "dsv4: DSV4 model case",
+]

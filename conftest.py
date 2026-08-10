@@ -1,5 +1,5 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Pytest setup for the standalone Mega-MoE tutorial."""
+"""Repository-wide pytest setup for the standalone Mega-MoE tutorial."""
 
 import os
 
@@ -7,11 +7,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "dist: requires a multi-rank Ascend HCCL/ACLSHMEM run"
-    )
 
 
 def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
