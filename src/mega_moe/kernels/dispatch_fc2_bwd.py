@@ -1,7 +1,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 # ============================================================================
 #  dispatch_fc2_bwd.py  —  step 1: dispatch-A2A(home->expert) + fc2 input-grad
-#  (push -> barrier -> GEMM; the dual of 06's GEMM -> push -> reduce)
+#  ONE FUSED KERNEL: Phase 1 push (Vector) -> barrier_all -> Phase 2 fc2 input-grad
+#  GEMM (Cube). The dual of combine_fc1_bwd's GEMM -> push -> reduce.
 # ============================================================================
 
 import torch
@@ -11,83 +12,102 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
+from triton.language.extra.cann.extension import sub_vec_id
 
 from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
 
 
-# PUSH AND GEMM ARE TWO SEPARATE KERNEL LAUNCHES, NOT ONE FUSED KERNEL.
-# The original fused kernel ran Phase 1 (push, Vector) -> barrier_all -> Phase 2
-# (fc2 input-grad GEMM, Cube) inside a single launch and deadlocked on this
-# Ascend backend (aicore execution timeout). This is the SAME Cube/Vector +
-# in-kernel barrier codegen interaction that step 4 (combine_fc1_bwd) already
-# hit and fixed by splitting (see its kernel_combine_push_reduce comment: "in a
-# single fused kernel the GEMM phase corrupted the push's read ... each verified
-# correct, so we launch them separately"). The pure-Vector push+barrier kernel
-# and the pure-Cube GEMM kernel are each correct on their own; fusing them is
-# what hangs. The two launches are stream-ordered, so the push kernel's device
-# barrier_all is enough cross-rank sync — no host sync needed (same as step 4).
+# ONE FUSED KERNEL: Phase 1 push (Vector) -> barrier_all -> Phase 2 fc2 input-grad
+# GEMM (Cube). This is the Ascend "AllGather+GEMM" fused pattern (see the
+# AscendKernelWiki kernel-allgather-gemm page): a mixed Cube/Vector kernel that the
+# compiler auto-splits into a vector_func (the dl.symm_at/tl.store push) and a
+# cube_func (the tl.dot GEMM), with the single barrier_all() living in BOTH funcs
+# so it fences the cross-rank push before any rank's GEMM gathers it.
 #
-# Phase 1 (launch 1, kernel_dispatch_push):
-#   for each home row h (sort_idxs order), write
-#   grad_combined_out_flat[h] -> dl.symm_at(peer_mem, h_dst_rank[h]) + h_dst_off[h]*H
-#   barrier_all()
-# Phase 2 (launch 2, kernel_fc2_input_grad_gemm, Cube):
-#   a = peer_mem[local_sort_idxs[row]] (gather back to sorted order),
-#   b = fc2[e][H,ffn]; acc[M,ffn] = a @ b
+# Why auto-split (no explicit al.scope) and not the explicit-scope form used by
+# combine_fc1_bwd: every verified fused kernel on this backend either runs Cube
+# FIRST then barrier then Vector (combine_fc1_bwd, forward _kernel_fc2_combine),
+# or runs Vector+Cube CONCURRENTLY with signal/wait (forward _kernel_dispatch_fc1).
+# There is NO verified instance of explicit `al.scope("vector") -> barrier_all ->
+# al.scope("cube")` — and in fact the explicit-scope form of THIS kernel was tried
+# and deadlocked (aicore execution timeout). The auto-split form (no al.scope)
+# matches the wiki's verified AllGather+GEMM, where cube GEMM legitimately runs
+# AFTER the barrier.
+#
+# Two fixes vs the original deadlocking fused kernel (commit 10347fe^):
+#   1. sub_vec_id() gating on the push — a mixed kernel has 2 vector sub-cores;
+#      without gating BOTH duplicate the dl.symm_at remote stores (the hazard
+#      dispatch_fc1.py:187-191 documents), racing the comm engine. Only
+#      sub_vec_id < PUSH_VECTOR_WORKERS may push.
+#   2. auto-split instead of explicit al.scope — see above.
+#
+# Phase 1 dispatch push (home->expert): for each home row h (sort_idxs order),
+#   write grad_combined_out_flat[h] -> dl.symm_at(peer_mem, h_dst_rank[h]) +
+#   h_dst_off[h]*H  (vector, sub_vec_id gated)
+# libshmem_device.barrier_all()
+# Phase 2 fc2 input-grad GEMM (Cube): a = peer_mem[local_sort_idxs[row]]
+#   (gather back to sorted order), b = fc2[e][H,ffn]; acc[M,ffn] = a @ b
 @triton.jit
-def kernel_dispatch_push(
-    # ---- push (home->expert) ----
+def kernel_dispatch_fc2_bwd(
+    # ---- Phase 1: dispatch push (home->expert, Vector) ----
     gco_ptr,                  # grad_combined_out_flat [total_send, H] (home, sort_idxs order)
     h_dst_rank_ptr,           # int32 [total_send]
     h_dst_off_ptr,            # int64 [total_send]
     peer_mem_ptr,             # symmetric [total_recv, H] at HEAP OFFSET 0 (reused with step 4)
     total_send, H,
     stride_gm, stride_gk,     # gco strides (H, 1)
-    BLOCK_H_PUSH: tl.constexpr,
-):
-    """Phase 1 only: dispatch push (home -> expert) + device barrier_all.
-    Pure Vector + libshmem barrier — NO Cube (tl.dot) in this kernel."""
-    pid = tl.program_id(axis=0)
-    ncore = tl.num_programs(axis=0)
-    ovh = tl.arange(0, BLOCK_H_PUSH)
-    ts64 = total_send
-    for h in range(pid, ts64, ncore):
-        h64 = h.to(tl.int64)
-        dst_rank = tl.load(h_dst_rank_ptr + h)
-        dst_off = tl.load(h_dst_off_ptr + h64).to(tl.int64)
-        rp = dl.symm_at(peer_mem_ptr, dst_rank)
-        for ns in range(0, H, BLOCK_H_PUSH):
-            mask = ovh < (H - ns)
-            ro = h64 * stride_gm + (ns + ovh) * stride_gk
-            val = tl.load(gco_ptr + ro, mask=mask, other=0.0)
-            ro2 = dst_off * H + (ns + ovh)
-            tl.store(rp + ro2, val, mask=mask)
-    libshmem_device.barrier_all()
-
-
-@triton.jit
-def kernel_fc2_input_grad_gemm(
-    # ---- GEMM (fc2 input-grad) ----
+    # ---- Phase 2: fc2 input-grad GEMM (Cube) ----
     fc2_ptr,                  # [E, H, ffn]  (K=H, N=ffn, weight_reduce_last_dim=True)
-    peer_mem_ptr,             # symmetric [total_recv, H] (arrival order, populated by the push kernel)
     local_sort_idxs_ptr,      # int64 [total_recv]  (arrival -> sorted)
     meta_expert_ids_ptr, meta_split_cum_ptr, meta_tile_num_ptr, expert_counts_ptr,
     M, N, K, E, num_tiles_m, num_tiles_n,
-    H,                        # peer_mem row stride (== K, the reduction dim)
     stride_we, stride_wk, stride_wn,   # fc2 [E,H,ffn]: (H*ffn, ffn, 1)
     # ---- output ----
     out_ptr,                  # grad_swiglu [M, ffn]
     # ---- constexpr ----
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_H_PUSH: tl.constexpr,
+    PUSH_VECTOR_WORKERS: tl.constexpr,
 ):
-    """Phase 2 only: fc2 input-grad GEMM (gather via local_sort_idxs).
-    acc[M, ffn] = peer_mem[local_sort_idxs[row]] @ fc2[e]. Pure Cube — NO comm."""
+    """Fused dispatch push (home->expert) + fc2 input-grad GEMM in one launch.
+    Phase 1 push + device barrier_all make every rank's pushes globally visible
+    before Phase 2 GEMM gathers them. No explicit al.scope: the compiler auto-
+    splits this mixed kernel (Vector push | Cube GEMM) and places the single
+    barrier_all in both halves — the verified AllGather+GEMM codegen path."""
     pid = tl.program_id(axis=0)
     ncore = tl.num_programs(axis=0)
+
+    # ===== Phase 1: dispatch push (home -> expert) -> peer_mem (VECTOR) =====
+    # sub_vec_id gating is mandatory in a mixed kernel: only one vector sub-core
+    # owns the dl.symm_at remote stores so the cube side cannot duplicate them.
+    # PUSH_VECTOR_WORKERS=1 -> push_worker_id=pid, num_push_workers=ncore, i.e.
+    # identical work distribution to the proven split push kernel.
+    push_sub_id = sub_vec_id().to(tl.int32)
+    if push_sub_id < PUSH_VECTOR_WORKERS:
+        push_worker_id = pid * PUSH_VECTOR_WORKERS + push_sub_id
+        num_push_workers = ncore * PUSH_VECTOR_WORKERS
+        ovh = tl.arange(0, BLOCK_H_PUSH)
+        for h in range(push_worker_id, total_send, num_push_workers):
+            h64 = h.to(tl.int64)
+            dst_rank = tl.load(h_dst_rank_ptr + h)
+            dst_off = tl.load(h_dst_off_ptr + h64).to(tl.int64)
+            rp = dl.symm_at(peer_mem_ptr, dst_rank)
+            for ns in range(0, H, BLOCK_H_PUSH):
+                mask = ovh < (H - ns)
+                ro = h64 * stride_gm + (ns + ovh) * stride_gk
+                val = tl.load(gco_ptr + ro, mask=mask, other=0.0)
+                ro2 = dst_off * H + (ns + ovh)
+                tl.store(rp + ro2, val, mask=mask)
+
+    libshmem_device.barrier_all()
+
+    # ===== Phase 2: fc2 input-grad GEMM (gather via local_sort_idxs) (CUBE) =====
+    # acc[M, ffn] = peer_mem[local_sort_idxs[row]] @ fc2[e]. Pure Cube (tl.dot) —
+    # the compiler routes it to the cube_func; reads peer_mem, now fully populated
+    # + globally visible after the barrier.
     om = tl.arange(0, BLOCK_M)
     on_ = tl.arange(0, BLOCK_N)
     ok = tl.arange(0, BLOCK_K)
-    # acc[M, ffn] = peer_mem[local_sort_idxs[row]] @ fc2[e]
     total_tasks = num_tiles_m * num_tiles_n
     for task_id in range(pid, total_tasks, ncore):
         tile_m = task_id % num_tiles_m
@@ -165,29 +185,22 @@ def _prepare_dispatch_fc2_bwd(saved, dy):
 
 
 def _launch_dispatch_fc2_bwd(prep, peer_mem, out):
-    # Launch 1: dispatch push (home -> expert) + device barrier_all. Pure Vector;
-    # the barrier_all makes every rank's pushes globally visible before launch 2.
-    kernel_dispatch_push[(ncore(), 1, 1)](
+    # Single fused launch: dispatch push (vector) + fc2 input-grad GEMM (cube),
+    # fenced by the in-kernel barrier_all — it makes every rank's pushes globally
+    # visible before the GEMM gathers them. No host sync (same rationale as
+    # combine_fc1_bwd's single fused launch). The GEMM writes every (m,n) tile
+    # (meta covers all tokens), so `out` needs no zero-fill.
+    kernel_dispatch_fc2_bwd[(ncore(), 1, 1)](
         prep["gco"], prep["h_dst_rank"], prep["h_dst_off"], peer_mem,
         prep["total_send"], prep["H"],
         prep["gco"].stride(0), prep["gco"].stride(1),
-        BLOCK_H_PUSH=512, num_warps=8, use_bytecode=True)
-    # No host sync needed: the GEMM reads peer_mem that the push kernel on every
-    # rank populated; the push kernel's device barrier_all already synced the
-    # cross-rank push, and the two launches are ordered on the same stream (same
-    # rationale as combine_fc1_bwd's two-launch split).
-    # Launch 2: fc2 input-grad GEMM (Cube). Pure Cube — reads peer_mem gathered
-    # by local_sort_idxs; every tile is written by the meta, so `out` needs no
-    # zero-fill.
-    kernel_fc2_input_grad_gemm[(ncore(), 1, 1)](
-        prep["fc2"], peer_mem, prep["local_sort_idxs"],
+        prep["fc2"], prep["local_sort_idxs"],
         prep["meta_expert_ids"], prep["meta_split_cum"], prep["meta_tile_num"], prep["expert_counts"],
         prep["M"], prep["N"], prep["K"], prep["E"], prep["num_tm"], prep["num_tn"],
-        prep["H"],
         prep["fc2"].stride(0), prep["fc2"].stride(1), prep["fc2"].stride(2),
         out,
         BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-        num_warps=8, use_bytecode=True)
+        BLOCK_H_PUSH=512, PUSH_VECTOR_WORKERS=1, num_warps=8)
     return out
 
 
@@ -198,8 +211,8 @@ def dispatch_fc2_bwd_triton(saved, dy, peer_mem):
     # GEMM writes every (m,n) tile (meta covers all tokens) -> empty, no zero-fill
     out = torch.empty(prep["M"], prep["N"], dtype=dy.dtype, device=dy.device)
     # peer_mem is fully overwritten by the push phase (every arrival row read by
-    # the GEMM is written by some sender's push); the kernel's barrier_all syncs
-    # push->GEMM, so no host zero/barrier is needed here.
+    # the GEMM is written by some sender's push); the fused kernel's barrier_all
+    # syncs push->GEMM, so no host zero/barrier is needed here.
     _launch_dispatch_fc2_bwd(prep, peer_mem, out)
     # grad_fc2_out_sorted = peer_mem (arrival) gathered by local_sort_idxs
     peer_view = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(prep["total_recv"], prep["H"])
