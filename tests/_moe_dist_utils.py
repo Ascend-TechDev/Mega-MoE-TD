@@ -66,12 +66,20 @@ def init_aclshmem(rank, world_size, size_bytes, ip_port=None):
 
 
 def make_peer_mem(saved, dtype, rank):
-    """Allocate the shared symmetric buffer sized to the larger of send/recv.
+    """Allocate the shared symmetric buffer sized to the GLOBAL max of send/recv.
 
     ``dl.symm_at`` only resolves at heap offset 0 (see mega_moe.kernels), so one
     peer_mem is allocated per config and reused by backward step 1 and step 4.
+    Using the GLOBAL max (all_reduce MAX) — not per-rank max — keeps peer_mem the
+    SAME size on every rank, so any subsequent symmetric allocation (e.g. the
+    backward signal_mem) lands at the same heap offset on every rank. Without this,
+    signal_mem's offset differs per rank and signal_op RMA writes land at the wrong
+    dst offset -> dl.wait never resolves -> deadlock.
     """
-    peer_elems = max(saved["total_recv"], saved["total_send"]) * saved["hidden_dim"]
+    local_elems = max(saved["total_recv"], saved["total_send"]) * saved["hidden_dim"]
+    t = torch.tensor([local_elems], dtype=torch.int64, device=f"npu:{rank}")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=saved["ep_group"])
+    peer_elems = int(t.item())
     return ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=rank)
 
 

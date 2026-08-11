@@ -303,6 +303,7 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
         recv_weights_sorted=recv_weights_sorted, fc2_out=fc2_out,
         # weights
         fc1_1=fc1_1, fc1_2=fc1_2, fc2=fc2, fc1_combined=fc1_combined,
+        selected_experts=selected_experts,
     )
     return output, saved
 

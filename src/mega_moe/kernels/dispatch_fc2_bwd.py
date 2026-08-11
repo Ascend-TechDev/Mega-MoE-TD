@@ -5,6 +5,7 @@
 #  GEMM (Cube). The dual of combine_fc1_bwd's GEMM -> push -> reduce.
 # ============================================================================
 
+import os
 import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
@@ -12,6 +13,7 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
+import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
 from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
@@ -159,14 +161,46 @@ def _dispatch_static_maps(saved):
 
     num_tiles_m = int(saved["num_tiles_total"].item())
     num_tiles_n = (saved["ffn_dim"] + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    # ---- expert-major metadata for signal/wait variant (mirror forward dispatch_fc1) ----
+    EPR = saved["experts_per_rank"]
+    flat = saved["selected_experts"].to(torch.int64).to(device).reshape(-1)   # [total_send] global expert
+    send_counts_re = torch.bincount(flat, minlength=W * EPR).to(torch.int32).reshape(W, EPR)  # [W,EPR]
+    all_send_e = torch.stack(all_gather_list(send_counts_re.reshape(-1), ep_group)).reshape(W, W, EPR)
+    recv_counts_re = all_send_e[:, pe, :]                                       # [W, EPR] (source, le)
+    recv_per_expert = recv_counts_re.sum(0).to(torch.int32)                     # [EPR]
+    recv_expert_offs = torch.zeros(EPR + 1, dtype=torch.int32, device=device)
+    recv_expert_offs[1:] = recv_per_expert.cumsum(0).to(torch.int32)            # [EPR+1]
+    bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True).to(torch.int32)  # [total_send]
+    send_counts_flat = send_counts_re.reshape(-1)
+    send_bucket_starts = torch.zeros(W * EPR + 1, dtype=torch.int32, device=device)
+    send_bucket_starts[1:] = send_counts_flat.cumsum(0).to(torch.int32)
+    dst_total = all_send_e.sum(0)                                               # [W, EPR]
+    expert_base = torch.zeros_like(dst_total)
+    expert_base[:, 1:] = dst_total.cumsum(1)[:, :-1]
+    source_prefix = all_send_e[:pe].sum(0).to(torch.int32) if pe > 0 else \
+        torch.zeros(W, EPR, dtype=torch.int32, device=device)
+    send_bucket_dst_starts = (expert_base.to(torch.int32) + source_prefix).reshape(-1).contiguous()
+
+    # sanity: expert-major metadata must match the rank-major counts already in saved
+    assert int(send_counts_re.sum().item()) == total_send, \
+        f"send_counts_re sum {send_counts_re.sum().item()} != total_send {total_send}"
+    assert int(recv_per_expert.sum().item()) == saved["total_recv"], \
+        f"recv_per_expert sum {recv_per_expert.sum().item()} != total_recv {saved['total_recv']}"
+
     cache = dict(
         h_dst_rank=h_dst_rank, h_dst_off=h_dst_off,
-        M=saved["M"], N=saved["ffn_dim"], K=H, E=saved["experts_per_rank"],
+        M=saved["M"], N=saved["ffn_dim"], K=H, E=EPR,
         num_tm=num_tiles_m, num_tn=num_tiles_n,
         fc2=saved["fc2"].contiguous(), local_sort_idxs=saved["local_sort_idxs"].to(torch.int64).to(device),
         meta_expert_ids=saved["meta_expert_ids"].to(device), meta_split_cum=saved["meta_split_cum"].to(device),
         meta_tile_num=saved["meta_tile_num"].to(device), expert_counts=saved["expert_counts"].to(device),
         total_send=total_send, H=H, total_recv=saved["total_recv"], sort_idxs=saved["sort_idxs"].to(device),
+        send_start_per_dst=own_start, send_count_per_dst=send_t, dst_off_per_dst=pe_offset_for_d,
+        # expert-major signal/wait metadata
+        send_counts_re=send_counts_flat.contiguous(), send_bucket_starts=send_bucket_starts,
+        send_bucket_dst_starts=send_bucket_dst_starts,
+        recv_per_expert=recv_per_expert, recv_expert_offs=recv_expert_offs,
+        bwd_expert_sort=bwd_expert_sort,
     )
     saved["_dispatch_cache"] = cache
     return cache
@@ -178,7 +212,7 @@ def _prepare_dispatch_fc2_bwd(saved, dy):
     p = _dispatch_static_maps(saved)
     topk = saved["topk"]
     # grad_combined_out_flat = dy.repeat_interleave(topk)[sort_idxs]  (home, sort_idxs order)
-    grad_combined_out_flat = dy.repeat_interleave(topk, dim=0)[p["sort_idxs"]].contiguous()
+    grad_combined_out_flat = dy.repeat_interleave(topk, dim=0)[p["bwd_expert_sort"].to(torch.int64)].contiguous()
     p = dict(p)
     p["gco"] = grad_combined_out_flat
     return p
@@ -204,17 +238,204 @@ def _launch_dispatch_fc2_bwd(prep, peer_mem, out):
     return out
 
 
-def dispatch_fc2_bwd_triton(saved, dy, peer_mem):
+# ============================================================================
+# signal/wait variant (expert-major, mirror forward dispatch_fc1): putmem push
+# by (dst,expert) bucket -> peer_mem expert-major CONTIGUOUS -> consumer reads
+# CONTIGUOUS (NO local_sort gather) + dl.wait/consume_token per expert. This is
+# the only form where consume_token (required to pair fence/signal_op, else
+# undefined _mlir_ciface_*.vector) is compatible with the GEMM load: contiguous
+# load dependency tracking works; gather did not. Enable with MOE_BWD_SIGNAL=1.
+# ============================================================================
+@triton.jit
+def _dispatch_direct_grad_buckets(
+    pid, num_cores,
+    gco_staging_ptr, peer_mem_ptr, signal_mem_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    H: tl.constexpr, stride_gm,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+):
+    """Mirror forward _dispatch_direct_expert_buckets (dispatch_fc1.py:659-707).
+    Expert-major work sharing so every dst receives early expert buckets
+    concurrently. No routing-weight putmem (reverse step1 doesn't carry it)."""
+    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
+    for work_id in range(pid, num_tasks, num_cores):
+        dst_rank = work_id % WORLD_SIZE
+        expert_id = work_id // WORLD_SIZE
+        task_id = dst_rank * EXPERTS_PER_RANK + expert_id
+        task_start = tl.load(send_bucket_starts_ptr + task_id)
+        task_count = tl.load(send_counts_re_ptr + task_id)
+        task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
+        if task_count > 0:
+            libshmem_device.putmem(
+                peer_mem_ptr + task_dst_start * H,
+                gco_staging_ptr + task_start * stride_gm,
+                task_count * H * 2, dst_rank)
+            libshmem_device.fence()
+        libshmem_device.signal_op(
+            signal_mem_ptr + expert_id * 16, 1,
+            libshmem_device.ACLSHMEM_SIGNAL_ADD, dst_rank)
+
+
+@triton.jit
+def _fc2_bwd_gemm_one_mn_tile(
+    input_ptr, weight_ptr, output_ptr,
+    expert_id, m_off, m_size, n_tile, N, K,
+    stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    """fc2 input-grad GEMM one tile. A = peer_mem[m_off, H] CONTIGUOUS (no gather),
+    B = fc2[expert][H, ffn], out = grad_swiglu[m_off, ffn]."""
+    if m_size > 0:
+        om = tl.arange(0, BLOCK_M); on_ = tl.arange(0, BLOCK_N); ok = tl.arange(0, BLOCK_K)
+        m_offs = m_off + om; m_mask = om < m_size
+        n_offs = n_tile * BLOCK_N + on_; n_mask = n_offs < N
+        wb = expert_id.to(tl.int64) * stride_we
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for ks in range(0, K, BLOCK_K):
+            k_offs = ks + ok; k_mask = k_offs < K
+            ao = m_offs[:, None] * stride_im + k_offs[None, :] * stride_ik
+            a = tl.load(input_ptr + ao, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            bo = k_offs[:, None] * stride_wk + n_offs[None, :] * stride_wn
+            b = tl.load(weight_ptr + wb + bo, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+            acc += tl.dot(a, b)
+        co = m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
+        tl.store(output_ptr + co, acc.to(output_ptr.dtype.element_ty),
+                 mask=m_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _triton_grouped_gemm_fc2_bwd_expert_wait(
+    pid, ncore,
+    peer_mem_ptr, signal_mem_ptr, fc2_ptr, output_ptr,
+    recv_per_expert_ptr, recv_expert_offs_ptr, signal_epoch,
+    N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, dtype: tl.constexpr,
+):
+    """Mirror _triton_grouped_gemm_expert_tiles_wait (dispatch_fc1.py:364-409).
+    Per-expert dl.wait + consume_token (pairs fence/signal_op -> no .vector
+    undefined) + CONTIGUOUS GEMM (no local_sort_idxs gather)."""
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    for expert_id in range(0, EXPERTS_PER_RANK):
+        expert_size = tl.load(recv_per_expert_ptr + expert_id)
+        expert_off = tl.load(recv_expert_offs_ptr + expert_id)
+        num_m_tiles = tl.cdiv(expert_size, BLOCK_M)
+        num_expert_tasks = num_m_tiles * num_n_tiles
+        if num_expert_tasks > 0:
+            token = dl.wait(
+                signal_mem_ptr + expert_id * 16, 1, "gpu", "acquire",
+                waitValue=signal_epoch * WORLD_SIZE)
+            ready_input_ptr = dl.consume_token(peer_mem_ptr, token)
+            for t in range(pid, num_expert_tasks, ncore):
+                m_tile = t // num_n_tiles; n_tile = t % num_n_tiles
+                m_off = expert_off + m_tile * BLOCK_M
+                m_size = tl.minimum(expert_size - m_tile * BLOCK_M, BLOCK_M)
+                _fc2_bwd_gemm_one_mn_tile(
+                    ready_input_ptr, fc2_ptr, output_ptr,
+                    expert_id, m_off, m_size, n_tile, N, K,
+                    stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+                    BLOCK_M, BLOCK_N, BLOCK_K, dtype)
+
+
+@triton.jit(do_not_specialize=["signal_epoch"])
+def kernel_dispatch_fc2_bwd_signal(
+    gco_staging_ptr, peer_mem_ptr, signal_mem_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    total_send, H, stride_gm,
+    fc2_ptr, output_ptr,
+    recv_per_expert_ptr, recv_expert_offs_ptr,
+    N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    signal_epoch,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    PUSH_VECTOR_WORKERS: tl.constexpr,
+):
+    """#3 barrier probe: auto-split (NO al.scope) + putmem push (expert-major) +
+    barrier_all + CONTIGUOUS GEMM. Isolates metadata/putmem from signal/wait."""
+    pid = tl.program_id(axis=0)
+    ncore_v = tl.num_programs(axis=0)
+    push_sub_id = sub_vec_id().to(tl.int32)
+    if push_sub_id < PUSH_VECTOR_WORKERS:
+        push_worker_id = pid * PUSH_VECTOR_WORKERS + push_sub_id
+        num_push_workers = ncore_v * PUSH_VECTOR_WORKERS
+        num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
+        for work_id in range(push_worker_id, num_tasks, num_push_workers):
+            dst_rank = work_id % WORLD_SIZE
+            expert_id = work_id // WORLD_SIZE
+            task_id = dst_rank * EXPERTS_PER_RANK + expert_id
+            task_count = tl.load(send_counts_re_ptr + task_id)
+            if task_count > 0:
+                task_start = tl.load(send_bucket_starts_ptr + task_id)
+                task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
+                libshmem_device.putmem(
+                    peer_mem_ptr + task_dst_start * H,
+                    gco_staging_ptr + task_start * stride_gm,
+                    task_count * H * 2, dst_rank)
+    libshmem_device.barrier_all()
+    om = tl.arange(0, BLOCK_M)
+    on_ = tl.arange(0, BLOCK_N)
+    ok = tl.arange(0, BLOCK_K)
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    for expert_id in range(0, EXPERTS_PER_RANK):
+        expert_size = tl.load(recv_per_expert_ptr + expert_id)
+        expert_off = tl.load(recv_expert_offs_ptr + expert_id)
+        num_m_tiles = tl.cdiv(expert_size, BLOCK_M)
+        num_expert_tasks = num_m_tiles * num_n_tiles
+        for t in range(pid, num_expert_tasks, ncore_v):
+            m_tile = t // num_n_tiles
+            n_tile = t % num_n_tiles
+            m_off = expert_off + m_tile * BLOCK_M
+            m_size = tl.minimum(expert_size - m_tile * BLOCK_M, BLOCK_M)
+            if m_size > 0:
+                mm = om < m_size
+                n_start = n_tile * BLOCK_N
+                mn = on_ < (N - n_start)
+                wb = expert_id.to(tl.int64) * stride_we
+                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for ks in range(0, K, BLOCK_K):
+                    mk = ok < (K - ks)
+                    ao = (m_off + om)[:, None] * H + (ks + ok[None, :])
+                    a = tl.load(peer_mem_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+                    bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+                    b = tl.load(fc2_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+                    acc += tl.dot(a, b)
+                co = (m_off + om)[:, None] * N + (n_start + on_[None, :])
+                tl.store(output_ptr + co, acc.to(output_ptr.dtype.element_ty),
+                         mask=mm[:, None] & mn[None, :])
+
+
+def _launch_dispatch_fc2_bwd_signal(prep, peer_mem, out, saved):
+    W = saved["world_size"]
+    fc2 = prep["fc2"]; H = prep["H"]; N = prep["N"]; K = prep["K"]
+    kernel_dispatch_fc2_bwd_signal[(ncore(), 1, 1)](
+        prep["gco"], peer_mem, None,
+        prep["send_bucket_starts"], prep["send_counts_re"], prep["send_bucket_dst_starts"],
+        prep["total_send"], H, prep["gco"].stride(0),
+        fc2, out,
+        prep["recv_per_expert"], prep["recv_expert_offs"],
+        N, K, H, 1, fc2.stride(0), fc2.stride(1), fc2.stride(2), N, 1, 0,
+        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
+        WORLD_SIZE=W, EXPERTS_PER_RANK=prep["E"], PUSH_VECTOR_WORKERS=2, num_warps=8)
+    return out
+
+
+def dispatch_fc2_bwd_triton(saved, dy, peer_mem, use_signal=None):
     """Step 1: returns (grad_swiglu [M,ffn], grad_fc2_out_sorted [M,H]).
-    peer_mem is the shared symmetric buffer at heap offset 0 (reused with step 4)."""
+    MOE_BWD_SIGNAL=1 selects the expert-major signal/wait variant (putmem +
+    dl.wait/consume_token, no barrier_all, no gather); default is the auto-split
+    + barrier_all fused kernel."""
     prep = _prepare_dispatch_fc2_bwd(saved, dy)
-    # GEMM writes every (m,n) tile (meta covers all tokens) -> empty, no zero-fill
     out = torch.empty(prep["M"], prep["N"], dtype=dy.dtype, device=dy.device)
-    # peer_mem is fully overwritten by the push phase (every arrival row read by
-    # the GEMM is written by some sender's push); the fused kernel's barrier_all
-    # syncs push->GEMM, so no host zero/barrier is needed here.
-    _launch_dispatch_fc2_bwd(prep, peer_mem, out)
-    # grad_fc2_out_sorted = peer_mem (arrival) gathered by local_sort_idxs
-    peer_view = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(prep["total_recv"], prep["H"])
-    grad_fc2_out_sorted = peer_view[prep["local_sort_idxs"]].contiguous()
+    if use_signal is None:
+        use_signal = os.environ.get("MOE_BWD_SIGNAL") == "1"
+    if use_signal:
+        _launch_dispatch_fc2_bwd_signal(prep, peer_mem, out, saved)
+        # expert-major peer_mem IS the sorted layout -> identity view (no gather)
+        grad_fc2_out_sorted = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(
+            prep["total_recv"], prep["H"]).contiguous()
+    else:
+        _launch_dispatch_fc2_bwd(prep, peer_mem, out)
+        peer_view = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(prep["total_recv"], prep["H"])
+        grad_fc2_out_sorted = peer_view[prep["local_sort_idxs"]].contiguous()
     return out, grad_fc2_out_sorted
