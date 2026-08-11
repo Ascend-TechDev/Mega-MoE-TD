@@ -53,17 +53,20 @@ The remaining environment variables are runtime knobs only:
 """
 
 import dataclasses
+import ctypes
 import fcntl
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 from collections import OrderedDict
 
 import pytest
@@ -117,6 +120,9 @@ PRODUCTION_PRODUCT_REMOTE = "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
 PRODUCT_REMOTE = PRODUCTION_PRODUCT_REMOTE
 PRODUCT_FEATURE_REF = "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810"
 PRODUCT_MAIN_REF = "refs/heads/main"
+BIGOP_REMOTE = "https://gitcode.com/jzhoujg/bigop.git"
+BIGOP_GITLINK_PATH = "3rdparty/bigop"
+BIGOP_IDENTITY_PREFIX = "gitlink:"
 AUTHORITY_SCHEMA = "uniep.environment-authority.v1"
 AUTHORITY_ENVELOPE_SCHEMA = "uniep.environment-authority-envelope.v1"
 AUTHORITY_PRODUCER_IDENTITY = "autoport-codex01"
@@ -210,6 +216,31 @@ class AuthorityEnvelope:
     product: dict
     environment: dict
     producer: dict
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class SnapshotEntry:
+    path: str
+    kind: str
+    mode: int
+    size: int | None = None
+    sha256: str | None = None
+    blob_oid: str | None = None
+    commit_oid: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class SnapshotIdentity:
+    root: Path
+    tree: str
+    manifest_sha256: str
+    entries: tuple[SnapshotEntry, ...]
+    canonical_manifest: bytes
+    bigop_commit: str
+    bigop_manifest_sha256: str
+    bigop_entries: tuple[SnapshotEntry, ...]
+    root_device: int
+    root_inode: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -626,6 +657,714 @@ def _git_blob(cwd: Path, bare_repo: Path, oid: str) -> bytes:
         ("--git-dir", str(bare_repo), "cat-file", "blob", oid),
         "Git blob read",
     )
+
+
+def _safe_snapshot_path(value: str) -> PurePosixPath:
+    try:
+        path = PurePosixPath(value)
+    except (TypeError, ValueError) as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot path") from error
+    if (
+        not value
+        or path.is_absolute()
+        or ".." in path.parts
+        or "." in path.parts
+        or str(path) != value
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot path")
+    return path
+
+
+def _snapshot_entry_record(entry: SnapshotEntry) -> dict:
+    if entry.kind == "file":
+        if (
+            entry.mode not in (0o100644, 0o100755)
+            or type(entry.size) is not int
+            or entry.size < 0
+            or not isinstance(entry.sha256, str)
+            or _SHA256_PATTERN.fullmatch(entry.sha256) is None
+            or not isinstance(entry.blob_oid, str)
+            or _GIT_OID_PATTERN.fullmatch(entry.blob_oid) is None
+            or entry.commit_oid is not None
+        ):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot file entry")
+        return {
+            "blob_oid": entry.blob_oid,
+            "kind": "file",
+            "mode": entry.mode,
+            "path": entry.path,
+            "sha256": entry.sha256,
+            "size": entry.size,
+        }
+    if entry.kind == "gitlink":
+        if (
+            entry.mode != 0o160000
+            or entry.size is not None
+            or entry.sha256 is not None
+            or entry.blob_oid is not None
+            or not isinstance(entry.commit_oid, str)
+            or _GIT_OID_PATTERN.fullmatch(entry.commit_oid) is None
+        ):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot gitlink entry")
+        return {
+            "commit_oid": entry.commit_oid,
+            "kind": "gitlink",
+            "mode": entry.mode,
+            "path": entry.path,
+        }
+    raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot entry kind")
+
+
+def _snapshot_manifest(entries: tuple[SnapshotEntry, ...]) -> tuple[bytes, str]:
+    if tuple(sorted(entries)) != entries or len({item.path for item in entries}) != len(
+        entries
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot entry order")
+    records = []
+    for entry in entries:
+        _safe_snapshot_path(entry.path)
+        records.append(_snapshot_entry_record(entry))
+    raw = (
+        json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _ls_tree_entries(
+    cwd: Path, bare_repo: Path, commit: str
+) -> tuple[tuple[SnapshotEntry, bytes | None], ...]:
+    raw = _checked_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "ls-tree", "-rz", "-r", commit),
+        "snapshot tree enumeration",
+    )
+    items = []
+    seen = set()
+    for record in (item for item in raw.split(b"\0") if item):
+        try:
+            header, encoded_path = record.split(b"\t", 1)
+            mode_text, kind, oid = header.decode("ascii").split()
+            relative = encoded_path.decode("utf-8", "strict")
+            mode = int(mode_text, 8)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_INVALID", "snapshot tree record"
+            ) from error
+        _safe_snapshot_path(relative)
+        if relative in seen:
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "duplicate snapshot path")
+        seen.add(relative)
+        if mode in (0o100644, 0o100755) and kind == "blob":
+            content = _git_blob(cwd, bare_repo, oid)
+            entry = SnapshotEntry(
+                path=relative,
+                kind="file",
+                mode=mode,
+                size=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+                blob_oid=oid,
+            )
+        elif mode == 0o160000 and kind == "commit":
+            content = None
+            entry = SnapshotEntry(
+                path=relative,
+                kind="gitlink",
+                mode=mode,
+                commit_oid=oid,
+            )
+        else:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_INVALID", "unsupported snapshot tree entry"
+            )
+        items.append((entry, content))
+    items.sort(key=lambda item: item[0])
+    return tuple(items)
+
+
+def _elf_build_id(content: bytes) -> str | None:
+    if len(content) < 64 or not content.startswith(b"\x7fELF"):
+        return None
+    elf_class, data_encoding = content[4], content[5]
+    if elf_class not in (1, 2) or data_encoding not in (1, 2):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "ELF identity")
+    byteorder = "little" if data_encoding == 1 else "big"
+
+    def integer(offset: int, size: int) -> int:
+        end = offset + size
+        if offset < 0 or end > len(content):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "ELF bounds")
+        return int.from_bytes(content[offset:end], byteorder)
+
+    if elf_class == 2:
+        program_offset = integer(32, 8)
+        entry_size = integer(54, 2)
+        entry_count = integer(56, 2)
+        offset_field, size_field, field_size = 8, 32, 8
+    else:
+        program_offset = integer(28, 4)
+        entry_size = integer(42, 2)
+        entry_count = integer(44, 2)
+        offset_field, size_field, field_size = 4, 16, 4
+    if entry_size == 0 or entry_count > 4096:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "ELF program headers")
+    for index in range(entry_count):
+        header = program_offset + index * entry_size
+        if integer(header, 4) != 4:
+            continue
+        note_offset = integer(header + offset_field, field_size)
+        note_size = integer(header + size_field, field_size)
+        cursor = note_offset
+        limit = note_offset + note_size
+        if limit > len(content):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "ELF note bounds")
+        while cursor + 12 <= limit:
+            name_size = integer(cursor, 4)
+            description_size = integer(cursor + 4, 4)
+            note_type = integer(cursor + 8, 4)
+            cursor += 12
+            name_end = cursor + name_size
+            description_start = (name_end + 3) & ~3
+            description_end = description_start + description_size
+            next_note = (description_end + 3) & ~3
+            if next_note > limit:
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "ELF note record")
+            name = content[cursor:name_end]
+            description = content[description_start:description_end]
+            if note_type == 3 and name.rstrip(b"\0") == b"GNU":
+                return description.hex()
+            cursor = next_note
+    return None
+
+
+def _bigop_component_members(
+    entries_with_bytes: tuple[tuple[SnapshotEntry, bytes | None], ...]
+) -> list[dict]:
+    members = []
+    for entry, content in entries_with_bytes:
+        if entry.kind != "file" or content is None:
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "nested bigop entry")
+        members.append(
+            {
+                "elf_build_id": _elf_build_id(content),
+                "kind": "file",
+                "mode": entry.mode,
+                "name": entry.path,
+                "sha256": entry.sha256,
+                "size": entry.size,
+            }
+        )
+    return members
+
+
+def _fetch_exact_commit(
+    cwd: Path, bare_repo: Path, remote: str, commit: str
+) -> None:
+    if _GIT_OID_PATTERN.fullmatch(commit) is None:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "gitlink commit")
+    _require_config_free_bare_repository(bare_repo)
+    completed = _remote_git(
+        cwd,
+        (
+            "--git-dir",
+            str(bare_repo),
+            "fetch",
+            "--no-tags",
+            remote,
+            f"+{commit}:refs/uniep/exact",
+        ),
+        None,
+    )
+    if completed.returncode != 0:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "gitlink fetch")
+    _require_config_free_bare_repository(bare_repo)
+    observed = _checked_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "rev-parse", "refs/uniep/exact^{commit}"),
+        "gitlink identity",
+    ).decode("ascii").strip()
+    if observed != commit:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "gitlink identity")
+
+
+def _derive_snapshot_plan(envelope: AuthorityEnvelope, scratch: Path) -> dict:
+    if not isinstance(envelope, AuthorityEnvelope):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "authority envelope")
+    product_repo = scratch / "product.git"
+    derived_product = _derive_product(
+        scratch, product_repo, envelope.product.get("commit", ""), None
+    )
+    if derived_product != envelope.product:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "product authority drift")
+    observed_tree = _checked_git(
+        scratch,
+        (
+            "--git-dir",
+            str(product_repo),
+            "rev-parse",
+            f"{envelope.product['commit']}^{{tree}}",
+        ),
+        "snapshot product tree",
+    ).decode("ascii").strip()
+    if observed_tree != envelope.product.get("tree"):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot product tree")
+    product_items = _ls_tree_entries(
+        scratch, product_repo, envelope.product["commit"]
+    )
+    product_entries = tuple(item[0] for item in product_items)
+    canonical_manifest, manifest_sha256 = _snapshot_manifest(product_entries)
+    product_by_path = {item.path: (item, content) for item, content in product_items}
+    for source in envelope.product.get("sources", ()):
+        candidate = product_by_path.get(source.get("path"))
+        if (
+            candidate is None
+            or candidate[0].kind != "file"
+            or candidate[0].blob_oid != source.get("blob_oid")
+            or candidate[0].sha256 != source.get("sha256")
+        ):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "source denominator")
+
+    modules_item = product_by_path.get(".gitmodules")
+    gitlink_item = product_by_path.get(BIGOP_GITLINK_PATH)
+    expected_modules = (
+        '[submodule "3rdparty/bigop"]\n'
+        "\tpath = 3rdparty/bigop\n"
+        f"\turl = {BIGOP_REMOTE}\n"
+    ).encode("utf-8")
+    if (
+        modules_item is None
+        or modules_item[0].kind != "file"
+        or modules_item[1] != expected_modules
+        or gitlink_item is None
+        or gitlink_item[0].kind != "gitlink"
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "bigop gitlink contract")
+    bigop_commit = gitlink_item[0].commit_oid
+    component = envelope.environment.get("bigop")
+    if (
+        not isinstance(component, dict)
+        or component.get("resolver_id") != "uniep-bigop-resolver-v1"
+        or component.get("identity") != BIGOP_IDENTITY_PREFIX + bigop_commit
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "bigop identity")
+
+    bigop_repo = scratch / "bigop.git"
+    _initialize_config_free_bare_repository(
+        scratch, bigop_repo, "bigop bare repository"
+    )
+    _fetch_exact_commit(scratch, bigop_repo, BIGOP_REMOTE, bigop_commit)
+    bigop_items = _ls_tree_entries(scratch, bigop_repo, bigop_commit)
+    if any(item.kind != "file" for item, _content in bigop_items):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "nested bigop tree")
+    bigop_members = _bigop_component_members(bigop_items)
+    encoded_members = (
+        json.dumps(bigop_members, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if (
+        component.get("members") != bigop_members
+        or component.get("member_count") != len(bigop_members)
+        or component.get("total_bytes")
+        != sum(item["size"] for item in bigop_members)
+        or component.get("manifest_sha256")
+        != hashlib.sha256(encoded_members).hexdigest()
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "bigop manifest")
+    return {
+        "bigop_commit": bigop_commit,
+        "bigop_entries": tuple(item[0] for item in bigop_items),
+        "bigop_items": bigop_items,
+        "bigop_manifest_sha256": hashlib.sha256(encoded_members).hexdigest(),
+        "canonical_manifest": canonical_manifest,
+        "manifest_sha256": manifest_sha256,
+        "product_entries": product_entries,
+        "product_items": product_items,
+        "tree": observed_tree,
+    }
+
+
+def _snapshot_name(tree: str, manifest_sha256: str) -> str:
+    if (
+        _GIT_OID_PATTERN.fullmatch(tree) is None
+        or _SHA256_PATTERN.fullmatch(manifest_sha256) is None
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity")
+    return f"{tree}-{manifest_sha256}"
+
+
+def _open_snapshot_parent(root: Path) -> int:
+    root = Path(root)
+    if not root.is_absolute():
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root")
+    try:
+        if not root.exists():
+            root.mkdir(mode=0o700)
+        before = root.lstat()
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root") from error
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o700
+        or before.st_uid != os.geteuid()
+        or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        os.close(descriptor)
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
+    return descriptor
+
+
+def _snapshot_physical_items(plan: dict) -> tuple[tuple[SnapshotEntry, bytes], ...]:
+    items = []
+    for entry, content in plan["product_items"]:
+        if entry.kind == "file":
+            items.append((entry, content))
+    for entry, content in plan["bigop_items"]:
+        items.append(
+            (
+                dataclasses.replace(entry, path=f"{BIGOP_GITLINK_PATH}/{entry.path}"),
+                content,
+            )
+        )
+    return tuple(sorted(items, key=lambda item: item[0]))
+
+
+def _create_snapshot_tree(
+    root_fd: int, physical_items: tuple[tuple[SnapshotEntry, bytes], ...]
+) -> None:
+    directory_names = set()
+    for entry, _content in physical_items:
+        relative = _safe_snapshot_path(entry.path)
+        for index in range(1, len(relative.parts)):
+            directory_names.add("/".join(relative.parts[:index]))
+    descriptors = {"": root_fd}
+    try:
+        for relative in sorted(directory_names, key=lambda value: (value.count("/"), value)):
+            path = PurePosixPath(relative)
+            parent = "/".join(path.parts[:-1])
+            os.mkdir(path.name, mode=0o755, dir_fd=descriptors[parent])
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=descriptors[parent],
+            )
+            os.fchmod(descriptor, 0o755)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o755
+                or opened.st_uid != os.geteuid()
+            ):
+                os.close(descriptor)
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot directory")
+            descriptors[relative] = descriptor
+        for entry, content in physical_items:
+            path = PurePosixPath(entry.path)
+            parent = "/".join(path.parts[:-1])
+            descriptor = os.open(
+                path.name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                entry.mode & 0o777,
+                dir_fd=descriptors[parent],
+            )
+            try:
+                view = memoryview(content)
+                written = 0
+                while written < len(view):
+                    written += os.write(descriptor, view[written:])
+                os.fchmod(descriptor, entry.mode & 0o777)
+                os.fsync(descriptor)
+                opened = os.fstat(descriptor)
+                observed = os.pread(descriptor, len(content) + 1, 0)
+                linked = os.stat(
+                    path.name, dir_fd=descriptors[parent], follow_symlinks=False
+                )
+                if (
+                    (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+                    or opened.st_nlink != 1
+                    or opened.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened.st_mode) != (entry.mode & 0o777)
+                    or observed != content
+                ):
+                    raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot write")
+            finally:
+                os.close(descriptor)
+        for name in sorted(descriptors, key=lambda value: value.count("/"), reverse=True):
+            os.fsync(descriptors[name])
+    except OSError as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot materialization") from error
+    finally:
+        for name, descriptor in tuple(descriptors.items()):
+            if name:
+                os.close(descriptor)
+
+
+def _publish_snapshot(parent_fd: int, staging_name: str, final_name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise AuthorityPreflightError("SNAPSHOT_PUBLISH_FAILED", "renameat2 unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            parent_fd,
+            os.fsencode(staging_name),
+            parent_fd,
+            os.fsencode(final_name),
+            1,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        raise AuthorityPreflightError(
+            "SNAPSHOT_PUBLISH_FAILED", os.strerror(error_number)
+        )
+    os.fsync(parent_fd)
+
+
+def _snapshot_identity_from_plan(root: Path, plan: dict) -> SnapshotIdentity:
+    try:
+        observed = root.lstat()
+    except OSError as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity") from error
+    if not stat.S_ISDIR(observed.st_mode):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity")
+    return SnapshotIdentity(
+        root=root,
+        tree=plan["tree"],
+        manifest_sha256=plan["manifest_sha256"],
+        entries=plan["product_entries"],
+        canonical_manifest=plan["canonical_manifest"],
+        bigop_commit=plan["bigop_commit"],
+        bigop_manifest_sha256=plan["bigop_manifest_sha256"],
+        bigop_entries=plan["bigop_entries"],
+        root_device=observed.st_dev,
+        root_inode=observed.st_ino,
+    )
+
+
+def _expected_physical_entries(identity: SnapshotIdentity) -> dict[str, SnapshotEntry]:
+    expected = {
+        item.path: item for item in identity.entries if item.kind == "file"
+    }
+    for item in identity.bigop_entries:
+        path = f"{BIGOP_GITLINK_PATH}/{item.path}"
+        expected[path] = dataclasses.replace(item, path=path)
+    return expected
+
+
+def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
+    expected = _expected_physical_entries(identity)
+    expected_directories = set()
+    for relative in expected:
+        path = PurePosixPath(relative)
+        for index in range(1, len(path.parts)):
+            expected_directories.add("/".join(path.parts[:index]))
+    try:
+        root_before = identity.root.lstat()
+        root_fd = os.open(
+            identity.root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root open") from error
+    observed_files = {}
+    observed_directories = set()
+
+    def walk(directory_fd: int, prefix: str) -> None:
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as error:
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot enumerate") from error
+        for name in names:
+            if not name or "/" in name or name in (".", ".."):
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot name")
+            relative = f"{prefix}/{name}" if prefix else name
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as error:
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot stat") from error
+            if stat.S_ISDIR(before.st_mode):
+                if (
+                    stat.S_IMODE(before.st_mode) != 0o755
+                    or before.st_uid != os.geteuid()
+                ):
+                    raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot directory")
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise AuthorityPreflightError(
+                        "SNAPSHOT_INVALID", "snapshot directory open"
+                    ) from error
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        raise AuthorityPreflightError(
+                            "SNAPSHOT_INVALID", "snapshot directory swap"
+                        )
+                    observed_directories.add(relative)
+                    walk(child_fd, relative)
+                    after = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise AuthorityPreflightError(
+                            "SNAPSHOT_INVALID", "snapshot directory replacement"
+                        )
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot file type")
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot file open") from error
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                    or opened.st_nlink != 1
+                    or opened.st_uid != os.geteuid()
+                ):
+                    raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot file identity")
+                chunks = []
+                offset = 0
+                while True:
+                    chunk = os.pread(descriptor, 1024 * 1024, offset)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    offset += len(chunk)
+                content = b"".join(chunks)
+                after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot file replacement")
+                observed_files[relative] = SnapshotEntry(
+                    path=relative,
+                    kind="file",
+                    mode=stat.S_IFREG | stat.S_IMODE(opened.st_mode),
+                    size=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    blob_oid=hashlib.sha1(
+                        f"blob {len(content)}\0".encode("ascii") + content
+                    ).hexdigest(),
+                )
+            finally:
+                os.close(descriptor)
+
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            (opened_root.st_dev, opened_root.st_ino)
+            != (root_before.st_dev, root_before.st_ino)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (identity.root_device, identity.root_inode)
+            or stat.S_IMODE(opened_root.st_mode) != 0o700
+            or opened_root.st_uid != os.geteuid()
+        ):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
+        walk(root_fd, "")
+        root_after = identity.root.lstat()
+        if (root_after.st_dev, root_after.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root replacement")
+    finally:
+        os.close(root_fd)
+    if observed_directories != expected_directories or observed_files != expected:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot physical inventory")
+
+
+def _materialize_product_snapshot(
+    envelope: AuthorityEnvelope, root: Path
+) -> SnapshotIdentity:
+    root = Path(root)
+    parent_fd = _open_snapshot_parent(root)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".uniep-snapshot-plan-") as temporary:
+            plan = _derive_snapshot_plan(envelope, Path(temporary))
+        final_name = _snapshot_name(plan["tree"], plan["manifest_sha256"])
+        final_root = root / final_name
+        try:
+            final_root.lstat()
+        except FileNotFoundError:
+            staging_name = f".{final_name}.staging-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
+                staging_fd = os.open(
+                    staging_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except OSError as error:
+                raise AuthorityPreflightError(
+                    "SNAPSHOT_INVALID", "snapshot staging"
+                ) from error
+            try:
+                _create_snapshot_tree(staging_fd, _snapshot_physical_items(plan))
+                staging_stat = os.fstat(staging_fd)
+                _publish_snapshot(parent_fd, staging_name, final_name)
+                final_stat = final_root.lstat()
+                if (final_stat.st_dev, final_stat.st_ino) != (
+                    staging_stat.st_dev,
+                    staging_stat.st_ino,
+                ):
+                    raise AuthorityPreflightError(
+                        "SNAPSHOT_INVALID", "snapshot publish identity"
+                    )
+            finally:
+                os.close(staging_fd)
+        identity = _snapshot_identity_from_plan(final_root, plan)
+    finally:
+        os.close(parent_fd)
+    _verify_product_snapshot(identity, envelope)
+    return identity
+
+
+def _verify_product_snapshot(
+    identity: SnapshotIdentity, envelope: AuthorityEnvelope
+) -> None:
+    if not isinstance(identity, SnapshotIdentity) or not identity.root.is_absolute():
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity")
+    with tempfile.TemporaryDirectory(prefix=".uniep-snapshot-verify-") as temporary:
+        plan = _derive_snapshot_plan(envelope, Path(temporary))
+    expected = _snapshot_identity_from_plan(identity.root, plan)
+    if dataclasses.replace(
+        expected,
+        root_device=identity.root_device,
+        root_inode=identity.root_inode,
+    ) != identity:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot authority identity")
+    if identity.root.name != _snapshot_name(identity.tree, identity.manifest_sha256):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot content address")
+    _verify_snapshot_physical(identity)
 
 
 def _canonical_json(raw: bytes):

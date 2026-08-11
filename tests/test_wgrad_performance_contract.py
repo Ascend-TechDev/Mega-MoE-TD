@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -1227,3 +1228,287 @@ def test_task2_test_only_closed_loop_closes_capability_exactly_once(
     assert close_calls == [capability.fd]
     with pytest.raises(OSError):
         os.fstat(capability.fd)
+
+
+def _task3_blob(repo: Path, commit: str, relative: str) -> tuple[str, bytes, int]:
+    record = _task2_git(repo, "ls-tree", commit, "--", relative).decode().strip()
+    mode, kind, oid, observed = record.split(maxsplit=3)
+    assert kind == "blob" and observed == relative
+    return oid, _task2_git(repo, "cat-file", "blob", oid), int(mode, 8)
+
+
+def _task3_fixture(monkeypatch, tmp_path: Path):
+    bigop_work = tmp_path / "bigop-work"
+    bigop_work.mkdir()
+    _task2_git(bigop_work, "init", "-q", "-b", "main")
+    _task2_git(bigop_work, "config", "user.name", "Task3 Bigop Fixture")
+    _task2_git(bigop_work, "config", "user.email", "task3@example.invalid")
+    (bigop_work / "include").mkdir()
+    (bigop_work / "include" / "bigop.h").write_text("#define BIGOP 1\n")
+    executable = bigop_work / "probe.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    bigop_commit = _task2_commit(bigop_work, "bigop fixture")
+    bigop_remote = tmp_path / "bigop.git"
+    _task2_git(tmp_path, "clone", "-q", "--bare", str(bigop_work), str(bigop_remote))
+
+    product_work = tmp_path / "task3-product-work"
+    product_work.mkdir()
+    _task2_git(product_work, "init", "-q", "-b", "main")
+    _task2_git(product_work, "config", "user.name", "Task3 Product Fixture")
+    _task2_git(product_work, "config", "user.email", "task3@example.invalid")
+    for index, relative in enumerate(_TASK2_SOURCE_PATHS):
+        target = product_work / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"anchor-{index}\n", encoding="utf-8")
+    modules = (
+        '[submodule "3rdparty/bigop"]\n'
+        "\tpath = 3rdparty/bigop\n"
+        f"\turl = {bigop_remote}\n"
+    )
+    (product_work / ".gitmodules").write_text(modules, encoding="utf-8")
+    _task2_git(product_work, "add", "-A")
+    _task2_git(
+        product_work,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{bigop_commit},3rdparty/bigop",
+    )
+    _task2_git(product_work, "commit", "-qm", "task3 main")
+    main_commit = _task2_git(product_work, "rev-parse", "HEAD").decode().strip()
+    runner = product_work / _TASK2_SOURCE_PATHS[0]
+    runner.write_text("anchor-0\nfeature\n", encoding="utf-8")
+    _task2_git(product_work, "add", _TASK2_SOURCE_PATHS[0])
+    _task2_git(product_work, "commit", "-qm", "task3 feature")
+    feature_commit = _task2_git(product_work, "rev-parse", "HEAD").decode().strip()
+    tree = _task2_git(
+        product_work, "rev-parse", f"{feature_commit}^{{tree}}"
+    ).decode().strip()
+    product_remote = tmp_path / "task3-product.git"
+    _task2_git(
+        tmp_path, "clone", "-q", "--bare", str(product_work), str(product_remote)
+    )
+    _task2_git(product_remote, "update-ref", "refs/heads/main", main_commit)
+    _task2_git(
+        product_remote,
+        "update-ref",
+        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        feature_commit,
+    )
+
+    sources = []
+    for relative in _TASK2_SOURCE_PATHS:
+        oid, raw, _mode = _task3_blob(product_work, feature_commit, relative)
+        sources.append(
+            {"blob_oid": oid, "path": relative, "sha256": hashlib.sha256(raw).hexdigest()}
+        )
+    product = {
+        "authority_path": (
+            f"authorities/uniep/wgrad/{feature_commit}/environment-authority.json"
+        ),
+        "commit": feature_commit,
+        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "main_is_ancestor": True,
+        "main_ref": "refs/heads/main",
+        "observed_main": main_commit,
+        "remote": str(product_remote),
+        "sole_parent": main_commit,
+        "sources": sources,
+        "tree": tree,
+    }
+    environment = _task2_environment()
+    bigop_members = []
+    for relative in ("include/bigop.h", "probe.sh"):
+        oid, raw, mode = _task3_blob(bigop_work, bigop_commit, relative)
+        del oid
+        bigop_members.append(
+            {
+                "elf_build_id": None,
+                "kind": "file",
+                "mode": mode,
+                "name": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    encoded_members = _task2_canonical_json(bigop_members)
+    environment["bigop"] = {
+        "identity": f"gitlink:{bigop_commit}",
+        "manifest_sha256": hashlib.sha256(encoded_members).hexdigest(),
+        "member_count": len(bigop_members),
+        "members": bigop_members,
+        "resolver_id": "uniep-bigop-resolver-v1",
+        "total_bytes": sum(item["size"] for item in bigop_members),
+    }
+    suite = _load_benchmark_suite()
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(product_remote))
+    monkeypatch.setattr(suite, "BIGOP_REMOTE", str(bigop_remote))
+    envelope = suite.AuthorityEnvelope(
+        raw=b"{}\n",
+        payload_sha256="a" * 64,
+        product=product,
+        environment=environment,
+        producer={},
+    )
+    return types.SimpleNamespace(
+        bigop_commit=bigop_commit,
+        envelope=envelope,
+        product_work=product_work,
+        suite=suite,
+    )
+
+
+def test_task3_snapshot_is_git_derived_content_addressed_and_reusable(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    ambient = tmp_path / "ambient"
+    ambient.mkdir()
+    (ambient / "benchmark.py").write_text("malicious\n", encoding="utf-8")
+
+    first = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    fixture.suite._verify_product_snapshot(first, fixture.envelope)
+    second = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+
+    assert second == first
+    assert first.tree == fixture.envelope.product["tree"]
+    assert first.root.name == f"{first.tree}-{first.manifest_sha256}"
+    assert first.root_device == first.root.stat().st_dev
+    assert first.root_inode == first.root.stat().st_ino
+    assert any(
+        item.kind == "gitlink"
+        and item.path == "3rdparty/bigop"
+        and item.commit_oid == fixture.bigop_commit
+        for item in first.entries
+    )
+    assert (first.root / "3rdparty" / "bigop" / "include" / "bigop.h").is_file()
+    assert str(ambient) not in first.canonical_manifest.decode()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "extra",
+        "symlink",
+        "hardlink",
+        "content",
+        "mode",
+        "bigop_content",
+        "root_replacement",
+        "gitlink_identity",
+        "gitmodules_url",
+    ),
+)
+def test_task3_snapshot_and_bigop_mutations_fail_closed(
+    monkeypatch, tmp_path, mutation
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    target = snapshot.root / "benchmark" / "layer" / "bench_moe_suite.py"
+    if mutation == "missing":
+        target.unlink()
+    elif mutation == "extra":
+        (snapshot.root / "extra").write_text("extra\n", encoding="utf-8")
+    elif mutation == "symlink":
+        target.unlink()
+        target.symlink_to(snapshot.root / "conftest.py")
+    elif mutation == "hardlink":
+        foreign = tmp_path / "foreign"
+        foreign.write_bytes(target.read_bytes())
+        target.unlink()
+        os.link(foreign, target)
+    elif mutation == "content":
+        target.write_text("mutated\n", encoding="utf-8")
+    elif mutation == "mode":
+        target.chmod(0o755)
+    elif mutation == "bigop_content":
+        (snapshot.root / "3rdparty" / "bigop" / "probe.sh").write_text(
+            "#!/bin/sh\nexit 7\n", encoding="utf-8"
+        )
+    elif mutation == "root_replacement":
+        held = tmp_path / "held-root"
+        snapshot.root.rename(held)
+        shutil.copytree(held, snapshot.root)
+    elif mutation == "gitlink_identity":
+        fixture.envelope.environment["bigop"]["identity"] = "gitlink:" + "0" * 40
+    elif mutation == "gitmodules_url":
+        monkeypatch.setattr(fixture.suite, "BIGOP_REMOTE", str(tmp_path / "wrong.git"))
+
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+
+
+def test_task3_snapshot_never_imports_or_calls_device(monkeypatch, tmp_path):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    device_events = []
+    monkeypatch.setattr(
+        fixture.suite,
+        "_load_benchmark_device_runtime",
+        lambda: device_events.append("loader"),
+    )
+
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+
+    assert device_events == []
+    assert "torch_npu" not in sys.modules
+
+
+def test_task3_enumeration_to_open_same_bytes_swap_is_rejected(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    target = snapshot.root / "benchmark" / "layer" / "bench_moe_suite.py"
+    held = tmp_path / "enumerated-leaf"
+    original_open = fixture.suite.os.open
+    replaced = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if (
+            not replaced
+            and path == "bench_moe_suite.py"
+            and flags & os.O_DIRECTORY == 0
+            and kwargs.get("dir_fd") is not None
+        ):
+            target.rename(held)
+            shutil.copy2(held, target)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(fixture.suite.os, "open", swap_before_open)
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+    assert replaced is True
+
+
+def test_task3_partial_content_addressed_generation_is_not_reused(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    seed = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "seed-snapshots"
+    )
+    root = tmp_path / "snapshots"
+    root.mkdir(mode=0o700)
+    partial = root / seed.root.name
+    partial.mkdir(mode=0o700)
+    (partial / "partial").write_text("not a snapshot\n", encoding="utf-8")
+
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._materialize_product_snapshot(fixture.envelope, root)
+
+    assert (partial / "partial").read_text(encoding="utf-8") == "not a snapshot\n"
