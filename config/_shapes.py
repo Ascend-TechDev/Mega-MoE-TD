@@ -230,7 +230,7 @@ _CASE_GROUPS = (
     ),
     CaseGroup(
         prefix="performance-bwd-kimi-k3", direction="backward", model="Kimi-K3",
-        tokens=(4096, 8192, 16384), worlds=(4, 8), hidden=3584, ffn=3072,
+        tokens=(2048, 4096, 8192, 16384), worlds=(4, 8), hidden=3584, ffn=3072,
         topk=16, num_experts=896,
         tags=frozenset({"performance", "backward", "kimi", "slow"}),
     ),
