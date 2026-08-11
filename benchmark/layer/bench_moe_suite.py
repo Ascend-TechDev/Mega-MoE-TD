@@ -110,9 +110,11 @@ BACKWARD_EVIDENCE_SOURCES = (
 BACKWARD_ENVIRONMENT_COMPONENTS = frozenset(
     {"python", "torch", "torch_npu", "triton", "cann", "aclshmem", "bigop"}
 )
-AUTHORITY_REMOTE = "https://github.com/EdisonAILab/agent-team-wiki.git"
+PRODUCTION_AUTHORITY_REMOTE = "https://github.com/EdisonAILab/agent-team-wiki.git"
+AUTHORITY_REMOTE = PRODUCTION_AUTHORITY_REMOTE
 AUTHORITY_REF = "refs/heads/main"
-PRODUCT_REMOTE = "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
+PRODUCTION_PRODUCT_REMOTE = "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
+PRODUCT_REMOTE = PRODUCTION_PRODUCT_REMOTE
 PRODUCT_FEATURE_REF = "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810"
 PRODUCT_MAIN_REF = "refs/heads/main"
 AUTHORITY_SCHEMA = "uniep.environment-authority.v1"
@@ -120,6 +122,12 @@ AUTHORITY_ENVELOPE_SCHEMA = "uniep.environment-authority-envelope.v1"
 AUTHORITY_PRODUCER_IDENTITY = "autoport-codex01"
 AUTHORITY_PRODUCER_POLICY = "uniep-wgrad-environment-authority-v1"
 CREDENTIAL_CAPABILITY_POLICY = "uniep-git-credential-capability-v1"
+TEST_ONLY_CREDENTIAL_CAPABILITY_POLICY = (
+    "uniep-test-only-injected-credential-capability-v1"
+)
+UNVERIFIED_C01_ISSUER = "UNVERIFIED_C01_ISSUER"
+TEST_ONLY_INJECTED_LAUNCHER = "TEST_ONLY_INJECTED_LAUNCHER"
+TEST_ONLY_AUTHORITY_RECEIPT_SCHEMA = "uniep.test-only-authority-read-receipt.v1"
 AUTHORITY_PRODUCER_TOOL_PATH = "tools/uniep_environment_authority.py"
 BACKWARD_TARGET_MODEL = "Qwen3-30B-A3B"
 BACKWARD_TARGET_WORLD_SIZE = 2
@@ -212,12 +220,20 @@ class CredentialCapability:
     helper_blob_oid: str
     helper_sha256: str
     policy: str
+    provenance: str
 
     def receipt_identity(self) -> dict:
+        status = (
+            "TEST_ONLY"
+            if self.provenance == TEST_ONLY_INJECTED_LAUNCHER
+            else "PRODUCTION_AUTHORITY_NOT_ESTABLISHED"
+        )
         return {
             "helper_blob_oid": self.helper_blob_oid,
             "helper_sha256": self.helper_sha256,
             "policy": self.policy,
+            "provenance": self.provenance,
+            "status": status,
         }
 
 
@@ -230,13 +246,15 @@ def _authority_path(product_commit: str) -> str:
     )
 
 
-def _credential_capability_from_c01_launcher(fd: int) -> CredentialCapability:
-    """Seal the consumer view of a launcher-owned anonymous credential FD."""
+def _credential_capability_from_launcher(
+    fd: int, *, policy: str, provenance: str
+) -> CredentialCapability:
     capability = CredentialCapability(
         fd=fd,
         helper_blob_oid=_ASKPASS_HELPER_BLOB_OID,
         helper_sha256=_ASKPASS_HELPER_SHA256,
-        policy=CREDENTIAL_CAPABILITY_POLICY,
+        policy=policy,
+        provenance=provenance,
     )
     try:
         _validate_credential_capability(capability)
@@ -249,15 +267,37 @@ def _credential_capability_from_c01_launcher(fd: int) -> CredentialCapability:
     return capability
 
 
+def _credential_capability_from_c01_launcher(fd: int) -> CredentialCapability:
+    """Parse the legacy claimed-C01 capability without proving its issuer."""
+    return _credential_capability_from_launcher(
+        fd,
+        policy=CREDENTIAL_CAPABILITY_POLICY,
+        provenance=UNVERIFIED_C01_ISSUER,
+    )
+
+
+def _credential_capability_from_test_only_launcher(fd: int) -> CredentialCapability:
+    """Create an explicitly non-production capability for isolated host fixtures."""
+    return _credential_capability_from_launcher(
+        fd,
+        policy=TEST_ONLY_CREDENTIAL_CAPABILITY_POLICY,
+        provenance=TEST_ONLY_INJECTED_LAUNCHER,
+    )
+
+
 def _validate_credential_capability(capability: CredentialCapability) -> None:
     if not isinstance(capability, CredentialCapability):
         raise AuthorityPreflightError(
             "AUTHORITY_REMOTE_AUTH_FAILED", "credential capability type"
         )
+    expected_provenance = {
+        CREDENTIAL_CAPABILITY_POLICY: UNVERIFIED_C01_ISSUER,
+        TEST_ONLY_CREDENTIAL_CAPABILITY_POLICY: TEST_ONLY_INJECTED_LAUNCHER,
+    }.get(capability.policy)
     if (
         capability.helper_blob_oid != _ASKPASS_HELPER_BLOB_OID
         or capability.helper_sha256 != _ASKPASS_HELPER_SHA256
-        or capability.policy != CREDENTIAL_CAPABILITY_POLICY
+        or capability.provenance != expected_provenance
     ):
         raise AuthorityPreflightError(
             "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper identity"
@@ -878,7 +918,7 @@ def _close_credential(capability: CredentialCapability | None) -> None:
         pass
 
 
-def _read_authority_object(
+def _read_authority_object_impl(
     product_commit: str,
     scratch: Path,
     credential: CredentialCapability | None,
@@ -942,6 +982,82 @@ def _read_authority_object(
             full_sha256=hashlib.sha256(raw).hexdigest(),
         )
         return anchor, envelope
+    finally:
+        _close_credential(credential)
+
+
+def _read_authority_object(
+    product_commit: str,
+    scratch: Path,
+    credential: CredentialCapability | None,
+) -> tuple[AuthorityAnchor, AuthorityEnvelope]:
+    """Production reader; an injected test capability cannot enter this API."""
+    if credential is not None:
+        try:
+            _validate_credential_capability(credential)
+            if credential.provenance == TEST_ONLY_INJECTED_LAUNCHER:
+                raise AuthorityPreflightError(
+                    "TEST_ONLY_REQUIRED", "use the explicit test-only authority reader"
+                )
+        except Exception:
+            _close_credential(credential)
+            raise
+    return _read_authority_object_impl(product_commit, scratch, credential)
+
+
+def _is_test_only_remote(remote: str) -> bool:
+    return (
+        Path(remote).is_absolute()
+        or remote.startswith("file://")
+        or remote.startswith("http://127.0.0.1:")
+        or remote.startswith("http://[::1]:")
+        or remote.startswith("http://localhost:")
+    )
+
+
+def _read_test_only_authority_object(
+    product_commit: str,
+    scratch: Path,
+    credential: CredentialCapability,
+) -> tuple[AuthorityAnchor, AuthorityEnvelope, dict]:
+    """Execute the host authority loop without creating production evidence."""
+    try:
+        _validate_credential_capability(credential)
+        if credential.provenance != TEST_ONLY_INJECTED_LAUNCHER:
+            raise AuthorityPreflightError(
+                "TEST_ONLY_REQUIRED", "test-only launcher capability"
+            )
+        if (
+            AUTHORITY_REMOTE == PRODUCTION_AUTHORITY_REMOTE
+            or PRODUCT_REMOTE == PRODUCTION_PRODUCT_REMOTE
+            or not _is_test_only_remote(AUTHORITY_REMOTE)
+            or not _is_test_only_remote(PRODUCT_REMOTE)
+        ):
+            raise AuthorityPreflightError(
+                "TEST_ONLY_REQUIRED", "test-only loopback or local remotes"
+            )
+        credential_identity = credential.receipt_identity()
+        anchor, envelope = _read_authority_object_impl(
+            product_commit, scratch, credential
+        )
+        receipt = {
+            "authority_anchor": {
+                "blob_oid": anchor.blob_oid,
+                "commit": anchor.commit,
+                "full_sha256": anchor.full_sha256,
+                "path": anchor.path,
+                "tree": anchor.tree,
+            },
+            "credential": credential_identity,
+            "device_actions": 0,
+            "environment_components": sorted(envelope.environment),
+            "product_commit": product_commit,
+            "production_authority_status": "NOT_ESTABLISHED",
+            "schema": TEST_ONLY_AUTHORITY_RECEIPT_SCHEMA,
+            "source_count": len(envelope.product["sources"]),
+            "status": "TEST_ONLY",
+        }
+        return anchor, envelope, receipt
     finally:
         _close_credential(credential)
 

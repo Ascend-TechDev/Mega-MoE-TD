@@ -718,9 +718,9 @@ def _task2_authenticated_remote(remote: Path, username: str, password: str):
         server.server_close()
 
 
-def _task2_credential(suite, username: str, password: str):
+def _task2_sealed_credential_fd(username: str, password: str) -> int:
     fd = os.memfd_create(
-        "uniep-c01-credential", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        "uniep-test-only-credential", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
     )
     payload = _task2_canonical_json({"password": password, "username": username})
     os.write(fd, payload)
@@ -734,7 +734,16 @@ def _task2_credential(suite, username: str, password: str):
     )
     fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
     os.set_inheritable(fd, True)
-    return suite._credential_capability_from_c01_launcher(fd)
+    return fd
+
+
+def _task2_test_only_credential(suite, username: str, password: str):
+    fd = _task2_sealed_credential_fd(username, password)
+    try:
+        return suite._credential_capability_from_test_only_launcher(fd)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def test_task2_authority_valid_local_bare_remotes(monkeypatch, tmp_path):
@@ -902,7 +911,9 @@ def test_task2_helper_identity_failure_removes_materialized_askpass(
     monkeypatch, tmp_path
 ):
     suite = _load_benchmark_suite()
-    capability = _task2_credential(suite, "c01", "helper-cleanup-secret")
+    capability = _task2_test_only_credential(
+        suite, "fixture", "helper-cleanup-secret"
+    )
     original_read_bytes = Path.read_bytes
 
     def drift_materialized_helper(path):
@@ -926,7 +937,9 @@ def test_task2_remote_auth_missing_capability_is_distinct_and_secret_free(
     suite = _load_benchmark_suite()
     fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
     monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
-    with _task2_authenticated_remote(fixture.authority_remote, "c01", "secret") as url:
+    with _task2_authenticated_remote(
+        fixture.authority_remote, "fixture", "secret"
+    ) as url:
         monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
         with pytest.raises(suite.AuthorityPreflightError) as captured:
             suite._read_authority_object(
@@ -954,7 +967,7 @@ def test_task2_remote_auth_and_credential_mutations_fail_closed(
     suite = _load_benchmark_suite()
     fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
     monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
-    username = "c01"
+    username = "fixture"
     password = "never-render-this-secret"
     server_password = password if mutation != "secret_output" else "different"
     side_effect = tmp_path / "ambient-helper-ran"
@@ -978,7 +991,7 @@ def test_task2_remote_auth_and_credential_mutations_fail_closed(
         "caller_credential",
         "missing_capability",
     }:
-        capability = _task2_credential(suite, username, password)
+        capability = _task2_test_only_credential(suite, username, password)
     if mutation == "invalid_capability":
         sealed_fd = capability.fd
         invalid_fd = os.memfd_create("unsealed-caller")
@@ -987,6 +1000,7 @@ def test_task2_remote_auth_and_credential_mutations_fail_closed(
             helper_blob_oid=capability.helper_blob_oid,
             helper_sha256=capability.helper_sha256,
             policy=capability.policy,
+            provenance=capability.provenance,
         )
         os.close(sealed_fd)
     elif mutation == "helper_identity_drift":
@@ -997,11 +1011,18 @@ def test_task2_remote_auth_and_credential_mutations_fail_closed(
     ) as url:
         monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
         with pytest.raises(suite.AuthorityPreflightError) as captured:
-            suite._read_authority_object(
-                fixture.product.feature_commit,
-                tmp_path / "scratch",
-                capability,
-            )
+            if capability is None:
+                suite._read_authority_object(
+                    fixture.product.feature_commit,
+                    tmp_path / "scratch",
+                    capability,
+                )
+            else:
+                suite._read_test_only_authority_object(
+                    fixture.product.feature_commit,
+                    tmp_path / "scratch",
+                    capability,
+                )
     assert captured.value.code == "AUTHORITY_REMOTE_AUTH_FAILED"
     assert password.encode() not in captured.value.rendered_bytes
     assert not side_effect.exists()
@@ -1019,16 +1040,17 @@ def test_task2_authenticated_fixed_ref_absent_product_path_is_authority_missing(
     suite = _load_benchmark_suite()
     fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
     monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
-    password = "bounded-c01-secret"
-    capability = _task2_credential(suite, "c01", password)
+    password = "synthetic-loopback-secret"
+    capability = _task2_test_only_credential(suite, "fixture", password)
     receipt_identity = capability.receipt_identity()
     assert "fd" not in receipt_identity and "path" not in json.dumps(receipt_identity)
+    assert receipt_identity["status"] == "TEST_ONLY"
     with _task2_authenticated_remote(
-        fixture.authority_remote, "c01", password
+        fixture.authority_remote, "fixture", password
     ) as url:
         monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
         with pytest.raises(suite.AuthorityPreflightError) as captured:
-            suite._read_authority_object(
+            suite._read_test_only_authority_object(
                 fixture.product.feature_commit,
                 tmp_path / "scratch",
                 capability,
@@ -1037,3 +1059,121 @@ def test_task2_authenticated_fixed_ref_absent_product_path_is_authority_missing(
     with pytest.raises(OSError):
         os.fstat(capability.fd)
     assert list((tmp_path / "scratch").glob(".uniep-askpass-*")) == []
+
+
+def test_task2_test_only_authenticated_host_closed_loop_has_explicit_receipt(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+    password = "synthetic-loopback-only"
+    capability = _task2_test_only_credential(suite, "fixture", password)
+    device_events = []
+    monkeypatch.setattr(
+        suite, "_load_benchmark_device_runtime", lambda: device_events.append("loader")
+    )
+
+    with _task2_authenticated_remote(
+        fixture.authority_remote, "fixture", password
+    ) as url:
+        monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
+        anchor, envelope, receipt = suite._read_test_only_authority_object(
+            fixture.product.feature_commit,
+            tmp_path / "scratch",
+            capability,
+        )
+
+    assert anchor.commit == fixture.authority_commit
+    assert envelope.product == fixture.product.product
+    assert receipt["schema"] == "uniep.test-only-authority-read-receipt.v1"
+    assert receipt["status"] == "TEST_ONLY"
+    assert receipt["production_authority_status"] == "NOT_ESTABLISHED"
+    assert receipt["credential"]["status"] == "TEST_ONLY"
+    assert receipt["credential"]["provenance"] == "TEST_ONLY_INJECTED_LAUNCHER"
+    assert receipt["product_commit"] == fixture.product.feature_commit
+    assert receipt["authority_anchor"]["blob_oid"] == anchor.blob_oid
+    assert receipt["source_count"] == len(_TASK2_SOURCE_PATHS)
+    assert tuple(receipt["environment_components"]) == _TASK2_COMPONENTS
+    assert receipt["device_actions"] == 0
+    rendered = json.dumps(receipt, sort_keys=True)
+    assert password not in rendered
+    assert str(tmp_path) not in rendered
+    assert "fd" not in receipt["credential"]
+    assert device_events == []
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)
+    assert list((tmp_path / "scratch").glob(".uniep-askpass-*")) == []
+
+
+def test_task2_test_only_injection_refuses_production_remotes_before_git(tmp_path):
+    suite = _load_benchmark_suite()
+    capability = _task2_test_only_credential(suite, "fixture", "local-only")
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._read_test_only_authority_object(
+            "1" * 40,
+            tmp_path / "scratch",
+            capability,
+        )
+
+    assert captured.value.code == "TEST_ONLY_REQUIRED"
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)
+    assert not (tmp_path / "scratch").exists()
+
+
+def test_task2_product_minted_c01_capability_never_claims_production_pass():
+    suite = _load_benchmark_suite()
+    fd = _task2_sealed_credential_fd("caller", "self-minted")
+    capability = suite._credential_capability_from_c01_launcher(fd)
+    try:
+        receipt = capability.receipt_identity()
+        assert receipt["status"] == "PRODUCTION_AUTHORITY_NOT_ESTABLISHED"
+        assert receipt["provenance"] == "UNVERIFIED_C01_ISSUER"
+        assert receipt["status"] != "TEST_ONLY"
+    finally:
+        os.close(capability.fd)
+
+
+def test_task2_test_only_capability_requires_explicit_test_only_reader(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+    capability = _task2_test_only_credential(suite, "fixture", "local-only")
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._read_authority_object(
+            fixture.product.feature_commit,
+            tmp_path / "scratch",
+            capability,
+        )
+
+    assert captured.value.code == "TEST_ONLY_REQUIRED"
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)
+    assert not (tmp_path / "scratch").exists()
+
+
+def test_task2_test_only_reader_rejects_unverified_c01_claim(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+    fd = _task2_sealed_credential_fd("caller", "self-minted")
+    capability = suite._credential_capability_from_c01_launcher(fd)
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._read_test_only_authority_object(
+            fixture.product.feature_commit,
+            tmp_path / "scratch",
+            capability,
+        )
+
+    assert captured.value.code == "TEST_ONLY_REQUIRED"
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)
+    assert not (tmp_path / "scratch").exists()
