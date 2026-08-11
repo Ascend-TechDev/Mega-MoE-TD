@@ -1344,6 +1344,15 @@ def _task3_fixture(monkeypatch, tmp_path: Path):
     suite = _load_benchmark_suite()
     monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(product_remote))
     monkeypatch.setattr(suite, "BIGOP_REMOTE", str(bigop_remote))
+    modules_oid, _modules_raw, _modules_mode = _task3_blob(
+        product_work, feature_commit, ".gitmodules"
+    )
+    monkeypatch.setattr(
+        suite, "BIGOP_GITMODULES_BLOB_OID", modules_oid, raising=False
+    )
+    monkeypatch.setattr(
+        suite, "BIGOP_GITLINK_COMMIT", bigop_commit, raising=False
+    )
     envelope = suite.AuthorityEnvelope(
         raw=b"{}\n",
         payload_sha256="a" * 64,
@@ -1512,3 +1521,89 @@ def test_task3_partial_content_addressed_generation_is_not_reused(
         fixture.suite._materialize_product_snapshot(fixture.envelope, root)
 
     assert (partial / "partial").read_text(encoding="utf-8") == "not a snapshot\n"
+
+
+def test_task3_late_extra_after_directory_enumeration_is_rejected(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    original_listdir = fixture.suite.os.listdir
+    injected = False
+
+    def inject_after_enumeration(path):
+        nonlocal injected
+        names = original_listdir(path)
+        if not injected and isinstance(path, int):
+            (snapshot.root / "late-extra").write_text("late\n", encoding="utf-8")
+            injected = True
+        return names
+
+    monkeypatch.setattr(fixture.suite.os, "listdir", inject_after_enumeration)
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+    assert injected is True
+
+
+def test_task3_snapshot_parent_replacement_during_plan_is_rejected(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    root = tmp_path / "snapshots"
+    fixture.suite._materialize_product_snapshot(fixture.envelope, root)
+    held = tmp_path / "held-snapshot-parent"
+    original_derive = fixture.suite._derive_snapshot_plan
+    replaced = False
+
+    def replace_parent_after_plan(*args, **kwargs):
+        nonlocal replaced
+        plan = original_derive(*args, **kwargs)
+        if not replaced:
+            root.rename(held)
+            shutil.copytree(held, root)
+            replaced = True
+        return plan
+
+    monkeypatch.setattr(
+        fixture.suite, "_derive_snapshot_plan", replace_parent_after_plan
+    )
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._materialize_product_snapshot(fixture.envelope, root)
+    assert replaced is True
+
+
+def test_task3_matching_envelope_cannot_override_required_bigop_gitlink(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(fixture.suite, "BIGOP_GITLINK_COMMIT", "0" * 40)
+
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._materialize_product_snapshot(
+            fixture.envelope, tmp_path / "snapshots"
+        )
+
+
+@pytest.mark.parametrize("failure_stage", ("create", "publish"))
+def test_task3_failed_materialization_reclaims_owned_staging(
+    monkeypatch, tmp_path, failure_stage
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    root = tmp_path / "snapshots"
+    target = (
+        "_create_snapshot_tree" if failure_stage == "create" else "_publish_snapshot"
+    )
+
+    def fail(*_args, **_kwargs):
+        raise fixture.suite.AuthorityPreflightError(
+            "SNAPSHOT_PUBLISH_FAILED", failure_stage
+        )
+
+    monkeypatch.setattr(fixture.suite, target, fail)
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._materialize_product_snapshot(fixture.envelope, root)
+
+    assert root.is_dir()
+    assert list(root.iterdir()) == []

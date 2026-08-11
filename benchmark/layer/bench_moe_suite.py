@@ -123,6 +123,8 @@ PRODUCT_MAIN_REF = "refs/heads/main"
 BIGOP_REMOTE = "https://gitcode.com/jzhoujg/bigop.git"
 BIGOP_GITLINK_PATH = "3rdparty/bigop"
 BIGOP_IDENTITY_PREFIX = "gitlink:"
+BIGOP_GITMODULES_BLOB_OID = "c42c065bf7df9c047a8704eea9871f804afb67f4"
+BIGOP_GITLINK_COMMIT = "68ca4cb68dca41ca8960e6aedc38bd224b08a2af"
 AUTHORITY_SCHEMA = "uniep.environment-authority.v1"
 AUTHORITY_ENVELOPE_SCHEMA = "uniep.environment-authority-envelope.v1"
 AUTHORITY_PRODUCER_IDENTITY = "autoport-codex01"
@@ -934,9 +936,11 @@ def _derive_snapshot_plan(envelope: AuthorityEnvelope, scratch: Path) -> dict:
     if (
         modules_item is None
         or modules_item[0].kind != "file"
+        or modules_item[0].blob_oid != BIGOP_GITMODULES_BLOB_OID
         or modules_item[1] != expected_modules
         or gitlink_item is None
         or gitlink_item[0].kind != "gitlink"
+        or gitlink_item[0].commit_oid != BIGOP_GITLINK_COMMIT
     ):
         raise AuthorityPreflightError("SNAPSHOT_INVALID", "bigop gitlink contract")
     bigop_commit = gitlink_item[0].commit_oid
@@ -1015,6 +1019,22 @@ def _open_snapshot_parent(root: Path) -> int:
         os.close(descriptor)
         raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
     return descriptor
+
+
+def _validate_snapshot_parent(root: Path, descriptor: int) -> os.stat_result:
+    try:
+        linked = Path(root).lstat()
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root") from error
+    if (
+        not stat.S_ISDIR(linked.st_mode)
+        or stat.S_IMODE(linked.st_mode) != 0o700
+        or linked.st_uid != os.geteuid()
+        or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
+    return opened
 
 
 def _snapshot_physical_items(plan: dict) -> tuple[tuple[SnapshotEntry, bytes], ...]:
@@ -1136,11 +1156,142 @@ def _publish_snapshot(parent_fd: int, staging_name: str, final_name: str) -> Non
     os.fsync(parent_fd)
 
 
-def _snapshot_identity_from_plan(root: Path, plan: dict) -> SnapshotIdentity:
+def _remove_owned_snapshot_tree(directory_fd: int) -> None:
     try:
-        observed = root.lstat()
+        names = sorted(os.listdir(directory_fd))
     except OSError as error:
-        raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity") from error
+        raise AuthorityPreflightError(
+            "SNAPSHOT_CLEANUP_FAILED", "snapshot staging enumerate"
+        ) from error
+    for name in names:
+        if not name or "/" in name or name in (".", ".."):
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging name"
+            )
+        try:
+            linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging stat"
+            ) from error
+        if linked.st_uid != os.geteuid():
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging owner"
+            )
+        if stat.S_ISDIR(linked.st_mode):
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise AuthorityPreflightError(
+                    "SNAPSHOT_CLEANUP_FAILED", "snapshot staging directory"
+                ) from error
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+                    raise AuthorityPreflightError(
+                        "SNAPSHOT_CLEANUP_FAILED", "snapshot staging directory swap"
+                    )
+                _remove_owned_snapshot_tree(child_fd)
+                after = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise AuthorityPreflightError(
+                        "SNAPSHOT_CLEANUP_FAILED",
+                        "snapshot staging directory replacement",
+                    )
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+            continue
+        if not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging file type"
+            )
+        try:
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging file"
+            ) from error
+        try:
+            opened = os.fstat(file_fd)
+            after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+                or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+            ):
+                raise AuthorityPreflightError(
+                    "SNAPSHOT_CLEANUP_FAILED", "snapshot staging file identity"
+                )
+        finally:
+            os.close(file_fd)
+        os.unlink(name, dir_fd=directory_fd)
+    if os.listdir(directory_fd):
+        raise AuthorityPreflightError(
+            "SNAPSHOT_CLEANUP_FAILED", "snapshot staging changed"
+        )
+
+
+def _cleanup_owned_staging(
+    parent_fd: int,
+    staging_name: str,
+    staging_identity: tuple[int, int],
+) -> None:
+    try:
+        staging_fd = os.open(
+            staging_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_CLEANUP_FAILED", "snapshot staging open"
+        ) from error
+    try:
+        opened = os.fstat(staging_fd)
+        linked = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (opened.st_dev, opened.st_ino) != staging_identity
+            or (linked.st_dev, linked.st_ino) != staging_identity
+            or opened.st_uid != os.geteuid()
+        ):
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging identity"
+            )
+        _remove_owned_snapshot_tree(staging_fd)
+        after = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != staging_identity:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_CLEANUP_FAILED", "snapshot staging replacement"
+            )
+    finally:
+        os.close(staging_fd)
+    os.rmdir(staging_name, dir_fd=parent_fd)
+
+
+def _snapshot_identity_from_plan(
+    root: Path, plan: dict, observed: os.stat_result | None = None
+) -> SnapshotIdentity:
+    if observed is None:
+        try:
+            observed = root.lstat()
+        except OSError as error:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_INVALID", "snapshot identity"
+            ) from error
     if not stat.S_ISDIR(observed.st_mode):
         raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity")
     return SnapshotIdentity(
@@ -1277,6 +1428,15 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
                 )
             finally:
                 os.close(descriptor)
+        try:
+            if sorted(os.listdir(directory_fd)) != names:
+                raise AuthorityPreflightError(
+                    "SNAPSHOT_INVALID", "snapshot directory changed"
+                )
+        except OSError as error:
+            raise AuthorityPreflightError(
+                "SNAPSHOT_INVALID", "snapshot enumerate"
+            ) from error
 
     try:
         opened_root = os.fstat(root_fd)
@@ -1308,14 +1468,20 @@ def _materialize_product_snapshot(
     root = Path(root)
     parent_fd = _open_snapshot_parent(root)
     try:
+        _validate_snapshot_parent(root, parent_fd)
         with tempfile.TemporaryDirectory(prefix=".uniep-snapshot-plan-") as temporary:
             plan = _derive_snapshot_plan(envelope, Path(temporary))
+        _validate_snapshot_parent(root, parent_fd)
         final_name = _snapshot_name(plan["tree"], plan["manifest_sha256"])
         final_root = root / final_name
         try:
-            final_root.lstat()
+            final_stat = os.stat(
+                final_name, dir_fd=parent_fd, follow_symlinks=False
+            )
         except FileNotFoundError:
             staging_name = f".{final_name}.staging-{secrets.token_hex(16)}"
+            staging_identity = None
+            published = False
             try:
                 os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
                 staging_fd = os.open(
@@ -1323,15 +1489,19 @@ def _materialize_product_snapshot(
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=parent_fd,
                 )
+                staging_stat = os.fstat(staging_fd)
+                staging_identity = (staging_stat.st_dev, staging_stat.st_ino)
             except OSError as error:
                 raise AuthorityPreflightError(
                     "SNAPSHOT_INVALID", "snapshot staging"
                 ) from error
             try:
                 _create_snapshot_tree(staging_fd, _snapshot_physical_items(plan))
-                staging_stat = os.fstat(staging_fd)
                 _publish_snapshot(parent_fd, staging_name, final_name)
-                final_stat = final_root.lstat()
+                published = True
+                final_stat = os.stat(
+                    final_name, dir_fd=parent_fd, follow_symlinks=False
+                )
                 if (final_stat.st_dev, final_stat.st_ino) != (
                     staging_stat.st_dev,
                     staging_stat.st_ino,
@@ -1341,7 +1511,28 @@ def _materialize_product_snapshot(
                     )
             finally:
                 os.close(staging_fd)
-        identity = _snapshot_identity_from_plan(final_root, plan)
+                if not published and staging_identity is not None:
+                    try:
+                        final_stat = os.stat(
+                            final_name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                    except FileNotFoundError:
+                        _cleanup_owned_staging(
+                            parent_fd, staging_name, staging_identity
+                        )
+                    else:
+                        published = (
+                            final_stat.st_dev,
+                            final_stat.st_ino,
+                        ) == staging_identity
+                        if not published:
+                            _cleanup_owned_staging(
+                                parent_fd, staging_name, staging_identity
+                            )
+        if not stat.S_ISDIR(final_stat.st_mode):
+            raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot identity")
+        _validate_snapshot_parent(root, parent_fd)
+        identity = _snapshot_identity_from_plan(final_root, plan, final_stat)
     finally:
         os.close(parent_fd)
     _verify_product_snapshot(identity, envelope)
