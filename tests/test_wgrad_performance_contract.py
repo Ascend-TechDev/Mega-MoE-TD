@@ -862,6 +862,64 @@ def test_task2_authority_source_denominator_is_ordered_and_exact(
     assert suite.BACKWARD_EVIDENCE_SOURCES == _TASK2_SOURCE_PATHS
 
 
+def test_task2_local_bare_config_cannot_rewrite_fixed_remote(tmp_path):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    caller_bare = tmp_path / "caller-controlled.git"
+    _task2_git(tmp_path, "init", "-q", "--bare", str(caller_bare))
+    fixed_remote = "https://fixed.invalid/authority.git"
+    _task2_git(
+        caller_bare,
+        "config",
+        f"url.file://{fixture.authority_remote}/.insteadOf",
+        fixed_remote,
+    )
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._fetch_refs(
+            tmp_path,
+            caller_bare,
+            fixed_remote,
+            (("refs/heads/main", "refs/uniep/authority", fixture.authority_commit),),
+            None,
+        )
+    assert captured.value.code == "AUTHORITY_INVALID"
+
+
+@pytest.mark.parametrize("component_name", _TASK2_COMPONENTS)
+def test_task2_component_resolver_id_is_exact(component_name):
+    suite = _load_benchmark_suite()
+    component = _task2_environment()[component_name]
+    component["resolver_id"] = f"caller-selected-{component_name}"
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._validate_component(component_name, component)
+
+    assert captured.value.code == "AUTHORITY_INVALID"
+
+
+def test_task2_helper_identity_failure_removes_materialized_askpass(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    capability = _task2_credential(suite, "c01", "helper-cleanup-secret")
+    original_read_bytes = Path.read_bytes
+
+    def drift_materialized_helper(path):
+        if path.name.startswith(".uniep-askpass-"):
+            return b"identity drift\n"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", drift_materialized_helper)
+    try:
+        with pytest.raises(suite.AuthorityPreflightError) as captured:
+            suite._write_askpass_helper(tmp_path, capability)
+        assert captured.value.code == "AUTHORITY_REMOTE_AUTH_FAILED"
+        assert list(tmp_path.glob(".uniep-askpass-*")) == []
+    finally:
+        os.close(capability.fd)
+
+
 def test_task2_remote_auth_missing_capability_is_distinct_and_secret_free(
     monkeypatch, tmp_path
 ):

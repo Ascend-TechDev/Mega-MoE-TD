@@ -313,8 +313,10 @@ def _git_environment(
         "LANG": "C",
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_DIR": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS_REQUIRE": "never",
     }
@@ -363,12 +365,14 @@ def _run_git(
 def _write_askpass_helper(cwd: Path, credential: CredentialCapability) -> Path:
     _validate_credential_capability(credential)
     helper_path = cwd / f".uniep-askpass-{os.getpid()}-{credential.fd}"
+    helper_created = False
     try:
         descriptor = os.open(
             helper_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
             0o700,
         )
+        helper_created = True
         with os.fdopen(descriptor, "wb") as helper_file:
             helper_file.write(_ASKPASS_HELPER_BYTES)
         helper_stat = helper_path.lstat()
@@ -383,11 +387,14 @@ def _write_askpass_helper(cwd: Path, credential: CredentialCapability) -> Path:
                 "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper materialization"
             )
         return helper_path
-    except OSError as error:
-        try:
-            helper_path.unlink()
-        except OSError:
-            pass
+    except Exception as error:
+        if helper_created:
+            try:
+                helper_path.unlink()
+            except OSError:
+                pass
+        if isinstance(error, AuthorityPreflightError):
+            raise
         raise AuthorityPreflightError(
             "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper materialization"
         ) from error
@@ -488,6 +495,35 @@ def _checked_git(cwd: Path, args, detail: str) -> bytes:
     return completed.stdout
 
 
+def _initialize_config_free_bare_repository(
+    cwd: Path, bare_repo: Path, detail: str
+) -> None:
+    initialized = _run_git(cwd, ("init", "--bare", str(bare_repo)))
+    if initialized.returncode != 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", detail)
+    config_path = bare_repo / "config"
+    try:
+        config_stat = config_path.lstat()
+        if not stat.S_ISREG(config_stat.st_mode) or config_stat.st_nlink != 1:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", detail)
+        config_path.unlink()
+    except OSError as error:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", detail) from error
+    try:
+        config_path.lstat()
+    except FileNotFoundError:
+        return
+    raise AuthorityPreflightError("AUTHORITY_INVALID", detail)
+
+
+def _require_config_free_bare_repository(bare_repo: Path) -> None:
+    try:
+        (bare_repo / "config").lstat()
+    except FileNotFoundError:
+        return
+    raise AuthorityPreflightError("AUTHORITY_INVALID", "bare repository local config")
+
+
 def _fetch_refs(
     cwd: Path,
     bare_repo: Path,
@@ -495,10 +531,12 @@ def _fetch_refs(
     refs: tuple[tuple[str, str, str], ...],
     credential: CredentialCapability | None,
 ) -> None:
+    _require_config_free_bare_repository(bare_repo)
     arguments = ["--git-dir", str(bare_repo), "fetch", "--no-tags", remote]
     for remote_ref, destination_ref, _expected in refs:
         arguments.append(f"+{remote_ref}:{destination_ref}")
     _remote_git(cwd, tuple(arguments), credential)
+    _require_config_free_bare_repository(bare_repo)
     for _remote_ref, destination_ref, expected in refs:
         actual = _checked_git(
             cwd,
@@ -590,7 +628,7 @@ def _validate_component(name: str, component) -> None:
         raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} component keys")
     if not isinstance(component["identity"], str) or not component["identity"].strip():
         raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} identity")
-    if not isinstance(component["resolver_id"], str) or not component["resolver_id"].strip():
+    if component["resolver_id"] != f"uniep-{name}-resolver-v1":
         raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} resolver")
     if Path(component["identity"]).is_absolute() or Path(
         component["resolver_id"]
@@ -656,9 +694,9 @@ def _derive_product(
     )
     if feature_commit != expected_product_commit:
         raise AuthorityPreflightError("AUTHORITY_INVALID", "product feature commit")
-    initialized = _run_git(cwd, ("init", "--bare", str(bare_repo)))
-    if initialized.returncode != 0:
-        raise AuthorityPreflightError("AUTHORITY_INVALID", "product bare repository")
+    _initialize_config_free_bare_repository(
+        cwd, bare_repo, "product bare repository"
+    )
     _fetch_refs(
         cwd,
         bare_repo,
@@ -866,9 +904,9 @@ def _read_authority_object(
             AUTHORITY_REMOTE, AUTHORITY_REF, scratch, credential
         )
         authority_repo = scratch / "authority.git"
-        initialized = _run_git(scratch, ("init", "--bare", str(authority_repo)))
-        if initialized.returncode != 0:
-            raise AuthorityPreflightError("AUTHORITY_INVALID", "authority bare repository")
+        _initialize_config_free_bare_repository(
+            scratch, authority_repo, "authority bare repository"
+        )
         _fetch_refs(
             scratch,
             authority_repo,
