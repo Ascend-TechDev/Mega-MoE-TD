@@ -1177,3 +1177,53 @@ def test_task2_test_only_reader_rejects_unverified_c01_claim(
     with pytest.raises(OSError):
         os.fstat(capability.fd)
     assert not (tmp_path / "scratch").exists()
+
+
+def test_task2_unknown_credential_policy_with_none_provenance_fails_closed():
+    suite = _load_benchmark_suite()
+    fd = _task2_sealed_credential_fd("fixture", "unknown-policy")
+    capability = suite.CredentialCapability(
+        fd=fd,
+        helper_blob_oid=suite._ASKPASS_HELPER_BLOB_OID,
+        helper_sha256=suite._ASKPASS_HELPER_SHA256,
+        policy="unknown-policy",
+        provenance=None,
+    )
+    try:
+        with pytest.raises(suite.AuthorityPreflightError) as captured:
+            suite._validate_credential_capability(capability)
+        assert captured.value.code == "AUTHORITY_REMOTE_AUTH_FAILED"
+    finally:
+        os.close(fd)
+
+
+def test_task2_test_only_closed_loop_closes_capability_exactly_once(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+    capability = _task2_test_only_credential(suite, "fixture", "close-once")
+    close_calls = []
+    original_close = suite._close_credential
+
+    def counted_close(candidate):
+        if candidate is not None:
+            close_calls.append(candidate.fd)
+        original_close(candidate)
+
+    monkeypatch.setattr(suite, "_close_credential", counted_close)
+    with _task2_authenticated_remote(
+        fixture.authority_remote, "fixture", "close-once"
+    ) as url:
+        monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
+        _, _, receipt = suite._read_test_only_authority_object(
+            fixture.product.feature_commit,
+            tmp_path / "scratch",
+            capability,
+        )
+
+    assert receipt["status"] == "TEST_ONLY"
+    assert close_calls == [capability.fd]
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)

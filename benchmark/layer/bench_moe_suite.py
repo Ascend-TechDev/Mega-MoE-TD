@@ -297,6 +297,7 @@ def _validate_credential_capability(capability: CredentialCapability) -> None:
     if (
         capability.helper_blob_oid != _ASKPASS_HELPER_BLOB_OID
         or capability.helper_sha256 != _ASKPASS_HELPER_SHA256
+        or expected_provenance is None
         or capability.provenance != expected_provenance
     ):
         raise AuthorityPreflightError(
@@ -1021,6 +1022,7 @@ def _read_test_only_authority_object(
     credential: CredentialCapability,
 ) -> tuple[AuthorityAnchor, AuthorityEnvelope, dict]:
     """Execute the host authority loop without creating production evidence."""
+    delegated_credential_close = False
     try:
         _validate_credential_capability(credential)
         if credential.provenance != TEST_ONLY_INJECTED_LAUNCHER:
@@ -1037,6 +1039,7 @@ def _read_test_only_authority_object(
                 "TEST_ONLY_REQUIRED", "test-only loopback or local remotes"
             )
         credential_identity = credential.receipt_identity()
+        delegated_credential_close = True
         anchor, envelope = _read_authority_object_impl(
             product_commit, scratch, credential
         )
@@ -1059,7 +1062,8 @@ def _read_test_only_authority_object(
         }
         return anchor, envelope, receipt
     finally:
-        _close_credential(credential)
+        if not delegated_credential_close:
+            _close_credential(credential)
 
 # This is the published protocol.  Keep debug/short runs under a differently
 # named script so their output cannot be mistaken for 5/50 evidence.
