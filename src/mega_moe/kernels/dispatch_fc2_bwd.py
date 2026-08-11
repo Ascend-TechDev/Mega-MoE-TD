@@ -187,6 +187,9 @@ def _dispatch_static_maps(saved):
     assert int(recv_per_expert.sum().item()) == saved["total_recv"], \
         f"recv_per_expert sum {recv_per_expert.sum().item()} != total_recv {saved['total_recv']}"
 
+    _local_max = torch.tensor([int(send_counts_re.max().item())], dtype=torch.int64, device=device)
+    dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
+    _global_max_bwd_tiles = max(1, (int(_local_max.item()) + 64 - 1) // 64)
     cache = dict(
         h_dst_rank=h_dst_rank, h_dst_off=h_dst_off,
         M=saved["M"], N=saved["ffn_dim"], K=H, E=EPR,
@@ -201,6 +204,11 @@ def _dispatch_static_maps(saved):
         send_bucket_dst_starts=send_bucket_dst_starts,
         recv_per_expert=recv_per_expert, recv_expert_offs=recv_expert_offs,
         bwd_expert_sort=bwd_expert_sort,
+        # C2 per-tile signal: receive counts [W,EPR] (source, expert) for merged-window
+        # overlap, and the source-tile slot capacity (max tiles any (dst,expert) bucket
+        # produces = tight bound for the signal slot space).
+        recv_counts_re=recv_counts_re.contiguous(),
+        max_bwd_tiles=_global_max_bwd_tiles,
     )
     saved["_dispatch_cache"] = cache
     return cache
@@ -420,16 +428,236 @@ def _launch_dispatch_fc2_bwd_signal(prep, peer_mem, out, saved):
     return out
 
 
+# ============================================================================
+# C2 per-tile signal variant: producer publishes each source-local BLOCK_M tile
+# with signal_op SET(epoch); consumer merged-window per-tile dl.wait/consume_token
+# + contiguous GEMM. No barrier_all — readiness fences only the window a Cube
+# GEMM is about to read. Mirrors the verified all-core tile-readiness pipeline of
+# forward _kernel_dispatch_fc1. Enable with MOE_BWD_TILE_SIGNAL=1.
+# ============================================================================
+@triton.jit
+def _dispatch_grad_source_tiles(
+    pid, num_cores,
+    gco_ptr, peer_mem_ptr, signal_mem_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    signal_epoch,
+    H: tl.constexpr, stride_gm,
+    LOCAL_RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    MAX_BWD_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H_PUSH: tl.constexpr,
+):
+    """Per-(dst,expert,tile) putmem + fence + signal_op SET. Adapted from forward
+    _dispatch_one_source_tile_task (dispatch_fc1.py:710-762): the staging buffer
+    (gco) is already expert-major contiguous, so each BLOCK_M tile is one bulk
+    putmem (no per-token gather). Expert-major work order mirrors
+    _dispatch_direct_grad_buckets so every dst receives early expert tiles
+    concurrently. slot = (LOCAL_RANK*EPR+expert)*MAX_BWD_TILES+source_tile; the
+    consumer waits the same slot keyed by source_id == LOCAL_RANK."""
+    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
+    for work_id in range(pid, num_tasks, num_cores):
+        dst_rank = work_id % WORLD_SIZE
+        expert_id = work_id // WORLD_SIZE
+        task_id = dst_rank * EXPERTS_PER_RANK + expert_id
+        task_start = tl.load(send_bucket_starts_ptr + task_id)
+        task_count = tl.load(send_counts_re_ptr + task_id)
+        task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
+        num_source_tiles = tl.cdiv(task_count, BLOCK_M)
+        for source_tile in range(num_source_tiles):
+            tile_start = source_tile * BLOCK_M
+            tile_count = tl.minimum(BLOCK_M, task_count - tile_start)
+            libshmem_device.putmem(
+                peer_mem_ptr + (task_dst_start + tile_start) * H,
+                gco_ptr + (task_start + tile_start) * stride_gm,
+                tile_count * H * 2, dst_rank)
+            libshmem_device.fence()
+            signal_slot = (
+                (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_BWD_TILES
+                + source_tile
+            )
+            libshmem_device.signal_op(
+                signal_mem_ptr + signal_slot * 16,
+                signal_epoch,
+                libshmem_device.ACLSHMEM_SIGNAL_SET,
+                dst_rank)
+
+
+@triton.jit
+def _fc2_bwd_gemm_merged_tiles_wait(
+    pid, ncore,
+    peer_mem_ptr, signal_mem_ptr, fc2_ptr, output_ptr,
+    recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+    signal_epoch,
+    N, K,
+    stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
+):
+    """Consume merged expert M windows as their source tiles become ready. Adapted
+    from forward _triton_grouped_gemm_expert_n_merged_tiles_wait
+    (dispatch_fc1.py:539-629). GEMM ownership is keyed by (expert, n_tile); source
+    rank participates only in the readiness dependency, so source fragments no
+    longer force independent full-weight scans. waitValue = signal_epoch (SET mode,
+    ONE value per epoch) — NOT signal_epoch*WORLD_SIZE, which is the C1 ADD-mode
+    per-expert counter. Reuses the existing contiguous-read _fc2_bwd_gemm_one_mn_tile
+    (stride_im=H, stride_ik=1)."""
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    num_tasks = EXPERTS_PER_RANK * num_n_tiles
+    for task_id in range(pid, num_tasks, ncore):
+        expert_id = task_id // num_n_tiles
+        n_tile = task_id % num_n_tiles
+        expert_size = tl.load(recv_per_expert_ptr + expert_id)
+        expert_off = tl.load(recv_expert_offs_ptr + expert_id)
+        if expert_size > 0:
+            num_m_windows = tl.cdiv(expert_size, BLOCK_M)
+            for m_window in range(num_m_windows):
+                window_start = m_window * BLOCK_M
+                window_size = tl.minimum(BLOCK_M, expert_size - window_start)
+                window_end = window_start + window_size
+                source_start = 0
+                ready_token = 0
+                # peer_mem is expert-major then source-major. Acquire every
+                # dispatch tile whose rows overlap this merged expert window.
+                for source_id in range(WORLD_SIZE):
+                    source_size = tl.load(
+                        recv_counts_re_ptr
+                        + source_id * EXPERTS_PER_RANK
+                        + expert_id)
+                    source_end = source_start + source_size
+                    overlap_start = tl.maximum(window_start, source_start)
+                    overlap_end = tl.minimum(window_end, source_end)
+                    if overlap_start < overlap_end:
+                        first_source_tile = (
+                            overlap_start - source_start
+                        ) // BLOCK_M
+                        last_source_tile = (
+                            overlap_end - source_start - 1
+                        ) // BLOCK_M
+                        for source_tile in range(
+                            first_source_tile, last_source_tile + 1
+                        ):
+                            signal_slot = (
+                                (source_id * EXPERTS_PER_RANK + expert_id)
+                                * MAX_BWD_TILES
+                                + source_tile
+                            )
+                            token = dl.wait(
+                                signal_mem_ptr + signal_slot * 16,
+                                1, "gpu", "acquire",
+                                waitValue=signal_epoch)
+                            ready_token += token
+                    source_start = source_end
+                ready_input_ptr = dl.consume_token(peer_mem_ptr, ready_token)
+                _fc2_bwd_gemm_one_mn_tile(
+                    ready_input_ptr, fc2_ptr, output_ptr,
+                    expert_id, expert_off + window_start, window_size, n_tile, N, K,
+                    stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+                    BLOCK_M, BLOCK_N, BLOCK_K, dtype)
+
+
+@triton.jit(do_not_specialize=["signal_epoch"])
+def kernel_dispatch_fc2_bwd_tile_signal(
+    gco_ptr, peer_mem_ptr, signal_mem_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    H: tl.constexpr, stride_gm,
+    fc2_ptr, output_ptr,
+    recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+    N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    signal_epoch,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    MAX_BWD_TILES: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    BLOCK_H_PUSH: tl.constexpr,
+):
+    """C2 fused per-tile dispatch + fc2 input-grad. The Vector side pushes
+    source-local BLOCK_M tiles + signal_op SET; the Cube side merged-window
+    dl.wait/consume_token + contiguous GEMM. They run concurrently on every AI
+    core (all-core pipeline), fenced per source-tile — no barrier_all. Mirrors the
+    verified ALL_CORE_PIPELINE + tile-readiness path of forward
+    _kernel_dispatch_fc1. sub_vec_id()==0 gates the push (same hazard as the C1
+    fused kernel: a mixed kernel has two vector sub-cores that would otherwise
+    duplicate the putmem)."""
+    pid = tl.program_id(axis=0)
+    num_cores = tl.num_programs(axis=0)
+    dtype = tl.bfloat16
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            _dispatch_grad_source_tiles(
+                pid, num_cores,
+                gco_ptr, peer_mem_ptr, signal_mem_ptr,
+                send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+                signal_epoch, H, stride_gm,
+                LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, BLOCK_M, BLOCK_H_PUSH)
+    with al.scope(core_mode="cube", disable_auto_sync=True):
+        _fc2_bwd_gemm_merged_tiles_wait(
+            pid, num_cores,
+            peer_mem_ptr, signal_mem_ptr, fc2_ptr, output_ptr,
+            recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+            signal_epoch,
+            N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+            BLOCK_M, BLOCK_N, BLOCK_K, WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, dtype)
+
+
+def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
+    import shmem as ash
+    W = saved["world_size"]
+    EPR = prep["E"]
+    MAX_BWD_TILES = prep["max_bwd_tiles"]
+    fc2 = prep["fc2"]; H = prep["H"]; N = prep["N"]; K = prep["K"]
+    # Lazy-alloc one SET slot per (source, expert, tile). Slot layout must match
+    # producer/consumer: (rank*EPR+expert)*MAX_BWD_TILES+tile, with rank as the
+    # source id. 16 int32 elements per slot (= 64 bytes) mirrors the forward
+    # workspace's signal slot granularity.
+    signal_mem = saved.get("_bwd_tile_signal_mem")
+    if signal_mem is None:
+        signal_mem = ash.aclshmem_create_tensor(
+            [W * EPR * MAX_BWD_TILES * 16],
+            dtype=torch.int32,
+            device_id=saved["ep_rank"])
+        signal_mem.zero_()
+        saved["_bwd_tile_signal_mem"] = signal_mem
+    # SET-mode epoch: producer writes signal_epoch, consumer waits waitValue=
+    # signal_epoch. Bump after launch so the next call sees a fresh value (no
+    # need to zero the slots — SET overwrites unconditionally).
+    signal_epoch = saved.get("_bwd_tile_signal_epoch", 1)
+    saved["_bwd_tile_signal_epoch"] = signal_epoch + 1
+    kernel_dispatch_fc2_bwd_tile_signal[(ncore(), 1, 1)](
+        prep["gco"], peer_mem, signal_mem,
+        prep["send_bucket_starts"], prep["send_counts_re"], prep["send_bucket_dst_starts"],
+        H, prep["gco"].stride(0),
+        fc2, out,
+        prep["recv_per_expert"], prep["recv_expert_offs"], prep["recv_counts_re"],
+        N, K, H, 1, fc2.stride(0), fc2.stride(1), fc2.stride(2), N, 1,
+        signal_epoch,
+        BLOCK_M=64, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
+        WORLD_SIZE=W, EXPERTS_PER_RANK=EPR, MAX_BWD_TILES=MAX_BWD_TILES,
+        LOCAL_RANK=saved["ep_rank"], BLOCK_H_PUSH=256, num_warps=8)
+    return out
+
+
 def dispatch_fc2_bwd_triton(saved, dy, peer_mem, use_signal=None):
     """Step 1: returns (grad_swiglu [M,ffn], grad_fc2_out_sorted [M,H]).
-    MOE_BWD_SIGNAL=1 selects the expert-major signal/wait variant (putmem +
-    dl.wait/consume_token, no barrier_all, no gather); default is the auto-split
-    + barrier_all fused kernel."""
+    MOE_BWD_TILE_SIGNAL=1 selects the C2 per-tile signal/wait variant (per-tile
+    putmem + signal_op SET, merged-window per-tile dl.wait/consume_token, no
+    barrier_all, no gather) and takes priority over MOE_BWD_SIGNAL. MOE_BWD_SIGNAL=1
+    selects the C1 expert-major signal/wait variant (whole-bucket putmem + ADD
+    counter dl.wait/consume_token, no barrier_all, no gather). Default is the
+    auto-split + barrier_all fused kernel."""
     prep = _prepare_dispatch_fc2_bwd(saved, dy)
     out = torch.empty(prep["M"], prep["N"], dtype=dy.dtype, device=dy.device)
+    # C2 (per-tile SET) takes priority over C1 (expert ADD) when both are set.
+    use_tile = os.environ.get("MOE_BWD_TILE_SIGNAL") == "1"
     if use_signal is None:
         use_signal = os.environ.get("MOE_BWD_SIGNAL") == "1"
-    if use_signal:
+    if use_tile:
+        _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved)
+        # expert-major peer_mem IS the sorted layout -> identity view (no gather)
+        grad_fc2_out_sorted = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(
+            prep["total_recv"], prep["H"]).contiguous()
+    elif use_signal:
         _launch_dispatch_fc2_bwd_signal(prep, peer_mem, out, saved)
         # expert-major peer_mem IS the sorted layout -> identity view (no gather)
         grad_fc2_out_sorted = peer_mem.view(-1)[:prep["total_recv"] * prep["H"]].view(
