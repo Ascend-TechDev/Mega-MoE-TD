@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import ast
+import base64
+import contextlib
+import functools
 import hashlib
+import http.server
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import types
 from unittest import mock
 
@@ -321,16 +327,21 @@ def test_backward_finalizer_requires_exact_three_complete_cases(tmp_path):
 
 def test_backward_provenance_binds_full_evidence_chain(monkeypatch, tmp_path):
     benchmark_suite = _load_benchmark_suite()
-    expected_sources = {
+    expected_sources = (
+        "benchmark/layer/bench_moe_suite.py",
+        "conftest.py",
+        "src/mega_moe/__init__.py",
         "src/mega_moe/ops/backward.py",
+        "src/mega_moe/kernels/__init__.py",
         "src/mega_moe/kernels/transposed_grouped_gemm.py",
         "src/mega_moe/kernels/common.py",
         "tests/_moe_testkit.py",
         "tests/_moe_baselines.py",
         "tests/_numeric.py",
         "config/_shapes.py",
-    }
-    assert set(benchmark_suite.BACKWARD_EVIDENCE_SOURCES) == expected_sources
+        "tests/layer/test_moe_suite.py",
+    )
+    assert benchmark_suite.BACKWARD_EVIDENCE_SOURCES == expected_sources
 
     checkout_root = tmp_path / "checkout"
     checkout_root.mkdir()
@@ -418,7 +429,7 @@ def test_backward_provenance_binds_full_evidence_chain(monkeypatch, tmp_path):
     provenance = benchmark_suite._backward_benchmark_provenance()
     assert provenance["checkout_identity"] == checkout
     assert provenance["environment_receipt"] == environment
-    assert set(provenance["backward_source_sha256"]) == expected_sources
+    assert tuple(provenance["backward_source_sha256"]) == expected_sources
     for relative_path, digest in provenance["backward_source_sha256"].items():
         expected = hashlib.sha256((ROOT / relative_path).read_bytes()).hexdigest()
         assert digest == expected
@@ -435,3 +446,536 @@ def test_backward_provenance_is_frozen_before_device_session():
     )
     assert "provenance = _backward_benchmark_provenance()" in runner
     assert "'provenance': provenance" in runner
+
+
+_TASK2_SOURCE_PATHS = (
+    "benchmark/layer/bench_moe_suite.py",
+    "conftest.py",
+    "src/mega_moe/__init__.py",
+    "src/mega_moe/ops/backward.py",
+    "src/mega_moe/kernels/__init__.py",
+    "src/mega_moe/kernels/transposed_grouped_gemm.py",
+    "src/mega_moe/kernels/common.py",
+    "tests/_moe_testkit.py",
+    "tests/_moe_baselines.py",
+    "tests/_numeric.py",
+    "config/_shapes.py",
+    "tests/layer/test_moe_suite.py",
+)
+_TASK2_COMPONENTS = (
+    "aclshmem",
+    "bigop",
+    "cann",
+    "python",
+    "torch",
+    "torch_npu",
+    "triton",
+)
+
+
+def _task2_git(cwd: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    completed = subprocess.run(
+        ["/usr/bin/git", *args],
+        cwd=cwd,
+        input=input_bytes,
+        check=True,
+        capture_output=True,
+    )
+    return completed.stdout
+
+
+def _task2_commit(repo: Path, message: str) -> str:
+    _task2_git(repo, "add", "-A")
+    _task2_git(repo, "commit", "-qm", message)
+    return _task2_git(repo, "rev-parse", "HEAD").decode().strip()
+
+
+def _task2_product_fixture(tmp_path: Path) -> types.SimpleNamespace:
+    work = tmp_path / "product-work"
+    work.mkdir()
+    _task2_git(work, "init", "-q", "-b", "main")
+    _task2_git(work, "config", "user.name", "Task2 Fixture")
+    _task2_git(work, "config", "user.email", "task2@example.invalid")
+    for index, relative in enumerate(_TASK2_SOURCE_PATHS):
+        target = work / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"anchor-{index}\n", encoding="utf-8")
+    main_commit = _task2_commit(work, "main")
+    runner = work / _TASK2_SOURCE_PATHS[0]
+    runner.write_text("anchor-0\nfeature\n", encoding="utf-8")
+    feature_commit = _task2_commit(work, "feature")
+    tree = _task2_git(work, "rev-parse", f"{feature_commit}^{{tree}}").decode().strip()
+
+    remote = tmp_path / "product.git"
+    _task2_git(tmp_path, "clone", "-q", "--bare", str(work), str(remote))
+    _task2_git(remote, "update-ref", "refs/heads/main", main_commit)
+    _task2_git(
+        remote,
+        "update-ref",
+        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        feature_commit,
+    )
+
+    sources = []
+    for relative in _TASK2_SOURCE_PATHS:
+        fields = _task2_git(
+            work, "ls-tree", feature_commit, "--", relative
+        ).decode().strip().split()
+        blob_oid = fields[2]
+        blob = _task2_git(work, "cat-file", "blob", blob_oid)
+        sources.append(
+            {
+                "blob_oid": blob_oid,
+                "path": relative,
+                "sha256": hashlib.sha256(blob).hexdigest(),
+            }
+        )
+    product = {
+        "authority_path": (
+            "authorities/uniep/wgrad/"
+            f"{feature_commit}/environment-authority.json"
+        ),
+        "commit": feature_commit,
+        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "main_is_ancestor": True,
+        "main_ref": "refs/heads/main",
+        "observed_main": main_commit,
+        "remote": str(remote),
+        "sole_parent": main_commit,
+        "sources": sources,
+        "tree": tree,
+    }
+    return types.SimpleNamespace(
+        remote=remote,
+        work=work,
+        product=product,
+        feature_commit=feature_commit,
+        main_commit=main_commit,
+        tree=tree,
+    )
+
+
+def _task2_environment() -> dict:
+    environment = {}
+    for name in _TASK2_COMPONENTS:
+        member_bytes = f"{name}-member\n".encode()
+        members = [
+            {
+                "elf_build_id": None,
+                "kind": "file",
+                "mode": 0o100644,
+                "name": f"{name}.identity",
+                "sha256": hashlib.sha256(member_bytes).hexdigest(),
+                "size": len(member_bytes),
+            }
+        ]
+        encoded = json.dumps(
+            members, sort_keys=True, separators=(",", ":")
+        ).encode() + b"\n"
+        environment[name] = {
+            "identity": f"{name}==fixture",
+            "manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+            "member_count": 1,
+            "members": members,
+            "resolver_id": f"uniep-{name}-resolver-v1",
+            "total_bytes": len(member_bytes),
+        }
+    return environment
+
+
+def _task2_canonical_json(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _task2_authority_fixture(
+    tmp_path: Path, mutation: str | None = None, *, authority_missing: bool = False
+) -> types.SimpleNamespace:
+    product_fixture = _task2_product_fixture(tmp_path)
+    work = tmp_path / "authority-work"
+    work.mkdir()
+    _task2_git(work, "init", "-q", "-b", "main")
+    _task2_git(work, "config", "user.name", "Task2 C01 Fixture")
+    _task2_git(work, "config", "user.email", "c01@example.invalid")
+    tool_path = work / "tools" / "uniep_environment_authority.py"
+    tool_path.parent.mkdir(parents=True)
+    tool_path.write_text("# reviewed producer\n", encoding="utf-8")
+    producer_commit = _task2_commit(work, "producer tool")
+    producer_tree = _task2_git(
+        work, "rev-parse", f"{producer_commit}^{{tree}}"
+    ).decode().strip()
+    tool_blob_oid = _task2_git(
+        work, "rev-parse", f"{producer_commit}:tools/uniep_environment_authority.py"
+    ).decode().strip()
+    producer = {
+        "commit": producer_commit,
+        "identity": "autoport-codex01",
+        "policy": "uniep-wgrad-environment-authority-v1",
+        "review_verdict_id": "1001",
+        "tool_blob_oid": tool_blob_oid,
+        "tool_path": "tools/uniep_environment_authority.py",
+        "tree": producer_tree,
+    }
+    if mutation == "wrong_tool":
+        producer["tool_blob_oid"] = "0" * 40
+    product = json.loads(json.dumps(product_fixture.product))
+    if mutation == "alternate_product":
+        product["commit"] = "9" * 40
+    authority = {
+        "environment": _task2_environment(),
+        "producer": producer,
+        "product": product,
+        "schema": "uniep.environment-authority.v1",
+        "status": "AUTHORIZED",
+    }
+    envelope = {
+        "authority": authority,
+        "authority_payload_sha256": hashlib.sha256(
+            _task2_canonical_json(authority)
+        ).hexdigest(),
+        "schema": "uniep.environment-authority-envelope.v1",
+    }
+    if mutation == "payload_digest":
+        envelope["authority_payload_sha256"] = "0" * 64
+    if mutation == "self_hash":
+        envelope["full_sha256"] = "1" * 64
+    raw = _task2_canonical_json(envelope)
+    if mutation == "wrong_blob":
+        raw = b"not-json\n"
+    elif mutation == "noncanonical":
+        raw = json.dumps(envelope, indent=2).encode() + b"\n"
+
+    relative = product_fixture.product["authority_path"]
+    if mutation == "wrong_path":
+        relative = f"wrong/{Path(relative).name}"
+    if not authority_missing:
+        target = work / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+    else:
+        marker = work / "authorities" / "uniep" / "wgrad" / "README.md"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("authority missing\n", encoding="utf-8")
+    authority_commit = _task2_commit(work, "authority")
+    marker = work / "moving-marker"
+    marker.write_text("moved\n", encoding="utf-8")
+    moving_commit = _task2_commit(work, "moving authority ref")
+    remote = tmp_path / "authority.git"
+    _task2_git(tmp_path, "clone", "-q", "--bare", str(work), str(remote))
+    _task2_git(remote, "update-ref", "refs/heads/main", authority_commit)
+    _task2_git(remote, "update-server-info")
+    return types.SimpleNamespace(
+        authority_commit=authority_commit,
+        authority_remote=remote,
+        moving_commit=moving_commit,
+        product=product_fixture,
+        raw=raw,
+    )
+
+
+def _task2_configure_remotes(monkeypatch, suite, fixture) -> None:
+    monkeypatch.setattr(suite, "AUTHORITY_REMOTE", str(fixture.authority_remote))
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+
+
+class _Task2BasicAuthHandler(http.server.SimpleHTTPRequestHandler):
+    expected_authorization = ""
+
+    def _authorized(self) -> bool:
+        if self.headers.get("Authorization") == self.expected_authorization:
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="uniep-task2"')
+        self.end_headers()
+        return False
+
+    def do_GET(self):
+        if self._authorized():
+            super().do_GET()
+
+    def do_HEAD(self):
+        if self._authorized():
+            super().do_HEAD()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+@contextlib.contextmanager
+def _task2_authenticated_remote(remote: Path, username: str, password: str):
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    handler = functools.partial(
+        _Task2BasicAuthHandler, directory=str(remote.parent)
+    )
+    _Task2BasicAuthHandler.expected_authorization = f"Basic {token}"
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/{remote.name}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def _task2_credential(suite, username: str, password: str):
+    fd = os.memfd_create(
+        "uniep-c01-credential", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+    )
+    payload = _task2_canonical_json({"password": password, "username": username})
+    os.write(fd, payload)
+    import fcntl
+
+    seals = (
+        fcntl.F_SEAL_SEAL
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_WRITE
+    )
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+    os.set_inheritable(fd, True)
+    return suite._credential_capability_from_c01_launcher(fd)
+
+
+def test_task2_authority_valid_local_bare_remotes(monkeypatch, tmp_path):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+
+    anchor, envelope = suite._read_authority_object(
+        fixture.product.feature_commit, tmp_path / "scratch", None
+    )
+
+    assert anchor.commit == fixture.authority_commit
+    assert anchor.path == fixture.product.product["authority_path"]
+    assert envelope.raw == fixture.raw
+    assert envelope.product == fixture.product.product
+    assert tuple(envelope.environment) == _TASK2_COMPONENTS
+
+
+def test_task2_missing_real_authority_is_exact_and_pre_loader(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+    loader_events = []
+    monkeypatch.setattr(
+        suite, "_load_benchmark_device_runtime", lambda: loader_events.append("loader")
+    )
+
+    with pytest.raises(suite.AuthorityPreflightError) as captured:
+        suite._read_authority_object(
+            fixture.product.feature_commit, tmp_path / "scratch", None
+        )
+    assert captured.value.code == "AUTHORITY_MISSING"
+    assert loader_events == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "moving_ref",
+        "wrong_path",
+        "wrong_blob",
+        "wrong_tool",
+        "self_hash",
+        "noncanonical",
+        "payload_digest",
+        "caller_path",
+        "caller_digest",
+        "local_config",
+        "url_rewrite",
+        "alternate_product",
+    ),
+)
+def test_task2_authority_and_canonical_substitutions_fail_closed(
+    monkeypatch, tmp_path, mutation
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(
+        tmp_path,
+        mutation if mutation in {
+            "wrong_path",
+            "wrong_blob",
+            "wrong_tool",
+            "self_hash",
+            "noncanonical",
+            "payload_digest",
+            "alternate_product",
+        } else None,
+    )
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+    scratch = tmp_path / "scratch"
+    if mutation == "caller_path":
+        monkeypatch.setenv("MOE_UNIEP_AUTHORITY_PATH", "/caller/authority.json")
+    elif mutation == "caller_digest":
+        monkeypatch.setenv("MOE_UNIEP_AUTHORITY_SHA256", "a" * 64)
+    elif mutation == "url_rewrite":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.file:///caller/.insteadOf")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://")
+    elif mutation == "local_config":
+        scratch.mkdir()
+        _task2_git(scratch, "init", "-q")
+    elif mutation == "moving_ref":
+        original = suite._run_git
+        moved = False
+
+        def move_after_first_authority_read(cwd, args, **kwargs):
+            nonlocal moved
+            completed = original(cwd, args, **kwargs)
+            if (
+                not moved
+                and "ls-remote" in args
+                and str(fixture.authority_remote) in args
+            ):
+                _task2_git(
+                    fixture.authority_remote,
+                    "update-ref",
+                    "refs/heads/main",
+                    fixture.moving_commit,
+                )
+                moved = True
+            return completed
+
+        monkeypatch.setattr(suite, "_run_git", move_after_first_authority_read)
+
+    with pytest.raises(suite.AuthorityPreflightError):
+        suite._read_authority_object(
+            fixture.product.feature_commit, scratch, None
+        )
+
+
+def test_task2_authority_source_denominator_is_ordered_and_exact(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+    _, envelope = suite._read_authority_object(
+        fixture.product.feature_commit, tmp_path / "scratch", None
+    )
+    assert tuple(item["path"] for item in envelope.product["sources"]) == (
+        _TASK2_SOURCE_PATHS
+    )
+    assert suite.BACKWARD_EVIDENCE_SOURCES == _TASK2_SOURCE_PATHS
+
+
+def test_task2_remote_auth_missing_capability_is_distinct_and_secret_free(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+    with _task2_authenticated_remote(fixture.authority_remote, "c01", "secret") as url:
+        monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
+        with pytest.raises(suite.AuthorityPreflightError) as captured:
+            suite._read_authority_object(
+                fixture.product.feature_commit, tmp_path / "scratch", None
+            )
+    assert captured.value.code == "AUTHORITY_REMOTE_AUTH_FAILED"
+    assert b"secret" not in captured.value.rendered_bytes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "ambient_helper",
+        "url_rewrite",
+        "caller_credential",
+        "missing_capability",
+        "invalid_capability",
+        "secret_output",
+        "helper_identity_drift",
+    ),
+)
+def test_task2_remote_auth_and_credential_mutations_fail_closed(
+    monkeypatch, tmp_path, mutation
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+    username = "c01"
+    password = "never-render-this-secret"
+    server_password = password if mutation != "secret_output" else "different"
+    side_effect = tmp_path / "ambient-helper-ran"
+    if mutation in {"ambient_helper", "caller_credential"}:
+        helper = tmp_path / "ambient-askpass"
+        helper.write_text(
+            "#!/bin/sh\nprintf ran > '" + str(side_effect) + "'\nprintf caller\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        monkeypatch.setenv("GIT_ASKPASS", str(helper))
+    if mutation == "url_rewrite":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.file:///caller/.insteadOf")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "http://")
+
+    capability = None
+    if mutation not in {
+        "ambient_helper",
+        "url_rewrite",
+        "caller_credential",
+        "missing_capability",
+    }:
+        capability = _task2_credential(suite, username, password)
+    if mutation == "invalid_capability":
+        sealed_fd = capability.fd
+        invalid_fd = os.memfd_create("unsealed-caller")
+        capability = suite.CredentialCapability(
+            fd=invalid_fd,
+            helper_blob_oid=capability.helper_blob_oid,
+            helper_sha256=capability.helper_sha256,
+            policy=capability.policy,
+        )
+        os.close(sealed_fd)
+    elif mutation == "helper_identity_drift":
+        object.__setattr__(capability, "helper_sha256", "0" * 64)
+
+    with _task2_authenticated_remote(
+        fixture.authority_remote, username, server_password
+    ) as url:
+        monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
+        with pytest.raises(suite.AuthorityPreflightError) as captured:
+            suite._read_authority_object(
+                fixture.product.feature_commit,
+                tmp_path / "scratch",
+                capability,
+            )
+    assert captured.value.code == "AUTHORITY_REMOTE_AUTH_FAILED"
+    assert password.encode() not in captured.value.rendered_bytes
+    assert not side_effect.exists()
+    if capability is not None:
+        with pytest.raises(OSError):
+            os.fstat(capability.fd)
+    scratch = tmp_path / "scratch"
+    if scratch.exists():
+        assert list(scratch.glob(".uniep-askpass-*")) == []
+
+
+def test_task2_authenticated_fixed_ref_absent_product_path_is_authority_missing(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path, authority_missing=True)
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(fixture.product.remote))
+    password = "bounded-c01-secret"
+    capability = _task2_credential(suite, "c01", password)
+    receipt_identity = capability.receipt_identity()
+    assert "fd" not in receipt_identity and "path" not in json.dumps(receipt_identity)
+    with _task2_authenticated_remote(
+        fixture.authority_remote, "c01", password
+    ) as url:
+        monkeypatch.setattr(suite, "AUTHORITY_REMOTE", url)
+        with pytest.raises(suite.AuthorityPreflightError) as captured:
+            suite._read_authority_object(
+                fixture.product.feature_commit,
+                tmp_path / "scratch",
+                capability,
+            )
+    assert captured.value.code == "AUTHORITY_MISSING"
+    with pytest.raises(OSError):
+        os.fstat(capability.fd)
+    assert list((tmp_path / "scratch").glob(".uniep-askpass-*")) == []

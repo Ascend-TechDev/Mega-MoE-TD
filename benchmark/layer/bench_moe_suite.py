@@ -52,6 +52,8 @@ The remaining environment variables are runtime knobs only:
     MOE_FUSED_ASH_SIZE_GB=64            # ACLSHMEM heap size, not shape selection
 """
 
+import dataclasses
+import fcntl
 import hashlib
 import json
 import math
@@ -92,17 +94,33 @@ ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-transport-v2"
 BACKWARD_RESULT_CONTRACT = "backward-wgrad-explicit-paired-v1"
 BACKWARD_EVIDENCE_SOURCES = (
+    "benchmark/layer/bench_moe_suite.py",
+    "conftest.py",
+    "src/mega_moe/__init__.py",
     "src/mega_moe/ops/backward.py",
+    "src/mega_moe/kernels/__init__.py",
     "src/mega_moe/kernels/transposed_grouped_gemm.py",
     "src/mega_moe/kernels/common.py",
     "tests/_moe_testkit.py",
     "tests/_moe_baselines.py",
     "tests/_numeric.py",
     "config/_shapes.py",
+    "tests/layer/test_moe_suite.py",
 )
 BACKWARD_ENVIRONMENT_COMPONENTS = frozenset(
     {"python", "torch", "torch_npu", "triton", "cann", "aclshmem", "bigop"}
 )
+AUTHORITY_REMOTE = "https://github.com/EdisonAILab/agent-team-wiki.git"
+AUTHORITY_REF = "refs/heads/main"
+PRODUCT_REMOTE = "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
+PRODUCT_FEATURE_REF = "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810"
+PRODUCT_MAIN_REF = "refs/heads/main"
+AUTHORITY_SCHEMA = "uniep.environment-authority.v1"
+AUTHORITY_ENVELOPE_SCHEMA = "uniep.environment-authority-envelope.v1"
+AUTHORITY_PRODUCER_IDENTITY = "autoport-codex01"
+AUTHORITY_PRODUCER_POLICY = "uniep-wgrad-environment-authority-v1"
+CREDENTIAL_CAPABILITY_POLICY = "uniep-git-credential-capability-v1"
+AUTHORITY_PRODUCER_TOOL_PATH = "tools/uniep_environment_authority.py"
 BACKWARD_TARGET_MODEL = "Qwen3-30B-A3B"
 BACKWARD_TARGET_WORLD_SIZE = 2
 BACKWARD_TARGET_SPEEDUP = 1.5
@@ -112,7 +130,782 @@ BACKWARD_RAW_ORDERS = (
 )
 BACKWARD_RAW_ARMS = ("triton_wgrad", "torch_wgrad")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_GIT_OID_PATTERN = re.compile(r"[0-9a-f]{40}")
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
+
+_ASKPASS_HELPER_BYTES = b"""#!/usr/bin/python3
+import json
+import os
+import sys
+
+fd = int(os.environ["UNIEP_CREDENTIAL_FD"])
+chunks = []
+offset = 0
+while True:
+    chunk = os.pread(fd, 4096, offset)
+    if not chunk:
+        break
+    chunks.append(chunk)
+    offset += len(chunk)
+credential = json.loads(b"".join(chunks).decode("utf-8"))
+prompt = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+field = "username" if "username" in prompt else "password"
+os.write(1, (credential[field] + "\\n").encode("utf-8"))
+"""
+_ASKPASS_HELPER_SHA256 = hashlib.sha256(_ASKPASS_HELPER_BYTES).hexdigest()
+_ASKPASS_HELPER_BLOB_OID = hashlib.sha1(
+    f"blob {len(_ASKPASS_HELPER_BYTES)}\0".encode("ascii") + _ASKPASS_HELPER_BYTES
+).hexdigest()
+_CALLER_AUTHORITY_OVERRIDES = frozenset(
+    {
+        "MOE_UNIEP_AUTHORITY_PATH",
+        "MOE_UNIEP_AUTHORITY_SHA256",
+        "MOE_UNIEP_AUTHORITY_REMOTE",
+        "MOE_UNIEP_AUTHORITY_REF",
+        "MOE_UNIEP_CREDENTIAL",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    }
+)
+
+
+class AuthorityPreflightError(RuntimeError):
+    """Typed, secret-free failure raised before any device runtime is loaded."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        self.detail = detail
+        self.rendered_bytes = f"{code}: {detail}".encode("utf-8")
+        super().__init__(self.rendered_bytes.decode("utf-8"))
+
+    def __reduce__(self):
+        return (type(self), (self.code, self.detail))
+
+
+@dataclasses.dataclass(frozen=True)
+class AuthorityAnchor:
+    commit: str
+    tree: str
+    path: str
+    blob_oid: str
+    full_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class AuthorityEnvelope:
+    raw: bytes
+    payload_sha256: str
+    product: dict
+    environment: dict
+    producer: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class CredentialCapability:
+    """One-shot C01 launcher capability; receipt identity excludes locator/FD."""
+
+    fd: int
+    helper_blob_oid: str
+    helper_sha256: str
+    policy: str
+
+    def receipt_identity(self) -> dict:
+        return {
+            "helper_blob_oid": self.helper_blob_oid,
+            "helper_sha256": self.helper_sha256,
+            "policy": self.policy,
+        }
+
+
+def _authority_path(product_commit: str) -> str:
+    if _GIT_OID_PATTERN.fullmatch(product_commit) is None:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product commit format")
+    return (
+        "authorities/uniep/wgrad/"
+        f"{product_commit}/environment-authority.json"
+    )
+
+
+def _credential_capability_from_c01_launcher(fd: int) -> CredentialCapability:
+    """Seal the consumer view of a launcher-owned anonymous credential FD."""
+    capability = CredentialCapability(
+        fd=fd,
+        helper_blob_oid=_ASKPASS_HELPER_BLOB_OID,
+        helper_sha256=_ASKPASS_HELPER_SHA256,
+        policy=CREDENTIAL_CAPABILITY_POLICY,
+    )
+    try:
+        _validate_credential_capability(capability)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return capability
+
+
+def _validate_credential_capability(capability: CredentialCapability) -> None:
+    if not isinstance(capability, CredentialCapability):
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "credential capability type"
+        )
+    if (
+        capability.helper_blob_oid != _ASKPASS_HELPER_BLOB_OID
+        or capability.helper_sha256 != _ASKPASS_HELPER_SHA256
+        or capability.policy != CREDENTIAL_CAPABILITY_POLICY
+    ):
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper identity"
+        )
+    try:
+        fd_stat = os.fstat(capability.fd)
+        seals = fcntl.fcntl(capability.fd, fcntl.F_GET_SEALS)
+        fd_target = os.readlink(f"/proc/self/fd/{capability.fd}")
+    except (OSError, ValueError) as error:
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "credential capability FD"
+        ) from error
+    required_seals = (
+        fcntl.F_SEAL_SEAL
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_WRITE
+    )
+    if (
+        not stat.S_ISREG(fd_stat.st_mode)
+        or (seals & required_seals) != required_seals
+        or not fd_target.startswith("/memfd:")
+        or not os.get_inheritable(capability.fd)
+    ):
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "credential capability is not sealed"
+        )
+
+
+def _reject_caller_authority_overrides() -> None:
+    rejected = sorted(name for name in _CALLER_AUTHORITY_OVERRIDES if name in os.environ)
+    rejected.extend(
+        sorted(
+            name
+            for name in os.environ
+            if name.startswith("GIT_CONFIG_KEY_")
+            or name.startswith("GIT_CONFIG_VALUE_")
+        )
+    )
+    if rejected:
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "caller Git or authority override"
+        )
+
+
+def _git_environment(
+    cwd: Path,
+    credential: CredentialCapability | None = None,
+    helper_path: Path | None = None,
+) -> dict[str, str]:
+    environment = {
+        "HOME": str(cwd),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS_REQUIRE": "never",
+    }
+    if credential is not None:
+        if helper_path is None:
+            raise AuthorityPreflightError(
+                "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper missing"
+            )
+        environment.update(
+            {
+                "GIT_ASKPASS": str(helper_path),
+                "GIT_ASKPASS_REQUIRE": "force",
+                "UNIEP_CREDENTIAL_FD": str(credential.fd),
+            }
+        )
+    return environment
+
+
+def _run_git(
+    cwd: Path,
+    args,
+    *,
+    credential: CredentialCapability | None = None,
+    helper_path: Path | None = None,
+):
+    """Run fixed Git with no caller configuration and no rendered stderr."""
+    pass_fds = () if credential is None else (credential.fd,)
+    return subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.useHttpPath=true",
+            *args,
+        ],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        env=_git_environment(cwd, credential, helper_path),
+        pass_fds=pass_fds,
+        timeout=30,
+    )
+
+
+def _write_askpass_helper(cwd: Path, credential: CredentialCapability) -> Path:
+    _validate_credential_capability(credential)
+    helper_path = cwd / f".uniep-askpass-{os.getpid()}-{credential.fd}"
+    try:
+        descriptor = os.open(
+            helper_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o700,
+        )
+        with os.fdopen(descriptor, "wb") as helper_file:
+            helper_file.write(_ASKPASS_HELPER_BYTES)
+        helper_stat = helper_path.lstat()
+        if (
+            not stat.S_ISREG(helper_stat.st_mode)
+            or stat.S_IMODE(helper_stat.st_mode) != 0o700
+            or helper_stat.st_nlink != 1
+            or hashlib.sha256(helper_path.read_bytes()).hexdigest()
+            != credential.helper_sha256
+        ):
+            raise AuthorityPreflightError(
+                "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper materialization"
+            )
+        return helper_path
+    except OSError as error:
+        try:
+            helper_path.unlink()
+        except OSError:
+            pass
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "credential helper materialization"
+        ) from error
+
+
+def _remote_git(
+    cwd: Path,
+    args,
+    credential: CredentialCapability | None,
+):
+    try:
+        anonymous = _run_git(cwd, args)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "fixed remote authentication"
+        ) from error
+    if anonymous.returncode == 0:
+        return anonymous
+    if credential is None:
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "fixed remote authentication"
+        )
+    helper_path = _write_askpass_helper(cwd, credential)
+    try:
+        try:
+            authenticated = _run_git(
+                cwd,
+                args,
+                credential=credential,
+                helper_path=helper_path,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AuthorityPreflightError(
+                "AUTHORITY_REMOTE_AUTH_FAILED", "fixed remote authentication"
+            ) from error
+    finally:
+        try:
+            helper_path.unlink()
+        except OSError:
+            pass
+    if authenticated.returncode != 0:
+        raise AuthorityPreflightError(
+            "AUTHORITY_REMOTE_AUTH_FAILED", "fixed remote authentication"
+        )
+    return authenticated
+
+
+def _read_stable_remote_ref(
+    remote: str,
+    ref: str,
+    cwd: Path,
+    credential: CredentialCapability | None,
+) -> str:
+    _reject_caller_authority_overrides()
+    cwd = Path(cwd)
+    if not cwd.is_absolute() or not cwd.is_dir() or cwd.is_symlink():
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "non-repository cwd")
+    probe = _run_git(cwd, ("rev-parse", "--git-dir"))
+    if probe.returncode == 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "cwd is a Git repository")
+
+    records = []
+    for _ in range(2):
+        completed = _remote_git(
+            cwd,
+            ("ls-remote", "--refs", remote, ref),
+            credential,
+        )
+        try:
+            decoded = completed.stdout.decode("ascii", "strict")
+        except UnicodeDecodeError as error:
+            raise AuthorityPreflightError(
+                "AUTHORITY_INVALID", "remote ref encoding"
+            ) from error
+        lines = [line for line in decoded.splitlines() if line]
+        if len(lines) != 1:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "remote ref cardinality")
+        fields = lines[0].split("\t")
+        if (
+            len(fields) != 2
+            or fields[1] != ref
+            or _GIT_OID_PATTERN.fullmatch(fields[0]) is None
+        ):
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "remote ref record")
+        records.append(fields[0])
+    if records[0] != records[1]:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "remote ref moved")
+    return records[0]
+
+
+def _checked_git(cwd: Path, args, detail: str) -> bytes:
+    try:
+        completed = _run_git(cwd, args)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", detail) from error
+    if completed.returncode != 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", detail)
+    return completed.stdout
+
+
+def _fetch_refs(
+    cwd: Path,
+    bare_repo: Path,
+    remote: str,
+    refs: tuple[tuple[str, str, str], ...],
+    credential: CredentialCapability | None,
+) -> None:
+    arguments = ["--git-dir", str(bare_repo), "fetch", "--no-tags", remote]
+    for remote_ref, destination_ref, _expected in refs:
+        arguments.append(f"+{remote_ref}:{destination_ref}")
+    _remote_git(cwd, tuple(arguments), credential)
+    for _remote_ref, destination_ref, expected in refs:
+        actual = _checked_git(
+            cwd,
+            ("--git-dir", str(bare_repo), "rev-parse", f"{destination_ref}^{{commit}}"),
+            "fetched ref identity",
+        ).decode("ascii").strip()
+        if actual != expected:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "fetched ref moved")
+
+
+def _tree_entry(cwd: Path, bare_repo: Path, commit: str, relative_path: str):
+    raw = _checked_git(
+        cwd,
+        (
+            "--git-dir",
+            str(bare_repo),
+            "ls-tree",
+            "-z",
+            commit,
+            "--",
+            relative_path,
+        ),
+        "Git tree read",
+    )
+    records = [record for record in raw.split(b"\0") if record]
+    if not records:
+        return None
+    if len(records) != 1:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "Git tree path cardinality")
+    try:
+        header, encoded_path = records[0].split(b"\t", 1)
+        mode, kind, oid = header.decode("ascii").split()
+        path = encoded_path.decode("utf-8", "strict")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "Git tree record") from error
+    if path != relative_path:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "Git tree path")
+    return mode, kind, oid
+
+
+def _git_blob(cwd: Path, bare_repo: Path, oid: str) -> bytes:
+    if _GIT_OID_PATTERN.fullmatch(oid) is None:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "Git blob OID")
+    return _checked_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "cat-file", "blob", oid),
+        "Git blob read",
+    )
+
+
+def _canonical_json(raw: bytes):
+    def reject_duplicate(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8", "strict"),
+            object_pairs_hook=reject_duplicate,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite value")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "authority JSON") from error
+    canonical = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    if canonical != raw:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "authority canonical bytes")
+    return value
+
+
+def _validate_component(name: str, component) -> None:
+    expected_keys = {
+        "identity",
+        "manifest_sha256",
+        "member_count",
+        "members",
+        "resolver_id",
+        "total_bytes",
+    }
+    if not isinstance(component, dict) or set(component) != expected_keys:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} component keys")
+    if not isinstance(component["identity"], str) or not component["identity"].strip():
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} identity")
+    if not isinstance(component["resolver_id"], str) or not component["resolver_id"].strip():
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} resolver")
+    if Path(component["identity"]).is_absolute() or Path(
+        component["resolver_id"]
+    ).is_absolute():
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} locator")
+    members = component["members"]
+    if not isinstance(members, list) or not members:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} members")
+    if type(component["member_count"]) is not int or component["member_count"] != len(members):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member count")
+    names = []
+    total_bytes = 0
+    member_keys = {"elf_build_id", "kind", "mode", "name", "sha256", "size"}
+    for member in members:
+        if not isinstance(member, dict) or set(member) != member_keys:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member keys")
+        relative_name = member["name"]
+        relative_path = Path(relative_name) if isinstance(relative_name, str) else None
+        if (
+            relative_path is None
+            or not relative_name
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or str(relative_path) != relative_name
+        ):
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member name")
+        if member["kind"] != "file" or member["mode"] not in (0o100644, 0o100755):
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member type")
+        if type(member["size"]) is not int or member["size"] < 0:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member size")
+        if not isinstance(member["sha256"], str) or _SHA256_PATTERN.fullmatch(member["sha256"]) is None:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member digest")
+        build_id = member["elf_build_id"]
+        if build_id is not None and (not isinstance(build_id, str) or not build_id):
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} ELF build ID")
+        names.append(relative_name)
+        total_bytes += member["size"]
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} member order")
+    encoded = (
+        json.dumps(members, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if (
+        type(component["total_bytes"]) is not int
+        or component["total_bytes"] != total_bytes
+        or not isinstance(component["manifest_sha256"], str)
+        or component["manifest_sha256"] != hashlib.sha256(encoded).hexdigest()
+    ):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", f"{name} manifest")
+
+
+def _derive_product(
+    cwd: Path,
+    bare_repo: Path,
+    expected_product_commit: str,
+    credential: CredentialCapability | None,
+) -> dict:
+    feature_commit = _read_stable_remote_ref(
+        PRODUCT_REMOTE, PRODUCT_FEATURE_REF, cwd, credential
+    )
+    main_commit = _read_stable_remote_ref(
+        PRODUCT_REMOTE, PRODUCT_MAIN_REF, cwd, credential
+    )
+    if feature_commit != expected_product_commit:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product feature commit")
+    initialized = _run_git(cwd, ("init", "--bare", str(bare_repo)))
+    if initialized.returncode != 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product bare repository")
+    _fetch_refs(
+        cwd,
+        bare_repo,
+        PRODUCT_REMOTE,
+        (
+            (PRODUCT_FEATURE_REF, "refs/uniep/product", feature_commit),
+            (PRODUCT_MAIN_REF, "refs/uniep/main", main_commit),
+        ),
+        credential,
+    )
+    tree = _checked_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "rev-parse", f"{feature_commit}^{{tree}}"),
+        "product tree",
+    ).decode("ascii").strip()
+    ancestry = _checked_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "rev-list", "--parents", "-n", "1", feature_commit),
+        "product ancestry",
+    ).decode("ascii").split()
+    if len(ancestry) != 2 or ancestry[0] != feature_commit:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product sole parent")
+    ancestor = _run_git(
+        cwd,
+        ("--git-dir", str(bare_repo), "merge-base", "--is-ancestor", main_commit, feature_commit),
+    )
+    if ancestor.returncode != 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product main ancestry")
+    sources = []
+    for relative_path in BACKWARD_EVIDENCE_SOURCES:
+        entry = _tree_entry(cwd, bare_repo, feature_commit, relative_path)
+        if entry is None or entry[0] != "100644" or entry[1] != "blob":
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "product source entry")
+        blob = _git_blob(cwd, bare_repo, entry[2])
+        sources.append(
+            {
+                "blob_oid": entry[2],
+                "path": relative_path,
+                "sha256": hashlib.sha256(blob).hexdigest(),
+            }
+        )
+    return {
+        "authority_path": _authority_path(feature_commit),
+        "commit": feature_commit,
+        "feature_ref": PRODUCT_FEATURE_REF,
+        "main_is_ancestor": True,
+        "main_ref": PRODUCT_MAIN_REF,
+        "observed_main": main_commit,
+        "remote": PRODUCT_REMOTE,
+        "sole_parent": ancestry[1],
+        "sources": sources,
+        "tree": tree,
+    }
+
+
+def _validate_producer(
+    cwd: Path,
+    authority_repo: Path,
+    authority_commit: str,
+    producer,
+) -> None:
+    expected_keys = {
+        "commit",
+        "identity",
+        "policy",
+        "review_verdict_id",
+        "tool_blob_oid",
+        "tool_path",
+        "tree",
+    }
+    if not isinstance(producer, dict) or set(producer) != expected_keys:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "producer keys")
+    if (
+        producer["identity"] != AUTHORITY_PRODUCER_IDENTITY
+        or producer["policy"] != AUTHORITY_PRODUCER_POLICY
+        or producer["tool_path"] != AUTHORITY_PRODUCER_TOOL_PATH
+        or not isinstance(producer["review_verdict_id"], str)
+        or not producer["review_verdict_id"].strip()
+    ):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "producer identity")
+    for key in ("commit", "tree", "tool_blob_oid"):
+        if not isinstance(producer[key], str) or _GIT_OID_PATTERN.fullmatch(producer[key]) is None:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", f"producer {key}")
+    actual_tree = _checked_git(
+        cwd,
+        ("--git-dir", str(authority_repo), "rev-parse", f"{producer['commit']}^{{tree}}"),
+        "producer commit",
+    ).decode("ascii").strip()
+    if actual_tree != producer["tree"] or producer["commit"] == authority_commit:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "producer tree")
+    predates = _run_git(
+        cwd,
+        (
+            "--git-dir",
+            str(authority_repo),
+            "merge-base",
+            "--is-ancestor",
+            producer["commit"],
+            authority_commit,
+        ),
+    )
+    if predates.returncode != 0:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "producer ancestry")
+    entry = _tree_entry(
+        cwd, authority_repo, producer["commit"], AUTHORITY_PRODUCER_TOOL_PATH
+    )
+    if (
+        entry is None
+        or entry[0] != "100644"
+        or entry[1] != "blob"
+        or entry[2] != producer["tool_blob_oid"]
+    ):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "producer tool blob")
+
+
+def _validate_envelope(
+    raw: bytes,
+    product: dict,
+    cwd: Path,
+    authority_repo: Path,
+    authority_commit: str,
+) -> AuthorityEnvelope:
+    envelope = _canonical_json(raw)
+    if not isinstance(envelope, dict) or set(envelope) != {
+        "authority",
+        "authority_payload_sha256",
+        "schema",
+    }:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "envelope keys")
+    if envelope["schema"] != AUTHORITY_ENVELOPE_SCHEMA:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "envelope schema")
+    authority = envelope["authority"]
+    if not isinstance(authority, dict) or set(authority) != {
+        "environment",
+        "producer",
+        "product",
+        "schema",
+        "status",
+    }:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "authority keys")
+    if authority["schema"] != AUTHORITY_SCHEMA or authority["status"] != "AUTHORIZED":
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "authority status")
+    canonical_authority = (
+        json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    payload_sha256 = hashlib.sha256(canonical_authority).hexdigest()
+    if envelope["authority_payload_sha256"] != payload_sha256:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "authority payload digest")
+    if authority["product"] != product:
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "product object")
+    environment = authority["environment"]
+    if not isinstance(environment, dict) or tuple(environment) != tuple(
+        sorted(BACKWARD_ENVIRONMENT_COMPONENTS)
+    ):
+        raise AuthorityPreflightError("AUTHORITY_INVALID", "environment denominator")
+    for name in sorted(BACKWARD_ENVIRONMENT_COMPONENTS):
+        _validate_component(name, environment[name])
+    _validate_producer(
+        cwd, authority_repo, authority_commit, authority["producer"]
+    )
+    return AuthorityEnvelope(
+        raw=raw,
+        payload_sha256=payload_sha256,
+        product=authority["product"],
+        environment=environment,
+        producer=authority["producer"],
+    )
+
+
+def _close_credential(capability: CredentialCapability | None) -> None:
+    if capability is None:
+        return
+    descriptor = getattr(capability, "fd", None)
+    if not isinstance(descriptor, int):
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _read_authority_object(
+    product_commit: str,
+    scratch: Path,
+    credential: CredentialCapability | None,
+) -> tuple[AuthorityAnchor, AuthorityEnvelope]:
+    """Read and validate the fixed live authority without ambient checkout trust."""
+    try:
+        _authority_path(product_commit)
+        _reject_caller_authority_overrides()
+        scratch = Path(scratch)
+        if not scratch.is_absolute() or scratch.is_symlink():
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "scratch path")
+        if scratch.exists():
+            if not scratch.is_dir() or any(scratch.iterdir()):
+                raise AuthorityPreflightError("AUTHORITY_INVALID", "scratch is not empty")
+        else:
+            scratch.mkdir(mode=0o700)
+        os.chmod(scratch, 0o700)
+
+        product = _derive_product(
+            scratch, scratch / "product.git", product_commit, credential
+        )
+        authority_commit = _read_stable_remote_ref(
+            AUTHORITY_REMOTE, AUTHORITY_REF, scratch, credential
+        )
+        authority_repo = scratch / "authority.git"
+        initialized = _run_git(scratch, ("init", "--bare", str(authority_repo)))
+        if initialized.returncode != 0:
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "authority bare repository")
+        _fetch_refs(
+            scratch,
+            authority_repo,
+            AUTHORITY_REMOTE,
+            ((AUTHORITY_REF, "refs/uniep/authority", authority_commit),),
+            credential,
+        )
+        authority_tree = _checked_git(
+            scratch,
+            (
+                "--git-dir",
+                str(authority_repo),
+                "rev-parse",
+                f"{authority_commit}^{{tree}}",
+            ),
+            "authority tree",
+        ).decode("ascii").strip()
+        path = _authority_path(product_commit)
+        entry = _tree_entry(scratch, authority_repo, authority_commit, path)
+        if entry is None:
+            raise AuthorityPreflightError("AUTHORITY_MISSING", "fixed authority path")
+        if entry[0] != "100644" or entry[1] != "blob":
+            raise AuthorityPreflightError("AUTHORITY_INVALID", "authority tree entry")
+        raw = _git_blob(scratch, authority_repo, entry[2])
+        envelope = _validate_envelope(
+            raw, product, scratch, authority_repo, authority_commit
+        )
+        anchor = AuthorityAnchor(
+            commit=authority_commit,
+            tree=authority_tree,
+            path=path,
+            blob_oid=entry[2],
+            full_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+        return anchor, envelope
+    finally:
+        _close_credential(credential)
 
 # This is the published protocol.  Keep debug/short runs under a differently
 # named script so their output cannot be mistaken for 5/50 evidence.
