@@ -813,7 +813,10 @@ def run_weighted_one(
     fc1_out = dispatch_result.fc1_output
     recv_weight = dispatch_result.received_routing_weights
     swiglu_out = weighted_swiglu_forward(
-        fc1_out, torch.ones_like(recv_weight), layer.num_aicore_programs)
+        fc1_out,
+        torch.ones_like(recv_weight),
+        layer.num_aivector_programs,
+    )
 
     kernel_exp = torch.repeat_interleave(
         torch.arange(layer.experts_per_rank, dtype=torch.int32, device=device),

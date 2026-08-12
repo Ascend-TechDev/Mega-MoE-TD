@@ -4,9 +4,9 @@
 The input rows are already grouped as local-expert major, then source-rank
 major.  Routing weights were applied by weighted SwiGLU before this stage.
 This module therefore performs only FC2, route-output transport, and the final
-top-k reduction.  The direct path pulls contiguous source/expert buckets into
-a local workspace before reducing; it never issues fine-grained remote loads
-from the token/top-k loop.
+top-k reduction.  Vector programs resolve each source rank's symmetric combine
+workspace and store contiguous source/expert FC2 tiles there before reducing
+locally.
 """
 
 import torch
@@ -19,6 +19,13 @@ from triton.language.extra.cann.extension import sub_vec_id
 
 _META_BLOCK = 256
 _ROUTE_BLOCK = 256
+_FC2_REMOTE_STORE_BLOCK = 4096
+_FC2_TRANSPORT_BLOCK_M = 256
+
+
+def _fc2_reduce_block_n(num_rows: int) -> int:
+    """Return the validated reduction width for the current route count."""
+    return 1024 if num_rows >= 1024 else 256
 
 
 @triton.jit
@@ -36,14 +43,15 @@ def _scatter_route_to_send_kernel(send_route_idx_ptr, route_to_send_ptr, num_sen
 
 
 @triton.jit
-def _prepare_fc2_combine_metadata_kernel(
+def _prepare_fc2_remote_store_metadata_kernel(
     counts_mem_ptr,
-    send_bucket_starts_ptr,
-    send_bucket_receive_offsets_ptr,
+    recv_expert_offs_ptr,
     pull_tile_rank_ptr,
     pull_tile_src_start_ptr,
     pull_tile_dst_start_ptr,
     pull_tile_row_count_ptr,
+    group_segment_start_ptr,
+    group_segment_count_ptr,
     num_pull_slots,
     LOCAL_RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -51,39 +59,93 @@ def _prepare_fc2_combine_metadata_kernel(
     NUM_BINS_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     META_BLOCK: tl.constexpr,
+    GROUP_EXPERTS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUP_INDEX_STRIDE: tl.constexpr,
 ):
-    """Build compact descriptors for pulling remote FC2 bucket rows."""
+    """Describe local FC2 tiles that are stored into each source rank.
+
+    For a local expert, received rows are source-major.  The source rank's
+    stable-send rows are global-expert major, so both offsets can be derived
+    from the replicated count cube without another host-side collective.
+    """
+    # Grouped remote-store uses a tiny segment table instead of making every
+    # Vector group scan the complete descriptor workspace.  The table stores
+    # one ``(start, count)`` pair per ``(expert-group, source-rank)``.  This
+    # metadata kernel has a single program, so resetting and updating the
+    # counters is race-free and does not require a host synchronization or a
+    # device atomic.
+    for group_id in range(0, NUM_GROUPS):
+        for source_rank in range(0, WORLD_SIZE):
+            segment_id = group_id * GROUP_INDEX_STRIDE + source_rank
+            tl.store(group_segment_start_ptr + segment_id, 0)
+            tl.store(group_segment_count_ptr + segment_id, 0)
+
     meta_offs = tl.arange(0, META_BLOCK)
     for start in range(0, num_pull_slots, META_BLOCK):
         offs = start + meta_offs
         tl.store(pull_tile_rank_ptr + offs, -1, mask=offs < num_pull_slots)
 
     transport_cursor = 0
-    # On the home/source rank, every stable-send bucket maps one-to-one to a
-    # contiguous source segment in the destination rank's expert-major FC2
-    # output.  Pull those segments into local stable-send order so the later
-    # top-k loop performs local loads only.
-    local_count_row = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
-    for bucket in range(0, WORLD_SIZE * EXPERTS_PER_RANK):
-        route_count = tl.load(local_count_row + bucket)
-        local_send_start = tl.load(send_bucket_starts_ptr + bucket)
-        remote_receive_start = tl.load(send_bucket_receive_offsets_ptr + bucket)
-        destination_rank = bucket // EXPERTS_PER_RANK
-        num_tiles = tl.cdiv(route_count, BLOCK_M)
-        for tile_id in range(0, num_tiles):
-            tile_delta = tile_id * BLOCK_M
-            row_count = tl.minimum(BLOCK_M, route_count - tile_delta)
-            tl.store(pull_tile_rank_ptr + transport_cursor, destination_rank)
-            tl.store(
-                pull_tile_src_start_ptr + transport_cursor,
-                remote_receive_start + tile_delta,
+    # Each source gets its own stable-send cursor.  Scan global buckets in the
+    # same order used by build_routing_plan and emit only this rank's buckets.
+    for source_rank in range(0, WORLD_SIZE):
+        remote_send_cursor = 0
+        for bucket in range(0, WORLD_SIZE * EXPERTS_PER_RANK):
+            route_count = tl.load(
+                counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
             )
-            tl.store(
-                pull_tile_dst_start_ptr + transport_cursor,
-                local_send_start + tile_delta,
-            )
-            tl.store(pull_tile_row_count_ptr + transport_cursor, row_count)
-            transport_cursor += 1
+            destination_rank = bucket // EXPERTS_PER_RANK
+            expert_id = bucket % EXPERTS_PER_RANK
+            if destination_rank == LOCAL_RANK:
+                source_local_start = tl.load(recv_expert_offs_ptr + expert_id)
+                for prior_source in range(0, source_rank):
+                    source_local_start += tl.load(
+                        counts_mem_ptr
+                        + prior_source * NUM_BINS_PAD
+                        + bucket
+                    )
+                num_tiles = tl.cdiv(route_count, BLOCK_M)
+                for tile_id in range(0, num_tiles):
+                    tile_delta = tile_id * BLOCK_M
+                    row_count = tl.minimum(
+                        BLOCK_M, route_count - tile_delta
+                    )
+                    encoded_rank = source_rank + expert_id * WORLD_SIZE
+                    tl.store(
+                        pull_tile_rank_ptr + transport_cursor, encoded_rank
+                    )
+                    tl.store(
+                        pull_tile_src_start_ptr + transport_cursor,
+                        source_local_start + tile_delta,
+                    )
+                    tl.store(
+                        pull_tile_dst_start_ptr + transport_cursor,
+                        remote_send_cursor + tile_delta,
+                    )
+                    tl.store(
+                        pull_tile_row_count_ptr + transport_cursor, row_count
+                    )
+                    # Descriptors are emitted source-major and expert-major,
+                    # so one group's entries for a source are contiguous.
+                    segment_id = (
+                        (expert_id // GROUP_EXPERTS) * GROUP_INDEX_STRIDE
+                        + source_rank
+                    )
+                    segment_count = tl.load(
+                        group_segment_count_ptr + segment_id
+                    )
+                    if segment_count == 0:
+                        tl.store(
+                            group_segment_start_ptr + segment_id,
+                            transport_cursor,
+                        )
+                    tl.store(
+                        group_segment_count_ptr + segment_id,
+                        segment_count + 1,
+                    )
+                    transport_cursor += 1
+            remote_send_cursor += route_count
 
 
 @triton.jit
@@ -108,7 +170,7 @@ def _fc2_gemm_one_mn_tile(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Compute one FC2 M/N tile for the expert/N-persistent schedule."""
+    """Compute one FC2 M/N tile for the coarse expert-group schedule."""
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
@@ -155,7 +217,7 @@ def _fc2_gemm_one_mn_tile(
 
 
 @triton.jit
-def _kernel_fc2_expert_n_persistent(
+def _kernel_fc2_expert_group(
     input_ptr,
     weight_ptr,
     peer_mem_ptr,
@@ -168,27 +230,22 @@ def _kernel_fc2_expert_n_persistent(
     stride_weight_k,
     stride_peer_m,
     stride_peer_n,
+    GROUP_FIRST_EXPERT: tl.constexpr,
+    GROUP_LAST_EXPERT: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
 ):
-    """Expert/N-persistent FC2, writing expert-major rows to symmetric GM."""
+    """Cube-only FC2 for one contiguous expert group."""
     pid = tl.program_id(0)
     ncore = tl.num_programs(0)
-
     with al.scope(core_mode="cube", disable_auto_sync=True):
-        # ``launch_fc2_combine`` requires BLOCK_N to divide N.  Keep this as
-        # pure constexpr arithmetic: the Ascend frontend materializes
-        # ``tl.cdiv`` as a semantic value, which cannot then be multiplied by
-        # the constexpr expert count in the persistent schedule.
         num_n_tiles: tl.constexpr = N // BLOCK_N
-        # Expert-major ownership: one task keeps a fixed (expert, N tile)
-        # while traversing every merged M window for that expert.
-        total_fc2_tasks: tl.constexpr = EXPERTS_PER_RANK * num_n_tiles
-        for task_id in range(pid, total_fc2_tasks, ncore):
+        first_task = GROUP_FIRST_EXPERT * num_n_tiles
+        last_task = GROUP_LAST_EXPERT * num_n_tiles
+        for task_id in range(pid + first_task, last_task, ncore):
             expert_id = task_id // num_n_tiles
             n_tile = task_id % num_n_tiles
             expert_size = tl.load(recv_per_expert_ptr + expert_id)
@@ -225,34 +282,73 @@ def _kernel_fc2_expert_n_persistent(
 
 
 @triton.jit
-def _kernel_direct_pull_transport(
-    fc2_buf_ptr,
+def _remote_store_one_tile(
+    reverse_buf_ptr,
+    peer_mem_ptr,
+    src_start,
+    dst_start,
+    row_count,
+    stride_reverse_m,
+    peer_rank,
+    N: tl.constexpr,
+    REMOTE_STORE_BLOCK: tl.constexpr,
+):
+    """Store one contiguous FC2 descriptor into its source rank."""
+    remote_reverse = libshmem_device.remote_ptr(reverse_buf_ptr, peer_rank)
+    flat_offsets = tl.arange(0, REMOTE_STORE_BLOCK)
+    num_elements = row_count * N
+    source_base = peer_mem_ptr + src_start * N
+    destination_base = remote_reverse + dst_start * stride_reverse_m
+    for flat_start in range(0, num_elements, REMOTE_STORE_BLOCK):
+        offsets = flat_start + flat_offsets
+        mask = offsets < num_elements
+        values = tl.load(
+            source_base + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        tl.store(destination_base + offsets, values, mask=mask)
+
+
+@triton.jit
+def _kernel_remote_store_transport_group(
+    reverse_buf_ptr,
     peer_mem_ptr,
     pull_tile_rank_ptr,
     pull_tile_src_start_ptr,
     pull_tile_dst_start_ptr,
     pull_tile_row_count_ptr,
-    num_pull_slots,
-    stride_fc2_m,
-    N: tl.constexpr,
+    group_segment_start_ptr,
+    group_segment_count_ptr,
+    stride_reverse_m,
+    GROUP_ID: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    GROUP_INDEX_STRIDE: tl.constexpr,
+    REMOTE_STORE_BLOCK: tl.constexpr,
+    N: tl.constexpr,
 ):
-    """Pull FC2 descriptors into an ordinary local workspace."""
+    """Vector-only remote store for one encoded expert group.
+
+    Each group/source pair is contiguous in the descriptor stream emitted by
+    ``_prepare_fc2_remote_store_metadata_kernel``.
+    """
     pid = tl.program_id(0)
     ncore = tl.num_programs(0)
-
-    # Reaching this separate launch proves that the local FC2 kernel has fully
-    # exited.  Synchronize here, rather than before that exit, so every peer's
-    # symmetric FC2 rows and Cube-store epilogue are visible before the first
-    # remote get starts.
-    libshmem_device.barrier_all_vec()
-
     with al.scope(core_mode="vector", disable_auto_sync=True):
         if sub_vec_id() == 0:
-            for peer_owner in range(pid, WORLD_SIZE, ncore):
-                for tile_id in range(0, num_pull_slots):
-                    peer_rank = tl.load(pull_tile_rank_ptr + tile_id)
-                    if peer_rank == peer_owner:
+            segment_base = GROUP_ID * GROUP_INDEX_STRIDE
+            for source_phase in range(0, WORLD_SIZE):
+                # Rotate peer order by pid to avoid all Vector programs
+                # targeting the same remote rank in one phase.
+                source_rank = (source_phase + pid + GROUP_ID) % WORLD_SIZE
+                segment_id = segment_base + source_rank
+                segment_start = tl.load(group_segment_start_ptr + segment_id)
+                segment_count = tl.load(group_segment_count_ptr + segment_id)
+                for segment_off in range(pid, segment_count, ncore):
+                    tile_id = segment_start + segment_off
+                    encoded_rank = tl.load(pull_tile_rank_ptr + tile_id)
+                    if encoded_rank >= 0:
+                        peer_rank = encoded_rank % WORLD_SIZE
                         src_start = tl.load(
                             pull_tile_src_start_ptr + tile_id
                         ).to(tl.int64)
@@ -262,15 +358,30 @@ def _kernel_direct_pull_transport(
                         row_count = tl.load(
                             pull_tile_row_count_ptr + tile_id
                         )
-                        libshmem_device.getmem(
-                            fc2_buf_ptr + dst_start * stride_fc2_m,
-                            peer_mem_ptr + src_start * N,
-                            row_count * N * 2,
+                        _remote_store_one_tile(
+                            reverse_buf_ptr,
+                            peer_mem_ptr,
+                            src_start,
+                            dst_start,
+                            row_count,
+                            stride_reverse_m,
                             peer_rank,
+                            N,
+                            REMOTE_STORE_BLOCK,
                         )
 
-    # All remote readers must leave symmetric FC2 storage before any rank can
-    # return and reuse it for the next dispatch.
+
+@triton.jit
+def _kernel_remote_store_barrier():
+    """Fence grouped Vector RMA with the backend's barrier-sized grid.
+
+    On Ascend950DT, ``barrier_all_vec`` is tied to one participating Vector
+    block per AI Core.  The transport itself can use all physical Vector
+    programs, but putting the barrier inside a 64-block transport launch can
+    leave the collective waiting forever.  Keep the data movement launch and
+    the rank-wide barrier as separate, stream-ordered kernels; the latter is
+    launched with the Cube/AICore-sized grid by the helper below.
+    """
     libshmem_device.barrier_all_vec()
 
 
@@ -289,7 +400,7 @@ def _kernel_local_topk_reduce(
     TOPK: tl.constexpr,
     BLOCK_N_REDUCE: tl.constexpr,
 ):
-    """Reduce locally staged route rows after the pull kernel has exited."""
+    """Reduce locally staged route rows after remote stores are visible."""
     pid = tl.program_id(0)
     ncore = tl.num_programs(0)
 
@@ -349,10 +460,9 @@ def build_route_to_send(send_route_idx: torch.Tensor, route_to_send: torch.Tenso
     return route_to_send
 
 
-def prepare_fc2_combine_metadata(
+def prepare_fc2_remote_store_metadata(
     counts_mem: torch.Tensor,
-    send_bucket_starts: torch.Tensor,
-    send_bucket_receive_offsets: torch.Tensor,
+    received_expert_offsets: torch.Tensor,
     pull_tile_rank: torch.Tensor,
     pull_tile_src_start: torch.Tensor,
     pull_tile_dst_start: torch.Tensor,
@@ -364,11 +474,14 @@ def prepare_fc2_combine_metadata(
     experts_per_rank: int,
     num_bins_pad: int,
     block_m: int,
+    group_segment_starts: torch.Tensor,
+    group_segment_counts: torch.Tensor,
+    group_experts: int,
 ) -> None:
+    """Build grouped descriptors for remote stores to source ranks."""
     named_tensors = {
         "counts_mem": counts_mem,
-        "send_bucket_starts": send_bucket_starts,
-        "send_bucket_receive_offsets": send_bucket_receive_offsets,
+        "received_expert_offsets": received_expert_offsets,
         "pull_tile_rank": pull_tile_rank,
         "pull_tile_src_start": pull_tile_src_start,
         "pull_tile_dst_start": pull_tile_dst_start,
@@ -390,14 +503,12 @@ def prepare_fc2_combine_metadata(
         raise ValueError("num_bins_pad is too small for the global expert buckets")
     if counts_mem.numel() < world_size * num_bins_pad:
         raise ValueError("counts_mem is smaller than the padded count cube")
-    num_experts = world_size * experts_per_rank
-    if (
-        send_bucket_starts.numel() < num_experts
-        or send_bucket_receive_offsets.numel() < num_experts
-    ):
+    if received_expert_offsets.numel() < experts_per_rank + 1:
         raise ValueError(
-            "send bucket metadata must contain one entry per global expert"
+            "received_expert_offsets must contain experts_per_rank + 1 entries"
         )
+    if num_pull_slots <= 0:
+        raise ValueError("num_pull_slots must be positive")
     for name, tensor in (
         ("pull_tile_rank", pull_tile_rank),
         ("pull_tile_src_start", pull_tile_src_start),
@@ -406,19 +517,43 @@ def prepare_fc2_combine_metadata(
     ):
         if tensor.numel() < num_pull_slots:
             raise ValueError(f"{name} has fewer than num_pull_slots entries")
-    if num_pull_slots <= 0:
-        raise ValueError("num_pull_slots must be positive")
     if block_m < 16 or block_m & (block_m - 1):
         raise ValueError("block_m must be a power of two no smaller than 16")
 
-    _prepare_fc2_combine_metadata_kernel[(1, )](
+    if group_experts <= 0:
+        raise ValueError("group_experts must be positive")
+    if group_experts > experts_per_rank:
+        raise ValueError("group_experts cannot exceed experts_per_rank")
+    num_groups = (experts_per_rank + group_experts - 1) // group_experts
+    metadata_device = counts_mem.device
+    for name, tensor in (
+        ("group_segment_starts", group_segment_starts),
+        ("group_segment_counts", group_segment_counts),
+    ):
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must use torch.int32")
+        if tensor.device != metadata_device:
+            raise ValueError(f"{name} must be on {metadata_device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    required_segments = num_groups * world_size
+    if (
+        group_segment_starts.numel() < required_segments
+        or group_segment_counts.numel() < required_segments
+    ):
+        raise ValueError(
+            "group segment metadata is smaller than the configured group/rank table"
+        )
+
+    _prepare_fc2_remote_store_metadata_kernel[(1, )](
         counts_mem,
-        send_bucket_starts,
-        send_bucket_receive_offsets,
+        received_expert_offsets,
         pull_tile_rank,
         pull_tile_src_start,
         pull_tile_dst_start,
         pull_tile_row_count,
+        group_segment_starts,
+        group_segment_counts,
         num_pull_slots,
         LOCAL_RANK=local_rank,
         WORLD_SIZE=world_size,
@@ -426,7 +561,120 @@ def prepare_fc2_combine_metadata(
         NUM_BINS_PAD=num_bins_pad,
         BLOCK_M=block_m,
         META_BLOCK=_META_BLOCK,
+        GROUP_EXPERTS=group_experts,
+        NUM_GROUPS=num_groups,
+        GROUP_INDEX_STRIDE=world_size,
     )
+
+
+def _launch_fc2_remote_store_pipeline(
+    weighted_activation: torch.Tensor,
+    down_weight: torch.Tensor,
+    fc2_buf: torch.Tensor,
+    peer_mem: torch.Tensor,
+    received_routes_per_expert: torch.Tensor,
+    received_expert_offsets: torch.Tensor,
+    pull_tile_rank: torch.Tensor,
+    pull_tile_src_start: torch.Tensor,
+    pull_tile_dst_start: torch.Tensor,
+    pull_tile_row_count: torch.Tensor,
+    *,
+    group_segment_starts: torch.Tensor,
+    group_segment_counts: torch.Tensor,
+    num_program_cores: int,
+    num_vector_programs: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    world_size: int,
+    pipeline_group_experts: int,
+    cube_stream,
+    vector_stream,
+    group_events,
+    start_event,
+    done_event,
+) -> None:
+    """Overlap coarse Cube groups and Vector remote-store groups.
+
+    The two streams are deliberately separate: Ascend950DT does not reliably
+    publish a Cube-side GM atomic from a mixed kernel, while a normal stream
+    event is ordered by the runtime and is cheap at the 7--14 group cadence.
+    ``done_event`` is waited by the caller's current stream before reduction.
+    """
+    experts_per_rank = down_weight.shape[0]
+    num_groups = (
+        experts_per_rank + pipeline_group_experts - 1
+    ) // pipeline_group_experts
+    if num_vector_programs <= 0:
+        raise ValueError("num_vector_programs must be positive")
+    if cube_stream is None or vector_stream is None:
+        raise ValueError("FC2 pipeline streams must be provided")
+    if group_events is None or len(group_events) < num_groups:
+        raise ValueError("FC2 pipeline requires one event per expert group")
+    if start_event is None or done_event is None:
+        raise ValueError("FC2 pipeline start and completion events must be provided")
+
+    current_stream = torch.npu.current_stream(weighted_activation.device)
+    start_event.record(current_stream)
+    cube_stream.wait_event(start_event)
+    vector_stream.wait_event(start_event)
+
+    N = down_weight.shape[1]
+    K = down_weight.shape[2]
+    for group_id in range(num_groups):
+        first_expert = group_id * pipeline_group_experts
+        last_expert = min(first_expert + pipeline_group_experts, experts_per_rank)
+        with torch.npu.stream(cube_stream):
+            _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
+                weighted_activation,
+                down_weight,
+                peer_mem,
+                received_routes_per_expert,
+                received_expert_offsets,
+                weighted_activation.stride(0),
+                weighted_activation.stride(1),
+                down_weight.stride(0),
+                down_weight.stride(1),
+                down_weight.stride(2),
+                N,
+                1,
+                GROUP_FIRST_EXPERT=first_expert,
+                GROUP_LAST_EXPERT=last_expert,
+                N=N,
+                K=K,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+            )
+            group_events[group_id].record(cube_stream)
+
+        vector_stream.wait_event(group_events[group_id])
+        with torch.npu.stream(vector_stream):
+            _kernel_remote_store_transport_group[(num_vector_programs, 1, 1)](
+                fc2_buf,
+                peer_mem,
+                pull_tile_rank,
+                pull_tile_src_start,
+                pull_tile_dst_start,
+                pull_tile_row_count,
+                group_segment_starts,
+                group_segment_counts,
+                fc2_buf.stride(0),
+                GROUP_ID=group_id,
+                WORLD_SIZE=world_size,
+                GROUP_INDEX_STRIDE=world_size,
+                REMOTE_STORE_BLOCK=_FC2_REMOTE_STORE_BLOCK,
+                N=N,
+            )
+
+    # All group transports are ordered on vector_stream.  A dedicated
+    # barrier-sized launch now fences their RMA writes before the caller's
+    # current stream is released and before local reduction reads them.
+    with torch.npu.stream(vector_stream):
+        _kernel_remote_store_barrier[(num_program_cores, 1, 1)]()
+
+    done_event.record(vector_stream)
+    current_stream.wait_event(done_event)
 
 
 def launch_fc2_combine(
@@ -447,12 +695,22 @@ def launch_fc2_combine(
     *,
     topk: int,
     num_program_cores: int,
+    num_vector_programs: int,
+    reduce_block_n: int,
     block_m: int,
     block_n: int,
     block_k: int,
     world_size: int,
+    pipeline_group_experts: int,
+    group_segment_starts: torch.Tensor,
+    group_segment_counts: torch.Tensor,
+    pipeline_cube_stream,
+    pipeline_vector_stream,
+    pipeline_group_events,
+    pipeline_start_event,
+    pipeline_done_event,
 ) -> torch.Tensor:
-    """Launch expert/N-persistent FC2, direct pull, then two-AIV reduction."""
+    """Launch pipelined FC2, remote-store transport, and local reduction."""
     if weighted_activation.ndim != 2 or down_weight.ndim != 3:
         raise ValueError("weighted_activation must be [M, K] and down_weight must be [E, N, K]")
     if weighted_activation.dtype != torch.bfloat16 or down_weight.dtype != torch.bfloat16:
@@ -483,7 +741,7 @@ def launch_fc2_combine(
         raise ValueError("peer_mem is too small for the symmetric FC2 rows")
     if fc2_buf.data_ptr() == peer_mem.data_ptr():
         raise ValueError(
-            "bulk direct-pull workspace must not alias symmetric FC2 rows"
+            "symmetric combine workspace must not alias local FC2 rows"
         )
     experts_per_rank = down_weight.shape[0]
     if experts_per_rank <= 0:
@@ -548,6 +806,28 @@ def launch_fc2_combine(
         raise ValueError("topk and num_program_cores must be positive")
     if world_size <= 0:
         raise ValueError("world_size must be positive")
+    if pipeline_group_experts <= 0:
+        raise ValueError("pipeline_group_experts must be positive")
+    if pipeline_group_experts > experts_per_rank:
+        raise ValueError("pipeline_group_experts cannot exceed experts_per_rank")
+    num_groups = (
+        experts_per_rank + pipeline_group_experts - 1
+    ) // pipeline_group_experts
+    required_segments = num_groups * world_size
+    for name, tensor in (
+        ("group_segment_starts", group_segment_starts),
+        ("group_segment_counts", group_segment_counts),
+    ):
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must use torch.int32")
+        if tensor.device != weighted_activation.device:
+            raise ValueError(f"{name} must be on {weighted_activation.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if tensor.numel() < required_segments:
+            raise ValueError(
+                f"{name} is smaller than the configured group/rank table"
+            )
     for name, block in (
         ("block_m", block_m),
         ("block_n", block_n),
@@ -560,44 +840,36 @@ def launch_fc2_combine(
             "FC2 block_n and block_k must divide N and K on the current Ascend backend"
         )
 
-    reduce_width = 512 if weighted_activation.shape[0] >= 1024 else 256
-    _kernel_fc2_expert_n_persistent[(num_program_cores, 1, 1)](
+    if reduce_block_n not in (256, 1024):
+        raise ValueError("reduce_block_n must be the production value 256 or 1024")
+    _launch_fc2_remote_store_pipeline(
         weighted_activation,
         down_weight,
+        fc2_buf,
         peer_mem,
         received_routes_per_expert,
         received_expert_offsets,
-        weighted_activation.stride(0),
-        weighted_activation.stride(1),
-        down_weight.stride(0),
-        down_weight.stride(1),
-        down_weight.stride(2),
-        fc2_buf.stride(0),
-        fc2_buf.stride(1),
-        N=down_weight.shape[1],
-        K=down_weight.shape[2],
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        EXPERTS_PER_RANK=experts_per_rank,
-    )
-    _kernel_direct_pull_transport[(num_program_cores, 1, 1)](
-        fc2_buf,
-        peer_mem,
         pull_tile_rank,
         pull_tile_src_start,
         pull_tile_dst_start,
         pull_tile_row_count,
-        num_pull_slots,
-        fc2_buf.stride(0),
-        N=down_weight.shape[1],
-        WORLD_SIZE=world_size,
+        num_program_cores=num_program_cores,
+        num_vector_programs=num_vector_programs,
+        group_segment_starts=group_segment_starts,
+        group_segment_counts=group_segment_counts,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        world_size=world_size,
+        pipeline_group_experts=pipeline_group_experts,
+        cube_stream=pipeline_cube_stream,
+        vector_stream=pipeline_vector_stream,
+        group_events=pipeline_group_events,
+        start_event=pipeline_start_event,
+        done_event=pipeline_done_event,
     )
-    # Blocking getmem only fences the Vector core that issued it; the kernel
-    # boundary makes every pulled GM row visible before both AIV sub-cores per
-    # AI Core consume the local workspace.  Derive the 2-AIV grid from the
-    # caller-provided AI Core program count so this remains portable.
-    _kernel_local_topk_reduce[(num_program_cores * 2, 1, 1)](
+    # The remote-store barrier fences every route row before local reduction.
+    _kernel_local_topk_reduce[(num_vector_programs, 1, 1)](
         fc2_buf,
         route_to_send,
         output,
@@ -609,13 +881,13 @@ def launch_fc2_combine(
         output.stride(1),
         N=down_weight.shape[1],
         TOPK=topk,
-        BLOCK_N_REDUCE=reduce_width,
+        BLOCK_N_REDUCE=reduce_block_n,
     )
     return output
 
 
 __all__ = [
     "build_route_to_send",
-    "prepare_fc2_combine_metadata",
+    "prepare_fc2_remote_store_metadata",
     "launch_fc2_combine",
 ]

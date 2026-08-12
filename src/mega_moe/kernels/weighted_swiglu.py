@@ -113,7 +113,8 @@ def weighted_swiglu_forward(
             out in the same dispatched-row order as ``fc1_output``.  The
             public routing-weight input remains FP32 throughout dispatch and
             this function consumes the transported FP32 payload directly.
-        num_cores: Maximum number of persistent Triton programs to launch.
+        num_cores: Number of physical Vector-core programs to launch.  The
+            caller obtains this from the device-owned ``NPUUtils`` query.
         activation: ``"swiglu"`` (default, ``silu(gate) * up``) or ``"situglu"``
             (``beta * tanh(gate / beta) * sigmoid(gate) * up``).
         situ_beta: Gate tanh width for SiTU-GLU.  Ignored for SwiGLU.
@@ -183,6 +184,9 @@ def weighted_swiglu_forward(
         return output
 
     num_tiles = triton.cdiv(num_rows, _BLOCK_M) * triton.cdiv(ffn_dim, _BLOCK_N)
+    # The launch count is supplied by the device-owned physical Vector-core
+    # query.  Do not derive it from a user-controlled environment variable or
+    # from the Cube count: 950DT reports 32 Cube and 64 Vector cores.
     num_programs = min(num_cores, num_tiles)
     _weighted_activation_kernel[(num_programs, )](
         fc1_output,
