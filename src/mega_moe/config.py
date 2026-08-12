@@ -1,7 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Configuration for the standalone Ascend Mega-MoE forward."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -19,6 +19,45 @@ _ACTIVATIONS = (
 )
 
 
+def _detect_physical_aicore_count() -> Optional[int]:
+    """Return the active device's physical AICore count when available.
+
+    The Triton Ascend driver owns the platform table, so using it here keeps
+    the forward launch grid aligned with the installed 950PR/950DT variant.
+    Import and driver failures are deliberately converted to ``None``: this
+    module is also imported by host-only unit tests and documentation tools.
+    """
+    try:
+        from triton.backends.ascend.driver import NPUUtils
+
+        count = NPUUtils().get_aicore_num()
+    except Exception:
+        return None
+    return count if type(count) is int and count > 0 else None
+
+
+def _default_num_aicore_programs() -> int:
+    """Resolve the launch grid from CANN's active-device report."""
+    count = _detect_physical_aicore_count()
+    if count is None:
+        raise RuntimeError(
+            "cannot determine the NPU AICore count; initialize CANN before "
+            "creating MoEForwardConfig"
+        )
+    return count
+
+
+def _detect_physical_aivector_core_count() -> Optional[int]:
+    """Return the active device's physical Vector-core count when available."""
+    try:
+        from triton.backends.ascend.driver import NPUUtils
+
+        count = NPUUtils().get_aivector_core_num()
+    except Exception:
+        return None
+    return count if type(count) is int and count > 0 else None
+
+
 @dataclass(frozen=True)
 class MoEForwardConfig:
     """Stage-specific launch and tiling parameters.
@@ -29,18 +68,23 @@ class MoEForwardConfig:
 
     ``dispatch_fc1_block_size_m`` controls both dispatch readiness slots and
     FC1 dot rows; ``fc1_gemm_block_size_{n,k}`` control the other FC1 dot axes.
-    Likewise, ``fc2_combine_block_size_m`` controls FC2/direct-pull row tiles,
-    while ``fc2_gemm_block_size_{n,k}`` control only FC2 dot tiles.  FC2 uses
-    the measured persistent expert-N GEMM, direct-pull transport, and both
-    Vector sub-cores for reduction; dominated A/B controls are not public
-    configuration fields.  The post-FC1 activation remains selectable for
-    compatibility with the target repository SiTU-GLU path.
+    Likewise, ``fc2_combine_block_size_m`` controls the FC2 GEMM row tile and
+    ``fc2_gemm_block_size_{n,k}`` control the remaining FC2 dot axes.  FC2 uses
+    the validated coarse expert-group Cube/Vector stream, fixed remote-store
+    coalescing, and all detected Vector cores for reduction; experimental
+    transport controls are not public configuration fields.  The post-FC1
+    activation remains selectable for compatibility with the target repository
+    SiTU-GLU path.
 
     activation selects SwiGLU or SiTU-GLU; situ_beta and situ_linear_beta
     configure the latter and are ignored for SwiGLU.
+
+    The launch grid queries CANN's ``NPUUtils().get_aicore_num()`` and uses
+    every physical AICore; it is device state rather than a user setting.
     """
 
-    num_aicore_programs: int = 24
+    num_aicore_programs: int = field(init=False)
+    num_aivector_programs: int = field(init=False)
     receive_capacity_factor: Optional[float] = None
     dispatch_fc1_block_size_m: int = 128
     fc1_gemm_block_size_n: int = 256
@@ -57,6 +101,16 @@ class MoEForwardConfig:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self):
+        object.__setattr__(
+            self, "num_aicore_programs", _default_num_aicore_programs()
+        )
+        vector_count = _detect_physical_aivector_core_count()
+        if vector_count is None:
+            raise RuntimeError(
+                "cannot determine the NPU Vector-core count; initialize CANN "
+                "before creating MoEForwardConfig"
+            )
+        object.__setattr__(self, "num_aivector_programs", vector_count)
         if self.num_aicore_programs < 2:
             raise ValueError("num_aicore_programs must be at least 2")
 
