@@ -11,6 +11,11 @@ the public boundary, during transport, and in the weighted-SwiGLU multiply.
 The optimized path calls the production layer interfaces directly; this file
 does not carry a benchmark-local FC2/combine kernel.
 
+FC2/combine always uses the production coarse expert-group stream: Cube FC2
+groups overlap a Triton ACLSHMEM ``remote_ptr`` + ``tl.store`` Vector
+transport before the local top-k reduction. There is no benchmark transport
+mode selector.
+
 The only performance baseline is Torch-NPU grouped-GEMM + HCCL.  The primary
 comparison is direct-call full E2E.  Four event slices (preprocess,
 dispatch+FC1, weighted SwiGLU, FC2+combine) are sampled for both the candidate
@@ -46,10 +51,9 @@ one rank; there is no environment-controlled shape or world-size selection.
 
 The remaining environment variables are runtime knobs only:
     MOE_FULL_BENCH_BREAKDOWN=0          # disable four-stage event diagnostics
-    MOE_FUSED_NUM_AICORE_PROGRAMS=24   # device tuning knob
     MOE_FULL_BENCH_RESULTS_DIR=/tmp/... # optional forward result directory
     MOE_BACKWARD_BENCH_RESULTS_DIR=/tmp/... # optional backward result directory
-    MOE_FUSED_ASH_SIZE_GB=64            # ACLSHMEM heap size, not shape selection
+    MOE_FUSED_ASH_SIZE_GB=6             # ACLSHMEM heap size, not shape selection
 """
 
 import hashlib
@@ -92,7 +96,7 @@ BACKWARD_TIMING = kit.BACKWARD_TIMING
 WARMUP_ITERS = FORWARD_TIMING.warmup
 BENCH_ITERS = FORWARD_TIMING.iterations
 RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "1") == "1"
-G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "4"))
+G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "6"))
 RESULTS_DIR = os.environ.get(
     "MOE_FULL_BENCH_RESULTS_DIR",
     str(PROJECT_ROOT / "results" / "forward"),
@@ -140,6 +144,8 @@ def _required_ash_bytes(case: CaseSpec, world_size):
     experts_per_rank = case.num_experts // world_size
     max_recv_rows = int(case.tokens * case.topk * case.capacity_factor)
     token_peer_bytes = max_recv_rows * case.hidden * ACTIVATION_DTYPE.itemsize
+    # FC2 remote-store writes stable-send rows into a symmetric combine buffer.
+    combine_bytes = case.tokens * case.topk * case.hidden * ACTIVATION_DTYPE.itemsize
     routing_peer_bytes = max_recv_rows * ROUTING_TRANSPORT_DTYPE.itemsize
     dispatch_tile_m = int(
         os.environ.get("MOE_FUSED_DISPATCH_FC1_BLOCK_SIZE_M", "128")
@@ -151,7 +157,13 @@ def _required_ash_bytes(case: CaseSpec, world_size):
     signal_bytes = signal_slots * 16 * torch.int32.itemsize
     metadata_bins = 1 << (case.num_experts - 1).bit_length()
     metadata_bytes = world_size * metadata_bins * torch.int32.itemsize
-    return token_peer_bytes + routing_peer_bytes + signal_bytes + metadata_bytes
+    return (
+        token_peer_bytes
+        + combine_bytes
+        + routing_peer_bytes
+        + signal_bytes
+        + metadata_bytes
+    )
 
 
 def _layer_tiling_overrides():
@@ -699,6 +711,29 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             },
             "provenance": _benchmark_provenance(),
             "receive_capacity_factor": case.capacity_factor,
+            "symmetric_heap_size_gb": G_ASH_SIZE_GB,
+            "dispatch_fc1_schedule": op.config.dispatch_fc1_schedule,
+            "weighted_vector_programs": op.num_aivector_programs,
+            "fc2_gemm_schedule": "coarse_expert_group_stream",
+            "fc2_combine_transport": (
+                "triton_aclshmem_remote_ptr_tl_store_stream_events"
+            ),
+            "fc2_remote_store_block": op._fc2_remote_store_block,
+            "fc2_pipeline_group_experts": op._fc2_pipeline_group_experts,
+            "fc2_reverse_vector_workers": op.num_aivector_programs,
+            "fc2_reduce_programs": op.num_aivector_programs,
+            "fc2_reduce_block_n_policy": (
+                "1024 if local received routes >= 1024 else 256"
+            ),
+            "tiles": {
+                "dispatch_fc1_m": op.config.dispatch_fc1_block_size_m,
+                "fc1_gemm_n": op.config.fc1_gemm_block_size_n,
+                "fc1_gemm_k": op.config.fc1_gemm_block_size_k,
+                "fc2_combine_m": op.config.fc2_combine_block_size_m,
+                "fc2_transport_m": op._fc2_transport_block_m,
+                "fc2_gemm_n": op.config.fc2_gemm_block_size_n,
+                "fc2_gemm_k": op.config.fc2_gemm_block_size_k,
+            },
             "metrics": OrderedDict(
                 {
                     "ascend_full_direct_e2e_ms": ascend_full,
@@ -787,9 +822,6 @@ def run_forward_benchmark(rank: int, world_size: int, case: CaseSpec):
         experts_per_rank = case.num_experts // world_size
         grouped_baseline = GroupedForwardBaseline(case, ep_group)
         config = MoEForwardConfig(
-            num_aicore_programs=int(
-                os.environ.get("MOE_FUSED_NUM_AICORE_PROGRAMS", "24")
-            ),
             receive_capacity_factor=case.capacity_factor,
             **_layer_tiling_overrides(),
         )
