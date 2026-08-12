@@ -1547,6 +1547,36 @@ def test_task3_late_extra_after_directory_enumeration_is_rejected(
     assert injected is True
 
 
+def test_task3_late_descendant_during_later_sibling_walk_is_rejected(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    original_listdir = fixture.suite.os.listdir
+    injected = False
+
+    def inject_while_walking_later_sibling(path):
+        nonlocal injected
+        names = original_listdir(path)
+        if isinstance(path, int) and not injected:
+            resolved = os.readlink(f"/proc/self/fd/{path}")
+            if resolved.endswith("/benchmark"):
+                (snapshot.root / "3rdparty" / "bigop" / "late-extra").write_text(
+                    "late\n", encoding="utf-8"
+                )
+                injected = True
+        return names
+
+    monkeypatch.setattr(
+        fixture.suite.os, "listdir", inject_while_walking_later_sibling
+    )
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+    assert injected is True
+
+
 def test_task3_snapshot_parent_replacement_during_plan_is_rejected(
     monkeypatch, tmp_path
 ):
@@ -1605,5 +1635,34 @@ def test_task3_failed_materialization_reclaims_owned_staging(
     with pytest.raises(fixture.suite.AuthorityPreflightError):
         fixture.suite._materialize_product_snapshot(fixture.envelope, root)
 
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
+
+
+def test_task3_staging_open_failure_reclaims_created_directory(
+    monkeypatch, tmp_path
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    root = tmp_path / "snapshots"
+    original_open = fixture.suite.os.open
+    failed = False
+
+    def fail_first_staging_open(path, flags, *args, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(path, str)
+            and ".staging-" in path
+            and flags & os.O_DIRECTORY
+        ):
+            failed = True
+            raise OSError(11, "injected staging open failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(fixture.suite.os, "open", fail_first_staging_open)
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._materialize_product_snapshot(fixture.envelope, root)
+
+    assert failed is True
     assert root.is_dir()
     assert list(root.iterdir()) == []

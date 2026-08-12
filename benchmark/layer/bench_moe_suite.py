@@ -1450,6 +1450,11 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
         ):
             raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
         walk(root_fd, "")
+        first_files = observed_files
+        first_directories = observed_directories
+        observed_files = {}
+        observed_directories = set()
+        walk(root_fd, "")
         root_after = identity.root.lstat()
         if (root_after.st_dev, root_after.st_ino) != (
             opened_root.st_dev,
@@ -1458,7 +1463,14 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
             raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root replacement")
     finally:
         os.close(root_fd)
-    if observed_directories != expected_directories or observed_files != expected:
+    if (
+        first_directories != expected_directories
+        or first_files != expected
+        or observed_directories != expected_directories
+        or observed_files != expected
+        or observed_directories != first_directories
+        or observed_files != first_files
+    ):
         raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot physical inventory")
 
 
@@ -1484,13 +1496,39 @@ def _materialize_product_snapshot(
             published = False
             try:
                 os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
-                staging_fd = os.open(
-                    staging_name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=parent_fd,
+                staging_linked = os.stat(
+                    staging_name, dir_fd=parent_fd, follow_symlinks=False
                 )
+                staging_identity = (
+                    staging_linked.st_dev,
+                    staging_linked.st_ino,
+                )
+                try:
+                    staging_fd = os.open(
+                        staging_name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                except OSError:
+                    _cleanup_owned_staging(
+                        parent_fd, staging_name, staging_identity
+                    )
+                    raise
                 staging_stat = os.fstat(staging_fd)
-                staging_identity = (staging_stat.st_dev, staging_stat.st_ino)
+                if (
+                    staging_stat.st_dev,
+                    staging_stat.st_ino,
+                ) != staging_identity:
+                    os.close(staging_fd)
+                    _cleanup_owned_staging(
+                        parent_fd, staging_name, staging_identity
+                    )
+                    raise AuthorityPreflightError(
+                        "SNAPSHOT_INVALID", "snapshot staging identity"
+                    )
             except OSError as error:
                 raise AuthorityPreflightError(
                     "SNAPSHOT_INVALID", "snapshot staging"
