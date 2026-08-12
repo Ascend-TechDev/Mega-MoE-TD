@@ -125,6 +125,17 @@ BIGOP_GITLINK_PATH = "3rdparty/bigop"
 BIGOP_IDENTITY_PREFIX = "gitlink:"
 BIGOP_GITMODULES_BLOB_OID = "c42c065bf7df9c047a8704eea9871f804afb67f4"
 BIGOP_GITLINK_COMMIT = "68ca4cb68dca41ca8960e6aedc38bd224b08a2af"
+_SNAPSHOT_INOTIFY_MASK = (
+    0x00000002  # IN_MODIFY
+    | 0x00000004  # IN_ATTRIB
+    | 0x00000008  # IN_CLOSE_WRITE
+    | 0x00000040  # IN_MOVED_FROM
+    | 0x00000080  # IN_MOVED_TO
+    | 0x00000100  # IN_CREATE
+    | 0x00000200  # IN_DELETE
+    | 0x00000400  # IN_DELETE_SELF
+    | 0x00000800  # IN_MOVE_SELF
+)
 AUTHORITY_SCHEMA = "uniep.environment-authority.v1"
 AUTHORITY_ENVELOPE_SCHEMA = "uniep.environment-authority-envelope.v1"
 AUTHORITY_PRODUCER_IDENTITY = "autoport-codex01"
@@ -1318,6 +1329,54 @@ def _expected_physical_entries(identity: SnapshotIdentity) -> dict[str, Snapshot
     return expected
 
 
+def _open_snapshot_change_watch() -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    initialize = getattr(libc, "inotify_init1", None)
+    if initialize is None:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot mutation watch unavailable"
+        )
+    initialize.argtypes = [ctypes.c_int]
+    initialize.restype = ctypes.c_int
+    descriptor = initialize(os.O_NONBLOCK | os.O_CLOEXEC)
+    if descriptor < 0:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot mutation watch"
+        )
+    return descriptor
+
+
+def _watch_snapshot_directory(watch_fd: int, directory_fd: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    add_watch = getattr(libc, "inotify_add_watch", None)
+    if add_watch is None:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot mutation watch unavailable"
+        )
+    add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add_watch.restype = ctypes.c_int
+    target = os.fsencode(f"/proc/self/fd/{directory_fd}")
+    if add_watch(watch_fd, target, _SNAPSHOT_INOTIFY_MASK) < 0:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot directory watch"
+        )
+
+
+def _require_snapshot_watch_quiet(watch_fd: int) -> None:
+    try:
+        event = os.read(watch_fd, 1024 * 1024)
+    except BlockingIOError:
+        return
+    except OSError as error:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot mutation watch"
+        ) from error
+    if event:
+        raise AuthorityPreflightError(
+            "SNAPSHOT_INVALID", "snapshot changed during verification"
+        )
+
+
 def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
     expected = _expected_physical_entries(identity)
     expected_directories = set()
@@ -1333,6 +1392,11 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
         )
     except OSError as error:
         raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root open") from error
+    try:
+        watch_fd = _open_snapshot_change_watch()
+    except Exception:
+        os.close(root_fd)
+        raise
     observed_files = {}
     observed_directories = set()
 
@@ -1374,6 +1438,7 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
                         raise AuthorityPreflightError(
                             "SNAPSHOT_INVALID", "snapshot directory swap"
                         )
+                    _watch_snapshot_directory(watch_fd, child_fd)
                     observed_directories.add(relative)
                     walk(child_fd, relative)
                     after = os.stat(
@@ -1449,6 +1514,7 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
             or opened_root.st_uid != os.geteuid()
         ):
             raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root identity")
+        _watch_snapshot_directory(watch_fd, root_fd)
         walk(root_fd, "")
         first_files = observed_files
         first_directories = observed_directories
@@ -1461,7 +1527,9 @@ def _verify_snapshot_physical(identity: SnapshotIdentity) -> None:
             opened_root.st_ino,
         ):
             raise AuthorityPreflightError("SNAPSHOT_INVALID", "snapshot root replacement")
+        _require_snapshot_watch_quiet(watch_fd)
     finally:
+        os.close(watch_fd)
         os.close(root_fd)
     if (
         first_directories != expected_directories

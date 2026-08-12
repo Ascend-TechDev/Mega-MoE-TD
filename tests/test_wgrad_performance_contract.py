@@ -1577,6 +1577,45 @@ def test_task3_late_descendant_during_later_sibling_walk_is_rejected(
     assert injected is True
 
 
+@pytest.mark.parametrize("mutation", ("extra", "content"))
+def test_task3_second_walk_late_descendant_mutation_is_rejected(
+    monkeypatch, tmp_path, mutation
+):
+    fixture = _task3_fixture(monkeypatch, tmp_path)
+    snapshot = fixture.suite._materialize_product_snapshot(
+        fixture.envelope, tmp_path / "snapshots"
+    )
+    original_listdir = fixture.suite.os.listdir
+    benchmark_visits = 0
+    injected = False
+
+    def inject_during_second_walk(path):
+        nonlocal benchmark_visits, injected
+        names = original_listdir(path)
+        if isinstance(path, int):
+            resolved = os.readlink(f"/proc/self/fd/{path}")
+            if resolved.endswith("/benchmark"):
+                benchmark_visits += 1
+                if benchmark_visits == 3:
+                    target = snapshot.root / "3rdparty" / "bigop"
+                    if mutation == "extra":
+                        (target / "late-extra").write_text(
+                            "late\n", encoding="utf-8"
+                        )
+                    else:
+                        (target / "probe.sh").write_text(
+                            "#!/bin/sh\nexit 9\n", encoding="utf-8"
+                        )
+                    injected = True
+        return names
+
+    monkeypatch.setattr(fixture.suite.os, "listdir", inject_during_second_walk)
+    with pytest.raises(fixture.suite.AuthorityPreflightError):
+        fixture.suite._verify_product_snapshot(snapshot, fixture.envelope)
+    assert benchmark_visits >= 3
+    assert injected is True
+
+
 def test_task3_snapshot_parent_replacement_during_plan_is_rejected(
     monkeypatch, tmp_path
 ):
