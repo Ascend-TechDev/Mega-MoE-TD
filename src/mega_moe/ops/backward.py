@@ -37,6 +37,7 @@ from ..kernels import (
     transposed_grouped_gemm_triton,
     combine_fc1_bwd_triton,
 )
+from ..kernels.fused_swiglu_bwd_fc2_wgrad import fused_swiglu_bwd_fc2_wgrad
 
 
 def _grouped_wgrad_torch(grad_out, orig_in, expert_counts, ec_list=None):
@@ -95,6 +96,8 @@ def moe_backward_triton(saved, dy, peer_mem):
     dy = dy.to(saved["fc1_1"].dtype)
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
+    use_fused = os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
+    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM") == "1"     # step3(cube) ∥ step2(vec) on two engine-pure streams
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
     _r = saved["ep_rank"]
     def _t(tag):
@@ -134,23 +137,64 @@ def moe_backward_triton(saved, dy, peer_mem):
     # step 1: dispatch + fc2 input-grad
     grad_swiglu, grad_fc2_out_sorted = dispatch_fc2_bwd_triton(saved, dy, peer_mem)
     _t("step1-dispatch_fc2 done")
-    # step 3: fc2 wgrad — launch on side stream NOW (depends only on step1),
-    # overlaps with step2 + step4.
-    if use_triton_wgrad:
-        grad_fc2 = _run_wgrad(transposed_grouped_gemm_triton,
+    if use_fused:
+        # step2 (SwiGLU bwd, Vector) + step3 (fc2 wgrad, Cube) fused into ONE
+        # launch so the two run concurrently on each AICore (vector hidden by
+        # cube). Inputs all ready after step1. No side stream (B3 showed s/w
+        # streams are a 12.5x regression). MOE_FUSED_WGRAD_BLOCK_M tunes cube BM.
+        grad_fc1_output, grad_gate, grad_fc2 = fused_swiglu_bwd_fc2_wgrad(
+            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec,
             saved["split_size_cum_per_expert"])
-    elif use_torch_wgrad:
-        grad_fc2 = _run_wgrad(_grouped_wgrad_torch,
-            grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
+        _t("step2+step3 fused done")
+    elif use_dual:
+        # step3 (fc2 wgrad, pure Cube via npu_grouped_matmul) ∥ step2 (swiglu,
+        # pure Vector triton) on TWO ENGINE-PURE streams — isolated from the
+        # mixed-engine step1/step4. The B3 MOE_WGRAD_STREAM pathology (12.5x)
+        # came from the wgrad stream contending with the main stream's mixed
+        # cube+vector triton kernels; here the overlap window contains only
+        # pure-cube (s_cube) + pure-vector (s_vec), mirroring /tmp/dual_stream.py.
+        cur = torch.npu.current_stream()
+        device = f"npu:{saved['ep_rank']}"
+        if saved.get("_dual_cube_stream") is None:
+            saved["_dual_cube_stream"] = torch.npu.Stream(device=device)
+            saved["_dual_vec_stream"] = torch.npu.Stream(device=device)
+        s_cube = saved["_dual_cube_stream"]
+        s_vec = saved["_dual_vec_stream"]
+        ev1 = torch.npu.Event(); ev1.record(cur)           # step1 main-stream progress
+        ev_cube = torch.npu.Event()
+        with torch.npu.stream(s_cube):
+            s_cube.wait_event(ev1)
+            grad_fc2 = _grouped_wgrad_npu(
+                grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)   # step3, pure Cube
+            ev_cube.record(s_cube)
+        ev_vec = torch.npu.Event()
+        with torch.npu.stream(s_vec):
+            s_vec.wait_event(ev1)
+            grad_fc1_output, grad_gate = swiglu_bwd_triton(
+                grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])  # step2, pure Vector
+            ev_vec.record(s_vec)
+        cur.wait_event(ev_cube)
+        cur.wait_event(ev_vec)
+        _t("step2+step3 dual-stream done")
     else:
-        grad_fc2 = _run_wgrad(_grouped_wgrad_npu,
-            grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
-    _t("step3-fc2_wgrad launched (side stream)")
-    # step 2: swiglu backward (main stream; overlaps with step3 wgrad cube)
-    grad_fc1_output, grad_gate = swiglu_bwd_triton(
-        grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
-    _t("step2-swiglu done")
+        # step 3: fc2 wgrad — launch on side stream NOW (depends only on step1),
+        # overlaps with step2 + step4.
+        if use_triton_wgrad:
+            grad_fc2 = _run_wgrad(transposed_grouped_gemm_triton,
+                grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec,
+                saved["split_size_cum_per_expert"])
+        elif use_torch_wgrad:
+            grad_fc2 = _run_wgrad(_grouped_wgrad_torch,
+                grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
+        else:
+            grad_fc2 = _run_wgrad(_grouped_wgrad_npu,
+                grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
+        _t("step3-fc2_wgrad launched (side stream)")
+        # step 2: swiglu backward (main stream; overlaps with step3 wgrad cube)
+        grad_fc1_output, grad_gate = swiglu_bwd_triton(
+            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
+        _t("step2-swiglu done")
     # step 5: fc1 wgrad — side stream (depends only on step2), overlaps with step4.
     if use_triton_wgrad:
         grad_fc1 = _run_wgrad(transposed_grouped_gemm_triton,
