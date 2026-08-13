@@ -1705,3 +1705,751 @@ def test_task3_staging_open_failure_reclaims_created_directory(
     assert failed is True
     assert root.is_dir()
     assert list(root.iterdir()) == []
+
+
+_TASK4_LAZY_IMPORT_PATHS = {
+    ROOT / "src" / "mega_moe" / "__init__.py": {
+        "mega_moe.ops.forward",
+        "mega_moe.ops.backward",
+    },
+    ROOT / "src" / "mega_moe" / "kernels" / "__init__.py": {
+        "mega_moe.kernels.common",
+        "mega_moe.kernels.swiglu_bwd",
+        "mega_moe.kernels.transposed_grouped_gemm",
+        "mega_moe.kernels.dispatch_fc2_bwd",
+        "mega_moe.kernels.combine_fc1_bwd",
+    },
+    ROOT / "src" / "mega_moe" / "ops" / "backward.py": {
+        "torch_npu",
+        "mega_moe.ops._torch_forward",
+        "mega_moe.kernels",
+    },
+    ROOT / "src" / "mega_moe" / "kernels" / "common.py": {
+        "torch_npu",
+        "triton.backends.ascend.driver",
+    },
+    ROOT / "tests" / "_moe_baselines.py": {
+        "mega_moe.kernels.weighted_swiglu",
+        "mega_moe.ops._torch_forward",
+    },
+}
+
+
+def _top_level_import_names(path: Path) -> set[str]:
+    names = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            prefix = "." * node.level
+            names.add(prefix + (node.module or ""))
+    return names
+
+
+@pytest.mark.parametrize("path", tuple(_TASK4_LAZY_IMPORT_PATHS))
+def test_task4_device_capable_product_imports_are_lazy(path):
+    imports = _top_level_import_names(path)
+    normalized = {
+        name.removeprefix("..").removeprefix(".") for name in imports
+    }
+    forbidden = {
+        name.split(".")[-1] if name.startswith("mega_moe.") else name
+        for name in _TASK4_LAZY_IMPORT_PATHS[path]
+    }
+    assert not normalized & _TASK4_LAZY_IMPORT_PATHS[path]
+    assert not {name.split(".")[-1] for name in normalized} & forbidden
+
+
+def test_task4_runtime_loader_requires_terminal_seal_before_import(monkeypatch):
+    imported = []
+    monkeypatch.setattr(kit.importlib, "import_module", lambda name: imported.append(name))
+    monkeypatch.setattr(kit, "_ACTIVE_RUNTIME_SEAL", None, raising=False)
+
+    with pytest.raises(RuntimeError, match="authorized runtime seal"):
+        kit.load_device_runtime()
+
+    assert imported == []
+
+
+def _load_root_conftest():
+    module_name = "_host_root_conftest_contract"
+    spec = importlib.util.spec_from_file_location(module_name, ROOT / "conftest.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_task4_distributed_worker_refuses_missing_predevice_callback(monkeypatch):
+    root_conftest = _load_root_conftest()
+    events = []
+    monkeypatch.setattr(
+        root_conftest.torch,
+        "npu",
+        types.SimpleNamespace(set_device=lambda rank: events.append("set_device")),
+        raising=False,
+    )
+    queue = mock.Mock()
+
+    root_conftest._worker_wrapper(0, 1, "hccl", lambda *_: events.append("body"), (), queue, None)
+
+    queue.put.assert_called_once()
+    assert events == []
+
+
+def test_task4_distributed_worker_terminal_callback_precedes_set_device(monkeypatch):
+    root_conftest = _load_root_conftest()
+    events = []
+    seal = mock.sentinel.runtime_seal
+    monkeypatch.setattr(
+        root_conftest.torch,
+        "npu",
+        types.SimpleNamespace(set_device=lambda rank: events.append("set_device")),
+        raising=False,
+    )
+    monkeypatch.setattr(root_conftest.dist, "init_process_group", lambda **kwargs: events.append("init"))
+    monkeypatch.setattr(root_conftest.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(root_conftest.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(kit, "activate_authorized_runtime", lambda observed: events.append(("seal", observed)))
+    monkeypatch.setattr(kit, "require_authorized_runtime", lambda: seal)
+    queue = mock.Mock()
+
+    root_conftest._worker_wrapper(
+        0,
+        1,
+        "hccl",
+        lambda *_: events.append("body"),
+        (),
+        queue,
+        lambda: (events.append("terminal"), seal)[1],
+    )
+
+    queue.put.assert_not_called()
+    assert events == [
+        "terminal",
+        ("seal", seal),
+        "set_device",
+        "init",
+        "barrier",
+        "body",
+    ]
+
+
+def _task4_seal_fixture(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    package = snapshot / "mega_moe"
+    package.mkdir(parents=True)
+    source = package / "fixture.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    module = types.ModuleType("mega_moe.fixture")
+    module.__file__ = str(source)
+    module.__spec__ = importlib.util.spec_from_file_location(module.__name__, source)
+    return snapshot, source, module
+
+
+def test_task4_loaded_module_closure_rejects_origin_or_byte_drift(tmp_path, monkeypatch):
+    snapshot, source, module = _task4_seal_fixture(tmp_path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    records = kit.capture_loaded_product_closure(
+        snapshot, ("mega_moe",), ("mega_moe.fixture",)
+    )
+    seal = kit.issue_authorized_runtime_seal(
+        authority_first_sha256="1" * 64,
+        authority_final_sha256="1" * 64,
+        snapshot_first_sha256="2" * 64,
+        snapshot_final_sha256="2" * 64,
+        runtime_first_sha256="3" * 64,
+        runtime_final_sha256="3" * 64,
+        loaded_product_modules=records,
+        explicit_plugins=(),
+        verification_trace=(
+            "stdlib_no_site",
+            "authority_first",
+            "snapshot_first",
+            "runtime_first",
+            "modules_loaded",
+            "authority_final",
+            "snapshot_final",
+            "runtime_final",
+            "modules_final",
+        ),
+    )
+    kit.verify_loaded_product_closure(seal)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="loaded product closure"):
+        kit.verify_loaded_product_closure(seal)
+
+
+def test_task4_loaded_module_closure_binds_manifest_blob_and_inode(
+    tmp_path, monkeypatch
+):
+    snapshot, source, module = _task4_seal_fixture(tmp_path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    content = source.read_bytes()
+    expected = types.SimpleNamespace(
+        kind="file",
+        sha256=hashlib.sha256(content).hexdigest(),
+        blob_oid=hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest(),
+        size=len(content),
+        mode=0o100000 | (source.stat().st_mode & 0o777),
+    )
+    records = kit.capture_loaded_product_closure(
+        snapshot,
+        ("mega_moe",),
+        ("mega_moe.fixture",),
+        {"mega_moe/fixture.py": expected},
+    )
+    assert records[0].manifest_blob_oid == expected.blob_oid
+
+    replacement = source.with_suffix(".replacement")
+    replacement.write_bytes(content)
+    replacement.chmod(source.stat().st_mode & 0o777)
+    os.replace(replacement, source)
+
+    seal = kit.AuthorizedRuntimeSeal(
+        authority_sha256="1" * 64,
+        snapshot_sha256="2" * 64,
+        runtime_sha256="3" * 64,
+        loaded_product_modules=records,
+        explicit_plugins=(),
+        verification_trace=(
+            "stdlib_no_site",
+            "authority_first",
+            "snapshot_first",
+            "runtime_first",
+            "modules_loaded",
+            "authority_final",
+            "snapshot_final",
+            "runtime_final",
+            "modules_final",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="loaded product closure"):
+        kit.verify_loaded_product_closure(seal)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("authority", "snapshot", "runtime", "trace", "missing_anchor"),
+)
+def test_task4_runtime_seal_rejects_terminal_or_denominator_drift(tmp_path, monkeypatch, mutation):
+    snapshot, _, module = _task4_seal_fixture(tmp_path)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    records = kit.capture_loaded_product_closure(
+        snapshot, ("mega_moe",), ("mega_moe.fixture",)
+    )
+    values = {
+        "authority_first_sha256": "1" * 64,
+        "authority_final_sha256": "1" * 64,
+        "snapshot_first_sha256": "2" * 64,
+        "snapshot_final_sha256": "2" * 64,
+        "runtime_first_sha256": "3" * 64,
+        "runtime_final_sha256": "3" * 64,
+        "loaded_product_modules": records,
+        "explicit_plugins": (),
+        "verification_trace": (
+            "stdlib_no_site",
+            "authority_first",
+            "snapshot_first",
+            "runtime_first",
+            "modules_loaded",
+            "authority_final",
+            "snapshot_final",
+            "runtime_final",
+            "modules_final",
+        ),
+    }
+    if mutation == "authority":
+        values["authority_final_sha256"] = "a" * 64
+    elif mutation == "snapshot":
+        values["snapshot_final_sha256"] = "a" * 64
+    elif mutation == "runtime":
+        values["runtime_final_sha256"] = "a" * 64
+    elif mutation == "trace":
+        values["verification_trace"] = ("modules_loaded",)
+    elif mutation == "missing_anchor":
+        values["loaded_product_modules"] = ()
+
+    with pytest.raises(RuntimeError, match="runtime seal"):
+        kit.issue_authorized_runtime_seal(**values)
+
+
+@pytest.mark.parametrize("attack", ("system_site_pth", "pytest_entry_point"))
+def test_task4_fixed_bootstrap_isolated_flags_precede_untrusted_imports(attack):
+    suite = _load_benchmark_suite()
+    code = suite._fresh_bootstrap_code()
+    compile(code, "<uniep-task4-bootstrap>", "exec")
+    assert "sys.flags.no_site" in code and "sys.flags.isolated" in code
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in code
+    assert "site.addsitedir" not in code
+    assert "import pytest" not in code
+    assert "live_authority(payload)" in code
+    assert "ProductFinder(root, expected)" in code
+    assert "__AUTHORITY_REMOTE_JSON__" not in code
+    if attack == "system_site_pth":
+        assert '"site" in sys.modules' in code
+    else:
+        assert '__import__("pytest")' in code
+
+
+def _task4_bootstrap_fixture(
+    tmp_path, monkeypatch, suite, *, anchor_side_effect=False
+):
+    product_work = tmp_path / "task4-product-work"
+    product_work.mkdir()
+    _task2_git(product_work, "init", "-q", "-b", "main")
+    _task2_git(product_work, "config", "user.name", "Task4 Fixture")
+    _task2_git(product_work, "config", "user.email", "task4@example.invalid")
+
+    module_by_path = {
+        "benchmark/layer/bench_moe_suite.py": "benchmark.layer.bench_moe_suite",
+        "conftest.py": "conftest",
+        "src/mega_moe/__init__.py": "mega_moe",
+        "src/mega_moe/ops/backward.py": "mega_moe.ops.backward",
+        "src/mega_moe/kernels/__init__.py": "mega_moe.kernels",
+        "src/mega_moe/kernels/transposed_grouped_gemm.py": (
+            "mega_moe.kernels.transposed_grouped_gemm"
+        ),
+        "src/mega_moe/kernels/common.py": "mega_moe.kernels.common",
+        "tests/_moe_testkit.py": "tests._moe_testkit",
+        "tests/_moe_baselines.py": "tests._moe_baselines",
+        "tests/_numeric.py": "tests._numeric",
+        "config/_shapes.py": "config._shapes",
+        "tests/layer/test_moe_suite.py": "tests.layer.test_moe_suite",
+    }
+    files = {
+        relative: f'"""fixture {module}."""\nVALUE = {index!r}\n'
+        for index, (relative, module) in enumerate(module_by_path.items())
+    }
+    files["benchmark/layer/bench_moe_suite.py"] = (
+        '"""fixture verified runner."""\n'
+        "BOOTSTRAP_PAYLOAD = None\n"
+        "def _configure_bootstrap_payload(payload):\n"
+        "    global BOOTSTRAP_PAYLOAD\n"
+        "    BOOTSTRAP_PAYLOAD = payload\n"
+        "    return payload\n"
+    )
+    files.update(
+        {
+            "benchmark/__init__.py": (
+                "import torch_npu\n"
+                if anchor_side_effect
+                else '"""regular benchmark root."""\n'
+            ),
+            "benchmark/layer/__init__.py": '"""regular benchmark layer."""\n',
+            "src/mega_moe/ops/__init__.py": '"""ops package."""\n',
+            "tests/__init__.py": '"""tests package."""\n',
+            "tests/layer/__init__.py": '"""layer tests package."""\n',
+            "config/__init__.py": '"""config package."""\n',
+        }
+    )
+    imports = "\n".join(
+        f"import {module}" for module in module_by_path.values()
+    )
+    files["tests/host_probe.py"] = imports + "\nHOST_PROBE = 'PASS'\n"
+    for relative, content in files.items():
+        target = product_work / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    main_commit = _task2_commit(product_work, "task4 main")
+    runner = product_work / "benchmark/layer/bench_moe_suite.py"
+    runner.write_text(runner.read_text() + "FEATURE = True\n", encoding="utf-8")
+    feature_commit = _task2_commit(product_work, "task4 feature")
+    product_tree = _task2_git(
+        product_work, "rev-parse", f"{feature_commit}^{{tree}}"
+    ).decode().strip()
+    product_remote = tmp_path / "task4-product.git"
+    _task2_git(tmp_path, "clone", "-q", "--bare", str(product_work), str(product_remote))
+    _task2_git(product_remote, "update-ref", "refs/heads/main", main_commit)
+    _task2_git(
+        product_remote,
+        "update-ref",
+        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        feature_commit,
+    )
+
+    sources = []
+    for relative in suite.BACKWARD_EVIDENCE_SOURCES:
+        fields = _task2_git(
+            product_work, "ls-tree", feature_commit, "--", relative
+        ).decode().strip().split()
+        raw = _task2_git(product_work, "cat-file", "blob", fields[2])
+        sources.append(
+            {
+                "blob_oid": fields[2],
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+
+    entries = []
+    for relative in sorted(files):
+        raw = (product_work / relative).read_bytes()
+        fields = _task2_git(
+            product_work, "ls-tree", feature_commit, "--", relative
+        ).decode().strip().split()
+        entries.append(
+            suite.SnapshotEntry(
+                path=relative,
+                kind="file",
+                mode=0o100644,
+                size=len(raw),
+                sha256=hashlib.sha256(raw).hexdigest(),
+                blob_oid=fields[2],
+            )
+        )
+    entries = tuple(entries)
+    canonical_manifest, manifest_sha256 = suite._snapshot_manifest(entries)
+    snapshot_parent = tmp_path / "snapshots"
+    snapshot_parent.mkdir(mode=0o700)
+    snapshot = snapshot_parent / suite._snapshot_name(product_tree, manifest_sha256)
+    snapshot.mkdir(mode=0o700)
+    for entry in entries:
+        source = product_work / entry.path
+        target = snapshot / entry.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o644)
+    for directory in sorted(
+        (item for item in snapshot.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        directory.chmod(0o755)
+    snapshot.chmod(0o700)
+    snapshot_stat = snapshot.lstat()
+    snapshot_identity = suite.SnapshotIdentity(
+        root=snapshot,
+        tree=product_tree,
+        manifest_sha256=manifest_sha256,
+        entries=entries,
+        canonical_manifest=canonical_manifest,
+        bigop_commit="0" * 40,
+        bigop_manifest_sha256=hashlib.sha256(b"[]\n").hexdigest(),
+        bigop_entries=(),
+        root_device=snapshot_stat.st_dev,
+        root_inode=snapshot_stat.st_ino,
+    )
+
+    runtime_parent = tmp_path / "runtime"
+    runtime_parent.mkdir()
+    environment = {}
+    runtime_roots = []
+    for component_name in sorted(suite.BACKWARD_ENVIRONMENT_COMPONENTS):
+        root = runtime_parent / component_name
+        root.mkdir()
+        if component_name == "python":
+            member_name = "pytest.py"
+            content = (
+                "import importlib\n"
+                "def main(args, plugins=()):\n"
+                "    assert plugins == []\n"
+                "    for name in args:\n"
+                "        importlib.import_module(name)\n"
+                "    return 0\n"
+            ).encode()
+        else:
+            member_name = f"{component_name}.identity"
+            content = f"{component_name}-fixture\n".encode()
+        member_path = root / member_name
+        member_path.write_bytes(content)
+        member_path.chmod(0o644)
+        member = {
+            "elf_build_id": None,
+            "kind": "file",
+            "mode": 0o100644,
+            "name": member_name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+        member_bytes = json.dumps(
+            [member], sort_keys=True, separators=(",", ":")
+        ).encode() + b"\n"
+        environment[component_name] = {
+            "identity": f"{component_name}==task4-fixture",
+            "manifest_sha256": hashlib.sha256(member_bytes).hexdigest(),
+            "member_count": 1,
+            "members": [member],
+            "resolver_id": f"uniep-{component_name}-resolver-v1",
+            "total_bytes": len(content),
+        }
+        runtime_roots.append((component_name, root.resolve()))
+
+    product = {
+        "authority_path": (
+            f"authorities/uniep/wgrad/{feature_commit}/environment-authority.json"
+        ),
+        "commit": feature_commit,
+        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "main_is_ancestor": True,
+        "main_ref": "refs/heads/main",
+        "observed_main": main_commit,
+        "remote": str(product_remote),
+        "sole_parent": main_commit,
+        "sources": sources,
+        "tree": product_tree,
+    }
+    producer = {"identity": "autoport-codex01", "policy": "task4-fixture"}
+    authority_body = {
+        "environment": environment,
+        "producer": producer,
+        "product": product,
+        "schema": "uniep.environment-authority.v1",
+        "status": "AUTHORIZED",
+    }
+    authority_object = {
+        "authority": authority_body,
+        "authority_payload_sha256": hashlib.sha256(
+            _task2_canonical_json(authority_body)
+        ).hexdigest(),
+        "schema": "uniep.environment-authority-envelope.v1",
+    }
+    authority_raw = _task2_canonical_json(authority_object)
+    authority_work = tmp_path / "task4-authority-work"
+    authority_work.mkdir()
+    _task2_git(authority_work, "init", "-q", "-b", "main")
+    _task2_git(authority_work, "config", "user.name", "Task4 C01 Fixture")
+    _task2_git(authority_work, "config", "user.email", "task4-c01@example.invalid")
+    authority_file = authority_work / product["authority_path"]
+    authority_file.parent.mkdir(parents=True)
+    authority_file.write_bytes(authority_raw)
+    authority_commit = _task2_commit(authority_work, "task4 authority")
+    authority_tree = _task2_git(
+        authority_work, "rev-parse", f"{authority_commit}^{{tree}}"
+    ).decode().strip()
+    authority_blob = _task2_git(
+        authority_work, "rev-parse", f"{authority_commit}:{product['authority_path']}"
+    ).decode().strip()
+    authority_remote = tmp_path / "task4-authority.git"
+    _task2_git(tmp_path, "clone", "-q", "--bare", str(authority_work), str(authority_remote))
+    _task2_git(authority_remote, "update-ref", "refs/heads/main", authority_commit)
+
+    monkeypatch.setattr(suite, "AUTHORITY_REMOTE", str(authority_remote))
+    monkeypatch.setattr(suite, "PRODUCT_REMOTE", str(product_remote))
+    anchor = suite.AuthorityAnchor(
+        commit=authority_commit,
+        tree=authority_tree,
+        path=product["authority_path"],
+        blob_oid=authority_blob,
+        full_sha256=hashlib.sha256(authority_raw).hexdigest(),
+    )
+    envelope = suite.AuthorityEnvelope(
+        raw=authority_raw,
+        payload_sha256=authority_object["authority_payload_sha256"],
+        product=product,
+        environment=environment,
+        producer=producer,
+    )
+    required_modules = (
+        "benchmark",
+        "benchmark.layer",
+        *tuple(module_by_path.values()),
+    )
+    preflight = suite.PreflightIdentity(
+        authority_anchor=anchor,
+        authority=envelope,
+        snapshot=snapshot_identity,
+        runtime_manifest_sha256=suite._runtime_authority_manifest_sha256(envelope),
+        required_anchor_modules=required_modules,
+        runtime_component_roots=tuple(runtime_roots),
+    )
+    return types.SimpleNamespace(
+        preflight=preflight,
+        args=("tests.host_probe",),
+        snapshot=snapshot,
+        runner=snapshot / "benchmark/layer/bench_moe_suite.py",
+    )
+
+
+def test_task4_shipped_fresh_bootstrap_real_subprocess_positive(
+    tmp_path, monkeypatch, capfd
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_bootstrap_fixture(tmp_path, monkeypatch, suite)
+
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    assert suite._launch_authorized_pytest(fixture.preflight, fixture.args) == 0
+
+    captured = capfd.readouterr()
+    evidence = json.loads(captured.out)
+    assert evidence["status"] == "HOST_ONLY_VERIFIED"
+    assert evidence["device_events"] == 0
+    assert set(fixture.preflight.required_anchor_modules) <= {
+        item["module_name"] for item in evidence["loaded_product_modules"]
+    }
+    assert captured.err == ""
+
+
+def test_task4_verified_payload_round_trips_into_picklable_worker_identity(
+    tmp_path, monkeypatch
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_bootstrap_fixture(tmp_path, monkeypatch, suite)
+    payload = json.loads(
+        suite._bootstrap_payload(fixture.preflight, fixture.args).decode("utf-8")
+    )
+
+    rebuilt = suite._configure_bootstrap_payload(payload)
+    callback = suite._worker_predevice_callback()
+
+    assert rebuilt == fixture.preflight
+    assert callback.args == (fixture.preflight,)
+
+
+def test_task4_shipped_bootstrap_snapshot_drift_known_bad_is_red(
+    tmp_path, monkeypatch
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_bootstrap_fixture(tmp_path, monkeypatch, suite)
+    build_payload = suite._bootstrap_payload
+
+    def mutate_after_payload(preflight, args):
+        payload = build_payload(preflight, args)
+        fixture.runner.write_text("MALICIOUS = True\n", encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(suite, "_bootstrap_payload", mutate_after_payload)
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+
+    assert completed.returncode != 0
+    assert b"SNAPSHOT_INVALID" in completed.stderr
+    assert b'"status":"HOST_ONLY_VERIFIED"' not in completed.stdout
+
+
+def test_task4_shipped_bootstrap_anchor_side_effect_known_bad_is_red(
+    tmp_path, monkeypatch
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_bootstrap_fixture(
+        tmp_path, monkeypatch, suite, anchor_side_effect=True
+    )
+
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+
+    assert completed.returncode != 0
+    assert b"MODULE_CLOSURE_INVALID: benchmark anchor side effect" in completed.stderr
+    assert b"No module named 'torch_npu'" not in completed.stderr
+    assert b'"status":"HOST_ONLY_VERIFIED"' not in completed.stdout
+
+
+_TASK4_BENCHMARK_ANCHORS = (
+    ROOT / "benchmark" / "__init__.py",
+    ROOT / "benchmark" / "layer" / "__init__.py",
+)
+
+
+@pytest.mark.parametrize("anchor", _TASK4_BENCHMARK_ANCHORS)
+def test_task4_benchmark_package_anchors_are_regular_side_effect_free(anchor):
+    metadata = anchor.lstat()
+    assert anchor.is_file() and not anchor.is_symlink()
+    assert metadata.st_nlink == 1
+    # The committed anchor is a normal Git 100644 leaf.  The author checkout's
+    # umask is not authority, so the materialized snapshot is the mode gate.
+    tree = ast.parse(anchor.read_text(encoding="utf-8"))
+    assert all(
+        isinstance(node, (ast.Expr, ast.ImportFrom))
+        and (
+            not isinstance(node, ast.Expr)
+            or isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        for node in tree.body
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_root", "missing_layer", "symlink", "bytes", "mode", "side_effect"),
+)
+def test_task4_benchmark_anchor_mutations_fail_before_device(monkeypatch, tmp_path, mutation):
+    snapshot = tmp_path / "snapshot"
+    package = snapshot / "benchmark"
+    layer = package / "layer"
+    layer.mkdir(parents=True)
+    (package / "__init__.py").write_text('"""root"""\n', encoding="utf-8")
+    (layer / "__init__.py").write_text('"""layer"""\n', encoding="utf-8")
+    (layer / "bench_moe_suite.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (package / "__init__.py").chmod(0o644)
+    (layer / "__init__.py").chmod(0o644)
+    records = tuple(
+        kit.LoadedModuleRecord(
+            module_name=name,
+            relative_path=relative,
+            loaded_sha256=hashlib.sha256((snapshot / relative).read_bytes()).hexdigest(),
+            loader_kind="SourceFileLoader",
+            manifest_blob_oid=hashlib.sha1(
+                f"blob {(snapshot / relative).stat().st_size}\0".encode("ascii")
+                + (snapshot / relative).read_bytes()
+            ).hexdigest(),
+            source_mode=(
+                0o100000 | ((snapshot / relative).stat().st_mode & 0o777)
+            ),
+            source_device=(snapshot / relative).stat().st_dev,
+            source_inode=(snapshot / relative).stat().st_ino,
+        )
+        for name, relative in (
+            ("benchmark", "benchmark/__init__.py"),
+            ("benchmark.layer", "benchmark/layer/__init__.py"),
+            ("benchmark.layer.bench_moe_suite", "benchmark/layer/bench_moe_suite.py"),
+        )
+    )
+    if mutation == "missing_root":
+        (package / "__init__.py").unlink()
+    elif mutation == "missing_layer":
+        (layer / "__init__.py").unlink()
+    elif mutation == "symlink":
+        target = package / "target.py"
+        target.write_text('"""target"""\n', encoding="utf-8")
+        (package / "__init__.py").unlink()
+        (package / "__init__.py").symlink_to(target.name)
+    elif mutation == "bytes":
+        (layer / "__init__.py").write_text("raise RuntimeError('drift')\n", encoding="utf-8")
+    elif mutation == "mode":
+        (layer / "__init__.py").chmod(0o700)
+    elif mutation == "side_effect":
+        (package / "__init__.py").write_text("import torch_npu\n", encoding="utf-8")
+
+    device_events = []
+    with pytest.raises(RuntimeError, match="benchmark package anchor"):
+        kit.verify_benchmark_package_anchors(snapshot, records)
+    assert device_events == []
+    assert "torch_npu" not in sys.modules
+
+
+def test_task4_valid_benchmark_import_binds_regular_parent_origins(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snapshot"
+    package = snapshot / "benchmark"
+    layer = package / "layer"
+    layer.mkdir(parents=True)
+    (package / "__init__.py").write_text('"""root"""\n', encoding="utf-8")
+    (layer / "__init__.py").write_text('"""layer"""\n', encoding="utf-8")
+    (layer / "bench_moe_suite.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (package / "__init__.py").chmod(0o644)
+    (layer / "__init__.py").chmod(0o644)
+    loaded = []
+    for name, relative in (
+        ("benchmark", "benchmark/__init__.py"),
+        ("benchmark.layer", "benchmark/layer/__init__.py"),
+        ("benchmark.layer.bench_moe_suite", "benchmark/layer/bench_moe_suite.py"),
+    ):
+        source = snapshot / relative
+        module = types.ModuleType(name)
+        module.__file__ = str(source)
+        module.__spec__ = importlib.util.spec_from_file_location(name, source)
+        monkeypatch.setitem(sys.modules, name, module)
+        loaded.append(name)
+    records = kit.capture_loaded_product_closure(
+        snapshot,
+        ("benchmark",),
+        tuple(loaded),
+    )
+
+    kit.verify_benchmark_package_anchors(snapshot, records)
+
+    by_name = {record.module_name: record for record in records}
+    assert by_name["benchmark"].relative_path == "benchmark/__init__.py"
+    assert by_name["benchmark.layer"].relative_path == "benchmark/layer/__init__.py"

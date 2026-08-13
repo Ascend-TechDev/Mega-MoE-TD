@@ -9,10 +9,25 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
+def _worker_wrapper(
+    rank,
+    world_size,
+    backend,
+    fn,
+    args,
+    error_queue,
+    pre_device_callback,
+):
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
     try:
+        if not callable(pre_device_callback):
+            raise RuntimeError("target distributed worker requires pre-device callback")
+        seal = pre_device_callback()
+        from tests import _moe_testkit as kit
+
+        kit.activate_authorized_runtime(seal)
+        kit.require_authorized_runtime()
         torch.npu.set_device(rank)
         dist.init_process_group(
             backend=backend,
@@ -29,13 +44,27 @@ def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
             dist.destroy_process_group()
 
 
-def run_dist_test(fn, world_size=2, backend="hccl", args=()):
+def run_dist_test(
+    fn,
+    world_size=2,
+    backend="hccl",
+    args=(),
+    *,
+    pre_device_callback=None,
+):
     """Run a worker function in an isolated multi-process HCCL world."""
     context = mp.get_context("spawn")
     error_queue = context.Queue()
     mp.spawn(
         _worker_wrapper,
-        args=(world_size, backend, fn, args, error_queue),
+        args=(
+            world_size,
+            backend,
+            fn,
+            args,
+            error_queue,
+            pre_device_callback,
+        ),
         nprocs=world_size,
         join=True,
     )

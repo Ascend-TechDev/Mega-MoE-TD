@@ -11,15 +11,10 @@ here.  This module contains no pytest entry points.
 
 from __future__ import annotations
 
+import importlib
 import torch
 import torch.distributed as dist
 
-from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
-from mega_moe.ops._torch_forward import (
-    grouped_matmul,
-    grouped_transposed_matmul,
-    moe_forward,
-)
 from tests._numeric import cmp_grad
 from tests._numeric import (
     APPROX_ATOL,
@@ -48,6 +43,36 @@ __all__ = [
     "torch_dispatch_fc1_weighted_swiglu_golden",
     "torch_moe_fwd_golden",
 ]
+
+
+def _require_runtime_helper(module_name, attribute):
+    testkit = importlib.import_module("tests._moe_testkit")
+    testkit.require_authorized_runtime()
+    return getattr(importlib.import_module(module_name), attribute)
+
+
+def weighted_swiglu_forward(*args, **kwargs):
+    helper = _require_runtime_helper(
+        "mega_moe.kernels.weighted_swiglu", "weighted_swiglu_forward"
+    )
+    return helper(*args, **kwargs)
+
+
+def grouped_matmul(*args, **kwargs):
+    helper = _require_runtime_helper("mega_moe.ops._torch_forward", "grouped_matmul")
+    return helper(*args, **kwargs)
+
+
+def grouped_transposed_matmul(*args, **kwargs):
+    helper = _require_runtime_helper(
+        "mega_moe.ops._torch_forward", "grouped_transposed_matmul"
+    )
+    return helper(*args, **kwargs)
+
+
+def moe_forward(*args, **kwargs):
+    helper = _require_runtime_helper("mega_moe.ops._torch_forward", "moe_forward")
+    return helper(*args, **kwargs)
 
 
 def make_backward_inputs(

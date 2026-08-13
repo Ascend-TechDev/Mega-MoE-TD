@@ -10,9 +10,14 @@ shipped by the ``mega_moe`` package.
 """
 
 import contextlib
+import ast
+import hashlib
 import importlib
 import os
+from pathlib import Path
 import statistics
+import stat
+import sys
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -25,6 +30,7 @@ import torch.distributed as dist
 # must not initialize or even probe an NPU runtime.
 torch_npu = None
 ash = None
+_ACTIVE_RUNTIME_SEAL = None
 
 
 __all__ = [
@@ -40,6 +46,14 @@ __all__ = [
     "get_ash_ip_port",
     "init_aclshmem",
     "load_device_runtime",
+    "LoadedModuleRecord",
+    "AuthorizedRuntimeSeal",
+    "capture_loaded_product_closure",
+    "issue_authorized_runtime_seal",
+    "verify_loaded_product_closure",
+    "verify_benchmark_package_anchors",
+    "activate_authorized_runtime",
+    "require_authorized_runtime",
     "make_peer_mem",
     "make_pytest_params",
     "validate_timing_spec",
@@ -55,9 +69,307 @@ _BACKWARD_GRADIENT_KEYS = (
     "grad_fc2",
 )
 
+_TERMINAL_VERIFICATION_TRACE = (
+    "stdlib_no_site",
+    "authority_first",
+    "snapshot_first",
+    "runtime_first",
+    "modules_loaded",
+    "authority_final",
+    "snapshot_final",
+    "runtime_final",
+    "modules_final",
+)
 
-def load_device_runtime() -> None:
+
+@dataclass(frozen=True, order=True)
+class LoadedModuleRecord:
+    module_name: str
+    relative_path: str
+    loaded_sha256: str
+    loader_kind: str
+    manifest_blob_oid: str
+    source_mode: int
+    source_device: int
+    source_inode: int
+
+
+@dataclass(frozen=True)
+class AuthorizedRuntimeSeal:
+    authority_sha256: str
+    snapshot_sha256: str
+    runtime_sha256: str
+    loaded_product_modules: tuple[LoadedModuleRecord, ...]
+    explicit_plugins: tuple[LoadedModuleRecord, ...]
+    verification_trace: tuple[str, ...]
+
+
+def _sha256_hex(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _module_source_bytes(
+    module_name: str, module, snapshot_root: Path
+) -> tuple[Path, bytes, os.stat_result]:
+    spec = getattr(module, "__spec__", None)
+    origin = getattr(spec, "origin", None) or getattr(module, "__file__", None)
+    if not isinstance(origin, str):
+        raise RuntimeError(f"loaded product closure has no origin: {module_name}")
+    path = Path(origin)
+    if path.suffix in {".pyc", ".pyo"}:
+        raise RuntimeError(f"loaded product closure uses cached bytecode: {module_name}")
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(snapshot_root)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"loaded product closure origin is outside snapshot: {module_name}"
+        ) from error
+    if (
+        path.absolute() != resolved
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+    ):
+        raise RuntimeError(f"loaded product closure origin is invalid: {module_name}")
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            f"loaded product closure origin is unreadable: {module_name}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+        ):
+            raise RuntimeError(
+                f"loaded product closure origin changed: {module_name}"
+            )
+        chunks = []
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 1024 * 1024, offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        content = b"".join(chunks)
+        after = resolved.lstat()
+        if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+            raise RuntimeError(
+                f"loaded product closure origin replaced: {module_name}"
+            )
+    finally:
+        os.close(descriptor)
+    return resolved, content, opened
+
+
+def capture_loaded_product_closure(
+    snapshot_root,
+    namespace_prefixes,
+    required_anchor_modules,
+    snapshot_manifest=None,
+) -> tuple[LoadedModuleRecord, ...]:
+    """Capture every loaded source module in the verified product namespaces."""
+    root = Path(snapshot_root).resolve(strict=True)
+    prefixes = tuple(namespace_prefixes)
+    if not prefixes or not all(isinstance(item, str) and item for item in prefixes):
+        raise RuntimeError("loaded product closure namespace denominator is invalid")
+    records = []
+    for module_name, module in sorted(sys.modules.items()):
+        if module is None or not any(
+            module_name == prefix or module_name.startswith(prefix + ".")
+            for prefix in prefixes
+        ):
+            continue
+        path, content, metadata = _module_source_bytes(module_name, module, root)
+        relative_path = path.relative_to(root).as_posix()
+        digest = hashlib.sha256(content).hexdigest()
+        blob_oid = hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest()
+        if snapshot_manifest is not None:
+            expected = snapshot_manifest.get(relative_path)
+            if (
+                expected is None
+                or getattr(expected, "kind", None) != "file"
+                or getattr(expected, "sha256", None) != digest
+                or getattr(expected, "blob_oid", None) != blob_oid
+                or getattr(expected, "size", None) != len(content)
+                or getattr(expected, "mode", None)
+                != (stat.S_IFREG | stat.S_IMODE(metadata.st_mode))
+            ):
+                raise RuntimeError(
+                    f"loaded product closure misses snapshot manifest: {module_name}"
+                )
+        records.append(
+            LoadedModuleRecord(
+                module_name=module_name,
+                relative_path=relative_path,
+                loaded_sha256=digest,
+                loader_kind=type(getattr(module, "__loader__", None)).__name__,
+                manifest_blob_oid=blob_oid,
+                source_mode=stat.S_IFREG | stat.S_IMODE(metadata.st_mode),
+                source_device=metadata.st_dev,
+                source_inode=metadata.st_ino,
+            )
+        )
+    names = {record.module_name for record in records}
+    required = tuple(required_anchor_modules)
+    if not required or len(set(required)) != len(required) or not set(required) <= names:
+        raise RuntimeError("loaded product closure misses a required anchor")
+    if len(names) != len(records):
+        raise RuntimeError("loaded product closure contains duplicate module names")
+    return tuple(records)
+
+
+def issue_authorized_runtime_seal(
+    *,
+    authority_first_sha256,
+    authority_final_sha256,
+    snapshot_first_sha256,
+    snapshot_final_sha256,
+    runtime_first_sha256,
+    runtime_final_sha256,
+    loaded_product_modules,
+    explicit_plugins,
+    verification_trace,
+) -> AuthorizedRuntimeSeal:
+    """Issue a seal only after exact first/final identities and order agree."""
+    pairs = (
+        (authority_first_sha256, authority_final_sha256),
+        (snapshot_first_sha256, snapshot_final_sha256),
+        (runtime_first_sha256, runtime_final_sha256),
+    )
+    records = tuple(loaded_product_modules)
+    plugins = tuple(explicit_plugins)
+    if (
+        not all(_sha256_hex(first) and first == final for first, final in pairs)
+        or not records
+        or not all(isinstance(record, LoadedModuleRecord) for record in records)
+        or not all(isinstance(record, LoadedModuleRecord) for record in plugins)
+        or len({record.module_name for record in records}) != len(records)
+        or tuple(verification_trace) != _TERMINAL_VERIFICATION_TRACE
+    ):
+        raise RuntimeError("runtime seal terminal verification is invalid")
+    seal = AuthorizedRuntimeSeal(
+        authority_sha256=authority_first_sha256,
+        snapshot_sha256=snapshot_first_sha256,
+        runtime_sha256=runtime_first_sha256,
+        loaded_product_modules=records,
+        explicit_plugins=plugins,
+        verification_trace=tuple(verification_trace),
+    )
+    verify_loaded_product_closure(seal)
+    return seal
+
+
+def verify_loaded_product_closure(seal: AuthorizedRuntimeSeal) -> None:
+    if not isinstance(seal, AuthorizedRuntimeSeal):
+        raise RuntimeError("authorized runtime seal is required")
+    seen = set()
+    for record in (*seal.loaded_product_modules, *seal.explicit_plugins):
+        module = sys.modules.get(record.module_name)
+        if module is None or record.module_name in seen:
+            raise RuntimeError("loaded product closure module is missing or duplicated")
+        seen.add(record.module_name)
+        spec = getattr(module, "__spec__", None)
+        origin_value = getattr(spec, "origin", None) or getattr(
+            module, "__file__", None
+        )
+        if not isinstance(origin_value, str):
+            raise RuntimeError("loaded product closure origin is missing")
+        origin_path = Path(origin_value).resolve(strict=True)
+        snapshot_root = origin_path.parents[len(Path(record.relative_path).parts) - 1]
+        origin, content, metadata = _module_source_bytes(
+            record.module_name, module, snapshot_root
+        )
+        blob_oid = hashlib.sha1(
+            f"blob {len(content)}\0".encode("ascii") + content
+        ).hexdigest()
+        if (
+            origin.as_posix().endswith("/" + record.relative_path) is False
+            or hashlib.sha256(content).hexdigest() != record.loaded_sha256
+            or blob_oid != record.manifest_blob_oid
+            or (stat.S_IFREG | stat.S_IMODE(metadata.st_mode)) != record.source_mode
+            or metadata.st_dev != record.source_device
+            or metadata.st_ino != record.source_inode
+        ):
+            raise RuntimeError("loaded product closure bytes changed")
+
+
+def verify_benchmark_package_anchors(
+    snapshot_root, records: tuple[LoadedModuleRecord, ...]
+) -> None:
+    """Bind both benchmark package parents to regular inert source leaves."""
+    root = Path(snapshot_root).resolve(strict=True)
+    by_name = {record.module_name: record for record in records}
+    expected = {
+        "benchmark": "benchmark/__init__.py",
+        "benchmark.layer": "benchmark/layer/__init__.py",
+    }
+    for module_name, relative_path in expected.items():
+        record = by_name.get(module_name)
+        path = root / relative_path
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise RuntimeError("benchmark package anchor is missing") from error
+        if (
+            record is None
+            or record.relative_path != relative_path
+            or not path.is_file()
+            or path.is_symlink()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+        ):
+            raise RuntimeError("benchmark package anchor is not a regular 0644 leaf")
+        content = path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != record.loaded_sha256:
+            raise RuntimeError("benchmark package anchor bytes changed")
+        try:
+            tree = ast.parse(content.decode("utf-8"))
+        except (UnicodeDecodeError, SyntaxError) as error:
+            raise RuntimeError("benchmark package anchor source is invalid") from error
+        for node in tree.body:
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                if isinstance(node.value.value, str):
+                    continue
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                continue
+            raise RuntimeError("benchmark package anchor has an import side effect")
+
+
+def activate_authorized_runtime(seal: AuthorizedRuntimeSeal) -> AuthorizedRuntimeSeal:
+    global _ACTIVE_RUNTIME_SEAL
+    verify_loaded_product_closure(seal)
+    _ACTIVE_RUNTIME_SEAL = seal
+    return seal
+
+
+def require_authorized_runtime(
+    seal: AuthorizedRuntimeSeal | None = None,
+) -> AuthorizedRuntimeSeal:
+    verified = seal if seal is not None else _ACTIVE_RUNTIME_SEAL
+    if not isinstance(verified, AuthorizedRuntimeSeal):
+        raise RuntimeError("authorized runtime seal is required before device entry")
+    verify_loaded_product_closure(verified)
+    return verified
+
+
+def load_device_runtime(seal: AuthorizedRuntimeSeal | None = None) -> None:
     """Load NPU-only modules after the caller's provenance gate has passed."""
+    require_authorized_runtime(seal)
     global torch_npu, ash
     if torch_npu is None:
         torch_npu = importlib.import_module("torch_npu")

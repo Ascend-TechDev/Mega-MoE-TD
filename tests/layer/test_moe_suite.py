@@ -8,6 +8,7 @@ environment variables.
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import pytest
@@ -15,20 +16,58 @@ import torch
 import torch.distributed as dist
 
 from config import CaseSpec, select_cases
-from mega_moe import FusedMoEForward, MoEForwardConfig, moe_backward_triton, pack_gate_up_weights
 from tests import _moe_testkit as kit
-from tests._moe_baselines import (
-    backward_torch_baseline,
-    build_backward_saved,
-    compare_backward_gradients,
-    make_down_weights,
-    make_gate_up_weights,
-    make_routing_weights,
-    prepare_inputs,
-    run_full_one,
-    run_one,
-    run_weighted_one,
-)
+
+
+FusedMoEForward = None
+MoEForwardConfig = None
+moe_backward_triton = None
+pack_gate_up_weights = None
+backward_torch_baseline = None
+build_backward_saved = None
+compare_backward_gradients = None
+make_down_weights = None
+make_gate_up_weights = None
+make_routing_weights = None
+prepare_inputs = None
+run_full_one = None
+run_one = None
+run_weighted_one = None
+
+
+def _load_functional_runtime():
+    global FusedMoEForward, MoEForwardConfig, moe_backward_triton
+    global pack_gate_up_weights, backward_torch_baseline, build_backward_saved
+    global compare_backward_gradients, make_down_weights, make_gate_up_weights
+    global make_routing_weights, prepare_inputs, run_full_one, run_one
+    global run_weighted_one
+    kit.require_authorized_runtime()
+    if FusedMoEForward is not None:
+        return
+    product = importlib.import_module("mega_moe")
+    baselines = importlib.import_module("tests._moe_baselines")
+    FusedMoEForward = product.FusedMoEForward
+    MoEForwardConfig = product.MoEForwardConfig
+    moe_backward_triton = product.moe_backward_triton
+    pack_gate_up_weights = product.pack_gate_up_weights
+    for name in (
+        "backward_torch_baseline",
+        "build_backward_saved",
+        "compare_backward_gradients",
+        "make_down_weights",
+        "make_gate_up_weights",
+        "make_routing_weights",
+        "prepare_inputs",
+        "run_full_one",
+        "run_one",
+        "run_weighted_one",
+    ):
+        globals()[name] = getattr(baselines, name)
+
+
+def _functional_pre_device_callback():
+    runner = importlib.import_module("benchmark.layer.bench_moe_suite")
+    return runner._worker_predevice_callback()
 
 
 def _tiling_overrides() -> dict[str, int]:
@@ -57,7 +96,9 @@ def _forward_config(case: CaseSpec) -> MoEForwardConfig:
 
 
 def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
+    kit.require_authorized_runtime()
     kit.load_device_runtime()
+    _load_functional_runtime()
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
     if kit.ash is None or kit.torch_npu is None:
@@ -182,7 +223,9 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
 
 
 def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
+    kit.require_authorized_runtime()
     kit.load_device_runtime()
+    _load_functional_runtime()
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
     if kit.ash is None or kit.torch_npu is None:
@@ -266,14 +309,24 @@ FUNCTIONAL_BACKWARD_CASES = kit.make_pytest_params(
 @pytest.mark.functional
 @pytest.mark.parametrize("case", FUNCTIONAL_FORWARD_CASES)
 def test_forward_suite(dist_test, case: CaseSpec):
-    dist_test(run_forward_case, world_size=case.world_size, args=(case,))
+    dist_test(
+        run_forward_case,
+        world_size=case.world_size,
+        args=(case,),
+        pre_device_callback=_functional_pre_device_callback(),
+    )
 
 
 @pytest.mark.dist
 @pytest.mark.functional
 @pytest.mark.parametrize("case", FUNCTIONAL_BACKWARD_CASES)
 def test_backward_suite(dist_test, case: CaseSpec):
-    dist_test(run_backward_case, world_size=case.world_size, args=(case,))
+    dist_test(
+        run_backward_case,
+        world_size=case.world_size,
+        args=(case,),
+        pre_device_callback=_functional_pre_device_callback(),
+    )
 
 
 # TODO: future work — when an all-directions session is introduced, finish and

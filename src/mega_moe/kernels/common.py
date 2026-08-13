@@ -6,10 +6,9 @@
 #  GEMM dot-tiles match 06 / the GPU backward tiling.
 # ============================================================================
 
+import importlib
 import torch
-import torch_npu  # noqa: F401
 import torch.distributed as dist
-from triton.backends.ascend.driver import NPUUtils
 
 # GEMM dot-tiles for the input-grad GEMMs (step1 dispatch_fc2, step4 combine_fc1).
 # BLOCK_SIZE_M is LOCKED to 64: the forward meta tiling (prepare_moe_metadata in
@@ -33,6 +32,8 @@ WGRAD_BLOCK_K = 256
 
 def ncore():
     """Return the device-reported physical AICore count."""
+    driver = importlib.import_module("triton.backends.ascend.driver")
+    NPUUtils = driver.NPUUtils
     return validate_physical_aicore_count(NPUUtils().get_aicore_num())
 
 

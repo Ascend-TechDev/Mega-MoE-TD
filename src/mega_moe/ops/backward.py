@@ -24,18 +24,36 @@ The 5 backward mega-ops (given dy [B,H]):
 5. ``transposed_gemm``   — fc1 weight-grad -> chunk(grad_fc1_1, grad_fc1_2)
 """
 
+import importlib
 import os
 
 import torch
-import torch_npu  # noqa: F401
 
-from ._torch_forward import moe_forward
-from ..kernels import (
-    dispatch_fc2_bwd_triton,
-    swiglu_bwd_triton,
-    transposed_grouped_gemm_triton,
-    combine_fc1_bwd_triton,
-)
+
+moe_forward = None
+dispatch_fc2_bwd_triton = None
+swiglu_bwd_triton = None
+transposed_grouped_gemm_triton = None
+combine_fc1_bwd_triton = None
+
+
+def _load_backward_runtime():
+    """Resolve device-capable helpers only inside an authorized device entry."""
+    global moe_forward
+    global dispatch_fc2_bwd_triton, swiglu_bwd_triton
+    global transposed_grouped_gemm_triton, combine_fc1_bwd_triton
+    if moe_forward is not None:
+        return
+    testkit = importlib.import_module("tests._moe_testkit")
+    testkit.require_authorized_runtime()
+    importlib.import_module("torch_npu")
+    torch_forward = importlib.import_module("mega_moe.ops._torch_forward")
+    kernels = importlib.import_module("mega_moe.kernels")
+    moe_forward = torch_forward.moe_forward
+    dispatch_fc2_bwd_triton = kernels.dispatch_fc2_bwd_triton
+    swiglu_bwd_triton = kernels.swiglu_bwd_triton
+    transposed_grouped_gemm_triton = kernels.transposed_grouped_gemm_triton
+    combine_fc1_bwd_triton = kernels.combine_fc1_bwd_triton
 
 
 def _grouped_wgrad_torch(grad_out, orig_in, expert_counts):
@@ -83,6 +101,7 @@ def moe_backward_triton(
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
     matching the hand-written test baseline."""
+    _load_backward_runtime()
     dy = dy.to(saved["fc1_1"].dtype)
     if use_triton_wgrad is None:
         use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
@@ -157,6 +176,7 @@ class MegaMoEBackwardFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden_states, routing_weights, selected_experts,
                 fc1_1, fc1_2, fc2, ep_group, topk, peer_mem):
+        _load_backward_runtime()
         with torch.no_grad():
             output, saved = moe_forward(
                 hidden_states, routing_weights, selected_experts,

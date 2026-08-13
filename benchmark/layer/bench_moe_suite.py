@@ -53,8 +53,10 @@ The remaining environment variables are runtime knobs only:
 """
 
 import dataclasses
+import base64
 import ctypes
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -254,6 +256,1086 @@ class SnapshotIdentity:
     bigop_entries: tuple[SnapshotEntry, ...]
     root_device: int
     root_inode: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflightIdentity:
+    authority_anchor: AuthorityAnchor
+    authority: AuthorityEnvelope
+    snapshot: SnapshotIdentity
+    runtime_manifest_sha256: str
+    required_anchor_modules: tuple[str, ...]
+    runtime_component_roots: tuple[tuple[str, Path], ...]
+    import_root_components: tuple[str, ...] = ("python",)
+    namespace_prefixes: tuple[str, ...] = (
+        "benchmark",
+        "config",
+        "mega_moe",
+        "tests",
+    )
+
+    def __post_init__(self):
+        required = tuple(self.required_anchor_modules)
+        if (
+            not required
+            or len(required) != len(set(required))
+            or not {"benchmark", "benchmark.layer"}.issubset(required)
+        ):
+            raise AuthorityPreflightError(
+                "MODULE_CLOSURE_INVALID", "regular benchmark package anchors"
+            )
+        if _SHA256_PATTERN.fullmatch(self.runtime_manifest_sha256) is None:
+            raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime manifest identity")
+        roots = dict(self.runtime_component_roots)
+        if (
+            len(roots) != len(self.runtime_component_roots)
+            or set(roots) != BACKWARD_ENVIRONMENT_COMPONENTS
+            or not all(isinstance(path, Path) and path.is_absolute() for path in roots.values())
+            or not self.import_root_components
+            or not set(self.import_root_components) <= set(roots)
+        ):
+            raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime component roots")
+
+
+_ACTIVE_PREFLIGHT = None
+
+
+_STDLIB_BOOTSTRAP_PRELUDE = r'''
+import ast
+import base64
+import contextlib
+import hashlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+AUTHORITY_REMOTE = __AUTHORITY_REMOTE_JSON__
+AUTHORITY_REF = __AUTHORITY_REF_JSON__
+PRODUCT_REMOTE = __PRODUCT_REMOTE_JSON__
+PRODUCT_FEATURE_REF = __PRODUCT_FEATURE_REF_JSON__
+PRODUCT_MAIN_REF = __PRODUCT_MAIN_REF_JSON__
+BIGOP_REMOTE = __BIGOP_REMOTE_JSON__
+TRACE = []
+LOADED = {}
+
+
+def fail(code, detail):
+    raise RuntimeError(code + ": " + detail)
+
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def elf_build_id(content):
+    if len(content) < 64 or not content.startswith(b"\x7fELF"):
+        return None
+    elf_class, data_encoding = content[4], content[5]
+    if elf_class not in (1, 2) or data_encoding not in (1, 2):
+        fail("RUNTIME_DRIFT", "ELF identity")
+    byteorder = "little" if data_encoding == 1 else "big"
+
+    def integer(offset, size):
+        end = offset + size
+        if offset < 0 or end > len(content):
+            fail("RUNTIME_DRIFT", "ELF bounds")
+        return int.from_bytes(content[offset:end], byteorder)
+
+    if elf_class == 2:
+        program_offset = integer(32, 8)
+        entry_size = integer(54, 2)
+        entry_count = integer(56, 2)
+        offset_field, size_field, field_size = 8, 32, 8
+    else:
+        program_offset = integer(28, 4)
+        entry_size = integer(42, 2)
+        entry_count = integer(44, 2)
+        offset_field, size_field, field_size = 4, 16, 4
+    if entry_size == 0 or entry_count > 4096:
+        fail("RUNTIME_DRIFT", "ELF program headers")
+    for index in range(entry_count):
+        header = program_offset + index * entry_size
+        if integer(header, 4) != 4:
+            continue
+        note_offset = integer(header + offset_field, field_size)
+        note_size = integer(header + size_field, field_size)
+        cursor = note_offset
+        limit = note_offset + note_size
+        if limit > len(content):
+            fail("RUNTIME_DRIFT", "ELF note bounds")
+        while cursor + 12 <= limit:
+            name_size = integer(cursor, 4)
+            description_size = integer(cursor + 4, 4)
+            note_type = integer(cursor + 8, 4)
+            cursor += 12
+            name_end = cursor + name_size
+            description_start = (name_end + 3) & ~3
+            description_end = description_start + description_size
+            next_note = (description_end + 3) & ~3
+            if next_note > limit:
+                fail("RUNTIME_DRIFT", "ELF note record")
+            name = content[cursor:name_end]
+            description = content[description_start:description_end]
+            if note_type == 3 and name.rstrip(b"\0") == b"GNU":
+                return description.hex()
+            cursor = next_note
+    return None
+
+
+def read_regular(path, expected, label):
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        fail(label, "open " + type(error).__name__)
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+            fail(label, "identity")
+        chunks = []
+        offset = 0
+        while True:
+            part = os.pread(fd, 1024 * 1024, offset)
+            if not part:
+                break
+            chunks.append(part)
+            offset += len(part)
+        content = b"".join(chunks)
+        after = os.stat(path, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+            fail(label, "replacement")
+    finally:
+        os.close(fd)
+    observed = {
+        "mode": stat.S_IFREG | stat.S_IMODE(opened.st_mode),
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    for key in ("mode", "size", "sha256"):
+        if expected.get(key) != observed[key]:
+            fail(label, key + " drift")
+    if "elf_build_id" in expected and expected["elf_build_id"] != elf_build_id(content):
+        fail(label, "ELF build id drift")
+    return content
+
+
+def git_env():
+    return {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def git(cwd, args, label):
+    completed = subprocess.run(
+        ["/usr/bin/git", "-c", "credential.helper=", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=cwd,
+        env=git_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        fail(label, "git rc " + str(completed.returncode))
+    return completed.stdout
+
+
+def stable_ref(cwd, remote, ref, label):
+    values = []
+    for _ in range(2):
+        lines = git(cwd, ["ls-remote", "--refs", remote, ref], label).decode("ascii").splitlines()
+        exact = [line.split("\t", 1)[0] for line in lines if line.endswith("\t" + ref)]
+        if len(exact) != 1 or len(exact[0]) != 40:
+            fail(label, "ref denominator")
+        values.append(exact[0])
+    if values[0] != values[1]:
+        fail(label, "moving ref")
+    return values[0]
+
+
+def tree_entries(cwd, repository, commit, label):
+    raw = git(cwd, ["--git-dir", repository, "ls-tree", "-rz", "-r", commit], label)
+    records = []
+    for row in raw.split(b"\0"):
+        if not row:
+            continue
+        try:
+            header, path_bytes = row.split(b"\t", 1)
+            mode_bytes, kind_bytes, oid_bytes = header.split(b" ")
+            relative = path_bytes.decode("utf-8", "strict")
+            mode = int(mode_bytes, 8)
+            kind = kind_bytes.decode("ascii")
+            oid = oid_bytes.decode("ascii")
+        except (ValueError, UnicodeDecodeError):
+            fail(label, "tree record")
+        if kind == "blob":
+            content = git(cwd, ["--git-dir", repository, "cat-file", "blob", oid], label)
+            records.append({
+                "blob_oid": oid,
+                "kind": "file",
+                "mode": mode,
+                "path": relative,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": len(content),
+            })
+        elif kind == "commit" and mode == 0o160000:
+            records.append({
+                "commit_oid": oid,
+                "kind": "gitlink",
+                "mode": mode,
+                "path": relative,
+            })
+        else:
+            fail(label, "unsupported tree member")
+    records.sort(key=lambda item: item["path"])
+    return records
+
+
+def live_authority(payload):
+    with tempfile.TemporaryDirectory(prefix="uniep-bootstrap-git-") as temporary:
+        authority_commit = stable_ref(temporary, AUTHORITY_REMOTE, AUTHORITY_REF, "AUTHORITY_REMOTE_AUTH_FAILED")
+        authority_repo = os.path.join(temporary, "authority.git")
+        git(temporary, ["init", "-q", "--bare", authority_repo], "AUTHORITY_INVALID")
+        git(temporary, ["--git-dir", authority_repo, "fetch", "--no-tags", AUTHORITY_REMOTE,
+                        "+" + authority_commit + ":refs/uniep/authority"], "AUTHORITY_REMOTE_AUTH_FAILED")
+        authority_tree = git(temporary, ["--git-dir", authority_repo, "rev-parse", authority_commit + "^{tree}"], "AUTHORITY_INVALID").decode("ascii").strip()
+        path = payload["authority_anchor"]["path"]
+        row = git(temporary, ["--git-dir", authority_repo, "ls-tree", authority_commit, "--", path], "AUTHORITY_MISSING").decode("ascii").strip().split()
+        if len(row) < 3 or row[1] != "blob":
+            fail("AUTHORITY_MISSING", "authority object")
+        blob_oid = row[2]
+        raw = git(temporary, ["--git-dir", authority_repo, "cat-file", "blob", blob_oid], "AUTHORITY_INVALID")
+        product = payload["authority_object"]["authority"]["product"]
+        product_commit = stable_ref(temporary, PRODUCT_REMOTE, PRODUCT_FEATURE_REF, "PRODUCT_INVALID")
+        main_commit = stable_ref(temporary, PRODUCT_REMOTE, PRODUCT_MAIN_REF, "PRODUCT_INVALID")
+        product_repo = os.path.join(temporary, "product.git")
+        git(temporary, ["init", "-q", "--bare", product_repo], "PRODUCT_INVALID")
+        git(temporary, ["--git-dir", product_repo, "fetch", "--no-tags", PRODUCT_REMOTE,
+                        "+" + product_commit + ":refs/uniep/product",
+                        "+" + main_commit + ":refs/uniep/main"], "PRODUCT_INVALID")
+        product_tree = git(temporary, ["--git-dir", product_repo, "rev-parse", product_commit + "^{tree}"], "PRODUCT_INVALID").decode("ascii").strip()
+        parent = git(temporary, ["--git-dir", product_repo, "rev-parse", product_commit + "^"], "PRODUCT_INVALID").decode("ascii").strip()
+        ancestry = subprocess.run(
+            ["/usr/bin/git", "--git-dir", product_repo, "merge-base", "--is-ancestor", main_commit, product_commit],
+            env=git_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0
+        observed_sources = []
+        for source in product["sources"]:
+            source_row = git(temporary, ["--git-dir", product_repo, "ls-tree", product_commit, "--", source["path"]], "PRODUCT_INVALID").decode("ascii").strip().split()
+            if len(source_row) < 3 or source_row[1] != "blob":
+                fail("PRODUCT_INVALID", "source missing")
+            source_blob = source_row[2]
+            source_raw = git(temporary, ["--git-dir", product_repo, "cat-file", "blob", source_blob], "PRODUCT_INVALID")
+            observed_sources.append({"path": source["path"], "blob_oid": source_blob, "sha256": hashlib.sha256(source_raw).hexdigest()})
+        product_entries = tree_entries(
+            temporary, product_repo, product_commit, "PRODUCT_INVALID"
+        )
+        if product_entries != payload["snapshot"]["entries"]:
+            fail("PRODUCT_INVALID", "full tree manifest")
+        product_manifest_sha256 = hashlib.sha256(canonical(product_entries)).hexdigest()
+        if product_manifest_sha256 != payload["snapshot"]["manifest_sha256"]:
+            fail("PRODUCT_INVALID", "full tree manifest identity")
+        bigop_links = [
+            item for item in product_entries
+            if item["kind"] == "gitlink" and item["path"] == "3rdparty/bigop"
+        ]
+        if bigop_links:
+            bigop_commit = bigop_links[0]["commit_oid"]
+            bigop_repo = os.path.join(temporary, "bigop.git")
+            git(temporary, ["init", "-q", "--bare", bigop_repo], "PRODUCT_INVALID")
+            git(temporary, ["--git-dir", bigop_repo, "fetch", "--no-tags", BIGOP_REMOTE,
+                            "+" + bigop_commit + ":refs/uniep/bigop"], "PRODUCT_INVALID")
+            bigop_entries = tree_entries(
+                temporary, bigop_repo, bigop_commit, "PRODUCT_INVALID"
+            )
+        else:
+            bigop_commit = "0" * 40
+            bigop_entries = []
+        if (
+            bigop_commit != payload["snapshot"]["bigop_commit"]
+            or bigop_entries != payload["snapshot"]["bigop_entries"]
+        ):
+            fail("PRODUCT_INVALID", "bigop manifest")
+        bigop_tree_manifest_sha256 = hashlib.sha256(
+            canonical(bigop_entries)
+        ).hexdigest()
+        observed_product = {
+            "commit": product_commit,
+            "tree": product_tree,
+            "sole_parent": parent,
+            "observed_main": main_commit,
+            "main_is_ancestor": ancestry,
+            "sources": observed_sources,
+            "product_manifest_sha256": product_manifest_sha256,
+            "bigop_commit": bigop_commit,
+            "bigop_tree_manifest_sha256": bigop_tree_manifest_sha256,
+        }
+        expected_product = {
+            "commit": product["commit"],
+            "tree": product["tree"],
+            "sole_parent": product["sole_parent"],
+            "observed_main": product["observed_main"],
+            "main_is_ancestor": product["main_is_ancestor"],
+            "sources": product["sources"],
+            "product_manifest_sha256": payload["snapshot"]["manifest_sha256"],
+            "bigop_commit": payload["snapshot"]["bigop_commit"],
+            "bigop_tree_manifest_sha256": hashlib.sha256(
+                canonical(payload["snapshot"]["bigop_entries"])
+            ).hexdigest(),
+        }
+        observed_anchor = {
+            "commit": authority_commit,
+            "tree": authority_tree,
+            "path": path,
+            "blob_oid": blob_oid,
+            "full_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        if observed_anchor != payload["authority_anchor"] or raw != base64.b64decode(payload["authority_raw_b64"]):
+            fail("AUTHORITY_DRIFT", "live authority identity")
+        if observed_product != expected_product:
+            fail("PRODUCT_INVALID", "live product identity")
+        return observed_anchor, observed_product
+
+
+def verify_snapshot(payload):
+    snapshot = payload["snapshot"]
+    root = snapshot["root"]
+    before = os.stat(root, follow_symlinks=False)
+    if (not stat.S_ISDIR(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o700
+            or [before.st_dev, before.st_ino] != snapshot["root_identity"]):
+        fail("SNAPSHOT_INVALID", "root identity")
+    expected = {item["path"]: item for item in snapshot["physical_entries"]}
+    observed = set()
+    for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames:
+            path = os.path.join(directory, name)
+            metadata = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o755:
+                fail("SNAPSHOT_INVALID", "directory")
+        for name in filenames:
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            if relative not in expected:
+                fail("SNAPSHOT_INVALID", "extra leaf")
+            read_regular(path, expected[relative], "SNAPSHOT_INVALID")
+            observed.add(relative)
+    if observed != set(expected):
+        fail("SNAPSHOT_INVALID", "leaf denominator")
+    after = os.stat(root, follow_symlinks=False)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        fail("SNAPSHOT_INVALID", "root replacement")
+    for relative in payload["required_source_paths"]:
+        if relative not in expected:
+            fail("MODULE_CLOSURE_INVALID", "required source missing")
+    return expected
+
+
+def verify_runtime(payload):
+    authority_environment = payload["authority_object"]["authority"]["environment"]
+    allowed = {}
+    roots = payload["runtime_component_roots"]
+    for component_name in sorted(authority_environment):
+        component = authority_environment[component_name]
+        root = roots[component_name]
+        for member in component["members"]:
+            path = os.path.join(root, *member["name"].split("/"))
+            content = read_regular(path, member, "RUNTIME_DRIFT")
+            allowed[os.path.realpath(path)] = member
+    return allowed
+
+
+def verify_benchmark_anchors(root, expected):
+    for relative in ("benchmark/__init__.py", "benchmark/layer/__init__.py"):
+        content = read_regular(
+            os.path.join(root, *relative.split("/")),
+            expected[relative],
+            "MODULE_CLOSURE_INVALID",
+        )
+        try:
+            tree = ast.parse(content.decode("utf-8"))
+        except (UnicodeDecodeError, SyntaxError):
+            fail("MODULE_CLOSURE_INVALID", "benchmark anchor syntax")
+        for node in tree.body:
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                continue
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                continue
+            fail("MODULE_CLOSURE_INVALID", "benchmark anchor side effect")
+
+
+class ProductLoader(importlib.abc.Loader):
+    def __init__(self, fullname, path, relative, is_package, expected):
+        self.fullname = fullname
+        self.path = path
+        self.relative = relative
+        self.is_package = is_package
+        self.expected = expected
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        content = read_regular(self.path, self.expected, "MODULE_CLOSURE_INVALID")
+        digest = hashlib.sha256(content).hexdigest()
+        module.__file__ = self.path
+        if self.is_package:
+            module.__path__ = [os.path.dirname(self.path)]
+        LOADED[self.fullname] = {
+            "module_name": self.fullname,
+            "relative_path": self.relative,
+            "loaded_sha256": digest,
+            "loader_kind": "VerifiedProductLoader",
+            "manifest_blob_oid": self.expected["blob_oid"],
+        }
+        exec(compile(content, self.path, "exec", dont_inherit=True), module.__dict__)
+
+
+class ProductFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, root, expected):
+        self.root = root
+        self.expected = expected
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "mega_moe" or fullname.startswith("mega_moe."):
+            base = "src/" + fullname.replace(".", "/")
+        elif fullname in ("benchmark", "config", "tests") or fullname.startswith(("benchmark.", "config.", "tests.")):
+            base = fullname.replace(".", "/")
+        elif fullname == "conftest":
+            base = "conftest"
+        else:
+            return None
+        candidates = ((base + "/__init__.py", True), (base + ".py", False))
+        for relative, is_package in candidates:
+            expected = self.expected.get(relative)
+            if expected is not None:
+                absolute = os.path.join(self.root, *relative.split("/"))
+                loader = ProductLoader(fullname, absolute, relative, is_package, expected)
+                return importlib.util.spec_from_file_location(
+                    fullname, absolute, loader=loader,
+                    submodule_search_locations=[os.path.dirname(absolute)] if is_package else None,
+                )
+        fail("MODULE_CLOSURE_INVALID", "namespace or missing product module " + fullname)
+
+
+class RuntimeLoader(importlib.abc.Loader):
+    def __init__(self, fullname, path, expected, is_package):
+        self.fullname = fullname
+        self.path = path
+        self.expected = expected
+        self.is_package = is_package
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        content = read_regular(self.path, self.expected, "RUNTIME_DRIFT")
+        module.__file__ = self.path
+        if self.is_package:
+            module.__path__ = [os.path.dirname(self.path)]
+        exec(compile(content, self.path, "exec", dont_inherit=True), module.__dict__)
+
+
+class RuntimeFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, roots, allowed):
+        self.roots = tuple(roots)
+        self.allowed = allowed
+
+    def find_spec(self, fullname, path=None, target=None):
+        search = list(path) if path is not None else list(self.roots)
+        spec = importlib.machinery.PathFinder.find_spec(fullname, search)
+        if spec is None:
+            return None
+        origin = spec.origin
+        if not isinstance(origin, str):
+            fail("RUNTIME_DRIFT", "namespace runtime module " + fullname)
+        resolved = os.path.realpath(origin)
+        under_runtime = any(
+            resolved == root or resolved.startswith(root + os.sep)
+            for root in self.roots
+        )
+        if not under_runtime:
+            return None
+        expected = self.allowed.get(resolved)
+        if expected is None:
+            fail("RUNTIME_DRIFT", "unmanifested runtime module " + fullname)
+        if not resolved.endswith(".py"):
+            fail("RUNTIME_DRIFT", "non-source runtime loader " + fullname)
+        is_package = spec.submodule_search_locations is not None
+        loader = RuntimeLoader(fullname, resolved, expected, is_package)
+        return importlib.util.spec_from_file_location(
+            fullname,
+            resolved,
+            loader=loader,
+            submodule_search_locations=[os.path.dirname(resolved)] if is_package else None,
+        )
+
+
+def verify_runtime_modules(allowed, runtime_roots):
+    roots = tuple(os.path.realpath(item) + os.sep for item in runtime_roots)
+    for name, module in sorted(sys.modules.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None) or getattr(module, "__file__", None)
+        if not isinstance(origin, str) or origin in ("built-in", "frozen"):
+            continue
+        resolved = os.path.realpath(origin)
+        if resolved.endswith((".pyc", ".pyo")):
+            source = resolved[:-1]
+            if source in allowed:
+                resolved = source
+        if any(resolved.startswith(root) for root in roots):
+            member = allowed.get(resolved)
+            if member is None:
+                fail("RUNTIME_DRIFT", "unmanifested runtime module " + name)
+            read_regular(resolved, member, "RUNTIME_DRIFT")
+
+
+def main():
+    if sys.flags.isolated != 1 or sys.flags.no_site != 1:
+        fail("BOOTSTRAP_INVALID", "isolated flags")
+    if "site" in sys.modules or "pytest" in sys.modules or "torch_npu" in sys.modules:
+        fail("BOOTSTRAP_INVALID", "preloaded module")
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+        if name in os.environ:
+            fail("BOOTSTRAP_INVALID", "ambient " + name)
+    payload = json.load(sys.stdin)
+    raw = base64.b64decode(payload["authority_raw_b64"])
+    authority_object = json.loads(raw.decode("utf-8"))
+    if canonical(authority_object) != raw or authority_object != payload["authority_object"]:
+        fail("AUTHORITY_INVALID", "canonical bytes")
+    authority_body = authority_object["authority"]
+    if hashlib.sha256(canonical(authority_body)).hexdigest() != authority_object["authority_payload_sha256"]:
+        fail("AUTHORITY_INVALID", "payload digest")
+    if hashlib.sha256(raw).hexdigest() != payload["authority_anchor"]["full_sha256"]:
+        fail("AUTHORITY_INVALID", "full digest")
+    runtime_identity = hashlib.sha256(
+        json.dumps(
+            authority_body["environment"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    if runtime_identity != payload["runtime_manifest_sha256"]:
+        fail("RUNTIME_DRIFT", "authority runtime identity")
+    TRACE.extend(("stdlib_no_site", "authority_first"))
+    first_authority, first_product = live_authority(payload)
+    expected = verify_snapshot(payload)
+    verify_benchmark_anchors(payload["snapshot"]["root"], expected)
+    TRACE.append("snapshot_first")
+    allowed_runtime = verify_runtime(payload)
+    TRACE.append("runtime_first")
+    product_namespaces = ("benchmark", "config", "mega_moe", "tests")
+    if any(name == prefix or name.startswith(prefix + ".") for name in sys.modules for prefix in product_namespaces):
+        fail("MODULE_CLOSURE_INVALID", "preloaded product namespace")
+    root = payload["snapshot"]["root"]
+    finder = ProductFinder(root, expected)
+    sys.meta_path.insert(0, finder)
+    stdlib_paths = [item for item in sys.path if item and "site-packages" not in item]
+    import_roots = [payload["runtime_component_roots"][name] for name in payload["import_root_components"]]
+    sys.path[:] = [root, os.path.join(root, "src"), *import_roots, *stdlib_paths]
+    sys.meta_path.insert(1, RuntimeFinder(import_roots, allowed_runtime))
+    os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    sys.dont_write_bytecode = True
+    TRACE.extend(("verified_import_roots", "pytest_explicit"))
+    pytest = __import__("pytest")
+    runner = __import__("benchmark.layer.bench_moe_suite", fromlist=["*"])
+    configure = getattr(runner, "_configure_bootstrap_payload", None)
+    if not callable(configure):
+        fail("BOOTSTRAP_INVALID", "runner bootstrap consumer")
+    configure(payload)
+    pytest_stdout = io.StringIO()
+    pytest_stderr = io.StringIO()
+    with contextlib.redirect_stdout(pytest_stdout), contextlib.redirect_stderr(pytest_stderr):
+        result = pytest.main(payload["args"], plugins=[])
+    if int(result) != 0:
+        fail("PYTEST_FAILED", str(result))
+    TRACE.append("modules_loaded")
+    required = set(payload["required_anchor_modules"])
+    if not required <= set(LOADED):
+        fail("MODULE_CLOSURE_INVALID", "required module denominator")
+    for name, module in sorted(sys.modules.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None) or getattr(module, "__file__", None)
+        if not isinstance(origin, str) or origin in ("built-in", "frozen"):
+            continue
+        try:
+            inside = os.path.commonpath((root, os.path.realpath(origin))) == root
+        except ValueError:
+            inside = False
+        in_namespace = any(name == prefix or name.startswith(prefix + ".") for prefix in product_namespaces)
+        if (inside or in_namespace) and name not in LOADED:
+            fail("MODULE_CLOSURE_INVALID", "unverified product module " + name)
+    final_authority, final_product = live_authority(payload)
+    TRACE.append("authority_final")
+    if final_authority != first_authority or final_product != first_product:
+        fail("AUTHORITY_DRIFT", "terminal live identity")
+    verify_snapshot(payload)
+    for record in LOADED.values():
+        read_regular(os.path.join(root, *record["relative_path"].split("/")), expected[record["relative_path"]], "MODULE_CLOSURE_INVALID")
+    TRACE.append("snapshot_final")
+    verify_runtime(payload)
+    verify_runtime_modules(allowed_runtime, import_roots)
+    TRACE.extend(("runtime_final", "modules_final"))
+    evidence = {
+        "schema": "uniep.task4-bootstrap-terminal.v1",
+        "status": "HOST_ONLY_VERIFIED",
+        "bootstrap_sha256": payload["bootstrap_sha256"],
+        "authority_sha256": hashlib.sha256(raw).hexdigest(),
+        "product_commit": first_product["commit"],
+        "snapshot_manifest_sha256": payload["snapshot"]["manifest_sha256"],
+        "runtime_manifest_sha256": payload["runtime_manifest_sha256"],
+        "loaded_product_modules": [LOADED[name] for name in sorted(LOADED)],
+        "trace": TRACE,
+        "device_events": 0,
+        "pytest_stdout_sha256": hashlib.sha256(
+            pytest_stdout.getvalue().encode("utf-8")
+        ).hexdigest(),
+        "pytest_stdout_size": len(pytest_stdout.getvalue().encode("utf-8")),
+        "pytest_stderr_sha256": hashlib.sha256(
+            pytest_stderr.getvalue().encode("utf-8")
+        ).hexdigest(),
+        "pytest_stderr_size": len(pytest_stderr.getvalue().encode("utf-8")),
+    }
+    sys.stdout.write(canonical(evidence).decode("utf-8"))
+
+
+main()
+'''
+
+
+def _canonical_identity_sha256(value) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _authority_identity_sha256(
+    anchor: AuthorityAnchor, envelope: AuthorityEnvelope
+) -> str:
+    return _canonical_identity_sha256(
+        {
+            "anchor": dataclasses.asdict(anchor),
+            "payload_sha256": envelope.payload_sha256,
+            "raw_sha256": hashlib.sha256(envelope.raw).hexdigest(),
+        }
+    )
+
+
+def _snapshot_identity_sha256(identity: SnapshotIdentity) -> str:
+    return _canonical_identity_sha256(
+        {
+            "tree": identity.tree,
+            "manifest_sha256": identity.manifest_sha256,
+            "canonical_manifest_sha256": hashlib.sha256(
+                identity.canonical_manifest
+            ).hexdigest(),
+            "bigop_commit": identity.bigop_commit,
+            "bigop_manifest_sha256": identity.bigop_manifest_sha256,
+            "root_device": identity.root_device,
+            "root_inode": identity.root_inode,
+        }
+    )
+
+
+def _runtime_authority_manifest_sha256(envelope: AuthorityEnvelope) -> str:
+    return _canonical_identity_sha256(envelope.environment)
+
+
+def _runtime_roots(preflight: PreflightIdentity) -> dict[str, Path]:
+    roots = dict(preflight.runtime_component_roots)
+    if set(roots) != BACKWARD_ENVIRONMENT_COMPONENTS:
+        raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime root denominator")
+    return roots
+
+
+def _read_runtime_member(root: Path, member: dict) -> bytes:
+    path = root.joinpath(*PurePosixPath(member["name"]).parts)
+    try:
+        before = path.lstat()
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+    except OSError as error:
+        raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime member open") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+        ):
+            raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime member identity")
+        chunks = []
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 1024 * 1024, offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        content = b"".join(chunks)
+        after = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+            raise AuthorityPreflightError(
+                "RUNTIME_DRIFT", "runtime member replacement"
+            )
+    finally:
+        os.close(descriptor)
+    observed = {
+        "elf_build_id": _elf_build_id(content),
+        "kind": "file",
+        "mode": stat.S_IFREG | stat.S_IMODE(opened.st_mode),
+        "name": member["name"],
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+    }
+    if observed != member:
+        raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime member bytes")
+    return content
+
+
+def _verify_runtime_component_roots(preflight: PreflightIdentity) -> str:
+    roots = _runtime_roots(preflight)
+    for component_name, component in preflight.authority.environment.items():
+        root = roots[component_name]
+        if not root.is_absolute() or root != root.resolve(strict=True):
+            raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime root identity")
+        for member in component["members"]:
+            _read_runtime_member(root, member)
+    observed = _runtime_authority_manifest_sha256(preflight.authority)
+    if observed != preflight.runtime_manifest_sha256:
+        raise AuthorityPreflightError("RUNTIME_DRIFT", "runtime manifest identity")
+    return observed
+
+
+def _fresh_bootstrap_code() -> str:
+    """Return the complete stdlib-only, fixed-policy child bootstrap."""
+    replacements = {
+        "__AUTHORITY_REMOTE_JSON__": json.dumps(AUTHORITY_REMOTE),
+        "__AUTHORITY_REF_JSON__": json.dumps(AUTHORITY_REF),
+        "__PRODUCT_REMOTE_JSON__": json.dumps(PRODUCT_REMOTE),
+        "__PRODUCT_FEATURE_REF_JSON__": json.dumps(PRODUCT_FEATURE_REF),
+        "__PRODUCT_MAIN_REF_JSON__": json.dumps(PRODUCT_MAIN_REF),
+        "__BIGOP_REMOTE_JSON__": json.dumps(BIGOP_REMOTE),
+    }
+    code = _STDLIB_BOOTSTRAP_PRELUDE
+    for marker, value in replacements.items():
+        code = code.replace(marker, value)
+    if any(marker in code for marker in replacements):
+        raise AuthorityPreflightError("BOOTSTRAP_INVALID", "policy substitution")
+    return code
+
+
+def _bootstrap_payload(
+    preflight: PreflightIdentity, pytest_args: tuple[str, ...]
+) -> bytes:
+    if not isinstance(preflight, PreflightIdentity):
+        raise AuthorityPreflightError("AUTHORITY_MISSING", "bootstrap preflight")
+    if (
+        not isinstance(pytest_args, tuple)
+        or not pytest_args
+        or not all(isinstance(item, str) and item for item in pytest_args)
+    ):
+        raise AuthorityPreflightError("BOOTSTRAP_INVALID", "pytest selector")
+    _verify_runtime_component_roots(preflight)
+    _verify_snapshot_physical(preflight.snapshot)
+    raw_object = _canonical_json(preflight.authority.raw)
+    physical_entries = tuple(
+        _snapshot_entry_record(item)
+        for item in _expected_physical_entries(preflight.snapshot).values()
+    )
+    code = _fresh_bootstrap_code()
+    payload = {
+        "args": list(pytest_args),
+        "authority_anchor": dataclasses.asdict(preflight.authority_anchor),
+        "authority_object": raw_object,
+        "authority_raw_b64": base64.b64encode(preflight.authority.raw).decode("ascii"),
+        "bootstrap_sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
+        "import_root_components": list(preflight.import_root_components),
+        "required_anchor_modules": list(preflight.required_anchor_modules),
+        "namespace_prefixes": list(preflight.namespace_prefixes),
+        "required_source_paths": list(BACKWARD_EVIDENCE_SOURCES),
+        "runtime_component_roots": {
+            name: str(path) for name, path in preflight.runtime_component_roots
+        },
+        "runtime_manifest_sha256": preflight.runtime_manifest_sha256,
+        "snapshot": {
+            "bigop_commit": preflight.snapshot.bigop_commit,
+            "bigop_entries": [
+                _snapshot_entry_record(item) for item in preflight.snapshot.bigop_entries
+            ],
+            "bigop_manifest_sha256": preflight.snapshot.bigop_manifest_sha256,
+            "canonical_manifest_b64": base64.b64encode(
+                preflight.snapshot.canonical_manifest
+            ).decode("ascii"),
+            "entries": [
+                _snapshot_entry_record(item) for item in preflight.snapshot.entries
+            ],
+            "manifest_sha256": preflight.snapshot.manifest_sha256,
+            "physical_entries": list(physical_entries),
+            "root": str(preflight.snapshot.root),
+            "root_identity": [
+                preflight.snapshot.root_device,
+                preflight.snapshot.root_inode,
+            ],
+            "tree": preflight.snapshot.tree,
+        },
+    }
+    return (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _snapshot_entry_from_record(record: dict) -> SnapshotEntry:
+    if not isinstance(record, dict):
+        raise AuthorityPreflightError("SNAPSHOT_INVALID", "bootstrap snapshot entry")
+    return SnapshotEntry(**record)
+
+
+def _configure_bootstrap_payload(payload: dict) -> PreflightIdentity:
+    """Consume only the child-verified payload and install its worker identity."""
+    if not isinstance(payload, dict):
+        raise AuthorityPreflightError("BOOTSTRAP_INVALID", "bootstrap payload")
+    authority_object = payload["authority_object"]["authority"]
+    snapshot_object = payload["snapshot"]
+    root = Path(snapshot_object["root"])
+    preflight = PreflightIdentity(
+        authority_anchor=AuthorityAnchor(**payload["authority_anchor"]),
+        authority=AuthorityEnvelope(
+            raw=base64.b64decode(payload["authority_raw_b64"]),
+            payload_sha256=payload["authority_object"]["authority_payload_sha256"],
+            product=authority_object["product"],
+            environment=authority_object["environment"],
+            producer=authority_object["producer"],
+        ),
+        snapshot=SnapshotIdentity(
+            root=root,
+            tree=snapshot_object["tree"],
+            manifest_sha256=snapshot_object["manifest_sha256"],
+            entries=tuple(
+                _snapshot_entry_from_record(item) for item in snapshot_object["entries"]
+            ),
+            canonical_manifest=base64.b64decode(
+                snapshot_object["canonical_manifest_b64"]
+            ),
+            bigop_commit=snapshot_object["bigop_commit"],
+            bigop_manifest_sha256=snapshot_object["bigop_manifest_sha256"],
+            bigop_entries=tuple(
+                _snapshot_entry_from_record(item)
+                for item in snapshot_object["bigop_entries"]
+            ),
+            root_device=snapshot_object["root_identity"][0],
+            root_inode=snapshot_object["root_identity"][1],
+        ),
+        runtime_manifest_sha256=payload["runtime_manifest_sha256"],
+        required_anchor_modules=tuple(payload["required_anchor_modules"]),
+        runtime_component_roots=tuple(
+            (name, Path(path))
+            for name, path in sorted(payload["runtime_component_roots"].items())
+        ),
+        import_root_components=tuple(payload["import_root_components"]),
+        namespace_prefixes=tuple(payload["namespace_prefixes"]),
+    )
+    if _bootstrap_payload(preflight, tuple(payload["args"])) != (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8"):
+        raise AuthorityPreflightError("BOOTSTRAP_INVALID", "bootstrap round trip")
+    _configure_active_preflight(preflight)
+    return preflight
+
+
+def _run_authorized_pytest(
+    preflight: PreflightIdentity, pytest_args: tuple[str, ...]
+) -> subprocess.CompletedProcess:
+    """Execute the reviewed bootstrap in a fresh isolated no-site interpreter."""
+    payload = _bootstrap_payload(preflight, pytest_args)
+    code = _fresh_bootstrap_code()
+    environment = {
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    try:
+        return subprocess.run(
+            [sys.executable, "-I", "-S", "-c", code],
+            cwd=preflight.snapshot.root,
+            env=environment,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AuthorityPreflightError("BOOTSTRAP_FAILED", type(error).__name__) from error
+
+
+def _launch_authorized_pytest(
+    preflight: PreflightIdentity, pytest_args: tuple[str, ...]
+) -> int:
+    """Run the shipped child and validate its one typed terminal record."""
+    completed = _run_authorized_pytest(preflight, pytest_args)
+    if completed.returncode != 0:
+        raise AuthorityPreflightError(
+            "BOOTSTRAP_FAILED", f"child rc {completed.returncode}"
+        )
+    try:
+        evidence = _canonical_json(completed.stdout)
+    except AuthorityPreflightError as error:
+        raise AuthorityPreflightError("BOOTSTRAP_FAILED", "terminal evidence") from error
+    expected_trace = [
+        "stdlib_no_site",
+        "authority_first",
+        "snapshot_first",
+        "runtime_first",
+        "verified_import_roots",
+        "pytest_explicit",
+        "modules_loaded",
+        "authority_final",
+        "snapshot_final",
+        "runtime_final",
+        "modules_final",
+    ]
+    if (
+        evidence.get("schema") != "uniep.task4-bootstrap-terminal.v1"
+        or evidence.get("status") != "HOST_ONLY_VERIFIED"
+        or evidence.get("device_events") != 0
+        or evidence.get("trace") != expected_trace
+        or evidence.get("bootstrap_sha256")
+        != hashlib.sha256(_fresh_bootstrap_code().encode("utf-8")).hexdigest()
+        or not evidence.get("loaded_product_modules")
+    ):
+        raise AuthorityPreflightError("BOOTSTRAP_FAILED", "terminal contract")
+    expected_identity = {
+        "authority_sha256": preflight.authority_anchor.full_sha256,
+        "product_commit": preflight.authority.product["commit"],
+        "snapshot_manifest_sha256": preflight.snapshot.manifest_sha256,
+        "runtime_manifest_sha256": preflight.runtime_manifest_sha256,
+    }
+    if any(evidence.get(key) != value for key, value in expected_identity.items()):
+        raise AuthorityPreflightError("BOOTSTRAP_FAILED", "terminal identity")
+    loaded = evidence["loaded_product_modules"]
+    loaded_names = [item.get("module_name") for item in loaded]
+    if (
+        len(loaded_names) != len(set(loaded_names))
+        or not set(preflight.required_anchor_modules) <= set(loaded_names)
+        or any(
+            set(item)
+            != {
+                "loader_kind",
+                "loaded_sha256",
+                "manifest_blob_oid",
+                "module_name",
+                "relative_path",
+            }
+            or item["loader_kind"] != "VerifiedProductLoader"
+            or _SHA256_PATTERN.fullmatch(item["loaded_sha256"]) is None
+            or _GIT_OID_PATTERN.fullmatch(item["manifest_blob_oid"]) is None
+            or PurePosixPath(item["relative_path"]).is_absolute()
+            for item in loaded
+        )
+    ):
+        raise AuthorityPreflightError("BOOTSTRAP_FAILED", "terminal module closure")
+    sys.stdout.buffer.write(completed.stdout)
+    return 0
+
+
+def _terminal_pre_device_verify(preflight: PreflightIdentity):
+    """Repeat live authority, snapshot and loaded-source checks before loader."""
+    if not isinstance(preflight, PreflightIdentity):
+        raise AuthorityPreflightError("AUTHORITY_MISSING", "preflight identity")
+    authority_first = _authority_identity_sha256(
+        preflight.authority_anchor, preflight.authority
+    )
+    snapshot_first = _snapshot_identity_sha256(preflight.snapshot)
+    runtime_first = _verify_runtime_component_roots(preflight)
+    records = kit.capture_loaded_product_closure(
+        preflight.snapshot.root,
+        preflight.namespace_prefixes,
+        preflight.required_anchor_modules,
+        _expected_physical_entries(preflight.snapshot),
+    )
+    kit.verify_benchmark_package_anchors(preflight.snapshot.root, records)
+    product_commit = preflight.authority.product["commit"]
+    with tempfile.TemporaryDirectory(prefix=".uniep-terminal-authority-") as temporary:
+        anchor_final, envelope_final = _read_authority_object(
+            product_commit, Path(temporary), None
+        )
+    _verify_product_snapshot(preflight.snapshot, envelope_final)
+    authority_final = _authority_identity_sha256(anchor_final, envelope_final)
+    snapshot_final = _snapshot_identity_sha256(preflight.snapshot)
+    runtime_final = _verify_runtime_component_roots(
+        dataclasses.replace(preflight, authority=envelope_final)
+    )
+    if anchor_final != preflight.authority_anchor or envelope_final != preflight.authority:
+        raise AuthorityPreflightError("AUTHORITY_DRIFT", "terminal authority")
+    seal = kit.issue_authorized_runtime_seal(
+        authority_first_sha256=authority_first,
+        authority_final_sha256=authority_final,
+        snapshot_first_sha256=snapshot_first,
+        snapshot_final_sha256=snapshot_final,
+        runtime_first_sha256=runtime_first,
+        runtime_final_sha256=runtime_final,
+        loaded_product_modules=records,
+        explicit_plugins=(),
+        verification_trace=(
+            "stdlib_no_site",
+            "authority_first",
+            "snapshot_first",
+            "runtime_first",
+            "modules_loaded",
+            "authority_final",
+            "snapshot_final",
+            "runtime_final",
+            "modules_final",
+        ),
+    )
+    kit.verify_loaded_product_closure(seal)
+    return seal
+
+
+def _configure_active_preflight(preflight: PreflightIdentity) -> None:
+    """Install only the bootstrap-produced immutable identity for collection."""
+    if not isinstance(preflight, PreflightIdentity):
+        raise AuthorityPreflightError("AUTHORITY_MISSING", "bootstrap preflight")
+    global _ACTIVE_PREFLIGHT
+    _ACTIVE_PREFLIGHT = preflight
+
+
+def _authorized_worker_predevice(preflight: PreflightIdentity | None = None):
+    selected = preflight if preflight is not None else _ACTIVE_PREFLIGHT
+    if selected is None:
+        raise AuthorityPreflightError("AUTHORITY_MISSING", "worker preflight")
+    return _terminal_pre_device_verify(selected)
+
+
+def _worker_predevice_callback():
+    """Return a spawn-picklable callback carrying the exact preflight object."""
+    if _ACTIVE_PREFLIGHT is None:
+        raise AuthorityPreflightError("AUTHORITY_MISSING", "worker preflight")
+    return functools.partial(_authorized_worker_predevice, _ACTIVE_PREFLIGHT)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3442,6 +4524,7 @@ def test_bench_forward_case(dist_test, spec: CaseSpec):
         run_forward_benchmark,
         world_size=spec.world_size,
         args=(spec,),
+        pre_device_callback=_worker_predevice_callback(),
     )
 
 
@@ -3453,6 +4536,7 @@ def test_bench_backward_case(dist_test, spec: CaseSpec):
         run_backward_benchmark,
         world_size=spec.world_size,
         args=(spec,),
+        pre_device_callback=_worker_predevice_callback(),
     )
 
 
