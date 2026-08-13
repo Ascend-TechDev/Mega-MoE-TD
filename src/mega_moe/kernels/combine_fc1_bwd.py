@@ -45,6 +45,20 @@ from .common import ncore, nvec, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BL
 GATE_PAD = 8
 
 
+def _combine_gemm_tile():
+    """Combine fc1-input-grad GEMM tile + num_stages, env-tunable for sweeping
+    (does NOT touch common.BLOCK_SIZE_*, which dispatch_fc2/wgrad also use).
+    Defaults: BM=64 (locked to the forward meta tiling), BN=256 / BK=128 —
+    BN=256 fills L0A (AscendKernelWiki pattern-low-mte-utilization-small-tile;
+    BK=128 is the largest K that fits UB with BN=256). num_stages=0 (off)."""
+    return (
+        int(os.environ.get("MOE_COMBINE_GEMM_BM", str(BLOCK_SIZE_M))),
+        int(os.environ.get("MOE_COMBINE_GEMM_BN", "256")),
+        int(os.environ.get("MOE_COMBINE_GEMM_BK", "128")),
+        int(os.environ.get("MOE_COMBINE_GEMM_NS", "0")),
+    )
+
+
 @triton.jit
 def _kernel_combine_fc1_bwd_gemm_group(
     # Phase 1 (Cube): fc1 input-grad GEMM for tile_m in [FIRST_TILE_M, LAST_TILE_M)
@@ -320,6 +334,11 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     fences the cross-rank peer_mem writes before the reduce runs on the caller
     stream. MOE_COMBINE_BWD_GROUP_EXPERTS tunes the group size (default 16)."""
     device = peer_mem.device
+    _gbm, _gbn, _gbk, _gns = _combine_gemm_tile()
+    _g_num_tn = (prep["N"] + _gbn - 1) // _gbn
+    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk, num_warps=8)
+    if _gns > 0:
+        _gkw["num_stages"] = _gns
     group_env = int(os.environ.get("MOE_COMBINE_BWD_GROUP_EXPERTS", "16"))
     num_groups, ftm, ltm, fs, ls = _combine_bwd_group_bounds(prep, group_env)
     cube_stream, vector_stream, group_events, start_ev, done_ev = \
@@ -340,12 +359,11 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
                 prep["inp"], prep["weight"], hidden_buf,
                 prep["meta_expert_ids"], prep["meta_split_cum"],
                 prep["meta_tile_num"], prep["expert_counts"],
-                prep["N"], prep["K"], prep["num_tn"],
+                prep["N"], prep["K"], _g_num_tn,
                 prep["inp_stride_im"], prep["inp_stride_ik"],
                 prep["we"], prep["wk"], prep["wn"],
                 FIRST_TILE_M=ftm[g], LAST_TILE_M=ltm[g],
-                BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-                num_warps=8)
+                **_gkw)
             group_events[g].record(cube_stream)
 
         vector_stream.wait_event(group_events[g])
@@ -388,16 +406,20 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
         _pev = [torch.npu.Event(enable_timing=True) for _ in range(4)]
         _pev[0].record()
     # phase 1: fc1 input-grad GEMM -> hidden_buf (Cube, all experts)
+    _gbm, _gbn, _gbk, _gns = _combine_gemm_tile()
+    _g_num_tn = (prep["N"] + _gbn - 1) // _gbn
+    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk, num_warps=8)
+    if _gns > 0:
+        _gkw["num_stages"] = _gns
     _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
         prep["inp"], prep["weight"], hidden_buf,
         prep["meta_expert_ids"], prep["meta_split_cum"],
         prep["meta_tile_num"], prep["expert_counts"],
-        prep["N"], prep["K"], prep["num_tn"],
+        prep["N"], prep["K"], _g_num_tn,
         prep["inp_stride_im"], prep["inp_stride_ik"],
         prep["we"], prep["wk"], prep["wn"],
         FIRST_TILE_M=0, LAST_TILE_M=prep["num_tm"],
-        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
-        num_warps=8)
+        **_gkw)
     if _pt:
         _pev[1].record()
     # phase 2: reverse-A2A push hidden_buf -> peer_mem (Vector, all rows) + cross-rank fence
