@@ -65,30 +65,39 @@ def _kernel_combine_fc1_bwd_gemm_group(
         ok = tl.arange(0, BLOCK_K)
         group_tiles = LAST_TILE_M - FIRST_TILE_M
         total_tasks = group_tiles * num_tiles_n
-        for task_id in range(pid, total_tasks, ncore):
-            tile_m = FIRST_TILE_M + (task_id % group_tiles)
-            tile_n = task_id // group_tiles
-            expert_id = tl.load(meta_expert_ids_ptr + tile_m)
-            cum_before = tl.load(meta_split_cum_ptr + tile_m)
-            tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
-            row_start = cum_before + tile_in_exp * BLOCK_M
-            n_start = tile_n * BLOCK_N
-            cnt = tl.load(expert_counts_ptr + expert_id)
-            rem = cnt - tile_in_exp * BLOCK_M
-            mm = om < rem
-            mn = on_ < (N - n_start)
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            wb = expert_id.to(tl.int64) * stride_we
-            for ks in range(0, K, BLOCK_K):
-                mk = ok < (K - ks)
-                ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
-                a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
-                bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-                b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
-                acc += tl.dot(a, b)
-            co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
-            tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
-                     mask=mm[:, None] & mn[None, :])
+        # contiguous block partition (per triton_gen/zhoujinggan/output/report.md
+        # iter_1): each pid owns [pid*blk, (pid+1)*blk) consecutive (tile_m,tile_n)
+        # tasks -> consecutive tiles of one expert reuse its weight rows in L1/L2
+        # (better locality than the interleaved stride). blk=ceil(total/ncore) + the
+        # task<total guard cover the tail on non-divisible shapes.
+        blk = (total_tasks + ncore - 1) // ncore
+        base = pid * blk
+        for i in range(blk):
+            task_id = base + i
+            if task_id < total_tasks:
+                tile_m = FIRST_TILE_M + (task_id % group_tiles)
+                tile_n = task_id // group_tiles
+                expert_id = tl.load(meta_expert_ids_ptr + tile_m)
+                cum_before = tl.load(meta_split_cum_ptr + tile_m)
+                tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
+                row_start = cum_before + tile_in_exp * BLOCK_M
+                n_start = tile_n * BLOCK_N
+                cnt = tl.load(expert_counts_ptr + expert_id)
+                rem = cnt - tile_in_exp * BLOCK_M
+                mm = om < rem
+                mn = on_ < (N - n_start)
+                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                wb = expert_id.to(tl.int64) * stride_we
+                for ks in range(0, K, BLOCK_K):
+                    mk = ok < (K - ks)
+                    ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
+                    a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+                    bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+                    b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+                    acc += tl.dot(a, b)
+                co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
+                tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
+                         mask=mm[:, None] & mn[None, :])
 
 
 @triton.jit
