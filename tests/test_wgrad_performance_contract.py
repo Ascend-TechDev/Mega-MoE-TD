@@ -2601,6 +2601,46 @@ def test_task4_host_decision_uses_conservative_order_without_pooling():
     assert decision.conservative_local_max_gain_fraction == pytest.approx(0.1)
 
 
+def test_task4_host_decision_uses_paired_samples_for_maximum_e2e_gain():
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    for order_name in _OPTIMIZATION_ORDERS:
+        order = payload["raw_by_order"][order_name]
+        order["e2e_samples"] = [100.0, 10.0, 10.0]
+        order["component_samples"]["stage_a"] = [90.0, 9.0, 0.0]
+        order["component_samples"]["stage_b"] = [0.0, 0.0, 0.0]
+        order["component_samples"]["stage_c"] = [0.0, 0.0, 0.0]
+        order["remainder_samples"] = [10.0, 1.0, 10.0]
+
+    decision = suite._derive_host_optimization_decision(payload)
+
+    assert isinstance(decision, kit.OptimizationDecision)
+    assert decision.decision == "REGENERATE_RECOMPOSE"
+    assert decision.reason_code == "LOCAL_CEILING_BELOW_TARGET"
+    assert dict(decision.local_max_gain_by_order) == {
+        "profile_then_e2e": 0.0,
+        "e2e_then_profile": 0.0,
+    }
+    assert decision.conservative_local_max_gain_fraction == 0.0
+
+
+@pytest.mark.parametrize("run_count", (2, 4))
+def test_task4_host_decision_requires_exactly_three_candidate_runs(run_count):
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    runs = payload["correctness"]["candidate_values_by_run"]
+    if run_count == 2:
+        runs.pop()
+    else:
+        runs.append(json.loads(json.dumps(runs[0])))
+
+    decision = suite._derive_host_optimization_decision(payload)
+
+    assert decision.decision == "INSUFFICIENT_EVIDENCE"
+    assert decision.reason_code == "CORRECTNESS_EVIDENCE_INVALID"
+    assert decision.determinism_sha256 == ()
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     (
@@ -2742,6 +2782,32 @@ def test_task4_host_decision_raw_identity_is_recomputed_without_device(monkeypat
     loader.assert_not_called()
     assert kit.torch_npu is None
     assert kit.ash is None
+
+
+def test_task4_host_decision_binds_canonical_raw_bytes_and_rejects_nan_identity():
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    canonical_raw = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+    valid = suite._derive_host_optimization_decision(payload)
+
+    assert valid.raw_evidence_sha256 == hashlib.sha256(canonical_raw).hexdigest()
+
+    payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]]["e2e_samples"][0] = float(
+        "nan"
+    )
+    invalid = suite._derive_host_optimization_decision(payload)
+
+    assert invalid.decision == "INSUFFICIENT_EVIDENCE"
+    assert invalid.reason_code == "RAW_SAMPLE_INVALID"
+    assert invalid.raw_evidence_sha256 is None
+    assert invalid.as_dict()["raw_evidence_sha256"] is None
 
 
 def test_task4_host_decision_recomputes_correctness_raw_identity():

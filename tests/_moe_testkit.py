@@ -173,7 +173,7 @@ class OptimizationDecision:
     component_share_by_order: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
     local_max_gain_by_order: tuple[tuple[str, float], ...]
     conservative_local_max_gain_fraction: float | None
-    raw_evidence_sha256: str
+    raw_evidence_sha256: str | None
     evidence_identity_sha256: str | None
     precision_passed: bool | None
     nonfinite_count: int | None
@@ -187,7 +187,10 @@ class OptimizationDecision:
             raise ValueError("unknown optimization decision")
         if not self.reason_code:
             raise ValueError("missing optimization reason")
-        if not _is_sha256(self.raw_evidence_sha256):
+        if self.raw_evidence_sha256 is None:
+            if self.decision != "INSUFFICIENT_EVIDENCE":
+                raise ValueError("missing raw evidence identity")
+        elif not _is_sha256(self.raw_evidence_sha256):
             raise ValueError("invalid raw evidence identity")
         if self.evidence_identity_sha256 is not None and not _is_sha256(
             self.evidence_identity_sha256
@@ -260,7 +263,7 @@ def _is_sha256(value: object) -> bool:
 
 
 def _insufficient_decision(
-    code: str, raw_sha256: str, payload: object
+    code: str, raw_sha256: str | None, payload: object
 ) -> OptimizationDecision:
     metric = payload.get("metric") if isinstance(payload, dict) else None
     unit = payload.get("unit") if isinstance(payload, dict) else None
@@ -387,10 +390,7 @@ def _validate_correctness(value: object) -> tuple[dict, dict[str, object]]:
         raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
     reference = _require_correctness_vector(correctness["reference_values"])
     runs = correctness["candidate_values_by_run"]
-    if (
-        not isinstance(runs, list)
-        or len(runs) < 3
-    ):
+    if not isinstance(runs, list) or len(runs) != 3:
         raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
     normalized_runs = tuple(
         _require_correctness_vector(run, expected_count=len(reference))
@@ -565,13 +565,24 @@ def _derive_optimization_order(
         )
         for component in expected
     )
+    ideal_post_local_e2e = tuple(
+        max(
+            0.0,
+            e2e_sample
+            - sum(normalized_components[component][index] for component in local),
+        )
+        for index, e2e_sample in enumerate(e2e)
+    )
+    ideal_post_local_median = float(statistics.median(ideal_post_local_e2e))
+    local_max_gain_fraction = min(
+        1.0,
+        max(0.0, (e2e_median - ideal_post_local_median) / e2e_median),
+    )
     return _OptimizationOrderSummary(
         identity=identity,
         sample_count=len(e2e),
         component_shares=shares,
-        local_max_gain_fraction=min(
-            1.0, sum(dict(shares)[component] for component in local)
-        ),
+        local_max_gain_fraction=local_max_gain_fraction,
         e2e_raw_sha256=_canonical_evidence_sha256(order["e2e_samples"]),
         component_raw_sha256=_canonical_evidence_sha256(
             {
@@ -673,7 +684,7 @@ def derive_optimization_decision(payload: object) -> OptimizationDecision:
         try:
             raw_sha256 = _canonical_evidence_sha256(payload)
         except _OptimizationEvidenceError:
-            raw_sha256 = "0" * 64
+            raw_sha256 = None
         return _insufficient_decision(error.code, raw_sha256, payload)
 
 

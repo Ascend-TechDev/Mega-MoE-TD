@@ -4159,7 +4159,7 @@ def _finalize_backward_target_payload(payload: dict) -> None:
 
 
 def _derive_host_optimization_decision(payload: object) -> kit.OptimizationDecision:
-    """Return the neutral host decision without loading an EP/device adapter."""
+    """Derive the paired-sample host decision without an EP/device adapter."""
     return kit.derive_optimization_decision(payload)
 
 
