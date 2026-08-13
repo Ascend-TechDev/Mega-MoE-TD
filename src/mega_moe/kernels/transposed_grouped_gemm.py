@@ -4,6 +4,8 @@
 #  (ported from GPU transposed_moe_grouped_gemm, Ascend strided schedule)
 # ============================================================================
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -79,12 +81,20 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     grad_w = torch.empty(E, N, K, dtype=grad_out.dtype, device=dev)
     num_tn = (N + WGRAD_BLOCK_N - 1) // WGRAD_BLOCK_N
     num_tk = (K + WGRAD_BLOCK_K - 1) // WGRAD_BLOCK_K
+    # num_stages hints MTE->cube software pipelining of the reduction M-loop.
+    # Without it the dynamic-bound inner loop (split_size loaded at runtime) leaves
+    # the cube MTE-bound at ~0.16% peak. MOE_WGRAD_NUM_STAGES tunes it (default 3);
+    # 0 = omit (legacy behavior).
+    num_stages = int(os.environ.get("MOE_WGRAD_NUM_STAGES", "3"))
+    kwargs = dict(BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K,
+                  num_warps=8, use_bytecode=True)
+    if num_stages > 0:
+        kwargs["num_stages"] = num_stages
     kernel_transposed_grouped_gemm[(ncore(), 1, 1)](
         grad_out_T, orig_in_c, grad_w,
         split_size_cum_per_expert, expert_counts,
         N, K, E, num_tn, num_tk,
         grad_out_T.stride(0), grad_out_T.stride(1), orig_in_c.stride(0), orig_in_c.stride(1),
         grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
-        BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K, num_warps=8,
-        use_bytecode=True)
+        **kwargs)
     return grad_w
