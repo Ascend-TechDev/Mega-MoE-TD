@@ -29,7 +29,6 @@ import os
 
 import torch
 import torch_npu  # noqa: F401
-import torch.distributed as dist
 import triton
 import triton.language as tl
 import triton_dist.language as dl
@@ -38,6 +37,11 @@ import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
 from .common import ncore, nvec, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+
+# Each peer_mem row packs the H hidden elements plus a trailing gate channel
+# (GATE_PAD wide) so the routing-weight grad rides step4's push+reduce instead
+# of a separate host HCCL all_to_all. 8 keeps the row stride 16-byte aligned.
+GATE_PAD = 8
 
 
 @triton.jit
@@ -91,12 +95,15 @@ def _kernel_combine_fc1_bwd_push_group(
     # Phase 2 (Vector): reverse-A2A push (expert->home) for src_pos in
     # [FIRST_SRC_POS, LAST_SRC_POS). Iterates src_pos (expert-major hidden_buf
     # row); write_rank_by_src/write_off_by_src give the per-row peer destination.
+    # Each peer_mem row is [hidden (H) | gate (GATE_PAD)] so the per-row routing-
+    # weight grad rides the same RMA as the hidden grad (no separate HCCL a2a).
     hidden_buf_ptr,
     write_rank_by_src_ptr, write_off_by_src_ptr,
-    peer_mem_ptr,           # symmetric [total_send, H] at HEAP OFFSET 0
+    peer_mem_ptr,           # symmetric [total_send, H+GATE_PAD] at HEAP OFFSET 0
+    grad_gate_ptr,          # [M] bf16 expert-sorted gate channel to pack
     H_push,
     FIRST_SRC_POS: tl.constexpr, LAST_SRC_POS: tl.constexpr,
-    BLOCK_N_PUSH: tl.constexpr,
+    BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_progs = tl.num_programs(axis=0)
@@ -106,16 +113,19 @@ def _kernel_combine_fc1_bwd_push_group(
         # over pid (forward _kernel_remote_store_transport_group pattern).
         if sub_vec_id() == 0:
             ovp = tl.arange(0, BLOCK_N_PUSH)
+            row_stride = H_push + GATE_PAD
             for src_pos in range(FIRST_SRC_POS + pid, LAST_SRC_POS, num_progs):
                 sp64 = src_pos.to(tl.int64)
                 dst_rank = tl.load(write_rank_by_src_ptr + sp64)
                 dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
-                rp = dl.symm_at(peer_mem_ptr, dst_rank)
+                dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
                 for ns in range(0, H_push, BLOCK_N_PUSH):
                     mask = ovp < (H_push - ns)
                     val = tl.load(hidden_buf_ptr + sp64 * H_push + (ns + ovp),
                                   mask=mask, other=0.0)
-                    tl.store(rp + dst_off * H_push + (ns + ovp), val, mask=mask)
+                    tl.store(dst_base + ns + ovp, val, mask=mask)
+                # pack the gate grad as the trailing channel of this row
+                tl.store(dst_base + H_push, tl.load(grad_gate_ptr + sp64))
 
 
 @triton.jit
@@ -131,13 +141,16 @@ def _kernel_combine_fc1_bwd_barrier():
 
 @triton.jit
 def _kernel_combine_fc1_bwd_reduce(
-    # Phase 3 (Vector): topk-sum reduce peer_mem -> grad_hidden
+    # Phase 3 (Vector): topk-sum reduce peer_mem -> grad_hidden, and gather the
+    # packed gate channel -> grad_routing_weights [B*topk] (one value per
+    # (token,slot), no sum).
     inv_sort_idxs_ptr,       # int64 [total_send]
     peer_mem_ptr,
     output_ptr,              # grad_hidden [B, H]
+    grad_routing_ptr,        # grad_routing_weights [B*topk] out
     B, topk, H_push,
     stride_om, stride_on,
-    BLOCK_N_PUSH: tl.constexpr,
+    BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_progs = tl.num_programs(axis=0)
@@ -145,15 +158,22 @@ def _kernel_combine_fc1_bwd_reduce(
         # Pure-AIV launch: distribute tokens directly over pid (forward
         # _kernel_local_topk_reduce pattern). Per-token topk sum order is fixed.
         ovr = tl.arange(0, BLOCK_N_PUSH)
+        row_stride = H_push + GATE_PAD
         for ti in range(pid, B, num_progs):
             ti64 = ti.to(tl.int64)
+            # gather the per-(token,slot) gate channel packed at row offset H_push
+            for j in range(topk):
+                fi = (ti * topk + j).to(tl.int64)
+                sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
+                tl.store(grad_routing_ptr + fi,
+                         tl.load(peer_mem_ptr + sp * row_stride + H_push))
             for ns in range(0, H_push, BLOCK_N_PUSH):
                 mask = ovr < (H_push - ns)
                 acc = tl.zeros((BLOCK_N_PUSH,), dtype=tl.float32)
                 for j in range(topk):
                     fi = ti * topk + j
                     sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
-                    acc += tl.load(peer_mem_ptr + sp * H_push + (ns + ovr),
+                    acc += tl.load(peer_mem_ptr + sp * row_stride + (ns + ovr),
                                    mask=mask, other=0.0)
                 oo = ti64 * stride_om + (ns + ovr) * stride_on
                 tl.store(output_ptr + oo, acc.to(output_ptr.dtype.element_ty), mask=mask)
@@ -230,24 +250,6 @@ def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
     return p
 
 
-def _gate_bwd_host(saved, grad_gate):
-    """Host-side gate (routing-weight) grad: grad_gate [M] (expert, sorted) ->
-    grad_routing_weights [B, topk] (home) via hccl all_to_all. Kept on the host
-    because dl.symm_at only resolves correctly at heap offset 0 with a varying
-    rank, so a second symmetric buffer for the scalar gate can't be used. The
-    gate is a tiny [M] vector, so a host all_to_all is cheap."""
-    B = saved["batch_size"]; topk = saved["topk"]; H = saved["hidden_dim"]
-    dtype = grad_gate.dtype; device = grad_gate.device
-    ep_group = saved["ep_group"]
-    grad_gate_unsorted = grad_gate[saved["inv_local"]]                       # arrival order
-    grad_sorted_weights = torch.empty((saved["total_send"],), dtype=dtype, device=device)
-    dist.all_to_all_single(grad_sorted_weights, grad_gate_unsorted,
-                           output_split_sizes=saved["splits_send_list"],
-                           input_split_sizes=saved["splits_recv_list"], group=ep_group)
-    grad_routing_flat = grad_sorted_weights[saved["inv_sort"]]               # [B*topk]
-    return grad_routing_flat.view(B, topk)
-
-
 def _combine_bwd_group_bounds(prep, group_experts):
     """Per-group Cube M-tile range and push src_pos range. Expert e occupies
     M-tiles [cum_tiles[e], cum_tiles[e+1]) — cum_tiles derived from
@@ -298,7 +300,7 @@ def _ensure_combine_bwd_pipeline_runtime(saved, num_groups, device):
     )
 
 
-def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, saved):
+def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing, saved):
     """Two-stream expert-group pipeline mirroring the forward FC2 remote-store
     pipeline (_launch_fc2_remote_store_pipeline, fc2_combine.py:570). Cube group
     g's fc1-input-grad GEMM overlaps Vector group (g-1)'s reverse-A2A push via
@@ -339,9 +341,9 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, saved):
         with torch.npu.stream(vector_stream):
             _kernel_combine_fc1_bwd_push_group[(nvec(), 1, 1)](
                 hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
-                peer_mem, prep["H"],
+                peer_mem, prep["grad_gate"], prep["H"],
                 FIRST_SRC_POS=fs[g], LAST_SRC_POS=ls[g],
-                BLOCK_N_PUSH=1024,
+                BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
                 num_warps=8)
 
     # All group pushes are ordered on vector_stream; one barrier_all_vec (AICore
@@ -354,10 +356,10 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, saved):
     current_stream.wait_event(done_ev)
 
     _kernel_combine_fc1_bwd_reduce[(nvec(), 1, 1)](
-        prep["inv_sort"], peer_mem, output,
+        prep["inv_sort"], peer_mem, output, grad_routing,
         prep["B"], prep["topk"], prep["H"],
         prep["stride_om"], prep["stride_on"],
-        BLOCK_N_PUSH=1024,
+        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
         num_warps=8)
     return output
 
@@ -365,8 +367,10 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, saved):
 def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_hidden=False):
     """Step 4: returns (grad_hidden [B,H], grad_routing_weights [B,topk]).
     peer_mem is the shared symmetric buffer at heap offset 0 (reused from step 1,
-    which has finished by now). The gate grad is computed on the host (all_to_all).
-    If return_hidden, also returns hidden_buf (=grad_recv_hidden_sorted)."""
+    which has finished by now). The gate (routing-weight) grad rides step4's
+    push+reduce as a packed peer_mem channel (row = [hidden | gate]), so there is
+    no host HCCL all_to_all for the gate. If return_hidden, also returns
+    hidden_buf (=grad_recv_hidden_sorted)."""
     prep = _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate)
     # GEMM writes every hidden_buf tile (meta covers all tokens); reduce writes
     # every output row -> empty, no zero-fill needed. hidden_buf is a plain
@@ -374,8 +378,9 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     # is fully overwritten by the push, so no host zero/barrier is needed.
     hidden_buf = torch.empty(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     output = torch.empty(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
-    _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, saved)
-    grad_routing_weights = _gate_bwd_host(saved, grad_gate)
+    grad_routing_flat = torch.empty(prep["B"] * prep["topk"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
+    _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
+    grad_routing_weights = grad_routing_flat.view(prep["B"], prep["topk"])
     if return_hidden:
         return output, grad_routing_weights, hidden_buf
     return output, grad_routing_weights
