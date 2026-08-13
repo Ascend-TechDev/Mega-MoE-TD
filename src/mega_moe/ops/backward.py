@@ -97,7 +97,7 @@ def moe_backward_triton(saved, dy, peer_mem):
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
     use_fused = os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
-    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM") == "1"     # step3(cube) ∥ step2(vec) on two engine-pure streams
+    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM", "1") != "0"  # step3(cube) ∥ step2(vec) on two engine-pure streams (DEFAULT ON; =0 disables)
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
     _r = saved["ep_rank"]
     def _t(tag):
@@ -133,9 +133,20 @@ def moe_backward_triton(saved, dy, peer_mem):
             wgrad_stream.wait_event(ev)  # wgrad waits until its inputs are ready
             return fn(*args)
 
+    # Per-stage NPU-event timing (default serial path only). Gated by
+    # MOE_BWD_STAGE_TIMING; records 6 events -> 5 stage intervals (dispatch /
+    # fc2_wgrad / swiglu / fc1_wgrad / combine), MAX-reduced across ranks and
+    # appended to saved["_bwd_stage_samples"] for the bench to aggregate.
+    _stage_timing = (not use_fused and not use_dual
+                     and os.environ.get("MOE_BWD_STAGE_TIMING") == "1")
+    if _stage_timing:
+        _sev = [torch.npu.Event(enable_timing=True) for _ in range(6)]
+        _sev[0].record()
     _t("step1-dispatch_fc2 start")
     # step 1: dispatch + fc2 input-grad
     grad_swiglu, grad_fc2_out_sorted = dispatch_fc2_bwd_triton(saved, dy, peer_mem)
+    if _stage_timing:
+        _sev[1].record()
     _t("step1-dispatch_fc2 done")
     if use_fused:
         # step2 (SwiGLU bwd, Vector) + step3 (fc2 wgrad, Cube) fused into ONE
@@ -190,10 +201,14 @@ def moe_backward_triton(saved, dy, peer_mem):
         else:
             grad_fc2 = _run_wgrad(_grouped_wgrad_npu,
                 grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
+        if _stage_timing:
+            _sev[2].record()
         _t("step3-fc2_wgrad launched (side stream)")
         # step 2: swiglu backward (main stream; overlaps with step3 wgrad cube)
         grad_fc1_output, grad_gate = swiglu_bwd_triton(
             grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
+        if _stage_timing:
+            _sev[3].record()
         _t("step2-swiglu done")
     # step 5: fc1 wgrad — side stream (depends only on step2), overlaps with step4.
     if use_triton_wgrad:
@@ -206,10 +221,21 @@ def moe_backward_triton(saved, dy, peer_mem):
     else:
         grad_fc1 = _run_wgrad(_grouped_wgrad_npu,
             grad_fc1_output, saved["recv_hidden_sorted"], ec)
+    if _stage_timing:
+        _sev[4].record()
     _t("step5-fc1_wgrad launched (side stream)")
     # step 4: combine + fc1 input-grad + gate-grad (main stream; overlaps step5)
     grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
         saved, grad_fc1_output, grad_gate, peer_mem)
+    if _stage_timing:
+        _sev[5].record()
+        _sev[5].synchronize()
+        _iv = [_sev[i].elapsed_time(_sev[i + 1]) for i in range(5)]
+        _tmax = torch.tensor(_iv, dtype=torch.float32,
+                             device=f"npu:{saved['ep_rank']}")
+        dist.all_reduce(_tmax, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        saved.setdefault("_bwd_stage_samples", []).append(
+            [float(x) for x in _tmax.cpu().tolist()])
     _t("step4-combine_fc1 done")
     # ensure side-stream wgrads finished before chunk/return
     if wgrad_stream is not None:

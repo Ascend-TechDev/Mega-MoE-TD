@@ -29,6 +29,7 @@ import os
 
 import torch
 import torch_npu  # noqa: F401
+import torch.distributed as dist
 import triton
 import triton.language as tl
 import triton_dist.language as dl
@@ -64,30 +65,39 @@ def _kernel_combine_fc1_bwd_gemm_group(
         ok = tl.arange(0, BLOCK_K)
         group_tiles = LAST_TILE_M - FIRST_TILE_M
         total_tasks = group_tiles * num_tiles_n
-        for task_id in range(pid, total_tasks, ncore):
-            tile_m = FIRST_TILE_M + (task_id % group_tiles)
-            tile_n = task_id // group_tiles
-            expert_id = tl.load(meta_expert_ids_ptr + tile_m)
-            cum_before = tl.load(meta_split_cum_ptr + tile_m)
-            tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
-            row_start = cum_before + tile_in_exp * BLOCK_M
-            n_start = tile_n * BLOCK_N
-            cnt = tl.load(expert_counts_ptr + expert_id)
-            rem = cnt - tile_in_exp * BLOCK_M
-            mm = om < rem
-            mn = on_ < (N - n_start)
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            wb = expert_id.to(tl.int64) * stride_we
-            for ks in range(0, K, BLOCK_K):
-                mk = ok < (K - ks)
-                ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
-                a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
-                bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-                b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
-                acc += tl.dot(a, b)
-            co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
-            tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
-                     mask=mm[:, None] & mn[None, :])
+        # contiguous block partition (per triton_gen/zhoujinggan/output/report.md
+        # iter_1): each pid owns [pid*blk, (pid+1)*blk) consecutive (tile_m,tile_n)
+        # tasks -> consecutive tiles of one expert reuse its weight rows in L1/L2
+        # (better locality than the interleaved stride). blk=ceil(total/ncore) + the
+        # task<total guard cover the tail on non-divisible shapes.
+        blk = (total_tasks + ncore - 1) // ncore
+        base = pid * blk
+        for i in range(blk):
+            task_id = base + i
+            if task_id < total_tasks:
+                tile_m = FIRST_TILE_M + (task_id % group_tiles)
+                tile_n = task_id // group_tiles
+                expert_id = tl.load(meta_expert_ids_ptr + tile_m)
+                cum_before = tl.load(meta_split_cum_ptr + tile_m)
+                tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
+                row_start = cum_before + tile_in_exp * BLOCK_M
+                n_start = tile_n * BLOCK_N
+                cnt = tl.load(expert_counts_ptr + expert_id)
+                rem = cnt - tile_in_exp * BLOCK_M
+                mm = om < rem
+                mn = on_ < (N - n_start)
+                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                wb = expert_id.to(tl.int64) * stride_we
+                for ks in range(0, K, BLOCK_K):
+                    mk = ok < (K - ks)
+                    ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
+                    a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+                    bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+                    b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+                    acc += tl.dot(a, b)
+                co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
+                tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
+                         mask=mm[:, None] & mn[None, :])
 
 
 @triton.jit
@@ -221,12 +231,13 @@ def _combine_static_maps(saved):
     write_off_by_src = write_off[local_sort_idxs].contiguous()
 
     num_tn = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    num_tm = int(saved["num_tiles_total"].item())
     fc1_combined = saved["fc1_combined"].contiguous()
     cache = dict(
         weight=fc1_combined,
         meta_expert_ids=saved["meta_expert_ids"].to(device), meta_split_cum=saved["meta_split_cum"].to(device),
         meta_tile_num=saved["meta_tile_num"].to(device), expert_counts=saved["expert_counts"].to(device),
-        M=M, N=H, K=fc1_combined.shape[1], E=saved["experts_per_rank"], num_tn=num_tn,
+        M=M, N=H, K=fc1_combined.shape[1], E=saved["experts_per_rank"], num_tm=num_tm, num_tn=num_tn,
         inv_sort=inv_sort,
         write_rank_by_src=write_rank_by_src, write_off_by_src=write_off_by_src,
         split_size_cum_per_expert=saved["split_size_cum_per_expert"].to(device),
@@ -364,6 +375,59 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     return output
 
 
+def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_routing, saved):
+    """Diagnostic 3-phase SERIAL combine (no two-stream group overlap): GEMM,
+    push+barrier, reduce run back-to-back on the caller stream. With
+    MOE_COMBINE_PHASE_TIMING=1, record NPU events around each phase
+    (combine_gemm / combine_push_barrier / combine_reduce), MAX-reduce across
+    ranks, append to saved['_combine_phase_samples']. Used to split combine's
+    wall time into its three components (the default pipeline overlaps phase 1
+    and 2 across expert groups)."""
+    _pt = os.environ.get("MOE_COMBINE_PHASE_TIMING") == "1"
+    if _pt:
+        _pev = [torch.npu.Event(enable_timing=True) for _ in range(4)]
+        _pev[0].record()
+    # phase 1: fc1 input-grad GEMM -> hidden_buf (Cube, all experts)
+    _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
+        prep["inp"], prep["weight"], hidden_buf,
+        prep["meta_expert_ids"], prep["meta_split_cum"],
+        prep["meta_tile_num"], prep["expert_counts"],
+        prep["N"], prep["K"], prep["num_tn"],
+        prep["inp_stride_im"], prep["inp_stride_ik"],
+        prep["we"], prep["wk"], prep["wn"],
+        FIRST_TILE_M=0, LAST_TILE_M=prep["num_tm"],
+        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
+        num_warps=8)
+    if _pt:
+        _pev[1].record()
+    # phase 2: reverse-A2A push hidden_buf -> peer_mem (Vector, all rows) + cross-rank fence
+    _kernel_combine_fc1_bwd_push_group[(nvec(), 1, 1)](
+        hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
+        peer_mem, prep["grad_gate"], prep["H"],
+        FIRST_SRC_POS=0, LAST_SRC_POS=prep["M"],
+        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
+        num_warps=8)
+    _kernel_combine_fc1_bwd_barrier[(ncore(), 1, 1)]()
+    if _pt:
+        _pev[2].record()
+    # phase 3: topk-sum reduce peer_mem -> grad_hidden (Vector)
+    _kernel_combine_fc1_bwd_reduce[(nvec(), 1, 1)](
+        prep["inv_sort"], peer_mem, output, grad_routing,
+        prep["B"], prep["topk"], prep["H"],
+        prep["stride_om"], prep["stride_on"],
+        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
+        num_warps=8)
+    if _pt:
+        _pev[3].record()
+        _pev[3].synchronize()
+        _iv = [_pev[i].elapsed_time(_pev[i + 1]) for i in range(3)]
+        _tmax = torch.tensor(_iv, dtype=torch.float32, device=peer_mem.device)
+        dist.all_reduce(_tmax, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        saved.setdefault("_combine_phase_samples", []).append(
+            [float(x) for x in _tmax.cpu().tolist()])
+    return output
+
+
 def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_hidden=False):
     """Step 4: returns (grad_hidden [B,H], grad_routing_weights [B,topk]).
     peer_mem is the shared symmetric buffer at heap offset 0 (reused from step 1,
@@ -379,7 +443,11 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     hidden_buf = torch.empty(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     output = torch.empty(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     grad_routing_flat = torch.empty(prep["B"] * prep["topk"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
-    _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
+    if os.environ.get("MOE_BWD_COMBINE_SERIAL") == "1":
+        # diagnostic: 3-phase serial combine (no group overlap) + per-phase timing
+        _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
+    else:
+        _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
     grad_routing_weights = grad_routing_flat.view(prep["B"], prep["topk"])
     if return_hidden:
         return output, grad_routing_weights, hidden_buf
