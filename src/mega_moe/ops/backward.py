@@ -111,11 +111,12 @@ def moe_backward_triton(saved, dy, peer_mem):
     # Roll back with MOE_WGRAD_NOSTREAM=1.
     # NOTE: torch.npu.Stream is a *software* stream — it does NOT map to separate
     # cube/vector engines, so a wgrad on a side stream just contends with the main
-    # stream's triton kernels for the same NPU queue. With torch's per-expert wgrad
-    # loop (many small matmuls) this is a net 2.5x SLOWDOWN on small shapes (launch
-    # storm + queue contention). Real cube/vector overlap has to live INSIDE one
-    # kernel via al.scope(core_mode=...) — see the P0 signal/wait work. Default off;
-    # opt back in with MOE_WGRAD_STREAM=1 for experimentation.
+    # stream's triton kernels for the same NPU queue. Re-tested 2026-08-13 with the
+    # current npu-grouped wgrad backend on Kimi-K3 w8 t4k: MOE_WGRAD_STREAM=1 is a
+    # ~12.5x SLOWDOWN (112 -> 1402 ms), even worse than the old torch per-expert
+    # loop's 2.5x. Software-stream overlap is a confirmed dead end here. Real
+    # cube/vector overlap has to live INSIDE one kernel via al.scope(core_mode=...)
+    # — see the P0 signal/wait work. Default off; opt back in with MOE_WGRAD_STREAM=1.
     use_side_stream = os.environ.get("MOE_WGRAD_STREAM") == "1"
     ec = saved["expert_counts"]
     wgrad_stream = torch.npu.Stream() if use_side_stream else None
