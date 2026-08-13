@@ -125,6 +125,8 @@ PRODUCT_FEATURE_REF = (
 )
 PRODUCT_MAIN_REF = "refs/heads/main"
 BIGOP_REMOTE = "https://gitcode.com/jzhoujg/bigop.git"
+BOOTSTRAP_POLICY_SCHEMA = "uniep.bootstrap-policy.v1"
+BOOTSTRAP_RUNNER_PATH = "benchmark/layer/bench_moe_suite.py"
 BIGOP_GITLINK_PATH = "3rdparty/bigop"
 BIGOP_IDENTITY_PREFIX = "gitlink:"
 BIGOP_GITMODULES_BLOB_OID = "c42c065bf7df9c047a8704eea9871f804afb67f4"
@@ -324,6 +326,8 @@ PRODUCT_REMOTE = __PRODUCT_REMOTE_JSON__
 PRODUCT_FEATURE_REF = __PRODUCT_FEATURE_REF_JSON__
 PRODUCT_MAIN_REF = __PRODUCT_MAIN_REF_JSON__
 BIGOP_REMOTE = __BIGOP_REMOTE_JSON__
+BOOTSTRAP_POLICY_SCHEMA = __BOOTSTRAP_POLICY_SCHEMA_JSON__
+BOOTSTRAP_RUNNER_PATH = __BOOTSTRAP_RUNNER_PATH_JSON__
 TRACE = []
 LOADED = {}
 
@@ -334,6 +338,96 @@ def fail(code, detail):
 
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def bootstrap_policy(payload):
+    policy = payload.get("bootstrap_policy")
+    digest = payload.get("bootstrap_policy_sha256")
+    keys = {
+        "authority_ref",
+        "authority_remote",
+        "bigop_remote",
+        "product_commit",
+        "product_feature_ref",
+        "product_main_ref",
+        "product_remote",
+        "product_tree",
+        "runner_blob_oid",
+        "runner_path",
+        "runner_sha256",
+        "schema",
+    }
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != keys
+        or not all(isinstance(value, str) and value for value in policy.values())
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or hashlib.sha256(canonical(policy)).hexdigest() != digest
+    ):
+        fail("BOOTSTRAP_INVALID", "bootstrap policy")
+    authority_product = payload["authority_object"]["authority"]["product"]
+    runner_entries = [
+        item
+        for item in payload["snapshot"]["entries"]
+        if item.get("path") == BOOTSTRAP_RUNNER_PATH
+    ]
+    expected = {
+        "authority_ref": AUTHORITY_REF,
+        "authority_remote": AUTHORITY_REMOTE,
+        "bigop_remote": BIGOP_REMOTE,
+        "product_commit": authority_product["commit"],
+        "product_feature_ref": PRODUCT_FEATURE_REF,
+        "product_main_ref": PRODUCT_MAIN_REF,
+        "product_remote": PRODUCT_REMOTE,
+        "product_tree": payload["snapshot"]["tree"],
+        "runner_blob_oid": runner_entries[0].get("blob_oid") if len(runner_entries) == 1 else "",
+        "runner_path": BOOTSTRAP_RUNNER_PATH,
+        "runner_sha256": runner_entries[0].get("sha256") if len(runner_entries) == 1 else "",
+        "schema": BOOTSTRAP_POLICY_SCHEMA,
+    }
+    if policy != expected or {
+        "feature_ref": authority_product.get("feature_ref"),
+        "main_ref": authority_product.get("main_ref"),
+        "remote": authority_product.get("remote"),
+    } != {
+        "feature_ref": PRODUCT_FEATURE_REF,
+        "main_ref": PRODUCT_MAIN_REF,
+        "remote": PRODUCT_REMOTE,
+    }:
+        fail("BOOTSTRAP_INVALID", "bootstrap policy identity")
+    return policy
+
+
+def configure_runner_policy(runner, payload, policy):
+    bindings = {
+        "AUTHORITY_REF": "authority_ref",
+        "AUTHORITY_REMOTE": "authority_remote",
+        "BIGOP_REMOTE": "bigop_remote",
+        "PRODUCT_FEATURE_REF": "product_feature_ref",
+        "PRODUCT_MAIN_REF": "product_main_ref",
+        "PRODUCT_REMOTE": "product_remote",
+    }
+    for attribute, key in bindings.items():
+        if not isinstance(getattr(runner, attribute, None), str):
+            fail("BOOTSTRAP_INVALID", "runner bootstrap policy")
+        setattr(runner, attribute, policy[key])
+        if getattr(runner, attribute, None) != policy[key]:
+            fail("BOOTSTRAP_INVALID", "runner bootstrap policy drift")
+    fresh = getattr(runner, "_fresh_bootstrap_code", None)
+    if not callable(fresh):
+        fail("BOOTSTRAP_INVALID", "runner bootstrap identity")
+    selected_code = fresh()
+    if not isinstance(selected_code, str) or not selected_code:
+        fail("BOOTSTRAP_INVALID", "runner bootstrap identity")
+    selected_payload = dict(payload)
+    selected_payload.pop("bootstrap_policy")
+    selected_payload.pop("bootstrap_policy_sha256")
+    selected_payload["bootstrap_sha256"] = hashlib.sha256(
+        selected_code.encode("utf-8")
+    ).hexdigest()
+    return selected_payload
 
 
 def elf_build_id(content):
@@ -815,6 +909,7 @@ def main():
         if name in os.environ:
             fail("BOOTSTRAP_INVALID", "ambient " + name)
     payload = json.load(sys.stdin)
+    policy = bootstrap_policy(payload)
     raw = base64.b64decode(payload["authority_raw_b64"])
     authority_object = json.loads(raw.decode("utf-8"))
     if canonical(authority_object) != raw or authority_object != payload["authority_object"]:
@@ -859,7 +954,7 @@ def main():
     configure = getattr(runner, "_configure_bootstrap_payload", None)
     if not callable(configure):
         fail("BOOTSTRAP_INVALID", "runner bootstrap consumer")
-    configure(payload)
+    configure(configure_runner_policy(runner, payload, policy))
     pytest_stdout = io.StringIO()
     pytest_stderr = io.StringIO()
     with contextlib.redirect_stdout(pytest_stdout), contextlib.redirect_stderr(pytest_stderr):
@@ -1038,6 +1133,8 @@ def _fresh_bootstrap_code() -> str:
         "__PRODUCT_FEATURE_REF_JSON__": json.dumps(PRODUCT_FEATURE_REF),
         "__PRODUCT_MAIN_REF_JSON__": json.dumps(PRODUCT_MAIN_REF),
         "__BIGOP_REMOTE_JSON__": json.dumps(BIGOP_REMOTE),
+        "__BOOTSTRAP_POLICY_SCHEMA_JSON__": json.dumps(BOOTSTRAP_POLICY_SCHEMA),
+        "__BOOTSTRAP_RUNNER_PATH_JSON__": json.dumps(BOOTSTRAP_RUNNER_PATH),
     }
     code = _STDLIB_BOOTSTRAP_PRELUDE
     for marker, value in replacements.items():
@@ -1066,12 +1163,52 @@ def _bootstrap_payload(
         for item in _expected_physical_entries(preflight.snapshot).values()
     )
     code = _fresh_bootstrap_code()
+    runner_entries = tuple(
+        item
+        for item in preflight.snapshot.entries
+        if item.path == BOOTSTRAP_RUNNER_PATH
+    )
+    if len(runner_entries) != 1:
+        raise AuthorityPreflightError(
+            "BOOTSTRAP_INVALID", "bootstrap runner identity"
+        )
+    runner = runner_entries[0]
+    if runner.kind != "file" or runner.blob_oid is None or runner.sha256 is None:
+        raise AuthorityPreflightError(
+            "BOOTSTRAP_INVALID", "bootstrap runner identity"
+        )
+    policy = {
+        "authority_ref": AUTHORITY_REF,
+        "authority_remote": AUTHORITY_REMOTE,
+        "bigop_remote": BIGOP_REMOTE,
+        "product_commit": preflight.authority.product["commit"],
+        "product_feature_ref": PRODUCT_FEATURE_REF,
+        "product_main_ref": PRODUCT_MAIN_REF,
+        "product_remote": PRODUCT_REMOTE,
+        "product_tree": preflight.snapshot.tree,
+        "runner_blob_oid": runner.blob_oid,
+        "runner_path": BOOTSTRAP_RUNNER_PATH,
+        "runner_sha256": runner.sha256,
+        "schema": BOOTSTRAP_POLICY_SCHEMA,
+    }
     payload = {
         "args": list(pytest_args),
         "authority_anchor": dataclasses.asdict(preflight.authority_anchor),
         "authority_object": raw_object,
         "authority_raw_b64": base64.b64encode(preflight.authority.raw).decode("ascii"),
         "bootstrap_sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
+        "bootstrap_policy": policy,
+        "bootstrap_policy_sha256": hashlib.sha256(
+            (
+                json.dumps(
+                    policy,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest(),
         "import_root_components": list(preflight.import_root_components),
         "required_anchor_modules": list(preflight.required_anchor_modules),
         "namespace_prefixes": list(preflight.namespace_prefixes),

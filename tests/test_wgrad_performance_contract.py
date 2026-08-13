@@ -45,6 +45,10 @@ _QWEN_EP2_CASES = (
 _ACCEPTED_PRODUCT_FEATURE_REF = (
     "refs/heads/codex02/uniep-stage1-authority-consumer-20260811"
 )
+_SELECTED_SOURCE_COMMIT = "611e7497e2d1080232ab9b83ff7446251ecc3f8d"
+_LEGACY_PRODUCT_FEATURE_REF = (
+    "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810"
+)
 
 
 def _load_benchmark_suite():
@@ -2022,7 +2026,12 @@ def test_task4_fixed_bootstrap_isolated_flags_precede_untrusted_imports(attack):
 
 
 def _task4_bootstrap_fixture(
-    tmp_path, monkeypatch, suite, *, anchor_side_effect=False
+    tmp_path,
+    monkeypatch,
+    suite,
+    *,
+    anchor_side_effect=False,
+    selected_runner_content: bytes | None = None,
 ):
     product_work = tmp_path / "task4-product-work"
     product_work.mkdir()
@@ -2046,18 +2055,63 @@ def _task4_bootstrap_fixture(
         "config/_shapes.py": "config._shapes",
         "tests/layer/test_moe_suite.py": "tests.layer.test_moe_suite",
     }
+    if selected_runner_content is not None:
+        module_by_path["benchmark/layer/_grouped_forward_baseline.py"] = (
+            "benchmark.layer._grouped_forward_baseline"
+        )
     files = {
         relative: f'"""fixture {module}."""\nVALUE = {index!r}\n'
         for index, (relative, module) in enumerate(module_by_path.items())
     }
     files["benchmark/layer/bench_moe_suite.py"] = (
         '"""fixture verified runner."""\n'
+        "AUTHORITY_REF = 'fixture'\n"
+        "AUTHORITY_REMOTE = 'fixture'\n"
+        "BIGOP_REMOTE = 'fixture'\n"
+        "PRODUCT_FEATURE_REF = 'fixture'\n"
+        "PRODUCT_MAIN_REF = 'fixture'\n"
+        "PRODUCT_REMOTE = 'fixture'\n"
         "BOOTSTRAP_PAYLOAD = None\n"
+        "def _fresh_bootstrap_code():\n"
+        "    return 'fixture bootstrap'\n"
         "def _configure_bootstrap_payload(payload):\n"
         "    global BOOTSTRAP_PAYLOAD\n"
         "    BOOTSTRAP_PAYLOAD = payload\n"
         "    return payload\n"
     )
+    if selected_runner_content is not None:
+        files["benchmark/layer/bench_moe_suite.py"] = (
+            selected_runner_content.decode("utf-8", "strict")
+        )
+        files["benchmark/layer/_grouped_forward_baseline.py"] = (
+            "class GroupedForwardBaseline:\n"
+            "    pass\n"
+        )
+        files["src/mega_moe/__init__.py"] = (
+            "class FusedMoEForward:\n"
+            "    pass\n"
+            "class MoEForwardConfig:\n"
+            "    pass\n"
+        )
+        files["tests/_moe_baselines.py"] = (
+            "def backward_torch_baseline(*args, **kwargs):\n"
+            "    return None\n"
+            "def build_backward_saved(*args, **kwargs):\n"
+            "    return None\n"
+            "def compare_backward_gradients(*args, **kwargs):\n"
+            "    return None\n"
+        )
+        files["tests/_moe_testkit.py"] = (
+            "class _Timing:\n"
+            "    warmup = 5\n"
+            "    iterations = 50\n"
+            "FORWARD_TIMING = _Timing()\n"
+            "BACKWARD_TIMING = _Timing()\n"
+            "class OptimizationDecision:\n"
+            "    pass\n"
+            "def make_pytest_params(*args, **kwargs):\n"
+            "    return ()\n"
+        )
     files.update(
         {
             "benchmark/__init__.py": (
@@ -2072,6 +2126,13 @@ def _task4_bootstrap_fixture(
             "config/__init__.py": '"""config package."""\n',
         }
     )
+    if selected_runner_content is not None:
+        files["config/__init__.py"] = (
+            "class CaseSpec:\n"
+            "    pass\n"
+            "def select_cases(*args, **kwargs):\n"
+            "    return ()\n"
+        )
     imports = "\n".join(
         f"import {module}" for module in module_by_path.values()
     )
@@ -2082,7 +2143,14 @@ def _task4_bootstrap_fixture(
         target.write_text(content, encoding="utf-8")
     main_commit = _task2_commit(product_work, "task4 main")
     runner = product_work / "benchmark/layer/bench_moe_suite.py"
-    runner.write_text(runner.read_text() + "FEATURE = True\n", encoding="utf-8")
+    if selected_runner_content is None:
+        runner.write_text(runner.read_text() + "FEATURE = True\n", encoding="utf-8")
+    else:
+        feature_marker = product_work / "selected-source-feature.txt"
+        feature_marker.write_text("selected source feature\n", encoding="utf-8")
+        files["selected-source-feature.txt"] = feature_marker.read_text(
+            encoding="utf-8"
+        )
     feature_commit = _task2_commit(product_work, "task4 feature")
     product_tree = _task2_git(
         product_work, "rev-parse", f"{feature_commit}^{{tree}}"
@@ -2168,39 +2236,86 @@ def _task4_bootstrap_fixture(
         root = runtime_parent / component_name
         root.mkdir()
         if component_name == "python":
-            member_name = "pytest.py"
-            content = (
+            pytest_source = (
                 "import importlib\n"
+                "class _Mark:\n"
+                "    def __getattr__(self, name):\n"
+                "        def marker(*args, **kwargs):\n"
+                "            if len(args) == 1 and callable(args[0]) and not kwargs:\n"
+                "                return args[0]\n"
+                "            return lambda function: function\n"
+                "        return marker\n"
+                "mark = _Mark()\n"
                 "def main(args, plugins=()):\n"
                 "    assert plugins == []\n"
                 "    for name in args:\n"
                 "        importlib.import_module(name)\n"
                 "    return 0\n"
             ).encode()
+            members_content = {"pytest.py": pytest_source}
+        elif component_name == "torch" and selected_runner_content is not None:
+            members_content = {
+                "torch/__init__.py": (
+                    "class _DType:\n"
+                    "    itemsize = 4\n"
+                    "bfloat16 = _DType()\n"
+                    "float32 = _DType()\n"
+                    "int32 = _DType()\n"
+                    "int64 = _DType()\n"
+                    "class _NoGrad:\n"
+                    "    def __call__(self, function):\n"
+                    "        return function\n"
+                    "    def __enter__(self):\n"
+                    "        return self\n"
+                    "    def __exit__(self, *args):\n"
+                    "        return False\n"
+                    "def no_grad():\n"
+                    "    return _NoGrad()\n"
+                ).encode(),
+                "torch/distributed/__init__.py": (
+                    "class ReduceOp:\n"
+                    "    SUM = 'sum'\n"
+                    "    MAX = 'max'\n"
+                    "    MIN = 'min'\n"
+                    "class group:\n"
+                    "    WORLD = object()\n"
+                ).encode(),
+                "torch/nn/__init__.py": b'"""fixture torch.nn."""\n',
+                "torch/nn/functional.py": (
+                    "def softmax(value, dim=-1):\n"
+                    "    return value\n"
+                ).encode(),
+            }
         else:
-            member_name = f"{component_name}.identity"
-            content = f"{component_name}-fixture\n".encode()
-        member_path = root / member_name
-        member_path.write_bytes(content)
-        member_path.chmod(0o644)
-        member = {
-            "elf_build_id": None,
-            "kind": "file",
-            "mode": 0o100644,
-            "name": member_name,
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "size": len(content),
-        }
+            members_content = {
+                f"{component_name}.identity": f"{component_name}-fixture\n".encode()
+            }
+        members = []
+        for member_name, content in sorted(members_content.items()):
+            member_path = root / member_name
+            member_path.parent.mkdir(parents=True, exist_ok=True)
+            member_path.write_bytes(content)
+            member_path.chmod(0o644)
+            members.append(
+                {
+                    "elf_build_id": None,
+                    "kind": "file",
+                    "mode": 0o100644,
+                    "name": member_name,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                }
+            )
         member_bytes = json.dumps(
-            [member], sort_keys=True, separators=(",", ":")
+            members, sort_keys=True, separators=(",", ":")
         ).encode() + b"\n"
         environment[component_name] = {
             "identity": f"{component_name}==task4-fixture",
             "manifest_sha256": hashlib.sha256(member_bytes).hexdigest(),
-            "member_count": 1,
-            "members": [member],
+            "member_count": len(members),
+            "members": members,
             "resolver_id": f"uniep-{component_name}-resolver-v1",
-            "total_bytes": len(content),
+            "total_bytes": sum(item["size"] for item in members),
         }
         runtime_roots.append((component_name, root.resolve()))
 
@@ -2281,12 +2396,19 @@ def _task4_bootstrap_fixture(
         runtime_manifest_sha256=suite._runtime_authority_manifest_sha256(envelope),
         required_anchor_modules=required_modules,
         runtime_component_roots=tuple(runtime_roots),
+        import_root_components=(
+            ("python", "torch")
+            if selected_runner_content is not None
+            else ("python",)
+        ),
     )
     return types.SimpleNamespace(
         preflight=preflight,
         args=("tests.host_probe",),
         snapshot=snapshot,
         runner=snapshot / "benchmark/layer/bench_moe_suite.py",
+        product_remote=product_remote,
+        product_main_commit=main_commit,
     )
 
 
@@ -2308,6 +2430,133 @@ def test_task4_shipped_fresh_bootstrap_real_subprocess_positive(
         item["module_name"] for item in evidence["loaded_product_modules"]
     }
     assert captured.err == ""
+
+
+def _selected_source_runner_content() -> bytes:
+    return _task2_git(
+        ROOT,
+        "show",
+        f"{_SELECTED_SOURCE_COMMIT}:benchmark/layer/bench_moe_suite.py",
+    )
+
+
+def _task4_real_selected_source_fixture(tmp_path, monkeypatch, suite):
+    content = _selected_source_runner_content()
+    assert hashlib.sha256(content).hexdigest() == (
+        "f7a67356fdfc595e1f1b6c2218aed04a972595d8212bf450b08b5c0ba478aec2"
+    )
+    assert _LEGACY_PRODUCT_FEATURE_REF.encode("ascii") in content
+    return _task4_bootstrap_fixture(
+        tmp_path,
+        monkeypatch,
+        suite,
+        selected_runner_content=content,
+    )
+
+
+def test_task4_real_selected_source_runner_accepts_exact_outer_policy(
+    tmp_path, monkeypatch
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_real_selected_source_fixture(tmp_path, monkeypatch, suite)
+
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+    evidence = json.loads(completed.stdout)
+    loaded = {
+        item["relative_path"]: item for item in evidence["loaded_product_modules"]
+    }
+    assert loaded["benchmark/layer/bench_moe_suite.py"]["loaded_sha256"] == (
+        hashlib.sha256(_selected_source_runner_content()).hexdigest()
+    )
+    assert evidence["product_commit"] == fixture.preflight.authority.product["commit"]
+    assert evidence["device_events"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_detail",
+    (
+        ("missing", b"BOOTSTRAP_INVALID: bootstrap policy"),
+        ("malformed", b"BOOTSTRAP_INVALID: bootstrap policy"),
+        ("legacy", b"BOOTSTRAP_INVALID: bootstrap policy identity"),
+        ("runner_mismatch", b"BOOTSTRAP_INVALID: bootstrap policy identity"),
+        ("commit_mismatch", b"BOOTSTRAP_INVALID: bootstrap policy identity"),
+    ),
+)
+def test_task4_real_selected_source_policy_known_bad_is_red(
+    tmp_path, monkeypatch, mutation, expected_detail
+):
+    suite = _load_benchmark_suite()
+    fixture = _task4_real_selected_source_fixture(tmp_path, monkeypatch, suite)
+    build_payload = suite._bootstrap_payload
+
+    def mutate_policy(preflight, args):
+        payload = json.loads(build_payload(preflight, args).decode("utf-8"))
+        if mutation == "missing":
+            payload.pop("bootstrap_policy")
+            payload.pop("bootstrap_policy_sha256")
+        elif mutation == "malformed":
+            payload["bootstrap_policy"] = []
+        else:
+            policy = payload["bootstrap_policy"]
+            if mutation == "legacy":
+                policy["product_feature_ref"] = _LEGACY_PRODUCT_FEATURE_REF
+            elif mutation == "runner_mismatch":
+                policy["runner_sha256"] = "0" * 64
+            elif mutation == "commit_mismatch":
+                policy["product_commit"] = "0" * 40
+            payload["bootstrap_policy_sha256"] = hashlib.sha256(
+                _task2_canonical_json(policy)
+            ).hexdigest()
+        return _task2_canonical_json(payload)
+
+    monkeypatch.setattr(suite, "_bootstrap_payload", mutate_policy)
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+
+    assert completed.returncode != 0
+    assert expected_detail in completed.stderr
+    assert b'"status":"HOST_ONLY_VERIFIED"' not in completed.stdout
+
+
+def test_task4_real_selected_source_live_ref_drift_is_red(tmp_path, monkeypatch):
+    suite = _load_benchmark_suite()
+    fixture = _task4_real_selected_source_fixture(tmp_path, monkeypatch, suite)
+    build_payload = suite._bootstrap_payload
+
+    def move_ref_after_payload(preflight, args):
+        payload = build_payload(preflight, args)
+        tree = _task2_git(
+            fixture.product_remote,
+            "rev-parse",
+            f"{preflight.authority.product['commit']}^{{tree}}",
+        ).decode().strip()
+        drift_commit = _task2_git(
+            fixture.product_remote,
+            "-c",
+            "user.name=Task4 Drift",
+            "-c",
+            "user.email=task4-drift@example.invalid",
+            "commit-tree",
+            tree,
+            "-p",
+            fixture.product_main_commit,
+            input_bytes=b"task4 live ref drift\n",
+        ).decode().strip()
+        _task2_git(
+            fixture.product_remote,
+            "update-ref",
+            _ACCEPTED_PRODUCT_FEATURE_REF,
+            drift_commit,
+        )
+        return payload
+
+    monkeypatch.setattr(suite, "_bootstrap_payload", move_ref_after_payload)
+    completed = suite._run_authorized_pytest(fixture.preflight, fixture.args)
+
+    assert completed.returncode != 0
+    assert b"PRODUCT_INVALID: live product identity" in completed.stderr
+    assert b'"status":"HOST_ONLY_VERIFIED"' not in completed.stdout
 
 
 def test_task4_verified_payload_round_trips_into_picklable_worker_identity(
