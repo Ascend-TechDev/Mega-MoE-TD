@@ -97,7 +97,7 @@ def moe_backward_triton(saved, dy, peer_mem):
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
     use_fused = os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
-    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM") == "1"     # step3(cube) ∥ step2(vec) on two engine-pure streams
+    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM", "1") != "0"  # step3(cube) ∥ step2(vec) on two engine-pure streams (DEFAULT ON; =0 disables)
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
     _r = saved["ep_rank"]
     def _t(tag):

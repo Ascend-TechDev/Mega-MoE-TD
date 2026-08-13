@@ -965,6 +965,7 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             backward_breakdown = None
             if os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0":
                 os.environ["MOE_BWD_STAGE_TIMING"] = "1"
+                os.environ["MOE_BWD_DUAL_STREAM"] = "0"   # stage timing needs the serial step2/3 path
                 saved["_bwd_stage_samples"] = []
                 torch.npu.synchronize(device)
                 dist.barrier(group=ep_group)
@@ -973,6 +974,7 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     with torch.no_grad():
                         moe_backward_triton(saved, dy, peer_mem)
                 os.environ.pop("MOE_BWD_STAGE_TIMING", None)
+                os.environ.pop("MOE_BWD_DUAL_STREAM", None)   # restore default (ON)
                 bd_samples = saved["_bwd_stage_samples"][_bd_warmup:]
                 _bwd_stage_names = ("dispatch", "fc2_wgrad", "swiglu", "fc1_wgrad", "combine")
                 backward_breakdown = OrderedDict(
