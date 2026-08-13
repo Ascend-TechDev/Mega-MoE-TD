@@ -2453,3 +2453,310 @@ def test_task4_valid_benchmark_import_binds_regular_parent_origins(monkeypatch, 
     by_name = {record.module_name: record for record in records}
     assert by_name["benchmark"].relative_path == "benchmark/__init__.py"
     assert by_name["benchmark.layer"].relative_path == "benchmark/layer/__init__.py"
+
+
+_OPTIMIZATION_ORDERS = ("profile_then_e2e", "e2e_then_profile")
+_OPTIMIZATION_COMPONENTS = ("stage_a", "stage_b", "stage_c")
+_OPTIMIZATION_SEQUENCE = (
+    "predevice_gate",
+    "precision",
+    "nonfinite",
+    "determinism",
+    *_OPTIMIZATION_ORDERS,
+)
+
+
+def _optimization_decision_payload() -> dict:
+    identity = {
+        "source_sha256": "1" * 64,
+        "binary_sha256": "2" * 64,
+        "environment_sha256": "3" * 64,
+        "workload_sha256": "4" * 64,
+        "task_graph_sha256": "5" * 64,
+        "predevice_identity_sha256": "6" * 64,
+        "module_closure_sha256": "7" * 64,
+    }
+    order = {
+        "identity": identity,
+        "e2e_samples": [10.0, 10.2, 9.8, 10.1, 9.9],
+        "component_samples": {
+            "stage_a": [2.0, 2.1, 1.9, 2.0, 2.0],
+            "stage_b": [4.0, 4.1, 3.9, 4.0, 4.0],
+            "stage_c": [1.0, 1.0, 1.0, 1.0, 1.0],
+        },
+        "remainder_samples": [3.0, 3.0, 3.0, 3.1, 2.9],
+    }
+    return {
+        "schema": "uniep.host-optimization-decision-input.v1",
+        "metric": "critical_path",
+        "unit": "ms/token",
+        "target_e2e_gain_fraction": 0.15,
+        "composition_tolerance_fraction": 0.03,
+        "expected_components": list(_OPTIMIZATION_COMPONENTS),
+        "local_tunable_components": ["stage_a"],
+        "orders": list(_OPTIMIZATION_ORDERS),
+        "evidence_sequence": list(_OPTIMIZATION_SEQUENCE),
+        "predevice_gate": {
+            "schema": "uniep.predevice-host-gate.v1",
+            "status": "VERIFIED",
+            "bootstrap": "python-I-S",
+            "site_loaded": False,
+            "pytest_plugin_autoload": False,
+            "device_events": [],
+            "first_identity_sha256": "6" * 64,
+            "final_identity_sha256": "6" * 64,
+            "first_module_closure_sha256": "7" * 64,
+            "final_module_closure_sha256": "7" * 64,
+        },
+        "correctness": {
+            "identity": json.loads(json.dumps(identity)),
+            "reference_values": [1.0, -2.0, 3.0, 4.0],
+            "candidate_values_by_run": [
+                [1.0, -2.0, 3.0, 4.0],
+                [1.0, -2.0, 3.0, 4.0],
+                [1.0, -2.0, 3.0, 4.0],
+            ],
+            "atol": 0.0,
+            "rtol": 0.0,
+        },
+        "raw_by_order": {
+            name: json.loads(json.dumps(order)) for name in _OPTIMIZATION_ORDERS
+        },
+    }
+
+
+def test_task4_host_decision_recomputes_local_tune_from_raw_components():
+    suite = _load_benchmark_suite()
+    decision = suite._derive_host_optimization_decision(
+        _optimization_decision_payload()
+    )
+
+    assert isinstance(decision, kit.OptimizationDecision)
+    assert decision.decision == "LOCAL_TUNE"
+    assert decision.reason_code == "LOCAL_CEILING_REACHES_TARGET"
+    assert decision.conservative_local_max_gain_fraction == pytest.approx(0.2)
+    assert dict(decision.component_share_by_order)["profile_then_e2e"] == (
+        ("stage_a", 0.2),
+        ("stage_b", 0.4),
+        ("stage_c", 0.1),
+    )
+    assert len(decision.raw_evidence_sha256) == 64
+    assert len(decision.evidence_identity_sha256) == 64
+    assert decision.precision_passed is True
+    assert decision.nonfinite_count == 0
+    assert len(set(decision.determinism_sha256)) == 1
+    assert len(decision.correctness_raw_sha256) == 64
+    assert set(dict(decision.e2e_raw_sha256_by_order)) == set(_OPTIMIZATION_ORDERS)
+    assert set(dict(decision.component_raw_sha256_by_order)) == set(
+        _OPTIMIZATION_ORDERS
+    )
+    assert decision.as_dict()["decision"] == "LOCAL_TUNE"
+    assert set(decision.as_dict()) == {
+        "schema",
+        "decision",
+        "reason_code",
+        "metric",
+        "unit",
+        "target_e2e_gain_fraction",
+        "component_share_by_order",
+        "local_max_gain_by_order",
+        "conservative_local_max_gain_fraction",
+        "raw_evidence_sha256",
+        "evidence_identity_sha256",
+        "precision_passed",
+        "nonfinite_count",
+        "correctness_raw_sha256",
+        "determinism_sha256",
+        "e2e_raw_sha256_by_order",
+        "component_raw_sha256_by_order",
+    }
+
+
+def test_task4_host_decision_selects_recompose_when_local_ceiling_is_too_low():
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    payload["target_e2e_gain_fraction"] = 0.25
+
+    decision = suite._derive_host_optimization_decision(payload)
+
+    assert decision.decision == "REGENERATE_RECOMPOSE"
+    assert decision.reason_code == "LOCAL_CEILING_BELOW_TARGET"
+    assert decision.conservative_local_max_gain_fraction == pytest.approx(0.2)
+
+
+def test_task4_host_decision_uses_conservative_order_without_pooling():
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    second = payload["raw_by_order"][_OPTIMIZATION_ORDERS[1]]
+    second["component_samples"]["stage_a"] = [1.0] * 5
+    second["remainder_samples"] = [4.0, 4.1, 3.9, 4.1, 3.9]
+
+    decision = suite._derive_host_optimization_decision(payload)
+
+    assert decision.decision == "REGENERATE_RECOMPOSE"
+    assert dict(decision.local_max_gain_by_order) == {
+        "profile_then_e2e": pytest.approx(0.2),
+        "e2e_then_profile": pytest.approx(0.1),
+    }
+    assert decision.conservative_local_max_gain_fraction == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("reported_decision", "UNEXPECTED_EVIDENCE_FIELD"),
+        ("reported_share", "UNEXPECTED_EVIDENCE_FIELD"),
+        ("omitted_component", "COMPONENT_DENOMINATOR_MISMATCH"),
+        ("extra_component", "COMPONENT_DENOMINATOR_MISMATCH"),
+        ("duplicate_component", "COMPONENT_DENOMINATOR_MISMATCH"),
+        ("mixed_environment", "EVIDENCE_IDENTITY_DRIFT"),
+        ("pooled_orders", "ORDER_DENOMINATOR_MISMATCH"),
+        ("composition_gap", "COMPONENT_COMPOSITION_MISMATCH"),
+        ("reported_correctness", "CORRECTNESS_EVIDENCE_INVALID"),
+        ("precision_failed", "PRECISION_NOT_PROVEN"),
+        ("nonfinite_output", "NONFINITE_OUTPUT"),
+        ("nondeterministic", "DETERMINISM_NOT_PROVEN"),
+        ("correctness_identity_drift", "EVIDENCE_IDENTITY_DRIFT"),
+        ("correctness_after_timing", "EVIDENCE_SEQUENCE_INVALID"),
+        ("nonfinite_timing", "RAW_SAMPLE_INVALID"),
+        ("unequal_sample_count", "RAW_SAMPLE_DENOMINATOR_INVALID"),
+        ("missing_task_graph", "EVIDENCE_IDENTITY_INVALID"),
+        ("predevice_identity_drift", "PREDEVICE_GATE_INVALID"),
+        ("predevice_module_drift", "PREDEVICE_GATE_INVALID"),
+        ("predevice_identity_unbound", "PREDEVICE_GATE_IDENTITY_MISMATCH"),
+        ("predevice_module_unbound", "PREDEVICE_GATE_IDENTITY_MISMATCH"),
+        ("predevice_device_event", "PREDEVICE_GATE_INVALID"),
+        ("site_enabled", "PREDEVICE_GATE_INVALID"),
+        ("plugin_autoload", "PREDEVICE_GATE_INVALID"),
+        ("unknown_local_component", "LOCAL_COMPONENT_DENOMINATOR_MISMATCH"),
+    ),
+)
+def test_task4_host_decision_false_accepts_fail_closed(mutation, reason):
+    suite = _load_benchmark_suite()
+    payload = _optimization_decision_payload()
+    if mutation == "reported_decision":
+        payload["reported_decision"] = "LOCAL_TUNE"
+    elif mutation == "reported_share":
+        payload["reported_component_share"] = 1.0
+    elif mutation == "omitted_component":
+        del payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]][
+            "component_samples"
+        ]["stage_c"]
+    elif mutation == "extra_component":
+        payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]][
+            "component_samples"
+        ]["stage_d"] = [0.0] * 5
+    elif mutation == "duplicate_component":
+        payload["expected_components"] = ["stage_a", "stage_a", "stage_c"]
+    elif mutation == "mixed_environment":
+        payload["raw_by_order"][_OPTIMIZATION_ORDERS[1]]["identity"][
+            "environment_sha256"
+        ] = "a" * 64
+    elif mutation == "pooled_orders":
+        payload["orders"] = ["pooled"]
+        payload["raw_by_order"] = {
+            "pooled": payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]]
+        }
+    elif mutation == "composition_gap":
+        payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]]["remainder_samples"] = [
+            1.0
+        ] * 5
+    elif mutation == "reported_correctness":
+        payload["correctness"]["precision_passed"] = True
+    elif mutation == "precision_failed":
+        payload["correctness"]["candidate_values_by_run"][0][0] = 100.0
+    elif mutation == "nonfinite_output":
+        payload["correctness"]["candidate_values_by_run"][0][0] = float("inf")
+    elif mutation == "nondeterministic":
+        payload["correctness"]["rtol"] = 0.01
+        payload["correctness"]["candidate_values_by_run"][-1][0] = 1.0001
+    elif mutation == "correctness_identity_drift":
+        payload["correctness"]["identity"]["workload_sha256"] = "a" * 64
+    elif mutation == "correctness_after_timing":
+        payload["evidence_sequence"] = [
+            "predevice_gate",
+            *_OPTIMIZATION_ORDERS,
+            "precision",
+            "nonfinite",
+            "determinism",
+        ]
+    elif mutation == "nonfinite_timing":
+        payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]]["e2e_samples"][0] = (
+            float("nan")
+        )
+    elif mutation == "unequal_sample_count":
+        payload["raw_by_order"][_OPTIMIZATION_ORDERS[1]]["e2e_samples"].pop()
+    elif mutation == "missing_task_graph":
+        for order in _OPTIMIZATION_ORDERS:
+            payload["raw_by_order"][order]["identity"]["task_graph_sha256"] = ""
+    elif mutation == "predevice_identity_drift":
+        payload["predevice_gate"]["final_identity_sha256"] = "a" * 64
+    elif mutation == "predevice_module_drift":
+        payload["predevice_gate"]["final_module_closure_sha256"] = "a" * 64
+    elif mutation == "predevice_identity_unbound":
+        payload["predevice_gate"]["first_identity_sha256"] = "a" * 64
+        payload["predevice_gate"]["final_identity_sha256"] = "a" * 64
+    elif mutation == "predevice_module_unbound":
+        payload["predevice_gate"]["first_module_closure_sha256"] = "a" * 64
+        payload["predevice_gate"]["final_module_closure_sha256"] = "a" * 64
+    elif mutation == "predevice_device_event":
+        payload["predevice_gate"]["device_events"] = ["loader"]
+    elif mutation == "site_enabled":
+        payload["predevice_gate"]["site_loaded"] = True
+    elif mutation == "plugin_autoload":
+        payload["predevice_gate"]["pytest_plugin_autoload"] = True
+    elif mutation == "unknown_local_component":
+        payload["local_tunable_components"] = ["unknown"]
+
+    decision = suite._derive_host_optimization_decision(payload)
+
+    assert decision.decision == "INSUFFICIENT_EVIDENCE"
+    assert decision.reason_code == reason
+    assert decision.component_share_by_order == ()
+    assert decision.local_max_gain_by_order == ()
+    assert decision.conservative_local_max_gain_fraction is None
+
+
+def test_task4_host_decision_raw_identity_is_recomputed_without_device(monkeypatch):
+    suite = _load_benchmark_suite()
+    loader = mock.Mock(side_effect=AssertionError("device loader reached"))
+    monkeypatch.setattr(kit, "load_device_runtime", loader)
+    first = suite._derive_host_optimization_decision(
+        _optimization_decision_payload()
+    )
+    changed_payload = _optimization_decision_payload()
+    changed_payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]]["e2e_samples"][0] = 10.1
+    changed_payload["raw_by_order"][_OPTIMIZATION_ORDERS[0]][
+        "remainder_samples"
+    ][0] = 3.1
+    changed = suite._derive_host_optimization_decision(changed_payload)
+
+    assert first.decision == changed.decision == "LOCAL_TUNE"
+    assert first.raw_evidence_sha256 != changed.raw_evidence_sha256
+    assert dict(first.e2e_raw_sha256_by_order)[_OPTIMIZATION_ORDERS[0]] != dict(
+        changed.e2e_raw_sha256_by_order
+    )[_OPTIMIZATION_ORDERS[0]]
+    assert dict(first.component_raw_sha256_by_order) == dict(
+        changed.component_raw_sha256_by_order
+    )
+    loader.assert_not_called()
+    assert kit.torch_npu is None
+    assert kit.ash is None
+
+
+def test_task4_host_decision_recomputes_correctness_raw_identity():
+    suite = _load_benchmark_suite()
+    first = suite._derive_host_optimization_decision(
+        _optimization_decision_payload()
+    )
+    changed_payload = _optimization_decision_payload()
+    changed_payload["correctness"]["rtol"] = 0.01
+    for run in changed_payload["correctness"]["candidate_values_by_run"]:
+        run[0] = 1.001
+    changed = suite._derive_host_optimization_decision(changed_payload)
+
+    assert first.decision == changed.decision == "LOCAL_TUNE"
+    assert first.correctness_raw_sha256 != changed.correctness_raw_sha256
+    assert first.evidence_identity_sha256 != changed.evidence_identity_sha256
+    assert first.raw_evidence_sha256 != changed.raw_evidence_sha256
+    assert len(set(changed.determinism_sha256)) == 1

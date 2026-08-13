@@ -13,6 +13,8 @@ import contextlib
 import ast
 import hashlib
 import importlib
+import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -36,6 +38,8 @@ _ACTIVE_RUNTIME_SEAL = None
 __all__ = [
     "TimingSpec",
     "TimingResult",
+    "OptimizationDecision",
+    "derive_optimization_decision",
     "PerformanceRunner",
     "FORWARD_TIMING",
     "BACKWARD_TIMING",
@@ -80,6 +84,597 @@ _TERMINAL_VERIFICATION_TRACE = (
     "runtime_final",
     "modules_final",
 )
+
+OPTIMIZATION_DECISIONS = (
+    "LOCAL_TUNE",
+    "REGENERATE_RECOMPOSE",
+    "INSUFFICIENT_EVIDENCE",
+)
+OPTIMIZATION_ORDERS = ("profile_then_e2e", "e2e_then_profile")
+_OPTIMIZATION_EVIDENCE_SEQUENCE = (
+    "predevice_gate",
+    "precision",
+    "nonfinite",
+    "determinism",
+    *OPTIMIZATION_ORDERS,
+)
+_OPTIMIZATION_INPUT_SCHEMA = "uniep.host-optimization-decision-input.v1"
+_OPTIMIZATION_INPUT_FIELDS = frozenset(
+    {
+        "schema",
+        "metric",
+        "unit",
+        "target_e2e_gain_fraction",
+        "composition_tolerance_fraction",
+        "expected_components",
+        "local_tunable_components",
+        "orders",
+        "evidence_sequence",
+        "predevice_gate",
+        "correctness",
+        "raw_by_order",
+    }
+)
+_PREDEVICE_GATE_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "bootstrap",
+        "site_loaded",
+        "pytest_plugin_autoload",
+        "device_events",
+        "first_identity_sha256",
+        "final_identity_sha256",
+        "first_module_closure_sha256",
+        "final_module_closure_sha256",
+    }
+)
+_CORRECTNESS_FIELDS = frozenset(
+    {
+        "identity",
+        "reference_values",
+        "candidate_values_by_run",
+        "atol",
+        "rtol",
+    }
+)
+_ORDER_FIELDS = frozenset(
+    {"identity", "e2e_samples", "component_samples", "remainder_samples"}
+)
+_EVIDENCE_IDENTITY_FIELDS = frozenset(
+    {
+        "source_sha256",
+        "binary_sha256",
+        "environment_sha256",
+        "workload_sha256",
+        "task_graph_sha256",
+        "predevice_identity_sha256",
+        "module_closure_sha256",
+    }
+)
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+class _OptimizationEvidenceError(ValueError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class OptimizationDecision:
+    """Typed host-only routing result recomputed from retained raw evidence."""
+
+    decision: str
+    reason_code: str
+    metric: str | None
+    unit: str | None
+    target_e2e_gain_fraction: float | None
+    component_share_by_order: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
+    local_max_gain_by_order: tuple[tuple[str, float], ...]
+    conservative_local_max_gain_fraction: float | None
+    raw_evidence_sha256: str
+    evidence_identity_sha256: str | None
+    precision_passed: bool | None
+    nonfinite_count: int | None
+    correctness_raw_sha256: str | None
+    determinism_sha256: tuple[str, ...]
+    e2e_raw_sha256_by_order: tuple[tuple[str, str], ...]
+    component_raw_sha256_by_order: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if self.decision not in OPTIMIZATION_DECISIONS:
+            raise ValueError("unknown optimization decision")
+        if not self.reason_code:
+            raise ValueError("missing optimization reason")
+        if not _is_sha256(self.raw_evidence_sha256):
+            raise ValueError("invalid raw evidence identity")
+        if self.evidence_identity_sha256 is not None and not _is_sha256(
+            self.evidence_identity_sha256
+        ):
+            raise ValueError("invalid optimization evidence identity")
+        if self.correctness_raw_sha256 is not None and not _is_sha256(
+            self.correctness_raw_sha256
+        ):
+            raise ValueError("invalid correctness evidence identity")
+        if not all(_is_sha256(digest) for digest in self.determinism_sha256):
+            raise ValueError("invalid determinism identity")
+        if any(
+            order not in OPTIMIZATION_ORDERS or not _is_sha256(digest)
+            for order, digest in (
+                *self.e2e_raw_sha256_by_order,
+                *self.component_raw_sha256_by_order,
+            )
+        ):
+            raise ValueError("invalid raw subset identity")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema": "uniep.host-optimization-decision.v1",
+            "decision": self.decision,
+            "reason_code": self.reason_code,
+            "metric": self.metric,
+            "unit": self.unit,
+            "target_e2e_gain_fraction": self.target_e2e_gain_fraction,
+            "component_share_by_order": {
+                order: dict(shares)
+                for order, shares in self.component_share_by_order
+            },
+            "local_max_gain_by_order": dict(self.local_max_gain_by_order),
+            "conservative_local_max_gain_fraction": (
+                self.conservative_local_max_gain_fraction
+            ),
+            "raw_evidence_sha256": self.raw_evidence_sha256,
+            "evidence_identity_sha256": self.evidence_identity_sha256,
+            "precision_passed": self.precision_passed,
+            "nonfinite_count": self.nonfinite_count,
+            "correctness_raw_sha256": self.correctness_raw_sha256,
+            "determinism_sha256": list(self.determinism_sha256),
+            "e2e_raw_sha256_by_order": dict(self.e2e_raw_sha256_by_order),
+            "component_raw_sha256_by_order": dict(
+                self.component_raw_sha256_by_order
+            ),
+        }
+
+
+def _canonical_evidence_sha256(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise _OptimizationEvidenceError("NONCANONICAL_EVIDENCE") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) <= _SHA256_HEX
+    )
+
+
+def _insufficient_decision(
+    code: str, raw_sha256: str, payload: object
+) -> OptimizationDecision:
+    metric = payload.get("metric") if isinstance(payload, dict) else None
+    unit = payload.get("unit") if isinstance(payload, dict) else None
+    target = (
+        payload.get("target_e2e_gain_fraction")
+        if isinstance(payload, dict)
+        else None
+    )
+    return OptimizationDecision(
+        decision="INSUFFICIENT_EVIDENCE",
+        reason_code=code,
+        metric=metric if isinstance(metric, str) else None,
+        unit=unit if isinstance(unit, str) else None,
+        target_e2e_gain_fraction=(
+            float(target)
+            if isinstance(target, (int, float))
+            and not isinstance(target, bool)
+            and math.isfinite(float(target))
+            else None
+        ),
+        component_share_by_order=(),
+        local_max_gain_by_order=(),
+        conservative_local_max_gain_fraction=None,
+        raw_evidence_sha256=raw_sha256,
+        evidence_identity_sha256=None,
+        precision_passed=None,
+        nonfinite_count=None,
+        correctness_raw_sha256=None,
+        determinism_sha256=(),
+        e2e_raw_sha256_by_order=(),
+        component_raw_sha256_by_order=(),
+    )
+
+
+def _require_exact_fields(
+    value: object, fields: frozenset[str], code: str
+) -> dict:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _OptimizationEvidenceError(code)
+    return value
+
+
+def _require_finite_samples(
+    value: object, *, positive: bool, expected_count: int | None = None
+) -> tuple[float, ...]:
+    if not isinstance(value, list) or len(value) < 3:
+        raise _OptimizationEvidenceError("RAW_SAMPLE_DENOMINATOR_INVALID")
+    if expected_count is not None and len(value) != expected_count:
+        raise _OptimizationEvidenceError("RAW_SAMPLE_DENOMINATOR_INVALID")
+    samples = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise _OptimizationEvidenceError("RAW_SAMPLE_INVALID")
+        sample = float(item)
+        if not math.isfinite(sample) or sample < 0.0 or (positive and sample == 0.0):
+            raise _OptimizationEvidenceError("RAW_SAMPLE_INVALID")
+        samples.append(sample)
+    return tuple(samples)
+
+
+def _validate_predevice_gate(value: object) -> dict:
+    gate = _require_exact_fields(
+        value, _PREDEVICE_GATE_FIELDS, "PREDEVICE_GATE_INVALID"
+    )
+    hashes = (
+        gate["first_identity_sha256"],
+        gate["final_identity_sha256"],
+        gate["first_module_closure_sha256"],
+        gate["final_module_closure_sha256"],
+    )
+    if (
+        gate["schema"] != "uniep.predevice-host-gate.v1"
+        or gate["status"] != "VERIFIED"
+        or gate["bootstrap"] != "python-I-S"
+        or gate["site_loaded"] is not False
+        or gate["pytest_plugin_autoload"] is not False
+        or gate["device_events"] != []
+        or not all(_is_sha256(item) for item in hashes)
+        or hashes[0] != hashes[1]
+        or hashes[2] != hashes[3]
+    ):
+        raise _OptimizationEvidenceError("PREDEVICE_GATE_INVALID")
+    return gate
+
+
+def _require_correctness_vector(
+    value: object, *, expected_count: int | None = None
+) -> tuple[float, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or expected_count is not None
+        and len(value) != expected_count
+    ):
+        raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
+    result = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
+        sample = float(item)
+        if not math.isfinite(sample):
+            raise _OptimizationEvidenceError("NONFINITE_OUTPUT")
+        result.append(sample)
+    return tuple(result)
+
+
+def _validate_correctness(value: object) -> tuple[dict, dict[str, object]]:
+    correctness = _require_exact_fields(
+        value, _CORRECTNESS_FIELDS, "CORRECTNESS_EVIDENCE_INVALID"
+    )
+    identity = _validate_identity(correctness["identity"])
+    atol = correctness["atol"]
+    rtol = correctness["rtol"]
+    if (
+        isinstance(atol, bool)
+        or not isinstance(atol, (int, float))
+        or not math.isfinite(float(atol))
+        or float(atol) < 0.0
+        or isinstance(rtol, bool)
+        or not isinstance(rtol, (int, float))
+        or not math.isfinite(float(rtol))
+        or not 0.0 <= float(rtol) <= 1.0
+    ):
+        raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
+    reference = _require_correctness_vector(correctness["reference_values"])
+    runs = correctness["candidate_values_by_run"]
+    if (
+        not isinstance(runs, list)
+        or len(runs) < 3
+    ):
+        raise _OptimizationEvidenceError("CORRECTNESS_EVIDENCE_INVALID")
+    normalized_runs = tuple(
+        _require_correctness_vector(run, expected_count=len(reference))
+        for run in runs
+    )
+    if any(
+        abs(actual - expected)
+        > float(atol) + float(rtol) * abs(expected)
+        for run in normalized_runs
+        for actual, expected in zip(run, reference)
+    ):
+        raise _OptimizationEvidenceError("PRECISION_NOT_PROVEN")
+    determinism = tuple(
+        _canonical_evidence_sha256(list(run)) for run in normalized_runs
+    )
+    if len(set(determinism)) != 1:
+        raise _OptimizationEvidenceError("DETERMINISM_NOT_PROVEN")
+    correctness_material = {
+        "identity": identity,
+        "reference_values": list(reference),
+        "candidate_values_by_run": [list(run) for run in normalized_runs],
+        "atol": float(atol),
+        "rtol": float(rtol),
+    }
+    return identity, {
+        "precision_passed": True,
+        "nonfinite_count": 0,
+        "correctness_raw_sha256": _canonical_evidence_sha256(
+            correctness_material
+        ),
+        "determinism_sha256": determinism,
+    }
+
+
+def _validate_identity(value: object) -> dict:
+    identity = _require_exact_fields(
+        value, _EVIDENCE_IDENTITY_FIELDS, "EVIDENCE_IDENTITY_INVALID"
+    )
+    if not all(_is_sha256(identity[field]) for field in sorted(identity)):
+        raise _OptimizationEvidenceError("EVIDENCE_IDENTITY_INVALID")
+    return identity
+
+
+@dataclass(frozen=True)
+class _OptimizationOrderSummary:
+    identity: dict
+    sample_count: int
+    component_shares: tuple[tuple[str, float], ...]
+    local_max_gain_fraction: float
+    e2e_raw_sha256: str
+    component_raw_sha256: str
+
+
+def _validate_optimization_header(
+    payload: object,
+) -> tuple[dict, list[str], list[str], float, float, dict, dict, dict]:
+    body = _require_exact_fields(
+        payload, _OPTIMIZATION_INPUT_FIELDS, "UNEXPECTED_EVIDENCE_FIELD"
+    )
+    if body["schema"] != _OPTIMIZATION_INPUT_SCHEMA:
+        raise _OptimizationEvidenceError("EVIDENCE_SCHEMA_INVALID")
+    if not isinstance(body["metric"], str) or not body["metric"]:
+        raise _OptimizationEvidenceError("METRIC_INVALID")
+    if body["unit"] not in {
+        "ns/request",
+        "us/request",
+        "ms/request",
+        "ns/token",
+        "us/token",
+        "ms/token",
+    }:
+        raise _OptimizationEvidenceError("METRIC_UNIT_INVALID")
+    target = body["target_e2e_gain_fraction"]
+    tolerance = body["composition_tolerance_fraction"]
+    if (
+        isinstance(target, bool)
+        or not isinstance(target, (int, float))
+        or not math.isfinite(float(target))
+        or not 0.0 < float(target) < 1.0
+    ):
+        raise _OptimizationEvidenceError("TARGET_INVALID")
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, (int, float))
+        or not math.isfinite(float(tolerance))
+        or not 0.0 <= float(tolerance) <= 0.03
+    ):
+        raise _OptimizationEvidenceError("COMPOSITION_TOLERANCE_INVALID")
+
+    expected = body["expected_components"]
+    local = body["local_tunable_components"]
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or not all(isinstance(item, str) and item for item in expected)
+        or len(set(expected)) != len(expected)
+    ):
+        raise _OptimizationEvidenceError("COMPONENT_DENOMINATOR_MISMATCH")
+    if (
+        not isinstance(local, list)
+        or not all(isinstance(item, str) and item for item in local)
+        or len(set(local)) != len(local)
+        or not set(local) <= set(expected)
+    ):
+        raise _OptimizationEvidenceError("LOCAL_COMPONENT_DENOMINATOR_MISMATCH")
+    if body["orders"] != list(OPTIMIZATION_ORDERS):
+        raise _OptimizationEvidenceError("ORDER_DENOMINATOR_MISMATCH")
+    if body["evidence_sequence"] != list(_OPTIMIZATION_EVIDENCE_SEQUENCE):
+        raise _OptimizationEvidenceError("EVIDENCE_SEQUENCE_INVALID")
+
+    gate = _validate_predevice_gate(body["predevice_gate"])
+    correctness_identity, correctness = _validate_correctness(body["correctness"])
+    raw_by_order = body["raw_by_order"]
+    if not isinstance(raw_by_order, dict) or set(raw_by_order) != set(
+        OPTIMIZATION_ORDERS
+    ):
+        raise _OptimizationEvidenceError("ORDER_DENOMINATOR_MISMATCH")
+    return (
+        body,
+        expected,
+        local,
+        float(target),
+        float(tolerance),
+        gate,
+        correctness_identity,
+        correctness,
+    )
+
+
+def _derive_optimization_order(
+    order: object,
+    *,
+    expected: list[str],
+    local: list[str],
+    tolerance: float,
+    expected_count: int | None,
+) -> _OptimizationOrderSummary:
+    order = _require_exact_fields(
+        order, _ORDER_FIELDS, "ORDER_EVIDENCE_INVALID"
+    )
+    identity = _validate_identity(order["identity"])
+    e2e = _require_finite_samples(
+        order["e2e_samples"], positive=True, expected_count=expected_count
+    )
+    remainder = _require_finite_samples(
+        order["remainder_samples"],
+        positive=False,
+        expected_count=len(e2e),
+    )
+    components = order["component_samples"]
+    if not isinstance(components, dict) or set(components) != set(expected):
+        raise _OptimizationEvidenceError("COMPONENT_DENOMINATOR_MISMATCH")
+    normalized_components = {
+        component: _require_finite_samples(
+            components[component], positive=False, expected_count=len(e2e)
+        )
+        for component in expected
+    }
+    for index, e2e_sample in enumerate(e2e):
+        composed = remainder[index] + sum(
+            normalized_components[component][index] for component in expected
+        )
+        if abs(composed - e2e_sample) > tolerance * e2e_sample:
+            raise _OptimizationEvidenceError("COMPONENT_COMPOSITION_MISMATCH")
+
+    e2e_median = float(statistics.median(e2e))
+    shares = tuple(
+        (
+            component,
+            float(statistics.median(normalized_components[component]))
+            / e2e_median,
+        )
+        for component in expected
+    )
+    return _OptimizationOrderSummary(
+        identity=identity,
+        sample_count=len(e2e),
+        component_shares=shares,
+        local_max_gain_fraction=min(
+            1.0, sum(dict(shares)[component] for component in local)
+        ),
+        e2e_raw_sha256=_canonical_evidence_sha256(order["e2e_samples"]),
+        component_raw_sha256=_canonical_evidence_sha256(
+            {
+                "expected_components": expected,
+                "component_samples": order["component_samples"],
+            }
+        ),
+    )
+
+
+def _derive_valid_optimization_decision(payload: object) -> OptimizationDecision:
+    (
+        body,
+        expected,
+        local,
+        target,
+        tolerance,
+        gate,
+        correctness_identity,
+        correctness,
+    ) = _validate_optimization_header(payload)
+
+    summaries = []
+    for order_name in OPTIMIZATION_ORDERS:
+        summaries.append(
+            _derive_optimization_order(
+                body["raw_by_order"][order_name],
+                expected=expected,
+                local=local,
+                tolerance=tolerance,
+                expected_count=(summaries[0].sample_count if summaries else None),
+            )
+        )
+
+    if any(summary.identity != summaries[0].identity for summary in summaries[1:]):
+        raise _OptimizationEvidenceError("EVIDENCE_IDENTITY_DRIFT")
+    if correctness_identity != summaries[0].identity:
+        raise _OptimizationEvidenceError("EVIDENCE_IDENTITY_DRIFT")
+    if (
+        summaries[0].identity["predevice_identity_sha256"]
+        != gate["first_identity_sha256"]
+        or summaries[0].identity["module_closure_sha256"]
+        != gate["first_module_closure_sha256"]
+    ):
+        raise _OptimizationEvidenceError("PREDEVICE_GATE_IDENTITY_MISMATCH")
+
+    identity_material = {
+        "identity": summaries[0].identity,
+        "predevice_gate": gate,
+        "correctness": correctness,
+        "evidence_sequence": body["evidence_sequence"],
+    }
+    raw_sha256 = _canonical_evidence_sha256(payload)
+    identity_sha256 = _canonical_evidence_sha256(identity_material)
+    conservative = min(summary.local_max_gain_fraction for summary in summaries)
+    if conservative >= target:
+        decision = "LOCAL_TUNE"
+        reason = "LOCAL_CEILING_REACHES_TARGET"
+    else:
+        decision = "REGENERATE_RECOMPOSE"
+        reason = "LOCAL_CEILING_BELOW_TARGET"
+    return OptimizationDecision(
+        decision=decision,
+        reason_code=reason,
+        metric=body["metric"],
+        unit=body["unit"],
+        target_e2e_gain_fraction=target,
+        component_share_by_order=tuple(
+            (order, summary.component_shares)
+            for order, summary in zip(OPTIMIZATION_ORDERS, summaries)
+        ),
+        local_max_gain_by_order=tuple(
+            (order, summary.local_max_gain_fraction)
+            for order, summary in zip(OPTIMIZATION_ORDERS, summaries)
+        ),
+        conservative_local_max_gain_fraction=conservative,
+        raw_evidence_sha256=raw_sha256,
+        evidence_identity_sha256=identity_sha256,
+        precision_passed=correctness["precision_passed"],
+        nonfinite_count=correctness["nonfinite_count"],
+        correctness_raw_sha256=correctness["correctness_raw_sha256"],
+        determinism_sha256=correctness["determinism_sha256"],
+        e2e_raw_sha256_by_order=tuple(
+            (order, summary.e2e_raw_sha256)
+            for order, summary in zip(OPTIMIZATION_ORDERS, summaries)
+        ),
+        component_raw_sha256_by_order=tuple(
+            (order, summary.component_raw_sha256)
+            for order, summary in zip(OPTIMIZATION_ORDERS, summaries)
+        ),
+    )
+
+
+def derive_optimization_decision(payload: object) -> OptimizationDecision:
+    """Fail closed and recompute one consumer-neutral host routing result."""
+    try:
+        return _derive_valid_optimization_decision(payload)
+    except _OptimizationEvidenceError as error:
+        try:
+            raw_sha256 = _canonical_evidence_sha256(payload)
+        except _OptimizationEvidenceError:
+            raw_sha256 = "0" * 64
+        return _insufficient_decision(error.code, raw_sha256, payload)
 
 
 @dataclass(frozen=True, order=True)

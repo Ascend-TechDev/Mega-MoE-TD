@@ -4158,6 +4158,11 @@ def _finalize_backward_target_payload(payload: dict) -> None:
     payload["target_met"] = all(item["metrics"]["target_met"] for item in cases)
 
 
+def _derive_host_optimization_decision(payload: object) -> kit.OptimizationDecision:
+    """Return the neutral host decision without loading an EP/device adapter."""
+    return kit.derive_optimization_decision(payload)
+
+
 def _upsert_result(path, direction, world_size, entry, protocol):
     """Atomically merge one pytest node into a direction/world envelope."""
     path = Path(path)
