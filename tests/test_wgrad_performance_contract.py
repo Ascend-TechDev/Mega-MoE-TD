@@ -42,6 +42,9 @@ _QWEN_EP2_CASES = (
     ("performance-bwd-qwen3-30b-a3b-w2-t8k", 8192),
     ("performance-bwd-qwen3-30b-a3b-w2-t16k", 16384),
 )
+_ACCEPTED_PRODUCT_FEATURE_REF = (
+    "refs/heads/codex02/uniep-stage1-authority-consumer-20260811"
+)
 
 
 def _load_benchmark_suite():
@@ -513,7 +516,7 @@ def _task2_product_fixture(tmp_path: Path) -> types.SimpleNamespace:
     _task2_git(
         remote,
         "update-ref",
-        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        _ACCEPTED_PRODUCT_FEATURE_REF,
         feature_commit,
     )
 
@@ -537,7 +540,7 @@ def _task2_product_fixture(tmp_path: Path) -> types.SimpleNamespace:
             f"{feature_commit}/environment-authority.json"
         ),
         "commit": feature_commit,
-        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "feature_ref": _ACCEPTED_PRODUCT_FEATURE_REF,
         "main_is_ancestor": True,
         "main_ref": "refs/heads/main",
         "observed_main": main_commit,
@@ -761,6 +764,29 @@ def test_task2_authority_valid_local_bare_remotes(monkeypatch, tmp_path):
     assert envelope.raw == fixture.raw
     assert envelope.product == fixture.product.product
     assert tuple(envelope.environment) == _TASK2_COMPONENTS
+
+
+def test_task2_product_ref_is_the_accepted_exact_source_authority(
+    monkeypatch, tmp_path
+):
+    suite = _load_benchmark_suite()
+    fixture = _task2_authority_fixture(tmp_path)
+    _task2_configure_remotes(monkeypatch, suite, fixture)
+
+    assert suite.PRODUCT_FEATURE_REF == _ACCEPTED_PRODUCT_FEATURE_REF
+    product = suite._derive_product(
+        tmp_path,
+        tmp_path / "product-ref-binding.git",
+        fixture.product.feature_commit,
+        None,
+    )
+
+    assert product["commit"] == fixture.product.feature_commit
+    assert product["feature_ref"] == _ACCEPTED_PRODUCT_FEATURE_REF
+    assert product["authority_path"] == (
+        "authorities/uniep/wgrad/"
+        f"{fixture.product.feature_commit}/environment-authority.json"
+    )
 
 
 def test_task2_missing_real_authority_is_exact_and_pre_loader(
@@ -1293,7 +1319,7 @@ def _task3_fixture(monkeypatch, tmp_path: Path):
     _task2_git(
         product_remote,
         "update-ref",
-        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        _ACCEPTED_PRODUCT_FEATURE_REF,
         feature_commit,
     )
 
@@ -1308,7 +1334,7 @@ def _task3_fixture(monkeypatch, tmp_path: Path):
             f"authorities/uniep/wgrad/{feature_commit}/environment-authority.json"
         ),
         "commit": feature_commit,
-        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "feature_ref": _ACCEPTED_PRODUCT_FEATURE_REF,
         "main_is_ancestor": True,
         "main_ref": "refs/heads/main",
         "observed_main": main_commit,
@@ -2067,7 +2093,7 @@ def _task4_bootstrap_fixture(
     _task2_git(
         product_remote,
         "update-ref",
-        "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        _ACCEPTED_PRODUCT_FEATURE_REF,
         feature_commit,
     )
 
@@ -2183,7 +2209,7 @@ def _task4_bootstrap_fixture(
             f"authorities/uniep/wgrad/{feature_commit}/environment-authority.json"
         ),
         "commit": feature_commit,
-        "feature_ref": "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810",
+        "feature_ref": _ACCEPTED_PRODUCT_FEATURE_REF,
         "main_is_ancestor": True,
         "main_ref": "refs/heads/main",
         "observed_main": main_commit,

@@ -120,7 +120,9 @@ AUTHORITY_REMOTE = PRODUCTION_AUTHORITY_REMOTE
 AUTHORITY_REF = "refs/heads/main"
 PRODUCTION_PRODUCT_REMOTE = "https://gitcode.com/jzhoujg/Mega-MoE-TD.git"
 PRODUCT_REMOTE = PRODUCTION_PRODUCT_REMOTE
-PRODUCT_FEATURE_REF = "refs/heads/codex02/uniep-triton-wgrad-1p5x-20260810"
+PRODUCT_FEATURE_REF = (
+    "refs/heads/codex02/uniep-stage1-authority-consumer-20260811"
+)
 PRODUCT_MAIN_REF = "refs/heads/main"
 BIGOP_REMOTE = "https://gitcode.com/jzhoujg/bigop.git"
 BIGOP_GITLINK_PATH = "3rdparty/bigop"
