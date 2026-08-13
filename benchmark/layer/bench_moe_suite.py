@@ -979,6 +979,29 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     (f"{name}_event_ms", _stats([s[i] for s in bd_samples], device))
                     for i, name in enumerate(_bwd_stage_names)
                 )
+
+            # Combine 3-phase breakdown (serial combine: gemm / push+barrier /
+            # reduce) — splits the combine stage into its components. The serial
+            # path disables the two-stream group overlap so the phases are clean.
+            combine_phase_breakdown = None
+            if os.environ.get("MOE_BWD_COMBINE_PHASE", "1") != "0":
+                os.environ["MOE_BWD_COMBINE_SERIAL"] = "1"
+                os.environ["MOE_COMBINE_PHASE_TIMING"] = "1"
+                saved["_combine_phase_samples"] = []
+                torch.npu.synchronize(device)
+                dist.barrier(group=ep_group)
+                _cp_warmup, _cp_iters = 2, 10
+                for _ in range(_cp_warmup + _cp_iters):
+                    with torch.no_grad():
+                        moe_backward_triton(saved, dy, peer_mem)
+                os.environ.pop("MOE_BWD_COMBINE_SERIAL", None)
+                os.environ.pop("MOE_COMBINE_PHASE_TIMING", None)
+                cp_samples = saved["_combine_phase_samples"][_cp_warmup:]
+                _cp_names = ("combine_gemm", "combine_push_barrier", "combine_reduce")
+                combine_phase_breakdown = OrderedDict(
+                    (f"{name}_ms", _stats([s[i] for s in cp_samples], device))
+                    for i, name in enumerate(_cp_names)
+                )
             entry = {
                 "schema_version": 1,
                 "direction": "backward",
@@ -1006,7 +1029,10 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "keys": sorted(torch_gate_result),
                     "comparison": "untimed structure gate",
                 },
-                "diagnostics": {"backward_stage_slices": backward_breakdown},
+                "diagnostics": {
+                    "backward_stage_slices": backward_breakdown,
+                    "combine_phase_slices": combine_phase_breakdown,
+                },
             }
             if rank == 0:
                 _upsert_result(
