@@ -957,6 +957,28 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             triton_ms = triton_timing.stats["median_ms"]
             torch_ms = torch_timing.stats["median_ms"]
             speedup = torch_ms / triton_ms if triton_ms > 0 else float("inf")
+
+            # Per-stage NPU-event breakdown of the default serial backward path
+            # (dispatch / fc2_wgrad / swiglu / fc1_wgrad / combine). The library
+            # records 6 events -> 5 intervals, MAX-reduced across ranks, appended
+            # to saved["_bwd_stage_samples"]. MOE_BWD_BREAKDOWN=0 disables.
+            backward_breakdown = None
+            if os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0":
+                os.environ["MOE_BWD_STAGE_TIMING"] = "1"
+                saved["_bwd_stage_samples"] = []
+                torch.npu.synchronize(device)
+                dist.barrier(group=ep_group)
+                _bd_warmup = max(1, BACKWARD_TIMING.warmup)
+                for _ in range(_bd_warmup + BACKWARD_TIMING.iterations):
+                    with torch.no_grad():
+                        moe_backward_triton(saved, dy, peer_mem)
+                os.environ.pop("MOE_BWD_STAGE_TIMING", None)
+                bd_samples = saved["_bwd_stage_samples"][_bd_warmup:]
+                _bwd_stage_names = ("dispatch", "fc2_wgrad", "swiglu", "fc1_wgrad", "combine")
+                backward_breakdown = OrderedDict(
+                    (f"{name}_event_ms", _stats([s[i] for s in bd_samples], device))
+                    for i, name in enumerate(_bwd_stage_names)
+                )
             entry = {
                 "schema_version": 1,
                 "direction": "backward",
@@ -984,6 +1006,7 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
                     "keys": sorted(torch_gate_result),
                     "comparison": "untimed structure gate",
                 },
+                "diagnostics": {"backward_stage_slices": backward_breakdown},
             }
             if rank == 0:
                 _upsert_result(
