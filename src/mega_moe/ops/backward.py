@@ -105,9 +105,10 @@ def moe_backward_triton(saved, dy, peer_mem):
     # their cube GEMMs overlap with step2 (swiglu, vector) and step4 (combine,
     # mostly vector push). Dependency: step3 needs only step1's grad_fc2_out_sorted;
     # step5 needs only step2's grad_fc1_output — neither needs the prior wgrad nor
-    # step4 (verified against the golden's per-op deps). expert_counts is invariant,
-    # so cache its list once to drop the per-call host sync. Roll back with
-    # MOE_WGRAD_NOSTREAM=1.
+    # step4 (verified against the golden's per-op deps). expert_counts is
+    # invariant; the torch wgrad path derives its python list lazily (only when
+    # MOE_WGRAD_TORCH=1), so the default npu/triton paths pay no host sync.
+    # Roll back with MOE_WGRAD_NOSTREAM=1.
     # NOTE: torch.npu.Stream is a *software* stream — it does NOT map to separate
     # cube/vector engines, so a wgrad on a side stream just contends with the main
     # stream's triton kernels for the same NPU queue. With torch's per-expert wgrad
@@ -117,7 +118,6 @@ def moe_backward_triton(saved, dy, peer_mem):
     # opt back in with MOE_WGRAD_STREAM=1 for experimentation.
     use_side_stream = os.environ.get("MOE_WGRAD_STREAM") == "1"
     ec = saved["expert_counts"]
-    ec_list = ec.cpu().tolist()  # one sync, reused by both wgrads
     wgrad_stream = torch.npu.Stream() if use_side_stream else None
 
     def _run_wgrad(fn, *args):
@@ -141,7 +141,7 @@ def moe_backward_triton(saved, dy, peer_mem):
             saved["split_size_cum_per_expert"])
     elif use_torch_wgrad:
         grad_fc2 = _run_wgrad(_grouped_wgrad_torch,
-            grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec, ec_list)
+            grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
     else:
         grad_fc2 = _run_wgrad(_grouped_wgrad_npu,
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec)
@@ -157,7 +157,7 @@ def moe_backward_triton(saved, dy, peer_mem):
             saved["split_size_cum_per_expert"])
     elif use_torch_wgrad:
         grad_fc1 = _run_wgrad(_grouped_wgrad_torch,
-            grad_fc1_output, saved["recv_hidden_sorted"], ec, ec_list)
+            grad_fc1_output, saved["recv_hidden_sorted"], ec)
     else:
         grad_fc1 = _run_wgrad(_grouped_wgrad_npu,
             grad_fc1_output, saved["recv_hidden_sorted"], ec)
