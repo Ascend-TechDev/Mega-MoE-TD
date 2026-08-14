@@ -769,6 +769,11 @@ def _launch_fc2_remote_store_pipeline(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_K=block_k,
+                **(
+                    {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
+                    if block_m * block_n > 128 * 256
+                    else {}
+                ),
             )
             group_events[group_id].record(cube_stream)
 
