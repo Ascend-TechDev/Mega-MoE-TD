@@ -14,6 +14,10 @@ _DISPATCH_FC1_SCHEDULES = (
 _MAX_FC1_GEMM_BLOCK_SIZE_M = 256
 _MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
+# FC2 uses the same FP32 Cube accumulator limit.  The transport tile is tuned
+# independently, so this bound applies only to the local expert GEMM.
+_MAX_FC2_GEMM_BLOCK_SIZE_M = 256
+_MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
 # Supported post-FC1 gated activations.  swiglu is silu(gate) * up;
 # situglu is beta * tanh(gate / beta) * sigmoid(gate) * up (with an
@@ -94,7 +98,7 @@ class MoEForwardConfig:
     dispatch_fc1_block_size_m: int = 128
     fc1_gemm_block_size_n: int = 256
     fc1_gemm_block_size_k: int = 128
-    fc2_combine_block_size_m: int = 128
+    fc2_combine_block_size_m: int = 256
     fc2_gemm_block_size_n: int = 256
     fc2_gemm_block_size_k: int = 128
     dispatch_fc1_schedule: str = "allcore_expert_n_tile"
@@ -145,6 +149,21 @@ class MoEForwardConfig:
             raise ValueError(
                 "fc1 GEMM M*N tile must be no larger than "
                 f"{_MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS} elements on the current "
+                "Ascend backend"
+            )
+
+        if self.fc2_combine_block_size_m > _MAX_FC2_GEMM_BLOCK_SIZE_M:
+            raise ValueError(
+                "fc2_combine_block_size_m must be no larger than "
+                f"{_MAX_FC2_GEMM_BLOCK_SIZE_M} on the current Ascend backend"
+            )
+        if (
+            self.fc2_combine_block_size_m * self.fc2_gemm_block_size_n
+            > _MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS
+        ):
+            raise ValueError(
+                "FC2 GEMM M*N tile must be no larger than "
+                f"{_MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS} elements on the current "
                 "Ascend backend"
             )
 
