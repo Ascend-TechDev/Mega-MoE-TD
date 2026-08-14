@@ -19,6 +19,8 @@ from typing import Iterator
 import torch
 import torch.distributed as dist
 
+from mega_moe.kernels.combine_fc1_bwd import GATE_PAD
+
 try:  # Keep registry/collection checks usable on a CPU-only Python install.
     import torch_npu  # noqa: F401
 except ImportError:  # pragma: no cover - exercised only outside Ascend.
@@ -111,7 +113,7 @@ def make_peer_mem(saved, dtype, rank):
     """
     if ash is None:
         raise RuntimeError("ACLSHMEM support is unavailable in this Python environment")
-    local_elems = max(saved["total_recv"], saved["total_send"]) * saved["hidden_dim"]
+    local_elems = max(saved["total_recv"], saved["total_send"]) * (saved["hidden_dim"] + GATE_PAD)
     t = torch.tensor([local_elems], dtype=torch.int64, device=f"npu:{rank}")
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=saved["ep_group"])
     peer_elems = int(t.item())

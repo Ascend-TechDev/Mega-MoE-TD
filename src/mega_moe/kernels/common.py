@@ -36,6 +36,19 @@ def ncore():
     return validate_physical_aicore_count(NPUUtils().get_aicore_num())
 
 
+def nvec():
+    """Return the device-reported physical AIVector core count.
+
+    Used as the launch grid for the pure-Vector pipeline kernels (push/reduce),
+    mirroring the forward FC2-combine pipeline. Falls back to ``ncore()`` if the
+    driver reports a non-positive value (older CANN on 910B1).
+    """
+    value = NPUUtils().get_aivector_core_num()
+    if type(value) is not int or value <= 0:
+        return ncore()
+    return value
+
+
 def validate_physical_aicore_count(value):
     """Require an exact positive device-reported physical AICore count.
 

@@ -9,6 +9,11 @@ _DISPATCH_FC1_SCHEDULES = (
     "allcore_expert_n_tile",
 )
 
+# The mixed FC1 kernel has been validated through a 256-row GEMM window on
+# the current Ascend backend. Larger FP32 accumulators can fail in codegen.
+_MAX_FC1_GEMM_BLOCK_SIZE_M = 256
+_MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
+
 
 # Supported post-FC1 gated activations.  swiglu is silu(gate) * up;
 # situglu is beta * tanh(gate / beta) * sigmoid(gate) * up (with an
@@ -66,8 +71,8 @@ class MoEForwardConfig:
     remain independent because they have different shapes and data-movement
     paths.
 
-    ``dispatch_fc1_block_size_m`` controls both dispatch readiness slots and
-    FC1 dot rows; ``fc1_gemm_block_size_{n,k}`` control the other FC1 dot axes.
+    ``dispatch_fc1_block_size_m`` controls dispatch readiness slots.
+    ``fc1_gemm_block_size_{m,n,k}`` independently control the FC1 dot axes.
     Likewise, ``fc2_combine_block_size_m`` controls the FC2 GEMM row tile and
     ``fc2_gemm_block_size_{n,k}`` control the remaining FC2 dot axes.  FC2 uses
     the validated coarse expert-group Cube/Vector stream, fixed remote-store
@@ -99,6 +104,8 @@ class MoEForwardConfig:
     activation: str = "swiglu"
     situ_beta: float = 1.0
     situ_linear_beta: Optional[float] = None
+    # Appended to preserve positional construction of the older config fields.
+    fc1_gemm_block_size_m: int = 256
 
     def __post_init__(self):
         object.__setattr__(
@@ -116,6 +123,7 @@ class MoEForwardConfig:
 
         for name, value in (
             ("dispatch_fc1_block_size_m", self.dispatch_fc1_block_size_m),
+            ("fc1_gemm_block_size_m", self.fc1_gemm_block_size_m),
             ("fc1_gemm_block_size_n", self.fc1_gemm_block_size_n),
             ("fc1_gemm_block_size_k", self.fc1_gemm_block_size_k),
             ("fc2_combine_block_size_m", self.fc2_combine_block_size_m),
@@ -124,6 +132,21 @@ class MoEForwardConfig:
         ):
             if value < 16 or value & (value - 1):
                 raise ValueError(f"{name} must be a power of two no smaller than 16")
+
+        if self.fc1_gemm_block_size_m > _MAX_FC1_GEMM_BLOCK_SIZE_M:
+            raise ValueError(
+                "fc1_gemm_block_size_m must be no larger than "
+                f"{_MAX_FC1_GEMM_BLOCK_SIZE_M} on the current Ascend backend"
+            )
+        if (
+            self.fc1_gemm_block_size_m * self.fc1_gemm_block_size_n
+            > _MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS
+        ):
+            raise ValueError(
+                "fc1 GEMM M*N tile must be no larger than "
+                f"{_MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS} elements on the current "
+                "Ascend backend"
+            )
 
         if self.receive_capacity_factor is not None and self.receive_capacity_factor < 1.0:
             raise ValueError("receive_capacity_factor must be at least 1")

@@ -17,6 +17,7 @@ from .common import (  # noqa: F401
     WGRAD_BLOCK_N,
     WGRAD_BLOCK_K,
     ncore,
+    nvec,
     all_gather_list,
 )
 from .swiglu_bwd import swiglu_bwd_triton, kernel_swiglu_bwd  # noqa: F401
@@ -29,5 +30,4 @@ from .dispatch_fc2_bwd import (  # noqa: F401
 )
 from .combine_fc1_bwd import (  # noqa: F401
     combine_fc1_bwd_triton,
-    kernel_combine_fc1_bwd,
 )

@@ -2,11 +2,11 @@
 """BF16 Ascend Triton kernel for MoE FC2 and distributed combine.
 
 The input rows are already grouped as local-expert major, then source-rank
-major.  Routing weights were applied by weighted SwiGLU before this stage.
-This module therefore performs only FC2, route-output transport, and the final
-top-k reduction.  Vector programs resolve each source rank's symmetric combine
-workspace and store contiguous source/expert FC2 tiles there before reducing
-locally.
+major.  The production pipeline computes weighted SwiGLU on the Vector stream,
+feeds FC2 on the Cube stream, and then performs route-output transport and the
+final top-k reduction.  Vector programs resolve each source rank's symmetric
+combine workspace and store contiguous source/expert FC2 tiles there before
+reducing locally.
 """
 
 import torch
@@ -15,6 +15,12 @@ import triton.language as tl
 from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
+
+from .weighted_swiglu import (
+    _BLOCK_M as _WEIGHTED_BLOCK_M,
+    _BLOCK_N as _WEIGHTED_BLOCK_N,
+    _weighted_activation_expert_group_kernel,
+)
 
 
 _META_BLOCK = 256
@@ -676,6 +682,13 @@ def _launch_fc2_remote_store_pipeline(
     group_events,
     start_event,
     done_event,
+    activation_events,
+    activation_fc1_output,
+    activation_routing_weights,
+    activation_id: int = 0,
+    activation_situ_beta: float = 1.0,
+    activation_situ_linear_beta: float = 0.0,
+    activation_has_linear_beta: bool = False,
 ) -> None:
     """Overlap coarse Cube groups and Vector remote-store groups.
 
@@ -696,6 +709,10 @@ def _launch_fc2_remote_store_pipeline(
         raise ValueError("FC2 pipeline requires one event per expert group")
     if start_event is None or done_event is None:
         raise ValueError("FC2 pipeline start and completion events must be provided")
+    if activation_events is None or len(activation_events) < num_groups:
+        raise ValueError("FC2 production pipeline requires one activation event per expert group")
+    if activation_fc1_output is None or activation_routing_weights is None:
+        raise ValueError("FC2 production pipeline requires shadow activation inputs")
 
     current_stream = torch.npu.current_stream(weighted_activation.device)
     start_event.record(current_stream)
@@ -704,9 +721,33 @@ def _launch_fc2_remote_store_pipeline(
 
     N = down_weight.shape[1]
     K = down_weight.shape[2]
+    # Queue every activation group before transport. Cube consumes each group
+    # as soon as its event fires while Vector produces later groups; transport
+    # follows after the activation producer tail.
+    with torch.npu.stream(vector_stream):
+        for group_id in range(num_groups):
+            _weighted_activation_expert_group_kernel[(num_vector_programs,)](
+                activation_fc1_output,
+                activation_routing_weights,
+                weighted_activation,
+                received_expert_offsets,
+                group_id,
+                K,
+                activation_situ_beta,
+                activation_situ_linear_beta,
+                BLOCK_M=_WEIGHTED_BLOCK_M,
+                BLOCK_N=_WEIGHTED_BLOCK_N,
+                ACTIVATION=activation_id,
+                HAS_LINEAR_BETA=activation_has_linear_beta,
+                GROUP_EXPERTS=pipeline_group_experts,
+                EXPERTS_PER_RANK=experts_per_rank,
+            )
+            activation_events[group_id].record(vector_stream)
+
     for group_id in range(num_groups):
         first_expert = group_id * pipeline_group_experts
         last_expert = min(first_expert + pipeline_group_experts, experts_per_rank)
+        cube_stream.wait_event(activation_events[group_id])
         with torch.npu.stream(cube_stream):
             _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
                 weighted_activation,
@@ -731,8 +772,9 @@ def _launch_fc2_remote_store_pipeline(
             )
             group_events[group_id].record(cube_stream)
 
-        vector_stream.wait_event(group_events[group_id])
-        with torch.npu.stream(vector_stream):
+    with torch.npu.stream(vector_stream):
+        for group_id in range(num_groups):
+            vector_stream.wait_event(group_events[group_id])
             _kernel_remote_store_transport_group[(num_vector_programs, 1, 1)](
                 fc2_buf,
                 peer_mem,
@@ -760,7 +802,7 @@ def _launch_fc2_remote_store_pipeline(
     current_stream.wait_event(done_event)
 
 
-def launch_fc2_combine(
+def _launch_fc2_combine(
     weighted_activation: torch.Tensor,
     down_weight: torch.Tensor,
     fc2_buf: torch.Tensor,
@@ -792,6 +834,13 @@ def launch_fc2_combine(
     pipeline_group_events,
     pipeline_start_event,
     pipeline_done_event,
+    pipeline_activation_events,
+    activation_fc1_output,
+    activation_routing_weights,
+    activation_id: int = 0,
+    activation_situ_beta: float = 1.0,
+    activation_situ_linear_beta: float = 0.0,
+    activation_has_linear_beta: bool = False,
 ) -> torch.Tensor:
     """Launch pipelined FC2, remote-store transport, and local reduction."""
     if weighted_activation.ndim != 2 or down_weight.ndim != 3:
@@ -861,6 +910,41 @@ def launch_fc2_combine(
         raise ValueError("all FC2/combine tensors must be on the same device")
     if any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("all FC2/combine tensors must be contiguous")
+    activation_args = (
+        activation_fc1_output,
+        activation_routing_weights,
+        pipeline_activation_events,
+    )
+    if any(value is None for value in activation_args):
+        raise ValueError("production FC2 requires all shadow activation arguments")
+    if activation_fc1_output.shape != (M, 2 * K):
+        raise ValueError(
+            "shadow activation FC1 output must have shape [M, 2 * K]"
+        )
+    if activation_fc1_output.dtype != torch.bfloat16:
+        raise TypeError("shadow activation FC1 output must use torch.bfloat16")
+    if activation_routing_weights.shape != (M,):
+        raise ValueError("shadow activation routing weights must have shape [M]")
+    if activation_routing_weights.dtype != torch.float32:
+        raise TypeError("shadow activation routing weights must use torch.float32")
+    if (
+        activation_fc1_output.device != weighted_activation.device
+        or activation_routing_weights.device != weighted_activation.device
+    ):
+        raise ValueError("shadow activation tensors must be on the FC2 device")
+    if (
+        not activation_fc1_output.is_contiguous()
+        or not activation_routing_weights.is_contiguous()
+    ):
+        raise ValueError("shadow activation tensors must be contiguous")
+    if activation_id not in (0, 1):
+        raise ValueError("activation_id must select SwiGLU (0) or SiTU-GLU (1)")
+    if activation_situ_beta <= 0.0:
+        raise ValueError("activation_situ_beta must be positive")
+    if activation_has_linear_beta and activation_situ_linear_beta <= 0.0:
+        raise ValueError(
+            "activation_situ_linear_beta must be positive when enabled"
+        )
     metadata_tensors = (
         route_to_send,
         received_routes_per_expert,
@@ -950,6 +1034,13 @@ def launch_fc2_combine(
         group_events=pipeline_group_events,
         start_event=pipeline_start_event,
         done_event=pipeline_done_event,
+        activation_events=pipeline_activation_events,
+        activation_fc1_output=activation_fc1_output,
+        activation_routing_weights=activation_routing_weights,
+        activation_id=activation_id,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+        activation_has_linear_beta=activation_has_linear_beta,
     )
     # The remote-store barrier fences every route row before local reduction.
     _kernel_local_topk_reduce[(num_vector_programs, 1, 1)](
@@ -972,5 +1063,4 @@ def launch_fc2_combine(
 __all__ = [
     "build_route_to_send",
     "prepare_fc2_remote_store_metadata",
-    "launch_fc2_combine",
 ]

@@ -80,7 +80,8 @@ def _kernel_dispatch_fc1(
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     FINAL_BARRIER: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
+    DISPATCH_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
@@ -110,7 +111,7 @@ def _kernel_dispatch_fc1(
                 send_bucket_starts_ptr, send_counts_re_ptr,
                 signal_epoch, hidden, stride_input_m,
                 LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
-                MAX_SOURCE_TILES, BLOCK_SIZE_M)
+                MAX_SOURCE_TILES, DISPATCH_BLOCK_SIZE_M)
     with al.scope(core_mode="cube", disable_auto_sync=True):
         _triton_grouped_gemm_expert_n_merged_tiles_wait(
             pid, NUM_PROGRAM_CORES,
@@ -120,7 +121,8 @@ def _kernel_dispatch_fc1(
             N, K, stride_input_m, stride_input_k,
             stride_weight_0, stride_weight_1, stride_weight_2,
             stride_output_m, stride_output_n,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            DISPATCH_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_M,
+            BLOCK_SIZE_N, BLOCK_SIZE_K,
             WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, dtype)
 
     # Standalone dispatch must finish globally before its single receive
@@ -173,7 +175,7 @@ def _dispatch_one_source_tile_task(
     LOCAL_RANK: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
+    DISPATCH_BLOCK_SIZE_M: tl.constexpr,
 ):
     """Dispatch the source-local tiles assigned to one lane of a nonempty bucket."""
     task_start = tl.load(send_bucket_starts_ptr + task_id)
@@ -181,11 +183,14 @@ def _dispatch_one_source_tile_task(
     task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
     dst_rank = task_id // EXPERTS_PER_RANK
     expert_id = task_id % EXPERTS_PER_RANK
-    num_source_tiles = tl.cdiv(task_count, BLOCK_SIZE_M)
+    num_source_tiles = tl.cdiv(task_count, DISPATCH_BLOCK_SIZE_M)
 
     for source_tile in range(task_lane, num_source_tiles, task_cores):
-        tile_start = source_tile * BLOCK_SIZE_M
-        tile_count = tl.minimum(BLOCK_SIZE_M, task_count - tile_start)
+        tile_start = source_tile * DISPATCH_BLOCK_SIZE_M
+        tile_count = tl.minimum(
+            DISPATCH_BLOCK_SIZE_M,
+            task_count - tile_start,
+        )
         for tile_token in range(tile_count):
             send_idx = task_start + tile_start + tile_token
             src_idx = tl.load(send_src_idx_ptr + send_idx)
@@ -287,7 +292,8 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
     stride_output_m, stride_output_n,
-    BLOCK_SIZE_M: tl.constexpr,
+    DISPATCH_BLOCK_SIZE_M: tl.constexpr,
+    GEMM_BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -312,11 +318,11 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
         expert_off = tl.load(recv_expert_offs_ptr + expert_id)
 
         if expert_size > 0:
-            num_m_windows = tl.cdiv(expert_size, BLOCK_SIZE_M)
+            num_m_windows = tl.cdiv(expert_size, GEMM_BLOCK_SIZE_M)
             for m_window in range(0, num_m_windows):
-                window_start = m_window * BLOCK_SIZE_M
+                window_start = m_window * GEMM_BLOCK_SIZE_M
                 window_size = tl.minimum(
-                    BLOCK_SIZE_M,
+                    GEMM_BLOCK_SIZE_M,
                     expert_size - window_start,
                 )
                 window_end = window_start + window_size
@@ -337,10 +343,10 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
                     if overlap_start < overlap_end:
                         first_source_tile = (
                             overlap_start - source_start
-                        ) // BLOCK_SIZE_M
+                        ) // DISPATCH_BLOCK_SIZE_M
                         last_source_tile = (
                             overlap_end - source_start - 1
-                        ) // BLOCK_SIZE_M
+                        ) // DISPATCH_BLOCK_SIZE_M
                         for source_tile in range(
                             first_source_tile,
                             last_source_tile + 1,
@@ -368,7 +374,7 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
                     stride_input_m, stride_input_k,
                     stride_weight_0, stride_weight_1, stride_weight_2,
                     stride_output_m, stride_output_n,
-                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, dtype)
+                    GEMM_BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, dtype)
 
 
 @triton.jit

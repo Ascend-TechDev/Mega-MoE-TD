@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .common import ncore
+from .common import nvec
 
 
 @triton.jit
@@ -22,9 +22,9 @@ def kernel_swiglu_bwd(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    ncore = tl.num_programs(axis=0)
+    nprogs = tl.num_programs(axis=0)
     offs = tl.arange(0, BLOCK_SIZE)
-    for row in range(pid, n_rows, ncore):
+    for row in range(pid, n_rows, nprogs):
         r64 = row.to(tl.int64)
         a_ptr = AB_ptr + r64 * AB_stride          # gate half
         b_ptr = a_ptr + ffn                        # up half
@@ -51,7 +51,9 @@ def swiglu_bwd_triton(grad_swiglu, fc1_output, recv_weights_sorted):
     dAB = torch.empty_like(fc1_output)
     dscale = torch.empty(M, dtype=fc1_output.dtype, device=fc1_output.device)
     BLOCK_SIZE = triton.next_power_of_2(ffn)
-    kernel_swiglu_bwd[(ncore(), 1, 1)](
+    # Pure-vector elementwise kernel: launch on nvec() (48) not ncore() (24) to
+    # use both vector lanes per AI core — 2x the vector-core parallelism.
+    kernel_swiglu_bwd[(nvec(), 1, 1)](
         grad_swiglu, grad_swiglu.stride(0), fc1_output, fc1_output.stride(0),
         ffn, recv_weights_sorted, dAB, dscale, M, BLOCK_SIZE=BLOCK_SIZE, num_warps=8,
         use_bytecode=True)
