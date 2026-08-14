@@ -17,8 +17,8 @@ from ..kernels.fc2_combine import (
     _FC2_REMOTE_STORE_BLOCK,
     _FC2_TRANSPORT_BLOCK_M,
     _fc2_reduce_block_n,
+    _launch_fc2_combine,
     build_route_to_send,
-    launch_fc2_combine,
     prepare_fc2_remote_store_metadata,
 )
 from ..runtime.routing import (
@@ -26,7 +26,6 @@ from ..runtime.routing import (
     build_routing_plan,
 )
 from ..runtime.workspace import create_moe_forward_context
-from ..kernels.weighted_swiglu import weighted_swiglu_forward
 
 
 _FC2_PIPELINE_GROUP_EXPERTS = 16
@@ -48,9 +47,8 @@ class FusedMoEForward(torch.nn.Module):
 
     Dispatch and FC1 overlap through per-source-tile readiness signals in the
     fixed all-core expert/N-tile pipeline.
-    ``dispatch_fc1_weighted_swiglu`` extends the supported path
-    through weighted SwiGLU. FC2, route transport, route restoration, and
-    top-k reduction then run in the dedicated combine kernels. Instances are
+    The production full path shadows weighted activation under FC2, route
+    transport, route restoration, and top-k reduction. Instances are
     single-in-flight because their workspaces, streams, and events are reused.
     """
 
@@ -136,6 +134,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
         self._combine_pipeline_group_events = []
+        self._combine_pipeline_activation_events = []
         self._combine_pipeline_start_event = None
         self._combine_pipeline_done_event = None
         self._route_to_send = None
@@ -176,6 +175,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
         self._combine_pipeline_group_events = []
+        self._combine_pipeline_activation_events = []
         self._combine_pipeline_start_event = None
         self._combine_pipeline_done_event = None
         self._route_to_send = None
@@ -231,7 +231,10 @@ class FusedMoEForward(torch.nn.Module):
             self.experts_per_rank * self.world_size
         )
 
-    def _ensure_group_pipeline_runtime(self, group_experts: int):
+    def _ensure_group_pipeline_runtime(
+        self,
+        group_experts: int,
+    ):
         """Create reusable streams/events for the coarse FC2 pipeline."""
         device = self.context.peer_mem.device
         if self._combine_pipeline_cube_stream is None:
@@ -244,6 +247,8 @@ class FusedMoEForward(torch.nn.Module):
         ) // group_experts
         while len(self._combine_pipeline_group_events) < num_groups:
             self._combine_pipeline_group_events.append(torch.npu.Event())
+        while len(self._combine_pipeline_activation_events) < num_groups:
+            self._combine_pipeline_activation_events.append(torch.npu.Event())
 
     def _validate_topk_indices(self, selected_experts: torch.Tensor):
         if selected_experts.ndim != 2:
@@ -294,6 +299,42 @@ class FusedMoEForward(torch.nn.Module):
             )
         if not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous")
+
+    def _validate_gate_up_weight(
+        self,
+        gate_up_weight: torch.Tensor,
+        device: torch.device,
+    ):
+        if gate_up_weight.ndim != 3:
+            raise ValueError(
+                "gate_up_weight must have shape [experts_per_rank, hidden, 2F]"
+            )
+        if gate_up_weight.shape[0] != self.experts_per_rank:
+            raise ValueError(
+                f"gate_up_weight has {gate_up_weight.shape[0]} local experts, "
+                f"expected {self.experts_per_rank}"
+            )
+        if gate_up_weight.shape[1] != self.hidden_size:
+            raise ValueError(
+                "gate_up_weight must use [experts_per_rank, hidden, 2F] layout "
+                f"with hidden_size={self.hidden_size}, got {tuple(gate_up_weight.shape)}"
+            )
+        packed_output_size = gate_up_weight.shape[2]
+        if packed_output_size <= 0 or packed_output_size % 2:
+            raise ValueError(
+                "gate_up_weight output dimension must be a positive even value (2F)"
+            )
+        if gate_up_weight.dtype != self.activation_dtype:
+            raise TypeError(
+                f"gate_up_weight must use {self.activation_dtype}, "
+                f"got {gate_up_weight.dtype}"
+            )
+        if gate_up_weight.device != device:
+            raise ValueError("gate_up_weight and hidden_states must be on the same device")
+        if not gate_up_weight.is_contiguous():
+            raise ValueError(
+                "gate_up_weight must be contiguous and pre-packed before forward"
+            )
 
     # ===================== routing metadata =========================
     def build_routing_plan(
@@ -448,7 +489,8 @@ class FusedMoEForward(torch.nn.Module):
         _, output_size, reduction_size = weight_for_gemm.shape
         block_n = self.config.fc1_gemm_block_size_n
         block_k = self.config.fc1_gemm_block_size_k
-        block_m = self.config.dispatch_fc1_block_size_m
+        dispatch_block_m = self.config.dispatch_fc1_block_size_m
+        gemm_block_m = self.config.fc1_gemm_block_size_m
         if output_size % block_n or reduction_size % block_k:
             raise ValueError(
                 "FC1 block_n and block_k must divide the output and reduction dimensions"
@@ -515,9 +557,15 @@ class FusedMoEForward(torch.nn.Module):
             EXPERTS_PER_RANK=self.experts_per_rank,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             FINAL_BARRIER=final_barrier,
-            BLOCK_SIZE_M=block_m,
+            DISPATCH_BLOCK_SIZE_M=dispatch_block_m,
+            GEMM_BLOCK_SIZE_M=gemm_block_m,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
+            **(
+                {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
+                if gemm_block_m * block_n > 128 * 256
+                else {}
+            ),
         )
         self._tile_signal_epoch += 1
 
@@ -535,112 +583,27 @@ class FusedMoEForward(torch.nn.Module):
             send_route_indices=send_route_indices,
         )
 
-    def weighted_swiglu(
-        self,
-        dispatch_result: DispatchFC1Result,
-    ) -> torch.Tensor:
-        """Apply the configured gated activation and route scaling in FP32.
-
-        self.activation selects SwiGLU or SiTU-GLU.  The activation
-        parameters are ignored for the default SwiGLU path.
-        """
-        return weighted_swiglu_forward(
-            dispatch_result.fc1_output,
-            dispatch_result.received_routing_weights,
-            self.num_aivector_programs,
-            activation=self.activation,
-            situ_beta=self.situ_beta,
-            situ_linear_beta=self.situ_linear_beta,
-        )
-
-    def dispatch_fc1_weighted_swiglu(
-        self,
-        hidden_states: torch.Tensor,
-        selected_experts: torch.Tensor,
-        routing_weights: torch.Tensor,
-        gate_up_weight: torch.Tensor,
-        *,
-        final_dispatch_barrier: bool = True,
-    ):
-        """Build routing, run dispatch+FC1, then weighted SwiGLU."""
-        self._validate_dispatch_inputs(hidden_states, selected_experts)
-        if gate_up_weight.ndim != 3:
-            raise ValueError(
-                "gate_up_weight must have shape [experts_per_rank, hidden, 2F]"
-            )
-        if gate_up_weight.shape[0] != self.experts_per_rank:
-            raise ValueError(
-                f"gate_up_weight has {gate_up_weight.shape[0]} local experts, "
-                f"expected {self.experts_per_rank}"
-            )
-        if gate_up_weight.shape[1] != self.hidden_size:
-            raise ValueError(
-                "gate_up_weight must use [experts_per_rank, hidden, 2F] layout "
-                f"with hidden_size={self.hidden_size}, got {tuple(gate_up_weight.shape)}"
-            )
-        packed_output_size = gate_up_weight.shape[2]
-        if packed_output_size <= 0 or packed_output_size % 2:
-            raise ValueError(
-                "gate_up_weight output dimension must be a positive even value (2F)"
-            )
-        if gate_up_weight.dtype != self.activation_dtype:
-            raise TypeError(
-                f"gate_up_weight must use {self.activation_dtype}, "
-                f"got {gate_up_weight.dtype}"
-            )
-        if gate_up_weight.device != hidden_states.device:
-            raise ValueError(
-                "gate_up_weight and hidden_states must be on the same device"
-            )
-        if not gate_up_weight.is_contiguous():
-            raise ValueError(
-                "gate_up_weight must be contiguous and pre-packed before forward"
-            )
-
-        routing_plan = self.build_routing_plan(selected_experts)
-        dispatch_result = self.dispatch_fc1(
-            hidden_states,
-            selected_experts,
-            routing_plan,
-            gate_up_weight,
-            routing_weights=routing_weights,
-            final_barrier=final_dispatch_barrier,
-        )
-        weighted_activation = self.weighted_swiglu(dispatch_result)
-        return weighted_activation, dispatch_result
-
     # ===================== FC2 + combine ============================
-    def fc2_combine(
+    def _fc2_combine_shadow_activation(
         self,
-        weighted_activation: torch.Tensor,
         down_weight: torch.Tensor,
         dispatch_result: DispatchFC1Result,
-        combine_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run BF16 FC2, reverse all-to-all, route restore, and top-k sum."""
-        if weighted_activation.ndim != 2:
-            raise ValueError(
-                "weighted_activation must have shape [received_routes, ffn_dim]"
-            )
+        """Produce grouped activation while FC2 consumes earlier groups."""
+        packed_dim = dispatch_result.fc1_output.shape[1]
+        if packed_dim <= 0 or packed_dim % 2:
+            raise ValueError("FC1 output dimension must be a positive even value")
+        weighted_activation = torch.empty(
+            (dispatch_result.routing_plan.num_received_routes, packed_dim // 2),
+            dtype=self.activation_dtype,
+            device=dispatch_result.fc1_output.device,
+        )
         num_received_routes, ffn_size = weighted_activation.shape
         plan = dispatch_result.routing_plan
-        if num_received_routes != plan.num_received_routes:
-            raise ValueError(
-                f"weighted_activation has {num_received_routes} rows but the "
-                f"routing plan requires {plan.num_received_routes}"
-            )
-        if weighted_activation.dtype != self.activation_dtype:
-            raise TypeError(
-                f"weighted_activation must use {self.activation_dtype}, "
-                f"got {weighted_activation.dtype}"
-            )
         if weighted_activation.device != self.context.peer_mem.device:
             raise ValueError(
                 "weighted_activation must be on the operator's NPU device"
             )
-        if not weighted_activation.is_contiguous():
-            raise ValueError("weighted_activation must be contiguous")
-
         expected_weight_shape = (
             self.experts_per_rank,
             self.hidden_size,
@@ -666,31 +629,11 @@ class FusedMoEForward(torch.nn.Module):
                 "[experts_per_rank, hidden_size, ffn_size]"
             )
 
-        expected_output_shape = (plan.num_input_tokens, self.hidden_size)
-        if combine_output is None:
-            output = torch.empty(
-                expected_output_shape,
-                dtype=self.activation_dtype,
-                device=weighted_activation.device,
-            )
-        else:
-            output = combine_output
-            if output.shape != expected_output_shape:
-                raise ValueError(
-                    f"combine_output must have shape {expected_output_shape}, "
-                    f"got {tuple(output.shape)}"
-                )
-            if output.dtype != self.activation_dtype:
-                raise TypeError(
-                    f"combine_output must use {self.activation_dtype}, "
-                    f"got {output.dtype}"
-                )
-            if output.device != weighted_activation.device:
-                raise ValueError(
-                    "combine_output and weighted_activation must be on the same device"
-                )
-            if not output.is_contiguous():
-                raise ValueError("combine_output must be contiguous")
+        output = torch.empty(
+            (plan.num_input_tokens, self.hidden_size),
+            dtype=self.activation_dtype,
+            device=weighted_activation.device,
+        )
 
         block_n = self.config.fc2_gemm_block_size_n
         block_k = self.config.fc2_gemm_block_size_k
@@ -706,7 +649,7 @@ class FusedMoEForward(torch.nn.Module):
         pipeline_group_experts = combine_metadata["pipeline_group_experts"]
         reduce_block_n = _fc2_reduce_block_n(num_received_routes)
         self._ensure_group_pipeline_runtime(pipeline_group_experts)
-        launch_fc2_combine(
+        _launch_fc2_combine(
             weighted_activation,
             down_weight,
             fc2_workspace,
@@ -737,6 +680,17 @@ class FusedMoEForward(torch.nn.Module):
             pipeline_group_events=self._combine_pipeline_group_events,
             pipeline_start_event=self._combine_pipeline_start_event,
             pipeline_done_event=self._combine_pipeline_done_event,
+            pipeline_activation_events=self._combine_pipeline_activation_events,
+            activation_fc1_output=dispatch_result.fc1_output,
+            activation_routing_weights=dispatch_result.received_routing_weights,
+            activation_id=0 if self.activation == "swiglu" else 1,
+            activation_situ_beta=float(self.situ_beta),
+            activation_situ_linear_beta=(
+                float(self.situ_linear_beta)
+                if self.situ_linear_beta is not None
+                else 0.0
+            ),
+            activation_has_linear_beta=self.situ_linear_beta is not None,
         )
         return output
 
@@ -754,16 +708,21 @@ class FusedMoEForward(torch.nn.Module):
         The caller provides selected experts and FP32 routing weights. Router
         matmul, softmax, and top-k selection are outside this boundary.
         """
-        weighted_activation, dispatch_result = self.dispatch_fc1_weighted_swiglu(
+        # Preserve the public validation order before routing launches any work.
+        self._validate_dispatch_inputs(hidden_states, selected_experts)
+        self._validate_gate_up_weight(gate_up_weight, hidden_states.device)
+        routing_plan = self.build_routing_plan(selected_experts)
+        dispatch_result = self.dispatch_fc1(
             hidden_states,
             selected_experts,
-            routing_weights,
+            routing_plan,
             gate_up_weight,
-            final_dispatch_barrier=False,
+            routing_weights=routing_weights,
+            final_barrier=False,
         )
-        # Weighted SwiGLU applies each route weight exactly once before FC2.
-        return self.fc2_combine(
-            weighted_activation,
+        # Produce expert-major activation groups on FC2's otherwise-idle
+        # Vector stream while the Cube stream consumes earlier groups.
+        return self._fc2_combine_shadow_activation(
             down_weight,
             dispatch_result,
         )
