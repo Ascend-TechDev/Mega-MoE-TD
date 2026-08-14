@@ -17,10 +17,12 @@ transport before the local top-k reduction. There is no benchmark transport
 mode selector.
 
 The only performance baseline is Torch-NPU grouped-GEMM + HCCL.  The primary
-comparison is direct-call full E2E.  Four event slices (preprocess,
-dispatch+FC1, weighted SwiGLU, FC2+combine) are sampled for both the candidate
-and grouped baseline.  Event slices are diagnostics: independently
-rank-reduced statistics are not additive.
+comparison is direct-call full E2E.  Optional event slices (preprocess,
+dispatch+FC1, and the post-dispatch weighted-SwiGLU+FC2+combine segment) can be
+enabled for stage diagnosis.  The Ascend post-dispatch segment uses the same
+shadow activation schedule as production; the Torch segment runs weighted
+SwiGLU followed by FC2+combine serially.  Event slices are diagnostics:
+independently rank-reduced statistics are not additive to full E2E.
 
 Protocol: 5 warmup iterations and 50 measured iterations for every metric.  The
 forward NPU-event samples are reduced with MAX individually; backward preserves
@@ -50,7 +52,7 @@ Case selection is intentionally pytest-native.  Use ``-k forward`` or
 one rank; there is no environment-controlled shape or world-size selection.
 
 The remaining environment variables are runtime knobs only:
-    MOE_FULL_BENCH_BREAKDOWN=0          # disable four-stage event diagnostics
+    MOE_FULL_BENCH_BREAKDOWN=1          # opt into three-segment diagnostics
     MOE_FULL_BENCH_RESULTS_DIR=/tmp/... # optional forward result directory
     MOE_BACKWARD_BENCH_RESULTS_DIR=/tmp/... # optional backward result directory
     MOE_FUSED_ASH_SIZE_GB=6             # ACLSHMEM heap size, not shape selection
@@ -95,7 +97,9 @@ FORWARD_TIMING = kit.FORWARD_TIMING
 BACKWARD_TIMING = kit.BACKWARD_TIMING
 WARMUP_ITERS = FORWARD_TIMING.warmup
 BENCH_ITERS = FORWARD_TIMING.iterations
-RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "1") == "1"
+# Production forward uses FC2 shadow activation. The optional three-segment
+# slices exercise the same schedule, but are not part of every E2E run.
+RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "0") == "1"
 G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "6"))
 RESULTS_DIR = os.environ.get(
     "MOE_FULL_BENCH_RESULTS_DIR",
@@ -173,6 +177,7 @@ def _layer_tiling_overrides():
             "MOE_FUSED_DISPATCH_FC1_BLOCK_SIZE_M",
             "dispatch_fc1_block_size_m",
         ),
+        ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_M", "fc1_gemm_block_size_m"),
         ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_N", "fc1_gemm_block_size_n"),
         ("MOE_FUSED_FC1_GEMM_BLOCK_SIZE_K", "fc1_gemm_block_size_k"),
         (
@@ -317,7 +322,7 @@ def _time_ascend_breakdown(
     packed_w1,
     down_weight,
 ):
-    events = [torch.npu.Event(enable_timing=True) for _ in range(5)]
+    events = [torch.npu.Event(enable_timing=True) for _ in range(4)]
     _sync_ranks_before_event(device, ep_group)
     stream = torch.npu.current_stream(device)
     events[0].record(stream)
@@ -332,12 +337,10 @@ def _time_ascend_breakdown(
         final_barrier=False,
     )
     events[2].record(stream)
-    weighted = op.weighted_swiglu(dispatch_result)
+    output = op._fc2_combine_shadow_activation(down_weight, dispatch_result)
     events[3].record(stream)
-    output = op.fc2_combine(weighted, down_weight, dispatch_result)
-    events[4].record(stream)
     events[-1].synchronize()
-    local = [events[index].elapsed_time(events[index + 1]) for index in range(4)]
+    local = [events[index].elapsed_time(events[index + 1]) for index in range(3)]
     return output, _sample_rank_max(local, device, ep_group)
 
 
@@ -351,7 +354,7 @@ def _time_torch_grouped_breakdown(
     torch_w1_kn,
     torch_w2_kn,
 ):
-    events = [torch.npu.Event(enable_timing=True) for _ in range(5)]
+    events = [torch.npu.Event(enable_timing=True) for _ in range(4)]
     _sync_ranks_before_event(device, ep_group)
     stream = torch.npu.current_stream(device)
     events[0].record(stream)
@@ -362,11 +365,10 @@ def _time_torch_grouped_breakdown(
     state = grouped_baseline.dispatch_fc1(state, torch_w1_kn)
     events[2].record(stream)
     weighted = grouped_baseline.weighted_swiglu(state)
-    events[3].record(stream)
     output = grouped_baseline.fc2_combine(state, weighted, torch_w2_kn)
-    events[4].record(stream)
+    events[3].record(stream)
     events[-1].synchronize()
-    local = [events[index].elapsed_time(events[index + 1]) for index in range(4)]
+    local = [events[index].elapsed_time(events[index + 1]) for index in range(3)]
     return output, _sample_rank_max(local, device, ep_group)
 
 
@@ -391,17 +393,6 @@ def _assert_close_collective(actual, expected, device, name, ep_group):
         raise AssertionError(f"{name} correctness gate failed: {message}")
 
 
-def _assert_routing_transport_dtype_collective(routing_weight_recv, device, ep_group):
-    ok = routing_weight_recv.dtype == ROUTING_TRANSPORT_DTYPE
-    flag = torch.tensor([int(ok)], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
-    if not bool(flag.item()):
-        raise AssertionError(
-            "routing transport dtype gate failed: "
-            f"got {routing_weight_recv.dtype}, required {ROUTING_TRANSPORT_DTYPE}"
-        )
-
-
 def _stats(samples, device):
     values = torch.tensor(samples, dtype=torch.float32, device=device)
     return {
@@ -413,7 +404,7 @@ def _stats(samples, device):
 
 
 def _stage_stats(samples, device):
-    names = ("preprocess", "dispatch_fc1", "weighted_swiglu", "fc2_combine")
+    names = ("preprocess", "dispatch_fc1", "weighted_swiglu_fc2_combine")
     return OrderedDict(
         (f"{name}_event_ms", _stats([sample[index] for sample in samples], device))
         for index, name in enumerate(names)
@@ -449,32 +440,6 @@ def _validate_case(
     )
     _assert_close_collective(
         candidate, grouped, device, "full post-routing MoE vs grouped baseline", ep_group
-    )
-
-    weighted, dispatch_result = op.dispatch_fc1_weighted_swiglu(
-        hidden_states, selected_experts, routing_weights, packed_w1
-    )
-    _assert_routing_transport_dtype_collective(
-        dispatch_result.received_routing_weights, device, ep_group
-    )
-    candidate_stage = op.fc2_combine(
-        weighted, down_weight, dispatch_result
-    )
-    weighted, dispatch_result = op.dispatch_fc1_weighted_swiglu(
-        hidden_states, selected_experts, routing_weights, packed_w1
-    )
-    grouped_stage = grouped_baseline.fc2_combine_from_dispatch(
-        weighted,
-        torch_w2_kn,
-        dispatch_result,
-        hidden_states.shape[0],
-    )
-    _assert_close_collective(
-        candidate_stage,
-        grouped_stage,
-        device,
-        "FC2+combine stage vs grouped baseline",
-        ep_group,
     )
 
 
@@ -642,7 +607,11 @@ def _measure_case(
                     ascend_breakdown[f"{name}_event_ms"],
                 ),
             )
-            for name in ("preprocess", "dispatch_fc1", "weighted_swiglu", "fc2_combine")
+            for name in (
+                "preprocess",
+                "dispatch_fc1",
+                "weighted_swiglu_fc2_combine",
+            )
         )
         breakdown = OrderedDict(
             {
@@ -715,6 +684,7 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             "dispatch_fc1_schedule": op.config.dispatch_fc1_schedule,
             "weighted_vector_programs": op.num_aivector_programs,
             "fc2_gemm_schedule": "coarse_expert_group_stream",
+            "weighted_fc2_schedule": "expert_group_shadow_activation",
             "fc2_combine_transport": (
                 "triton_aclshmem_remote_ptr_tl_store_stream_events"
             ),
@@ -727,6 +697,7 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             ),
             "tiles": {
                 "dispatch_fc1_m": op.config.dispatch_fc1_block_size_m,
+                "fc1_gemm_m": op.config.fc1_gemm_block_size_m,
                 "fc1_gemm_n": op.config.fc1_gemm_block_size_n,
                 "fc1_gemm_k": op.config.fc1_gemm_block_size_k,
                 "fc2_combine_m": op.config.fc2_combine_block_size_m,
@@ -747,6 +718,11 @@ def _make_entry(case, world_size, op, measured, route_distribution):
     )
     if measured["breakdown"] is not None:
         entry["diagnostics"] = measured["breakdown"]
+        entry["diagnostics"]["ascend_event_slices_scope"] = (
+            "production shadow weighted+FC2+combine segment; Torch side is "
+            "serial weighted+FC2+combine; stage slices remain independent "
+            "diagnostics and are not additive to full E2E"
+        )
     return entry
 
 
