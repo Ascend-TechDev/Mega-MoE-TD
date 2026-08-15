@@ -253,15 +253,40 @@ def _dispatch_count_derived_source_tiles(
     MAX_SOURCE_TILES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
-    """Assign cores only to nonempty buckets, then stripe each bucket's tiles."""
-    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
-    num_active_tasks = 0
-    for task_id in range(0, num_tasks):
-        task_count = tl.load(send_counts_re_ptr + task_id)
-        num_active_tasks += tl.where(task_count > 0, 1, 0)
+    """Assign expert-major source buckets to Vector cores.
 
-    if num_active_tasks > 0:
-        if num_cores >= num_active_tasks:
+    For the production shape, the raw task space is much larger than the
+    number of cores and almost every bucket is nonempty.  In that regime,
+    compacting active tasks makes every core rescan the full count matrix for
+    every task it owns.  Stripe the raw expert-major task space directly and
+    skip empty buckets instead.  Keep the compact schedule for small task
+    spaces, where multiple cores per nonempty bucket can still be useful.
+    """
+    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
+    if num_tasks > num_cores:
+        for schedule_task in range(pid, num_tasks, num_cores):
+            task_id = _full_active_task_id(
+                schedule_task, WORLD_SIZE, EXPERTS_PER_RANK)
+            task_count = tl.load(send_counts_re_ptr + task_id)
+            if task_count > 0:
+                _dispatch_one_source_tile_task(
+                    task_id, 0, 1,
+                    input_ptr, peer_mem_ptr,
+                    routing_weight_ptr, routing_weight_recv_ptr,
+                    signal_mem_ptr,
+                    send_src_idx_ptr, send_route_idx_ptr,
+                    send_bucket_dst_starts_ptr,
+                    send_bucket_starts_ptr, send_counts_re_ptr,
+                    signal_epoch, hidden, stride_input_m,
+                    LOCAL_RANK, EXPERTS_PER_RANK,
+                    MAX_SOURCE_TILES, BLOCK_SIZE_M)
+    else:
+        num_active_tasks = 0
+        for task_id in range(0, num_tasks):
+            task_count = tl.load(send_counts_re_ptr + task_id)
+            num_active_tasks += tl.where(task_count > 0, 1, 0)
+
+        if num_active_tasks > 0:
             active_task_id = pid % num_active_tasks
             task_lane = pid // num_active_tasks
             task_cores = (
@@ -285,26 +310,6 @@ def _dispatch_count_derived_source_tiles(
                 signal_epoch, hidden, stride_input_m,
                 LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
                 BLOCK_SIZE_M)
-        else:
-            for active_task_id in range(pid, num_active_tasks, num_cores):
-                if num_active_tasks == num_tasks:
-                    task_id = _full_active_task_id(
-                        active_task_id, WORLD_SIZE, EXPERTS_PER_RANK)
-                else:
-                    task_id = _find_nth_nonempty_task(
-                        send_counts_re_ptr, active_task_id, num_tasks,
-                        WORLD_SIZE, EXPERTS_PER_RANK)
-                _dispatch_one_source_tile_task(
-                    task_id, 0, 1,
-                    input_ptr, peer_mem_ptr,
-                    routing_weight_ptr, routing_weight_recv_ptr,
-                    signal_mem_ptr,
-                    send_src_idx_ptr, send_route_idx_ptr,
-                    send_bucket_dst_starts_ptr,
-                    send_bucket_starts_ptr, send_counts_re_ptr,
-                    signal_epoch, hidden, stride_input_m,
-                    LOCAL_RANK, EXPERTS_PER_RANK,
-                    MAX_SOURCE_TILES, BLOCK_SIZE_M)
 
 
 @triton.jit
