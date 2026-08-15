@@ -162,6 +162,23 @@ def _find_nth_nonempty_task(
 
 
 @triton.jit
+def _full_active_task_id(
+    active_task_id,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+):
+    """Map expert-major schedule order to rank-major metadata storage.
+
+    When every rank/expert bucket is nonempty, the dense active ordinal is
+    exactly the expert-major schedule ordinal.  Avoid rescanning the full
+    count matrix for every task while preserving the sparse fallback below.
+    """
+    expert_id = active_task_id // WORLD_SIZE
+    dst_rank = active_task_id % WORLD_SIZE
+    return dst_rank * EXPERTS_PER_RANK + expert_id
+
+
+@triton.jit
 def _dispatch_one_source_tile_task(
     task_id, task_lane, task_cores,
     input_ptr, peer_mem_ptr,
@@ -250,9 +267,13 @@ def _dispatch_count_derived_source_tiles(
             task_cores = (
                 num_cores + num_active_tasks - 1 - active_task_id
             ) // num_active_tasks
-            task_id = _find_nth_nonempty_task(
-                send_counts_re_ptr, active_task_id, num_tasks,
-                WORLD_SIZE, EXPERTS_PER_RANK)
+            if num_active_tasks == num_tasks:
+                task_id = _full_active_task_id(
+                    active_task_id, WORLD_SIZE, EXPERTS_PER_RANK)
+            else:
+                task_id = _find_nth_nonempty_task(
+                    send_counts_re_ptr, active_task_id, num_tasks,
+                    WORLD_SIZE, EXPERTS_PER_RANK)
             _dispatch_one_source_tile_task(
                 task_id, task_lane, task_cores,
                 input_ptr, peer_mem_ptr,
@@ -266,9 +287,13 @@ def _dispatch_count_derived_source_tiles(
                 BLOCK_SIZE_M)
         else:
             for active_task_id in range(pid, num_active_tasks, num_cores):
-                task_id = _find_nth_nonempty_task(
-                    send_counts_re_ptr, active_task_id, num_tasks,
-                    WORLD_SIZE, EXPERTS_PER_RANK)
+                if num_active_tasks == num_tasks:
+                    task_id = _full_active_task_id(
+                        active_task_id, WORLD_SIZE, EXPERTS_PER_RANK)
+                else:
+                    task_id = _find_nth_nonempty_task(
+                        send_counts_re_ptr, active_task_id, num_tasks,
+                        WORLD_SIZE, EXPERTS_PER_RANK)
                 _dispatch_one_source_tile_task(
                     task_id, 0, 1,
                     input_ptr, peer_mem_ptr,

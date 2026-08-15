@@ -53,6 +53,7 @@ one rank; there is no environment-controlled shape or world-size selection.
 
 The remaining environment variables are runtime knobs only:
     MOE_FULL_BENCH_BREAKDOWN=1          # opt into three-segment diagnostics
+    MOE_FULL_BENCH_WALL_CONTROL=1       # also record synchronized host wall time
     MOE_FULL_BENCH_RESULTS_DIR=/tmp/... # optional forward result directory
     MOE_BACKWARD_BENCH_RESULTS_DIR=/tmp/... # optional backward result directory
     MOE_FUSED_ASH_SIZE_GB=6             # ACLSHMEM heap size, not shape selection
@@ -100,6 +101,7 @@ BENCH_ITERS = FORWARD_TIMING.iterations
 # Production forward uses FC2 shadow activation. The optional three-segment
 # slices exercise the same schedule, but are not part of every E2E run.
 RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "0") == "1"
+RUN_WALL_CONTROL = os.environ.get("MOE_FULL_BENCH_WALL_CONTROL", "0") == "1"
 G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "6"))
 RESULTS_DIR = os.environ.get(
     "MOE_FULL_BENCH_RESULTS_DIR",
@@ -527,27 +529,56 @@ def _measure_case(
     down_weight,
     torch_w2_kn,
 ):
+    candidate_call = lambda: ascend_full_post_routing(
+        op,
+        hidden_states,
+        selected_experts,
+        packed_w1,
+        down_weight,
+        routing_weights,
+    )
+    baseline_call = lambda: grouped_baseline.full_post_routing(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        packed_w1,
+        torch_w2_kn,
+    )
     runner = kit.PerformanceRunner(
-        lambda: ascend_full_post_routing(
-            op,
-            hidden_states,
-            selected_experts,
-            packed_w1,
-            down_weight,
-            routing_weights,
-        ),
-        lambda: grouped_baseline.full_post_routing(
-            hidden_states,
-            selected_experts,
-            routing_weights,
-            packed_w1,
-            torch_w2_kn,
-        ),
+        candidate_call,
+        baseline_call,
         FORWARD_TIMING,
         device=device,
         ep_group=ep_group,
     )
     ascend_full_result, torch_grouped_full_result = runner.run()
+
+    wall_control = None
+    if RUN_WALL_CONTROL:
+        wall_timing = kit.TimingSpec(
+            warmup=WARMUP_ITERS,
+            iterations=BENCH_ITERS,
+            clock="host_wall",
+        )
+        wall_runner = kit.PerformanceRunner(
+            candidate_call,
+            baseline_call,
+            wall_timing,
+            device=device,
+            ep_group=ep_group,
+        )
+        ascend_wall, torch_grouped_wall = wall_runner.run()
+        wall_control = {
+            "protocol": wall_timing.as_dict(),
+            "ascend_full_synchronized_host_wall_ms": ascend_wall.stats,
+            "torch_npu_grouped_hccl_synchronized_host_wall_ms": (
+                torch_grouped_wall.stats
+            ),
+            "torch_npu_grouped_hccl_over_ascend_wall": _median_ratio(
+                torch_grouped_wall.stats,
+                ascend_wall.stats,
+            ),
+        }
 
     breakdown = None
     if RUN_BREAKDOWN:
@@ -628,6 +659,7 @@ def _measure_case(
     return {
         "ascend_full": ascend_full_result.stats,
         "torch_grouped_full": torch_grouped_full_result.stats,
+        "wall_control": wall_control,
         "breakdown": breakdown,
     }
 
@@ -723,6 +755,8 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             "serial weighted+FC2+combine; stage slices remain independent "
             "diagnostics and are not additive to full E2E"
         )
+    if measured["wall_control"] is not None:
+        entry["wall_clock_control"] = measured["wall_control"]
     return entry
 
 
