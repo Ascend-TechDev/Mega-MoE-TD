@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Extract readable full-forward and four-stage tables from benchmark JSON."""
+"""Extract readable full-forward and event-slice tables from benchmark JSON."""
 
 from __future__ import annotations
 
@@ -12,12 +12,20 @@ from pathlib import Path
 
 
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results" / "forward"
-DEFAULT_PATTERN = "bench_full_forward_*_grouped_routefp32_w*.json"
-STAGES = (
+DEFAULT_PATTERNS = (
+    "bench_forward_suite_w*.json",
+    "bench_full_forward_*_grouped_routefp32_w*.json",
+)
+LEGACY_STAGES = (
     ("preprocess", "preprocess"),
     ("dispatch_fc1", "dispatch+FC1"),
     ("weighted_swiglu", "weighted SwiGLU"),
     ("fc2_combine", "FC2+combine"),
+)
+CURRENT_STAGES = (
+    ("preprocess", "preprocess"),
+    ("dispatch_fc1", "dispatch+FC1"),
+    ("weighted_swiglu_fc2_combine", "weighted SwiGLU+FC2+combine"),
 )
 
 
@@ -57,12 +65,22 @@ def _parse_args() -> argparse.Namespace:
 
 def _expand_paths(requested: list[Path]) -> list[Path]:
     if not requested:
-        paths = sorted(RESULTS_DIR.glob(DEFAULT_PATTERN))
+        paths = sorted(
+            path
+            for pattern in DEFAULT_PATTERNS
+            for path in RESULTS_DIR.glob(pattern)
+        )
     else:
         paths = []
         for path in requested:
             if path.is_dir():
-                paths.extend(sorted(path.glob(DEFAULT_PATTERN)))
+                paths.extend(
+                    sorted(
+                        candidate
+                        for pattern in DEFAULT_PATTERNS
+                        for candidate in path.glob(pattern)
+                    )
+                )
             else:
                 paths.append(path)
 
@@ -80,12 +98,23 @@ def _load_entries(paths: list[Path]) -> list[dict]:
     for path in paths:
         with path.open("r", encoding="utf-8") as input_file:
             payload = json.load(input_file)
-        if not isinstance(payload, list):
-            raise ValueError(f"{path}: expected a top-level JSON array")
-        for index, entry in enumerate(payload):
+        if isinstance(payload, list):
+            file_entries = payload
+        elif (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and isinstance(payload.get("cases"), list)
+        ):
+            file_entries = payload["cases"]
+        else:
+            raise ValueError(f"{path}: expected a legacy array or schema-v1 envelope")
+        for index, entry in enumerate(file_entries):
             if not isinstance(entry, dict):
                 raise ValueError(f"{path}: entry {index} is not a JSON object")
-            status = entry.get("correctness_gates", {}).get("status")
+            correctness = entry.get("correctness_gate") or entry.get(
+                "correctness_gates", {}
+            )
+            status = correctness.get("status")
             if status != "passed_before_timing":
                 print(
                     f"warning: {path.name} entry {index} has correctness status {status!r}",
@@ -95,10 +124,10 @@ def _load_entries(paths: list[Path]) -> list[dict]:
 
     entries.sort(
         key=lambda entry: (
-            str(entry.get("model_profile", "")),
+            str(entry.get("model", entry.get("model_profile", ""))),
             int(entry.get("world_size", 0)),
             int(entry.get("tokens_per_rank", 0)),
-            str(entry.get("config", "")),
+            str(entry.get("case_id", entry.get("config", ""))),
         )
     )
     return entries
@@ -133,9 +162,9 @@ def _full_rows(entries: list[dict], stat: str) -> list[list[str]]:
         grouped_full = _stat_value(metrics["torch_npu_grouped_hccl_full_direct_e2e_ms"], stat)
         rows.append(
             [
-                str(entry["model_profile"]),
+                str(entry.get("model", entry.get("model_profile", ""))),
                 str(entry["world_size"]),
-                str(entry["config"]),
+                str(entry.get("case_id", entry.get("config", ""))),
                 str(entry["tokens_per_rank"]),
                 _format_ms(ascend_full),
                 _format_ms(grouped_full),
@@ -151,19 +180,28 @@ def _stage_rows(entries: list[dict], stat: str) -> tuple[list[list[str]], list[s
     for entry in entries:
         diagnostics = entry.get("diagnostics")
         if not diagnostics:
-            skipped.append(f"{entry.get('model_profile')}/W{entry.get('world_size')}/{entry.get('config')}")
+            skipped.append(
+                f"{entry.get('model', entry.get('model_profile'))}/"
+                f"W{entry.get('world_size')}/"
+                f"{entry.get('case_id', entry.get('config'))}"
+            )
             continue
         ascend_slices = diagnostics["ascend_event_slices"]
         grouped_slices = diagnostics["torch_npu_grouped_hccl_event_slices"]
-        for stage_key, stage_label in STAGES:
+        stages = (
+            CURRENT_STAGES
+            if "weighted_swiglu_fc2_combine_event_ms" in ascend_slices
+            else LEGACY_STAGES
+        )
+        for stage_key, stage_label in stages:
             stats_key = f"{stage_key}_event_ms"
             ascend_ms = _stat_value(ascend_slices[stats_key], stat)
             grouped_ms = _stat_value(grouped_slices[stats_key], stat)
             rows.append(
                 [
-                    str(entry["model_profile"]),
+                    str(entry.get("model", entry.get("model_profile", ""))),
                     str(entry["world_size"]),
-                    str(entry["config"]),
+                    str(entry.get("case_id", entry.get("config", ""))),
                     stage_label,
                     _format_ms(ascend_ms),
                     _format_ms(grouped_ms),
@@ -218,7 +256,7 @@ def main() -> int:
         )
     if args.section in ("all", "stages"):
         printer(
-            f"Four-stage independent event slices ({args.stat})",
+            f"Independent event slices ({args.stat})",
             ["Model", "W", "Case", "Stage", "Ascend/ms", "Grouped/ms", "speedup"],
             stage_rows,
         )
@@ -227,7 +265,7 @@ def main() -> int:
         print(f"warning: no four-stage diagnostics recorded for {case}", file=sys.stderr)
     if args.format == "markdown":
         print("> speedup = Grouped latency / Ascend latency; values greater than 1 mean Ascend is faster.")
-        print("> Four-stage slices are sampled independently and must not be added to reconstruct full E2E.")
+        print("> Event slices are sampled independently and must not be added to reconstruct full E2E.")
     return 0
 
 

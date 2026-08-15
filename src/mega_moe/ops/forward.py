@@ -14,12 +14,11 @@ import torch.distributed
 from ..config import MoEForwardConfig
 from ..kernels.dispatch_fc1 import _kernel_dispatch_fc1
 from ..kernels.fc2_combine import (
-    _FC2_REMOTE_STORE_BLOCK,
-    _FC2_TRANSPORT_BLOCK_M,
     _fc2_reduce_block_n,
     _launch_fc2_combine,
+    _validate_putmem_descriptor_capacity,
     build_route_to_send,
-    prepare_fc2_remote_store_metadata,
+    prepare_fc2_device_put_metadata,
 )
 from ..runtime.routing import (
     MoERoutingPlan,
@@ -104,8 +103,6 @@ class FusedMoEForward(torch.nn.Module):
         self._fc2_pipeline_group_experts = min(
             _FC2_PIPELINE_GROUP_EXPERTS, self.experts_per_rank
         )
-        self._fc2_remote_store_block = _FC2_REMOTE_STORE_BLOCK
-        self._fc2_transport_block_m = _FC2_TRANSPORT_BLOCK_M
         # Keep the public metadata value for provenance; the implementation is
         # fixed to this validated default and no longer branches on it.
         self.dispatch_fc1_schedule = self.config.dispatch_fc1_schedule
@@ -133,6 +130,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_fc2_storage = None
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
+        self._combine_pipeline_transfer_stream = None
         self._combine_pipeline_group_events = []
         self._combine_pipeline_activation_events = []
         self._combine_pipeline_start_event = None
@@ -142,12 +140,6 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
-        # Grouped remote-store metadata: one contiguous descriptor segment per
-        # (local expert group, source rank).  These ordinary-GM workspaces are
-        # rebuilt by the single metadata kernel for each forward.
-        self._pull_group_segment_starts = None
-        self._pull_group_segment_counts = None
-        self._max_pull_tile_slots = 0
         self._routing_weights_keepalive = None
 
         # All ranks must observe zeroed symmetric buffers before first use.
@@ -159,10 +151,9 @@ class FusedMoEForward(torch.nn.Module):
         torch.npu.synchronize()
 
     def finalize(self):
-        # Grouped FC2 may still have work queued on its dedicated Cube/Vector
-        # streams even when the caller never explicitly synchronized.  Drain
-        # every stream before releasing any symmetric allocation they can
-        # still reference.
+        # Grouped FC2 may still have work queued on its dedicated Cube, Vector,
+        # and transfer streams. Drain every stream before releasing
+        # any symmetric allocation they can still reference.
         if self.context.peer_mem is not None:
             torch.npu.synchronize(self.context.peer_mem.device)
         if self._combine_fc2_storage is not None:
@@ -174,6 +165,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_fc2_buf = None
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
+        self._combine_pipeline_transfer_stream = None
         self._combine_pipeline_group_events = []
         self._combine_pipeline_activation_events = []
         self._combine_pipeline_start_event = None
@@ -183,8 +175,6 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
-        self._pull_group_segment_starts = None
-        self._pull_group_segment_counts = None
         self.context.finalize()
 
     def _ensure_combine_buffers(self):
@@ -192,16 +182,12 @@ class FusedMoEForward(torch.nn.Module):
         if self._combine_fc2_buf is not None:
             return
 
+        max_send = self.max_tokens_per_rank * self.top_k
+        _validate_putmem_descriptor_capacity(max_send, self.hidden_size)
+
         import shmem as ash
 
-        max_send = self.max_tokens_per_rank * self.top_k
-        max_receive = self.context.peer_mem.numel() // self.hidden_size
-        max_receive_tiles = (
-            max_receive + self._fc2_transport_block_m - 1
-        ) // self._fc2_transport_block_m
-        self._max_pull_tile_slots = (
-            max_receive_tiles + self.world_size * self.experts_per_rank
-        )
+        descriptor_slots = self.world_size * self.experts_per_rank
         device = self.context.peer_mem.device
         self._combine_fc2_storage = ash.aclshmem_create_tensor(
             [max_send * self.hidden_size],
@@ -217,19 +203,10 @@ class FusedMoEForward(torch.nn.Module):
         def make_int_workspace(size):
             return torch.empty(size, dtype=torch.int32, device=device)
 
-        self._pull_tile_rank = make_int_workspace(self._max_pull_tile_slots)
-        self._pull_tile_src_start = make_int_workspace(self._max_pull_tile_slots)
-        self._pull_tile_dst_start = make_int_workspace(self._max_pull_tile_slots)
-        self._pull_tile_row_count = make_int_workspace(self._max_pull_tile_slots)
-        # At most one group per local expert is useful.  Segment metadata is
-        # indexed [group, source-rank], so its size is independent of the
-        # token/route count and remains tiny compared with the FC2 workspace.
-        self._pull_group_segment_starts = make_int_workspace(
-            self.experts_per_rank * self.world_size
-        )
-        self._pull_group_segment_counts = make_int_workspace(
-            self.experts_per_rank * self.world_size
-        )
+        self._pull_tile_rank = make_int_workspace(descriptor_slots)
+        self._pull_tile_src_start = make_int_workspace(descriptor_slots)
+        self._pull_tile_dst_start = make_int_workspace(descriptor_slots)
+        self._pull_tile_row_count = make_int_workspace(descriptor_slots)
 
     def _ensure_group_pipeline_runtime(
         self,
@@ -240,6 +217,7 @@ class FusedMoEForward(torch.nn.Module):
         if self._combine_pipeline_cube_stream is None:
             self._combine_pipeline_cube_stream = torch.npu.Stream(device=device)
             self._combine_pipeline_vector_stream = torch.npu.Stream(device=device)
+            self._combine_pipeline_transfer_stream = torch.npu.Stream(device=device)
             self._combine_pipeline_start_event = torch.npu.Event()
             self._combine_pipeline_done_event = torch.npu.Event()
         num_groups = (
@@ -349,7 +327,7 @@ class FusedMoEForward(torch.nn.Module):
         self,
         dispatch_result: DispatchFC1Result,
     ) -> dict:
-        """Build schedule-required FC2 metadata and the route inverse."""
+        """Build device-put FC2 descriptors and the route inverse."""
         self._ensure_combine_buffers()
         plan = dispatch_result.routing_plan
         send_route_indices = dispatch_result.send_route_indices
@@ -367,42 +345,22 @@ class FusedMoEForward(torch.nn.Module):
         route_to_send = self._route_to_send[:num_routes]
         build_route_to_send(send_route_indices, route_to_send)
 
-        transport_block_m = self._fc2_transport_block_m
         pipeline_group_experts = self._fc2_pipeline_group_experts
-        # The production remote-store descriptors retain the expert-major
-        # receive layout and coalesce each bucket at the separately tuned
-        # transport row size.  This is intentionally independent from the
-        # FC2 GEMM M tile: a large RMA request must not force a huge Cube
-        # accumulator tile.
-        receive_tiles = (
-            plan.num_received_routes + transport_block_m - 1
-        ) // transport_block_m
-        num_pull_slots = receive_tiles + self.world_size * self.experts_per_rank
-        if num_pull_slots > self._max_pull_tile_slots:
-            raise ValueError(
-                "remote-store tile metadata exceeds its configured workspace"
-            )
 
-        prepare_fc2_remote_store_metadata(
+        prepare_fc2_device_put_metadata(
             self.context.metadata_counts_mem,
             plan.received_expert_offsets,
             self._pull_tile_rank,
             self._pull_tile_src_start,
             self._pull_tile_dst_start,
             self._pull_tile_row_count,
-            num_pull_slots,
             local_rank=self.rank,
             world_size=self.world_size,
             experts_per_rank=self.experts_per_rank,
             num_bins_pad=self.context.metadata_num_bins,
-            block_m=transport_block_m,
-            group_segment_starts=self._pull_group_segment_starts,
-            group_segment_counts=self._pull_group_segment_counts,
-            group_experts=pipeline_group_experts,
         )
         return {
             "route_to_send": route_to_send,
-            "num_pull_slots": num_pull_slots,
             "pipeline_group_experts": pipeline_group_experts,
         }
 
@@ -642,9 +600,8 @@ class FusedMoEForward(torch.nn.Module):
                 "FC2 block_n and block_k must divide the output and reduction dimensions"
             )
         combine_metadata = self._prepare_combine_metadata(dispatch_result)
-        # FC2 writes destination-local rows to one symmetric workspace; the
-        # Vector pipeline stores them directly into each source rank's
-        # symmetric send-order workspace before top-k reduction.
+        # FC2 stages destination-local rows in symmetric GM. Device-put workers
+        # move each source segment into send order before top-k reduction.
         fc2_workspace = self._combine_fc2_buf[:plan.num_sent_routes]
         pipeline_group_experts = combine_metadata["pipeline_group_experts"]
         reduce_block_n = _fc2_reduce_block_n(num_received_routes)
@@ -662,7 +619,6 @@ class FusedMoEForward(torch.nn.Module):
             self._pull_tile_src_start,
             self._pull_tile_dst_start,
             self._pull_tile_row_count,
-            combine_metadata["num_pull_slots"],
             plan.num_sent_routes,
             topk=self.top_k,
             num_program_cores=self.num_aicore_programs,
@@ -673,10 +629,9 @@ class FusedMoEForward(torch.nn.Module):
             block_k=block_k,
             world_size=self.world_size,
             pipeline_group_experts=pipeline_group_experts,
-            group_segment_starts=self._pull_group_segment_starts,
-            group_segment_counts=self._pull_group_segment_counts,
             pipeline_cube_stream=self._combine_pipeline_cube_stream,
             pipeline_vector_stream=self._combine_pipeline_vector_stream,
+            pipeline_transfer_stream=self._combine_pipeline_transfer_stream,
             pipeline_group_events=self._combine_pipeline_group_events,
             pipeline_start_event=self._combine_pipeline_start_event,
             pipeline_done_event=self._combine_pipeline_done_event,
