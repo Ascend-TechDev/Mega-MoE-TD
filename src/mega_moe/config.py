@@ -14,8 +14,8 @@ _DISPATCH_FC1_SCHEDULES = (
 _MAX_FC1_GEMM_BLOCK_SIZE_M = 256
 _MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
-# FC2 uses the same FP32 Cube accumulator limit.  The transport tile is tuned
-# independently, so this bound applies only to the local expert GEMM.
+# FC2 uses the same FP32 Cube accumulator limit; this bound applies only to the
+# local expert GEMM and is independent from device-put transport.
 _MAX_FC2_GEMM_BLOCK_SIZE_M = 256
 _MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
@@ -78,12 +78,11 @@ class MoEForwardConfig:
     ``dispatch_fc1_block_size_m`` controls dispatch readiness slots.
     ``fc1_gemm_block_size_{m,n,k}`` independently control the FC1 dot axes.
     Likewise, ``fc2_combine_block_size_m`` controls the FC2 GEMM row tile and
-    ``fc2_gemm_block_size_{n,k}`` control the remaining FC2 dot axes.  FC2 uses
-    the validated coarse expert-group Cube/Vector stream, fixed remote-store
-    coalescing, and all detected Vector cores for reduction; experimental
-    transport controls are not public configuration fields.  The post-FC1
-    activation remains selectable for compatibility with the target repository
-    SiTU-GLU path.
+    ``fc2_gemm_block_size_{n,k}`` control the remaining FC2 dot axes.  FC2
+    stages each expert group in local GM, then uses striped ACLSHMEM device-put
+    workers for reverse transport.  All detected Vector cores participate in
+    reduction.  The post-FC1 activation remains selectable for compatibility
+    with the target repository SiTU-GLU path.
 
     activation selects SwiGLU or SiTU-GLU; situ_beta and situ_linear_beta
     configure the latter and are ignored for SwiGLU.

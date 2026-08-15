@@ -9,6 +9,7 @@ environment variables.
 from __future__ import annotations
 
 import os
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from triton.backends.ascend.driver import NPUUtils
 from config import CaseSpec, select_cases
 from mega_moe import FusedMoEForward, MoEForwardConfig, moe_backward_triton, pack_gate_up_weights
 import mega_moe.kernels.fc2_combine as fc2_combine_module
+from benchmark.layer import bench_moe_suite as bench_module
 from mega_moe.kernels.weighted_swiglu import (
     _BLOCK_M as _WEIGHTED_BLOCK_M,
     _BLOCK_N as _WEIGHTED_BLOCK_N,
@@ -64,8 +66,8 @@ def _forward_config(case: CaseSpec) -> MoEForwardConfig:
     )
 
 
-def test_remote_store_workspaces_cover_send_and_receive_capacity(monkeypatch):
-    """Size combine rows by sends and descriptors by receive capacity."""
+def test_device_put_workspaces_cover_send_and_expert_source_pairs(monkeypatch):
+    """Size combine rows by sends and descriptors by expert/source pairs."""
     if kit.ash is None:
         pytest.skip("ACLSHMEM is unavailable")
 
@@ -78,7 +80,6 @@ def test_remote_store_workspaces_cover_send_and_receive_capacity(monkeypatch):
     op.rank = 0
     op.experts_per_rank = 112
     op.activation_dtype = torch.bfloat16
-    op._fc2_transport_block_m = fc2_combine_module._FC2_TRANSPORT_BLOCK_M
     op.context = SimpleNamespace(peer_mem=torch.empty(4096, dtype=torch.bfloat16))
     op._combine_fc2_buf = None
 
@@ -93,9 +94,38 @@ def test_remote_store_workspaces_cover_send_and_receive_capacity(monkeypatch):
 
     assert op._combine_fc2_buf.shape == (16, 4)
     assert op._route_to_send.shape == (16,)
-    expected_slots = 4 + 8 * 112
-    assert op._max_pull_tile_slots == expected_slots
+    expected_slots = 8 * 112
     assert op._pull_tile_rank.shape == (expected_slots,)
+
+
+def test_device_put_descriptor_capacity_uses_uint32_bytes():
+    row_width = 3584
+    max_rows = fc2_combine_module._ACLSHMEM_PUTMEM_MAX_BYTES // (
+        row_width * 2
+    )
+
+    fc2_combine_module._validate_putmem_descriptor_capacity(
+        max_rows,
+        row_width,
+    )
+    with pytest.raises(ValueError, match="uint32 byte-count ABI"):
+        fc2_combine_module._validate_putmem_descriptor_capacity(
+            max_rows + 1,
+            row_width,
+        )
+
+
+def test_device_put_worker_layout_requires_one_worker_per_rank():
+    assert fc2_combine_module._fc2_device_put_worker_layout(8, 8, 16) == (
+        1,
+        8,
+    )
+    assert fc2_combine_module._fc2_device_put_worker_layout(64, 8, 16) == (
+        8,
+        64,
+    )
+    with pytest.raises(ValueError, match="one Vector program per rank"):
+        fc2_combine_module._fc2_device_put_worker_layout(7, 8, 16)
 
 
 def test_pack_gate_up_weights_returns_contiguous_kn_layout():
@@ -253,12 +283,11 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
                 op, hs, expert_indices, packed_w1, case.num_experts,
                 f"{case.case_id}-dispatch", rank, device, dtype,
             )
-            if case.model in {"S", "S-drop"}:
-                all_passed &= run_full_one(
-                    op, hs, expert_indices, routing_weights,
-                    w_gate, w_up, packed_w1, w2, case.num_experts,
-                    f"{case.case_id}-full", rank, device,
-                )
+            all_passed &= run_full_one(
+                op, hs, expert_indices, routing_weights,
+                w_gate, w_up, packed_w1, w2, case.num_experts,
+                f"{case.case_id}-full", rank, device,
+            )
 
             # Keep the asymmetric routing, all-drop and epoch-reuse coverage
             # from the former forward test, but only on the representative S.
@@ -286,9 +315,10 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
                     w_gate, w_up, packed_w1, w2, case.num_experts,
                     f"{case.case_id}-all-drop-full", rank, device,
                 )
-                all_passed &= run_one(
-                    op, hs, expert_indices, packed_w1, case.num_experts,
-                    f"{case.case_id}-epoch-reuse", rank, device, dtype,
+                all_passed &= run_full_one(
+                    op, hs, expert_indices, routing_weights,
+                    w_gate, w_up, packed_w1, w2, case.num_experts,
+                    f"{case.case_id}-full-epoch-reuse", rank, device,
                 )
         finally:
             op.finalize()

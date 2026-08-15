@@ -11,10 +11,9 @@ the public boundary, during transport, and in the weighted-SwiGLU multiply.
 The optimized path calls the production layer interfaces directly; this file
 does not carry a benchmark-local FC2/combine kernel.
 
-FC2/combine always uses the production coarse expert-group stream: Cube FC2
-groups overlap a Triton ACLSHMEM ``remote_ptr`` + ``tl.store`` Vector
-transport before the local top-k reduction. There is no benchmark transport
-mode selector.
+FC2/combine uses one production schedule: Cube FC2 groups stage output in local
+GM while striped ACLSHMEM device-put workers transport completed groups before
+the local top-k reduction.
 
 The only performance baseline is Torch-NPU grouped-GEMM + HCCL.  The primary
 comparison is direct-call full E2E.  Optional event slices (preprocess,
@@ -79,6 +78,7 @@ except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from mega_moe import FusedMoEForward, MoEForwardConfig
+from mega_moe.kernels.fc2_combine import _fc2_device_put_worker_layout
 from config import CaseSpec, select_cases
 from benchmark.layer._grouped_forward_baseline import GroupedForwardBaseline
 from tests import _moe_testkit as kit
@@ -88,7 +88,7 @@ from tests._moe_baselines import backward_torch_baseline, build_backward_saved
 ACTIVATION_DTYPE = torch.bfloat16
 ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
-RESULT_CONTRACT = "bf16-activations-fp32-routing-transport-v2"
+RESULT_CONTRACT = "bf16-activations-fp32-routing-device-put-v3"
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
 
 # This is the published protocol.  Keep debug/short runs under a differently
@@ -148,7 +148,7 @@ def _required_ash_bytes(case: CaseSpec, world_size):
     experts_per_rank = case.num_experts // world_size
     max_recv_rows = int(case.tokens * case.topk * case.capacity_factor)
     token_peer_bytes = max_recv_rows * case.hidden * ACTIVATION_DTYPE.itemsize
-    # FC2 remote-store writes stable-send rows into a symmetric combine buffer.
+    # FC2 device-put writes stable-send rows into a symmetric combine buffer.
     combine_bytes = case.tokens * case.topk * case.hidden * ACTIVATION_DTYPE.itemsize
     routing_peer_bytes = max_recv_rows * ROUTING_TRANSPORT_DTYPE.itemsize
     dispatch_tile_m = int(
@@ -636,6 +636,11 @@ def _make_entry(case, world_size, op, measured, route_distribution):
     """Build one schema-v1 forward result entry for one immutable case."""
     ascend_full = measured["ascend_full"]
     torch_grouped_full = measured["torch_grouped_full"]
+    _, device_put_workers = _fc2_device_put_worker_layout(
+        op.num_aivector_programs,
+        world_size,
+        op._fc2_pipeline_group_experts,
+    )
     device_properties = torch_npu.npu.get_device_properties(op.rank)
     entry = OrderedDict(
         {
@@ -683,14 +688,11 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             "symmetric_heap_size_gb": G_ASH_SIZE_GB,
             "dispatch_fc1_schedule": op.config.dispatch_fc1_schedule,
             "weighted_vector_programs": op.num_aivector_programs,
-            "fc2_gemm_schedule": "coarse_expert_group_stream",
-            "weighted_fc2_schedule": "expert_group_shadow_activation",
             "fc2_combine_transport": (
-                "triton_aclshmem_remote_ptr_tl_store_stream_events"
+                "aclshmem_device_putmem_striped_workers_stream_events"
             ),
-            "fc2_remote_store_block": op._fc2_remote_store_block,
             "fc2_pipeline_group_experts": op._fc2_pipeline_group_experts,
-            "fc2_reverse_vector_workers": op.num_aivector_programs,
+            "fc2_reverse_vector_workers": device_put_workers,
             "fc2_reduce_programs": op.num_aivector_programs,
             "fc2_reduce_block_n_policy": (
                 "1024 if local received routes >= 1024 else 256"
@@ -701,7 +703,6 @@ def _make_entry(case, world_size, op, measured, route_distribution):
                 "fc1_gemm_n": op.config.fc1_gemm_block_size_n,
                 "fc1_gemm_k": op.config.fc1_gemm_block_size_k,
                 "fc2_combine_m": op.config.fc2_combine_block_size_m,
-                "fc2_transport_m": op._fc2_transport_block_m,
                 "fc2_gemm_n": op.config.fc2_gemm_block_size_n,
                 "fc2_gemm_k": op.config.fc2_gemm_block_size_k,
             },
@@ -751,15 +752,35 @@ def _upsert_result(path, direction, world_size, entry, protocol):
     if path.is_file():
         with path.open("r", encoding="utf-8") as input_file:
             existing = json.load(input_file)
-        if (
+        compatible = (
             isinstance(existing, dict)
             and existing.get("schema_version") == 1
             and existing.get("direction") == direction
             and existing.get("world_size") == world_size
             and existing.get("protocol") == protocol
-        ):
-            payload = existing
-    cases = [item for item in payload.get("cases", []) if item.get("case_id") != entry["case_id"]]
+        )
+        if not compatible:
+            raise ValueError(
+                f"refusing to overwrite incompatible benchmark result {path}; "
+                "use a fresh results directory"
+            )
+        existing_contracts = {
+            item.get("provenance", {}).get("result_contract")
+            for item in existing.get("cases", [])
+            if isinstance(item, dict)
+        }
+        entry_contract = entry.get("provenance", {}).get("result_contract")
+        if existing_contracts - {entry_contract}:
+            raise ValueError(
+                f"refusing to mix benchmark contracts in {path}; "
+                "use a fresh results directory"
+            )
+        payload = existing
+    cases = [
+        item
+        for item in payload.get("cases", [])
+        if item.get("case_id") != entry["case_id"]
+    ]
     cases.append(entry)
     payload["cases"] = sorted(cases, key=lambda item: item["case_id"])
     temporary = path.with_suffix(path.suffix + ".tmp")
