@@ -5,8 +5,8 @@ Ascend (CANN/NPU) fused EP MoE dispatch + FC1 kernel — default schedule only.
 Architecture:
 
   Phase 1 — In-kernel dispatch:
-    Each AI core iterates local tokens and uses ACLSHMEM ``putmem`` to write
-    them directly into remote ranks' symmetric memory (peer_mem).
+    Each AI core iterates local tokens and batches ACLSHMEM ``putmem_nbi``
+    writes into remote ranks' symmetric memory (peer_mem).
     This replaces host-side ``all_to_all_single``.
 
   The all-core pipeline runs Vector dispatch and Cube FC1 concurrently on
@@ -197,15 +197,29 @@ def _dispatch_one_source_tile_task(
             dst_offs = task_dst_start + tile_start + tile_token
             src_base = input_ptr + src_idx * stride_input_m
             dst_base = peer_mem_ptr + dst_offs * stride_input_m
-            libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
+            libshmem_device.putmem_nbi(
+                dst_base, src_base, hidden * 2, dst_rank)
             route_idx = tl.load(send_route_idx_ptr + send_idx)
-            libshmem_device.putmem(
-                routing_weight_recv_ptr + dst_offs,
-                routing_weight_ptr + route_idx,
-                4,
-                dst_rank,
-            )
+            if tile_token == tile_count - 1:
+                # Blocking putmem submits this final write and then drains all
+                # outstanding operations to dst_rank, including the payload
+                # and routing-weight NBI writes issued earlier in this tile.
+                libshmem_device.putmem(
+                    routing_weight_recv_ptr + dst_offs,
+                    routing_weight_ptr + route_idx,
+                    4,
+                    dst_rank,
+                )
+            else:
+                libshmem_device.putmem_nbi(
+                    routing_weight_recv_ptr + dst_offs,
+                    routing_weight_ptr + route_idx,
+                    4,
+                    dst_rank,
+                )
 
+        # The final blocking write above is the transport-aware completion
+        # point; keep the existing pipe/cache fence before publishing the tile.
         libshmem_device.fence()
         signal_slot = (
             (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_SOURCE_TILES
