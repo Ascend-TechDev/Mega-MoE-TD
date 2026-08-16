@@ -411,15 +411,21 @@ def _triton_grouped_gemm_one_mn_tile(
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
-            b_ptrs = (
-                weight_base
-                + k_offs[:, None] * stride_weight_2
-                + n_offs[None, :] * stride_weight_1
+            b_block_ptr = tl.make_block_ptr(
+                base=weight_base,
+                shape=(K, N),
+                strides=(stride_weight_2, stride_weight_1),
+                offsets=(
+                    k_block * BLOCK_SIZE_K,
+                    n_tile * BLOCK_SIZE_N,
+                ),
+                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+                order=(1, 0),
             )
             b = tl.load(
-                b_ptrs,
-                mask=k_mask[:, None] & n_mask[None, :],
-                other=0.0,
+                b_block_ptr,
+                boundary_check=(0, 1),
+                padding_option="zero",
             )
             acc += tl.dot(a, b)
 
