@@ -191,6 +191,11 @@ def _dispatch_one_source_tile_task(
             DISPATCH_BLOCK_SIZE_M,
             task_count - tile_start,
         )
+        signal_slot = (
+            (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_SOURCE_TILES
+            + source_tile
+        )
+        signal_addr = signal_mem_ptr + signal_slot * 16
         for tile_token in range(tile_count):
             send_idx = task_start + tile_start + tile_token
             src_idx = tl.load(send_src_idx_ptr + send_idx)
@@ -199,24 +204,20 @@ def _dispatch_one_source_tile_task(
             dst_base = peer_mem_ptr + dst_offs * stride_input_m
             libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
             route_idx = tl.load(send_route_idx_ptr + send_idx)
-            libshmem_device.putmem(
-                routing_weight_recv_ptr + dst_offs,
-                routing_weight_ptr + route_idx,
-                4,
-                dst_rank,
-            )
-
-        libshmem_device.fence()
-        signal_slot = (
-            (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_SOURCE_TILES
-            + source_tile
-        )
-        libshmem_device.signal_op(
-            signal_mem_ptr + signal_slot * 16,
-            signal_epoch,
-            libshmem_device.ACLSHMEM_SIGNAL_SET,
-            dst_rank,
-        )
+            route_dst = routing_weight_recv_ptr + dst_offs
+            route_src = routing_weight_ptr + route_idx
+            if tile_token + 1 == tile_count:
+                libshmem_device.putmem_signal(
+                    route_dst,
+                    route_src,
+                    4,
+                    signal_addr,
+                    signal_epoch,
+                    libshmem_device.ACLSHMEM_SIGNAL_SET,
+                    dst_rank,
+                )
+            else:
+                libshmem_device.putmem(route_dst, route_src, 4, dst_rank)
 
 
 @triton.jit
