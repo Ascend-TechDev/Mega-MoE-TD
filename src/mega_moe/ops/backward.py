@@ -210,23 +210,44 @@ def moe_backward_triton(saved, dy, peer_mem):
         if _stage_timing:
             _sev[3].record()
         _t("step2-swiglu done")
-    # step 5: fc1 wgrad — side stream (depends only on step2), overlaps with step4.
-    if use_triton_wgrad:
-        grad_fc1 = _run_wgrad(transposed_grouped_gemm_triton,
-            grad_fc1_output, saved["recv_hidden_sorted"], ec,
-            saved["split_size_cum_per_expert"])
-    elif use_torch_wgrad:
-        grad_fc1 = _run_wgrad(_grouped_wgrad_torch,
-            grad_fc1_output, saved["recv_hidden_sorted"], ec)
+    # step 5: fc1 wgrad — depends only on step2's grad_fc1_output. By default it
+    # is NOT launched inline: it is deferred into step4's combine pipeline as the
+    # cube-stream tail (after the last combine GEMM group), so the pure-Cube
+    # wgrad overlaps step4's pure-Vector push/barrier/reduce drain instead of
+    # serializing before the whole combine. Inline launch (old behavior) is
+    # restored with MOE_BWD_WGRAD_TAIL=0, and stays inline for the diagnostic
+    # serial/stage-timing paths and the host-syncing torch wgrad backend.
+    _wgrad_tail = (
+        not use_fused and not _stage_timing
+        and os.environ.get("MOE_BWD_COMBINE_SERIAL") != "1"
+        and not use_torch_wgrad and not use_side_stream
+        and os.environ.get("MOE_BWD_WGRAD_TAIL", "1") != "0"
+    )
+
+    def _fc1_wgrad():
+        if use_triton_wgrad:
+            return _run_wgrad(transposed_grouped_gemm_triton,
+                              grad_fc1_output, saved["recv_hidden_sorted"], ec,
+                              saved["split_size_cum_per_expert"])
+        if use_torch_wgrad:
+            return _run_wgrad(_grouped_wgrad_torch,
+                              grad_fc1_output, saved["recv_hidden_sorted"], ec)
+        return _run_wgrad(_grouped_wgrad_npu,
+                          grad_fc1_output, saved["recv_hidden_sorted"], ec)
+
+    if not _wgrad_tail:
+        grad_fc1 = _fc1_wgrad()
+        if _stage_timing:
+            _sev[4].record()
+        _t("step5-fc1_wgrad launched (inline)")
+    # step 4: combine + fc1 input-grad + gate-grad; with the tail, step5's wgrad
+    # rides the combine cube stream and is returned with the combine results.
+    if _wgrad_tail:
+        grad_hidden, grad_routing_weights, grad_fc1 = combine_fc1_bwd_triton(
+            saved, grad_fc1_output, grad_gate, peer_mem, cube_tail=_fc1_wgrad)
     else:
-        grad_fc1 = _run_wgrad(_grouped_wgrad_npu,
-            grad_fc1_output, saved["recv_hidden_sorted"], ec)
-    if _stage_timing:
-        _sev[4].record()
-    _t("step5-fc1_wgrad launched (side stream)")
-    # step 4: combine + fc1 input-grad + gate-grad (main stream; overlaps step5)
-    grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
-        saved, grad_fc1_output, grad_gate, peer_mem)
+        grad_hidden, grad_routing_weights = combine_fc1_bwd_triton(
+            saved, grad_fc1_output, grad_gate, peer_mem)
     if _stage_timing:
         _sev[5].record()
         _sev[5].synchronize()
