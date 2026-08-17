@@ -8,6 +8,8 @@
 #  written expert-major and read contiguously, so no local_sort gather is needed.
 # ============================================================================
 
+import os
+
 import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
@@ -186,6 +188,7 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     N, K,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    TILE_M: tl.constexpr,
     WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
     MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
 ):
@@ -195,7 +198,14 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     rank participates only in the readiness dependency, so source fragments no
     longer force independent full-weight scans. waitValue = signal_epoch (SET mode,
     ONE value per epoch). Reuses the contiguous-read _fc2_bwd_gemm_one_mn_tile
-    (stride_im=H, stride_ik=1)."""
+    (stride_im=H, stride_ik=1).
+
+    BLOCK_M is the GEMM tile height AND the merged readiness window; TILE_M is
+    the producer's push/signal tile height (64, matches the signal-slot layout).
+    A BLOCK_M=128 window simply waits every 64-row source tile overlapping it
+    before running one double-height GEMM — the readiness protocol itself is
+    unchanged, which decouples the GEMM L0A fill (a-tile [64,BK] bf16 = half of
+    64KB L0A) from the transport tile granularity."""
     num_n_tiles = tl.cdiv(N, BLOCK_N)
     num_tasks = EXPERTS_PER_RANK * num_n_tiles
     for task_id in range(pid, num_tasks, ncore):
@@ -224,10 +234,10 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                     if overlap_start < overlap_end:
                         first_source_tile = (
                             overlap_start - source_start
-                        ) // BLOCK_M
+                        ) // TILE_M
                         last_source_tile = (
                             overlap_end - source_start - 1
-                        ) // BLOCK_M
+                        ) // TILE_M
                         for source_tile in range(
                             first_source_tile, last_source_tile + 1
                         ):
@@ -260,6 +270,7 @@ def kernel_dispatch_fc2_bwd_tile_signal(
     N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
     signal_epoch,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    PUSH_BLOCK_M: tl.constexpr,
     WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
     MAX_BWD_TILES: tl.constexpr, LOCAL_RANK: tl.constexpr,
     BLOCK_H_PUSH: tl.constexpr,
@@ -281,7 +292,7 @@ def kernel_dispatch_fc2_bwd_tile_signal(
                 gco_ptr, peer_mem_ptr, signal_mem_ptr,
                 send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
                 signal_epoch, H, stride_gm,
-                LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, BLOCK_M, BLOCK_H_PUSH)
+                LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
     with al.scope(core_mode="cube", disable_auto_sync=True):
         _fc2_bwd_gemm_merged_tiles_wait(
             pid, num_cores,
@@ -289,7 +300,22 @@ def kernel_dispatch_fc2_bwd_tile_signal(
             recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
             signal_epoch,
             N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
-            BLOCK_M, BLOCK_N, BLOCK_K, WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, dtype)
+            BLOCK_M, BLOCK_N, BLOCK_K, PUSH_BLOCK_M,
+            WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, dtype)
+
+
+def _dispatch_gemm_tile():
+    """Step1 fc2 input-grad GEMM tile, env-tunable (does NOT touch
+    common.BLOCK_SIZE_*). Defaults: BM=128 / BN=256 / BK=128 — measured best on
+    Kimi-K3 w8 t2k (42.5 -> 35.5ms e2e; BM=64 left the a-tile at half of L0A,
+    per AscendKernelWiki pattern-low-mte-utilization-small-tile); the
+    transport/signal granularity stays 64 (PUSH_BLOCK_M), so a taller GEMM tile
+    only widens the merged readiness window."""
+    return (
+        int(os.environ.get("MOE_DISPATCH_GEMM_BM", "128")),
+        int(os.environ.get("MOE_DISPATCH_GEMM_BN", "256")),
+        int(os.environ.get("MOE_DISPATCH_GEMM_BK", "128")),
+    )
 
 
 def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
@@ -315,6 +341,7 @@ def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
     # need to zero the slots — SET overwrites unconditionally).
     signal_epoch = saved.get("_bwd_tile_signal_epoch", 1)
     saved["_bwd_tile_signal_epoch"] = signal_epoch + 1
+    gemm_bm, gemm_bn, gemm_bk = _dispatch_gemm_tile()
     kernel_dispatch_fc2_bwd_tile_signal[(ncore(), 1, 1)](
         prep["gco"], peer_mem, signal_mem,
         prep["send_bucket_starts"], prep["send_counts_re"], prep["send_bucket_dst_starts"],
@@ -323,7 +350,7 @@ def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
         prep["recv_per_expert"], prep["recv_expert_offs"], prep["recv_counts_re"],
         N, K, H, 1, fc2.stride(0), fc2.stride(1), fc2.stride(2), N, 1,
         signal_epoch,
-        BLOCK_M=64, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K,
+        BLOCK_M=gemm_bm, BLOCK_N=gemm_bn, BLOCK_K=gemm_bk, PUSH_BLOCK_M=64,
         WORLD_SIZE=W, EXPERTS_PER_RANK=EPR, MAX_BWD_TILES=MAX_BWD_TILES,
         LOCAL_RANK=saved["ep_rank"], BLOCK_H_PUSH=256, num_warps=8)
     return out
