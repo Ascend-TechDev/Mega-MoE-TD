@@ -48,15 +48,53 @@ GATE_PAD = 8
 def _combine_gemm_tile():
     """Combine fc1-input-grad GEMM tile + num_stages, env-tunable for sweeping
     (does NOT touch common.BLOCK_SIZE_*, which dispatch_fc2/wgrad also use).
-    Defaults: BM=64 (locked to the forward meta tiling), BN=256 / BK=128 —
-    BN=256 fills L0A (AscendKernelWiki pattern-low-mte-utilization-small-tile;
+    Defaults: BM=128 / BN=256 / BK=128 — BN=256 and BM=128 fill L0A/L0B
+    (AscendKernelWiki pattern-low-mte-utilization-small-tile: the verified v2
+    config measures MTE2/MAC 8.07 -> 1.00 when both L0 caches are filled;
     BK=128 is the largest K that fits UB with BN=256). num_stages=0 (off)."""
     return (
-        int(os.environ.get("MOE_COMBINE_GEMM_BM", str(BLOCK_SIZE_M))),
+        int(os.environ.get("MOE_COMBINE_GEMM_BM", "128")),
         int(os.environ.get("MOE_COMBINE_GEMM_BN", "256")),
         int(os.environ.get("MOE_COMBINE_GEMM_BK", "128")),
         int(os.environ.get("MOE_COMBINE_GEMM_NS", "0")),
     )
+
+
+def _gemm_tile_maps(saved, block_m):
+    """Per-GEMM-tile expert/row tables for BM>64 combine tiling, cached per BM.
+
+    The forward meta tiling locks tokens into BLOCK_SIZE_M=64 rows, which pins
+    the combine GEMM to BM=64 and leaves L0A 1/4-full (a-tile [64,128] bf16 =
+    16KB vs 64KB L0A). These tables decouple the GEMM tile height from that
+    meta: tiles are derived directly from expert_counts in `block_m` rows,
+    expert-major, so the GEMM can use BM=128/256 while the push/reduce phases
+    keep their row-range group bounds."""
+    cache_key = f"_combine_gemm_tiles_{block_m}"
+    cached = saved.get(cache_key)
+    if cached is not None:
+        return cached
+    device = f"npu:{saved['ep_rank']}"
+    counts = saved["expert_counts"].to(device)
+    epr = counts.shape[0]
+    tiles_per_expert = (counts.to(torch.int64) + block_m - 1) // block_m
+    cum_tiles = torch.zeros(epr + 1, dtype=torch.int64, device=device)
+    cum_tiles[1:] = tiles_per_expert.cumsum(0)
+    tile_expert = torch.repeat_interleave(
+        torch.arange(epr, dtype=torch.int64, device=device), tiles_per_expert)
+    chunk = torch.arange(int(tiles_per_expert.sum()), dtype=torch.int64, device=device) \
+        - cum_tiles[tile_expert]
+    row_cum = saved["split_size_cum_per_expert"].to(device).to(torch.int64)
+    row0 = row_cum[tile_expert] + chunk * block_m
+    rows = torch.clamp(counts.to(torch.int64)[tile_expert] - chunk * block_m,
+                       min=0, max=block_m).to(torch.int32)
+    cached = dict(
+        tile_expert=tile_expert.to(torch.int32).contiguous(),
+        tile_row0=row0.to(torch.int32).contiguous(),
+        tile_rows=rows.contiguous(),
+        num_tiles_m=int(tiles_per_expert.sum().item()),
+    )
+    saved[cache_key] = cached
+    return cached
 
 
 @triton.jit
@@ -65,7 +103,9 @@ def _kernel_combine_fc1_bwd_gemm_group(
     inp_ptr,                  # grad_fc1_output [M, 2*ffn]  (sorted)
     weight_ptr,               # fc1_combined [E, 2*ffn, H]  (K=2*ffn, N=H)
     hidden_buf_ptr,           # grad_recv_hidden_sorted [M, H] out (LOCAL)
-    meta_expert_ids_ptr, meta_split_cum_ptr, meta_tile_num_ptr, expert_counts_ptr,
+    tile_expert_ptr,          # int32 [T_m] expert of each GEMM tile (expert-major)
+    tile_row0_ptr,            # int32 [T_m] first row of each GEMM tile
+    tile_rows_ptr,            # int32 [T_m] valid row count of each GEMM tile
     N, K, num_tiles_n,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn,
     FIRST_TILE_M: tl.constexpr, LAST_TILE_M: tl.constexpr,
@@ -91,13 +131,10 @@ def _kernel_combine_fc1_bwd_gemm_group(
             if task_id < total_tasks:
                 tile_m = FIRST_TILE_M + (task_id % group_tiles)
                 tile_n = task_id // group_tiles
-                expert_id = tl.load(meta_expert_ids_ptr + tile_m)
-                cum_before = tl.load(meta_split_cum_ptr + tile_m)
-                tile_in_exp = tl.load(meta_tile_num_ptr + tile_m)
-                row_start = cum_before + tile_in_exp * BLOCK_M
+                expert_id = tl.load(tile_expert_ptr + tile_m)
+                row_start = tl.load(tile_row0_ptr + tile_m)
+                rem = tl.load(tile_rows_ptr + tile_m)
                 n_start = tile_n * BLOCK_N
-                cnt = tl.load(expert_counts_ptr + expert_id)
-                rem = cnt - tile_in_exp * BLOCK_M
                 mm = om < rem
                 mn = on_ < (N - n_start)
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -275,17 +312,17 @@ def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
     return p
 
 
-def _combine_bwd_group_bounds(prep, group_experts):
+def _combine_bwd_group_bounds(prep, group_experts, block_m):
     """Per-group Cube M-tile range and push src_pos range. Expert e occupies
     M-tiles [cum_tiles[e], cum_tiles[e+1]) — cum_tiles derived from
-    expert_counts (ceil(count/BLOCK_M)); saved meta_tile_num_cum is indexed
-    per-TILE, not per-expert, so it cannot be used here — and rows
+    expert_counts (ceil(count/block_m), using the GEMM tile height, NOT the
+    forward 64-row meta); and rows
     [split_size_cum_per_expert[e], split_size_cum_per_expert[e+1]). The Cube
     group writes the same hidden_buf rows its push group reads, so a per-group
     stream event fences the handoff. Returns (num_groups, first_tile_m[],
     last_tile_m[], first_src[], last_src[]) as Python int lists."""
     expert_counts = prep["expert_counts"].cpu().tolist()
-    tiles_per_expert = [(c + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M for c in expert_counts]
+    tiles_per_expert = [(c + block_m - 1) // block_m for c in expert_counts]
     cum_tiles = [0]
     for t in tiles_per_expert:
         cum_tiles.append(cum_tiles[-1] + t)            # cum_tiles[e] = first tile of expert e
@@ -325,14 +362,21 @@ def _ensure_combine_bwd_pipeline_runtime(saved, num_groups, device):
     )
 
 
-def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing, saved):
+def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing, saved,
+                                     cube_tail=None):
     """Two-stream expert-group pipeline mirroring the forward FC2 remote-store
     pipeline (_launch_fc2_remote_store_pipeline, fc2_combine.py:570). Cube group
     g's fc1-input-grad GEMM overlaps Vector group (g-1)'s reverse-A2A push via
     per-group NPU events. The Cube->push handoff is intra-rank (hidden_buf is
     local) so a stream Event is enough; one barrier_all_vec after all groups
     fences the cross-rank peer_mem writes before the reduce runs on the caller
-    stream. MOE_COMBINE_BWD_GROUP_EXPERTS tunes the group size (default 16)."""
+    stream. MOE_COMBINE_BWD_GROUP_EXPERTS tunes the group size (default 16).
+
+    ``cube_tail`` (optional zero-arg callable) is enqueued on the cube stream
+    right after the LAST GEMM group, so a pure-Cube op (the caller's fc1 wgrad)
+    overlaps the pure-Vector push/barrier/reduce drain instead of serializing
+    before the whole combine. Its return value is passed through; the caller
+    stream waits a tail event before consuming it."""
     device = peer_mem.device
     _gbm, _gbn, _gbk, _gns = _combine_gemm_tile()
     _g_num_tn = (prep["N"] + _gbn - 1) // _gbn
@@ -340,7 +384,15 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     if _gns > 0:
         _gkw["num_stages"] = _gns
     group_env = int(os.environ.get("MOE_COMBINE_BWD_GROUP_EXPERTS", "16"))
-    num_groups, ftm, ltm, fs, ls = _combine_bwd_group_bounds(prep, group_env)
+    # The bounds derive only from the static expert_counts / row cumulative
+    # offsets already cached in prep, but _combine_bwd_group_bounds pays a
+    # .cpu().tolist() host sync — caching removes that per-iteration stall.
+    # Keyed on (group_env, BM) because the M-tile ranges are in GEMM-tile units.
+    cached_bounds = saved.get("_combine_bwd_bounds")
+    if cached_bounds is None or cached_bounds[:2] != (group_env, _gbm):
+        cached_bounds = (group_env, _gbm, _combine_bwd_group_bounds(prep, group_env, _gbm))
+        saved["_combine_bwd_bounds"] = cached_bounds
+    num_groups, ftm, ltm, fs, ls = cached_bounds[2]
     cube_stream, vector_stream, group_events, start_ev, done_ev = \
         _ensure_combine_bwd_pipeline_runtime(saved, num_groups, device)
 
@@ -353,18 +405,29 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     # groups); group g's push reads the same rows, gated by group_events[g]. So
     # while Vector pushes group g, Cube can run group g+1 — depth-1 pipeline at
     # expert-group granularity, exactly like the forward FC2 pipeline.
+    tail_result = None
+    tail_event = None
+    tiles = _gemm_tile_maps(saved, _gbm)
     for g in range(num_groups):
         with torch.npu.stream(cube_stream):
             _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
                 prep["inp"], prep["weight"], hidden_buf,
-                prep["meta_expert_ids"], prep["meta_split_cum"],
-                prep["meta_tile_num"], prep["expert_counts"],
+                tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
                 prep["N"], prep["K"], _g_num_tn,
                 prep["inp_stride_im"], prep["inp_stride_ik"],
                 prep["we"], prep["wk"], prep["wn"],
                 FIRST_TILE_M=ftm[g], LAST_TILE_M=ltm[g],
                 **_gkw)
             group_events[g].record(cube_stream)
+            if cube_tail is not None and g == num_groups - 1:
+                # After the last GEMM group the cube engine would idle while the
+                # vector stream drains the remaining pushes + barrier + reduce;
+                # fill that window with the caller's pure-Cube tail op. The last
+                # group's push is already released by group_events[g], which was
+                # recorded BEFORE the tail was enqueued.
+                tail_result = cube_tail()
+                tail_event = torch.npu.Event()
+                tail_event.record(cube_stream)
 
         vector_stream.wait_event(group_events[g])
         with torch.npu.stream(vector_stream):
@@ -383,6 +446,8 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
 
     done_ev.record(vector_stream)
     current_stream.wait_event(done_ev)
+    if tail_event is not None:
+        current_stream.wait_event(tail_event)
 
     _kernel_combine_fc1_bwd_reduce[(nvec(), 1, 1)](
         prep["inv_sort"], peer_mem, output, grad_routing,
@@ -390,7 +455,8 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
         prep["stride_om"], prep["stride_on"],
         BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
         num_warps=8)
-    return output
+    # tail_result is None when no cube_tail was given.
+    return tail_result
 
 
 def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_routing, saved):
@@ -411,14 +477,14 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
     _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk, num_warps=8)
     if _gns > 0:
         _gkw["num_stages"] = _gns
+    tiles = _gemm_tile_maps(saved, _gbm)
     _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
         prep["inp"], prep["weight"], hidden_buf,
-        prep["meta_expert_ids"], prep["meta_split_cum"],
-        prep["meta_tile_num"], prep["expert_counts"],
+        tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
         prep["N"], prep["K"], _g_num_tn,
         prep["inp_stride_im"], prep["inp_stride_ik"],
         prep["we"], prep["wk"], prep["wn"],
-        FIRST_TILE_M=0, LAST_TILE_M=prep["num_tm"],
+        FIRST_TILE_M=0, LAST_TILE_M=tiles["num_tiles_m"],
         **_gkw)
     if _pt:
         _pev[1].record()
@@ -450,13 +516,17 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
     return output
 
 
-def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_hidden=False):
+def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_hidden=False,
+                           cube_tail=None):
     """Step 4: returns (grad_hidden [B,H], grad_routing_weights [B,topk]).
     peer_mem is the shared symmetric buffer at heap offset 0 (reused from step 1,
     which has finished by now). The gate (routing-weight) grad rides step4's
     push+reduce as a packed peer_mem channel (row = [hidden | gate]), so there is
     no host HCCL all_to_all for the gate. If return_hidden, also returns
-    hidden_buf (=grad_recv_hidden_sorted)."""
+    hidden_buf (=grad_recv_hidden_sorted). If cube_tail is given (pipeline path
+    only), it is enqueued on the cube stream after the last GEMM group and its
+    return value is appended to the result for the caller to consume after the
+    tail event."""
     prep = _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate)
     # GEMM writes every hidden_buf tile (meta covers all tokens); reduce writes
     # every output row -> empty, no zero-fill needed. hidden_buf is a plain
@@ -465,12 +535,17 @@ def combine_fc1_bwd_triton(saved, grad_fc1_output, grad_gate, peer_mem, return_h
     hidden_buf = torch.empty(prep["M"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     output = torch.empty(prep["B"], prep["N"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
     grad_routing_flat = torch.empty(prep["B"] * prep["topk"], dtype=grad_fc1_output.dtype, device=grad_fc1_output.device)
+    tail_result = None
     if os.environ.get("MOE_BWD_COMBINE_SERIAL") == "1":
         # diagnostic: 3-phase serial combine (no group overlap) + per-phase timing
         _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
     else:
-        _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing_flat, saved)
+        tail_result = _launch_combine_fc1_bwd_pipeline(
+            prep, peer_mem, hidden_buf, output, grad_routing_flat, saved,
+            cube_tail=cube_tail)
     grad_routing_weights = grad_routing_flat.view(prep["B"], prep["topk"])
+    if cube_tail is not None:
+        return output, grad_routing_weights, tail_result
     if return_hidden:
         return output, grad_routing_weights, hidden_buf
     return output, grad_routing_weights
