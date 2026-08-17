@@ -87,7 +87,7 @@ def transposed_grouped_gemm_triton(grad_out, orig_in, expert_counts, split_size_
     # 0 = omit (legacy behavior).
     num_stages = int(os.environ.get("MOE_WGRAD_NUM_STAGES", "3"))
     kwargs = dict(BLOCK_M=WGRAD_BLOCK_M, BLOCK_N=WGRAD_BLOCK_N, BLOCK_K=WGRAD_BLOCK_K,
-                  num_warps=8, use_bytecode=True)
+                  num_warps=8)
     if num_stages > 0:
         kwargs["num_stages"] = num_stages
     kernel_transposed_grouped_gemm[(ncore(), 1, 1)](
