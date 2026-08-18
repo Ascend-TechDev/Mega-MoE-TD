@@ -225,22 +225,15 @@ def _kernel_build_routing_metadata(
 
 
 @triton.jit(do_not_specialize=["num_valid"])
-def _kernel_build_routing_metadata_lower_bound(
+def _kernel_publish_routing_counts_lower_bound(
     sorted_key_ptr,
     counts_mem_ptr,
-    send_bucket_starts_ptr,
-    send_bucket_dst_starts_ptr,
-    recv_counts_re_ptr,
-    recv_per_expert_ptr,
-    recv_expert_offs_ptr,
-    stats_ptr,
     num_valid,
     LOCAL_RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
 ):
-    """Build 1024-bin Kimi metadata without the unsupported histogram."""
+    """Publish a large lower-bound count row before metadata consumers run."""
     bin_offs = tl.arange(0, NUM_BINS_PAD)
     left_lo = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
     left_hi = left_lo + num_valid
@@ -272,21 +265,123 @@ def _kernel_build_routing_metadata_lower_bound(
         right_lo = tl.where(right_advance, right_mid + 1, right_lo)
         right_hi = tl.where(right_active & ~right_advance, right_mid, right_hi)
     local_counts = right_lo - left_lo
-    _publish_counts_and_build_metadata(
-        local_counts,
-        bin_offs,
-        counts_mem_ptr,
-        send_bucket_starts_ptr,
-        send_bucket_dst_starts_ptr,
-        recv_counts_re_ptr,
-        recv_per_expert_ptr,
-        recv_expert_offs_ptr,
-        stats_ptr,
-        LOCAL_RANK,
-        WORLD_SIZE,
-        EXPERTS_PER_RANK,
-        NUM_BINS_PAD,
+
+    local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
+    tl.store(local_row_ptr + bin_offs, local_counts)
+    if sub_vec_id() == 0:
+        for peer_rank in range(WORLD_SIZE):
+            if peer_rank != LOCAL_RANK:
+                libshmem_device.putmem(
+                    local_row_ptr,
+                    local_row_ptr,
+                    NUM_BINS_PAD * 4,
+                    peer_rank,
+                )
+
+    # Preserve the validated count-publication acquire point.  No metadata
+    # program is launched until every rank's complete row is visible.
+    libshmem_device.barrier_all_vec()
+
+
+@triton.jit
+def _kernel_build_routing_metadata_by_destination(
+    counts_mem_ptr,
+    send_bucket_starts_ptr,
+    send_bucket_dst_starts_ptr,
+    recv_counts_re_ptr,
+    recv_per_expert_ptr,
+    recv_expert_offs_ptr,
+    stats_ptr,
+    LOCAL_RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    NUM_BINS_PAD: tl.constexpr,
+):
+    """Build one destination rank's metadata per Vector program."""
+    dst_rank = tl.program_id(0)
+    local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
+    is_local_dst = dst_rank == LOCAL_RANK
+
+    # send_bucket_starts is an exclusive prefix over the complete local count
+    # row.  Recover this destination's base in parallel, then retain the
+    # historically validated expert/source order within its disjoint slice.
+    bin_offs = tl.arange(0, NUM_BINS_PAD)
+    first_bucket = dst_rank * EXPERTS_PER_RANK
+    preceding_counts = tl.load(
+        local_row_ptr + bin_offs,
+        mask=bin_offs < first_bucket,
+        other=0,
     )
+    send_running = tl.sum(preceding_counts)
+    expert_base = 0
+
+    for local_expert in range(EXPERTS_PER_RANK):
+        bucket = first_bucket + local_expert
+        local_count = tl.load(local_row_ptr + bucket)
+        tl.store(send_bucket_starts_ptr + bucket, send_running)
+
+        target_total = 0
+        source_prefix = 0
+        for source_rank in range(WORLD_SIZE):
+            source_count = tl.load(
+                counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
+            )
+            target_total += source_count
+            if source_rank < LOCAL_RANK:
+                source_prefix += source_count
+            tl.store(
+                recv_counts_re_ptr
+                + source_rank * EXPERTS_PER_RANK
+                + local_expert,
+                source_count,
+                mask=is_local_dst,
+            )
+
+        tl.store(
+            send_bucket_dst_starts_ptr + bucket,
+            expert_base + source_prefix,
+        )
+        tl.store(
+            recv_per_expert_ptr + local_expert,
+            target_total,
+            mask=is_local_dst,
+        )
+        tl.store(
+            recv_expert_offs_ptr + local_expert,
+            expert_base,
+            mask=is_local_dst,
+        )
+
+        send_running += local_count
+        expert_base += target_total
+
+    tl.store(
+        recv_expert_offs_ptr + EXPERTS_PER_RANK,
+        expert_base,
+        mask=is_local_dst,
+    )
+    tl.store(stats_ptr, expert_base, mask=is_local_dst)
+    tl.store(stats_ptr + 2 + dst_rank, expert_base)
+
+
+@triton.jit
+def _kernel_finalize_routing_metadata(
+    stats_ptr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Reduce destination capacities and protect the shared count cube."""
+    max_required = 0
+    for dst_rank in range(WORLD_SIZE):
+        max_required = tl.maximum(
+            max_required,
+            tl.load(stats_ptr + 2 + dst_rank),
+        )
+    tl.store(stats_ptr + 1, max_required)
+
+    # This remains a one-program collective, matching the old lower-bound
+    # kernel.  It prevents a faster rank's next invocation from overwriting a
+    # count row while any peer still consumes the current invocation.
+    libshmem_device.barrier_all_vec()
 
 
 def build_routing_plan(
@@ -338,12 +433,32 @@ def build_routing_plan(
         num_valid,
     )
     if context.metadata_num_bins > 512:
-        _kernel_build_routing_metadata_lower_bound[(1, 1, 1)](
-            *metadata_args,
+        _kernel_publish_routing_counts_lower_bound[(1, 1, 1)](
+            metadata_sorted_experts,
+            context.metadata_counts_mem,
+            num_valid,
+            LOCAL_RANK=context.rank,
+            WORLD_SIZE=world_size,
+            NUM_BINS_PAD=context.metadata_num_bins,
+        )
+        _kernel_build_routing_metadata_by_destination[
+            (world_size, 1, 1)
+        ](
+            context.metadata_counts_mem,
+            context.metadata_send_bucket_starts,
+            context.metadata_send_bucket_dst_starts,
+            context.metadata_recv_counts_re,
+            context.metadata_recv_per_expert,
+            context.metadata_recv_expert_offs,
+            context.metadata_stats,
             LOCAL_RANK=context.rank,
             WORLD_SIZE=world_size,
             EXPERTS_PER_RANK=experts_per_rank,
             NUM_BINS_PAD=context.metadata_num_bins,
+        )
+        _kernel_finalize_routing_metadata[(1, 1, 1)](
+            context.metadata_stats,
+            WORLD_SIZE=world_size,
         )
     else:
         _kernel_build_routing_metadata[(1, 1, 1)](

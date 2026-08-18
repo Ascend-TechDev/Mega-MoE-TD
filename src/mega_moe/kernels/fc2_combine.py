@@ -94,42 +94,42 @@ def _prepare_fc2_device_put_metadata_kernel(
     stable-send rows are global-expert major, so both offsets can be derived
     from the replicated count cube without another host-side collective.
     """
-    for source_rank in range(0, WORLD_SIZE):
-        remote_send_cursor = 0
-        for bucket in range(0, WORLD_SIZE * EXPERTS_PER_RANK):
-            route_count = tl.load(
-                counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
+    source_rank = tl.program_id(axis=0)
+    remote_send_cursor = 0
+    for bucket in range(0, WORLD_SIZE * EXPERTS_PER_RANK):
+        route_count = tl.load(
+            counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
+        )
+        destination_rank = bucket // EXPERTS_PER_RANK
+        expert_id = bucket % EXPERTS_PER_RANK
+        if destination_rank == LOCAL_RANK:
+            source_local_start = tl.load(recv_expert_offs_ptr + expert_id)
+            for prior_source in range(0, WORLD_SIZE):
+                source_local_start += tl.load(
+                    counts_mem_ptr
+                    + prior_source * NUM_BINS_PAD
+                    + bucket,
+                    mask=prior_source < source_rank,
+                    other=0,
+                )
+            segment_id = expert_id * WORLD_SIZE + source_rank
+            tl.store(
+                pull_tile_rank_ptr + segment_id,
+                tl.where(route_count > 0, source_rank, -1),
             )
-            destination_rank = bucket // EXPERTS_PER_RANK
-            expert_id = bucket % EXPERTS_PER_RANK
-            if destination_rank == LOCAL_RANK:
-                source_local_start = tl.load(
-                    recv_expert_offs_ptr + expert_id
-                )
-                for prior_source in range(0, source_rank):
-                    source_local_start += tl.load(
-                        counts_mem_ptr
-                        + prior_source * NUM_BINS_PAD
-                        + bucket
-                    )
-                segment_id = expert_id * WORLD_SIZE + source_rank
-                tl.store(
-                    pull_tile_rank_ptr + segment_id,
-                    tl.where(route_count > 0, source_rank, -1),
-                )
-                tl.store(
-                    pull_tile_src_start_ptr + segment_id,
-                    source_local_start,
-                )
-                tl.store(
-                    pull_tile_dst_start_ptr + segment_id,
-                    remote_send_cursor,
-                )
-                tl.store(
-                    pull_tile_row_count_ptr + segment_id,
-                    route_count,
-                )
-            remote_send_cursor += route_count
+            tl.store(
+                pull_tile_src_start_ptr + segment_id,
+                source_local_start,
+            )
+            tl.store(
+                pull_tile_dst_start_ptr + segment_id,
+                remote_send_cursor,
+            )
+            tl.store(
+                pull_tile_row_count_ptr + segment_id,
+                route_count,
+            )
+        remote_send_cursor += route_count
 
 
 @triton.jit
@@ -539,7 +539,7 @@ def prepare_fc2_device_put_metadata(
                 f"{name} must provide one slot per expert/source pair"
             )
 
-    _prepare_fc2_device_put_metadata_kernel[(1, )](
+    _prepare_fc2_device_put_metadata_kernel[(world_size, )](
         counts_mem,
         received_expert_offsets,
         pull_tile_rank,
