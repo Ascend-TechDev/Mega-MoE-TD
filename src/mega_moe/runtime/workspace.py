@@ -151,8 +151,13 @@ def create_moe_forward_context(
     context.metadata_recv_expert_offs = torch.empty(
         experts_per_rank + 1, dtype=torch.int32, device=device
     )
-    # [local receive routes, maximum receive routes required by any rank]
-    context.metadata_stats = torch.empty(2, dtype=torch.int32, device=device)
+    # [local receive routes, maximum receive routes required by any rank,
+    #  one temporary receive total per destination rank]
+    context.metadata_stats = torch.empty(
+        2 + world_size,
+        dtype=torch.int32,
+        device=device,
+    )
 
     num_routes = max_tokens_per_rank * top_k
     context.row_token_indices = (
