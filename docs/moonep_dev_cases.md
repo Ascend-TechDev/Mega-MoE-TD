@@ -85,17 +85,6 @@
   tests 侧 import 同步替换。
 - **预防**：vendor 同步流程不变（cp + `diff -rq` + 更新 commit 注记）。
 
----
-
-## 里程碑状态
-
-| # | 内容 | 状态 |
-|---|---|---|
-| M0 | oracle vendor（6/6 自测绿）+ Step 0 smoke（4/4 绿，产出 CASE-01..04） | ✅ aa93b4b / ee99e2f |
-| M1 | Triton planning：C.1 计数排序 + putmem order0 + C.2 + dedup kernel；bit-exact rand/dup/R=1 全绿 | ✅ dbed413 |
-| M2 | workspace + prefetch | 进行中 |
-| M3-M5 | dispatch/GEMM 接线、forward 组装、基准 | 待启动 |
-
 ## CASE-09 aclshmem_init 有堆大小下限（64MB init 失败）
 
 - **现象**：两 rank 同时报 `aclshmem_init failed`——workspace 估算堆仅
