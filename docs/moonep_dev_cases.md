@@ -95,3 +95,30 @@
 | M1 | Triton planning：C.1 计数排序 + putmem order0 + C.2 + dedup kernel；bit-exact rand/dup/R=1 全绿 | ✅ dbed413 |
 | M2 | workspace + prefetch | 进行中 |
 | M3-M5 | dispatch/GEMM 接线、forward 组装、基准 | 待启动 |
+
+## CASE-09 aclshmem_init 有堆大小下限（64MB init 失败）
+
+- **现象**：两 rank 同时报 `aclshmem_init failed`——workspace 估算堆仅
+  ~64MB 时。
+- **解决**：堆下限取 256MB（smoke 验证过）；`MoonepWorkspace.required_bytes`
+  仅作下界估算，session sizing 用 `max(估算×2, 256MB)`。
+- **预防**：`test_prefetch_bitexact.py` 的 heap 计算行。
+
+## CASE-10 cu/zfr 的形状是 [E+B] 不是 [epn+B]
+
+- **现象**：M2 测试初版把 cu_seqlens/zero_fill_ranges 按 `topo.seg=epn+B`
+  分配——planning 输出实际是**全局专家段** [E+B]（压缩段视图才是 epn+B，
+  由 build_moonep_segment_meta 在消费侧派生）。
+- **预防**：M2 测试的 outs 契约注释；M3 的 segment meta 构建器要显式做
+  E+B → epn+B 的压缩。
+
+---
+
+## 里程碑状态（更新）
+
+| # | 内容 | 状态 |
+|---|---|---|
+| M0 | oracle vendor + Step 0 smoke | ✅ aa93b4b / ee99e2f |
+| M1 | Triton planning bit-exact（rand/dup/R=1） | ✅ dbed413 |
+| M2 | MoonepWorkspace（8 张对称张量定序）+ prefetch push kernel 对拍 | ✅ 见本次提交 |
+| M3 | dispatch + segment/send meta + FC1 GEMM 接线 | 待启动 |

@@ -70,12 +70,17 @@ class MoonepPlanBuffers:
     代算 rank0 的 order 暂存）。
     """
 
-    def __init__(self, N: int, device):
+    def __init__(self, N: int, device, order0: torch.Tensor | None = None):
         import shmem as ash
 
         self.N = N
-        self.order0 = ash.aclshmem_create_tensor(
-            [N], torch.int32, device_id=_device_id(device))
+        self._owns_order0 = order0 is None
+        if order0 is None:
+            order0 = ash.aclshmem_create_tensor(
+                [N], torch.int32, device_id=_device_id(device))
+        else:
+            assert order0.dtype == torch.int32 and order0.numel() == N
+        self.order0 = order0
         self.order = torch.empty(N, dtype=torch.int32, device=device)
         self.dst_row = torch.empty(N, dtype=torch.int64, device=device)
         self.order0_local = torch.empty(N, dtype=torch.int32, device=device)
@@ -83,7 +88,8 @@ class MoonepPlanBuffers:
     def finalize(self):
         import shmem as ash
 
-        ash.aclshmem_free_tensor(self.order0)
+        if self._owns_order0:
+            ash.aclshmem_free_tensor(self.order0)
 
 
 # ---------------------------------------------------------------------------
