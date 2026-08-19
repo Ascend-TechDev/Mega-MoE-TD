@@ -19,7 +19,7 @@ import sys
 import pytest
 import torch
 
-from tests._moonep_oracle import (
+from mega_moe.moonep_ref import (
     _phase_b_tables,
     _phase_c1_order,
     _phase_c2_rank,
