@@ -111,3 +111,42 @@
 | M1 | Triton planning bit-exact（rand/dup/R=1） | ✅ dbed413 |
 | M2 | MoonepWorkspace（8 张对称张量定序）+ prefetch push kernel 对拍 | ✅ 见本次提交 |
 | M3 | dispatch + segment/send meta + FC1 GEMM 接线 | 待启动 |
+
+## CASE-11 send_meta 的段压缩必须按【目的 rank】，不是本 rank
+
+- **现象**：dispatch 融合 kernel aicore 超时（消费侧 GEMM `dl.wait` 等不到
+  信号）。
+- **定位**：二分法——push-only 变体（去 Cube 半边）VM/权重全对 ⇒ 推半边
+  无辜；离线复算表数据全自洽 ⇒ 表值无辜；剩下信号槽键。`build_moonep_
+  send_meta` 里 `_compress_seg(g, rank, ...)` 用了**本 rank**——段是目的
+  rank 的本地段，必须 `g − dr·epn`；且段查表的 **cu 也必须是目的 rank
+  的**（cu 每 rank 不同）。
+- **解决**：planning 宿主把全组表经 `outs["_tbl"]` 捎带（cu_all），
+  send_meta 按目的 rank 分组查表+压缩。
+- **预防**：`test_dispatch_bitexact.py`（任何信号不匹配都会以超时显形）。
+
+## CASE-12 910B Cube 不支持 16×16×16 的小块 bf16 dot（fixp 崩/挂）
+
+- **现象**：BLOCK_M/N/K=16 时 kernel aicore 超时，设备 dump 报
+  **fixp**（定点单元）错误；push-only（纯 Vector）同尺寸正常。
+- **根因**：生产路径 classic GEMM 从不跑 16 方块（tail 最低收缩到 32/64），
+  小尺寸 cube dot 在 910B 上触发硬件异常。
+- **解决**：测试规格提到生产量级（H=256, 2F=256, BLOCK=128）后一次通过。
+  **结论：moonep 的 GEMM 调用面 block 下限 128**（与 classic 一致）。
+- **预防**：launcher 文档注释 + 本条案例；后续小规格功能用例只测
+  planning/prefetch/push，不测 Cube GEMM。
+
+## CASE-13 期望算式的转置方向（测试侧）
+
+fc1 期望 = `vm @ gu[s]`（W 物理 [H,2F]，b[k,n]=phys[k,n]），不是
+`@ gu[s].T`——以 classic b_ptrs 步长公式为准推导，不要凭直觉。
+
+---
+
+## 里程碑状态（更新）
+
+| # | 内容 | 状态 |
+|---|---|---|
+| M0-M2 | oracle/smoke/planning/prefetch | ✅ |
+| M3 | zero_fill + segment/send/recv 元数据 + dispatch 融合 kernel（复用 classic FC1 GEMM，Seg 替换 EPR）；VM/权重逐位 + fc1 数值全绿 | ✅ 见本次提交 |
+| M4 | combine_push + topk_reduce + MoonepForward 组装 | 待启动 |

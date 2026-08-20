@@ -295,6 +295,9 @@ def launch_moonep_planning(
         bufs.dst_row, outs["dst"], N=N, NvS=NvS, K=K, BLOCK=_DEDUP_BLOCK)
 
     # ---- 输出表：宿主切片拷贝 ----
+    # _tbl 捎带全组宿主表（cu_all 等，cpu/int64）——dispatch 侧 send_meta
+    # 需要【目的 rank】的段边界，避免二次 allgather
+    outs["_tbl"] = tbl
     outs["cu_seqlens"].copy_(tbl["cu_all"][rank].to(torch.int32).to(dev))
     outs["experts_to_copy"].copy_(
         tbl["etc_all"].to(torch.int32).to(dev))

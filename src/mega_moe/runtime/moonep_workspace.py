@@ -127,7 +127,8 @@ class MoonepWorkspace:
         epn = t.epn
         assert tuple(gate_up_local.shape) == (epn, t.H, 2 * t.F), \
             f"gate_up_local 形状应为 ({epn},{t.H},{2 * t.F})"
-        assert tuple(down_local.shape) == (epn, t.H, t.F)
+        assert tuple(down_local.shape) == (epn, t.H, t.F), \
+            f"down_local 形状应为 ({epn},{t.H},{t.F})"
 
         def _copy_chunks(dst, src):
             flat_dst = dst.reshape(-1)
