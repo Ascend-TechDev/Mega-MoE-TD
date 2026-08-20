@@ -311,6 +311,7 @@ def launch_moonep_planning(
                 for _ in range(R)]
     dist.all_gather(dst_list, outs["dst"], group=ep_group)
     dst_all = torch.stack([d.to(torch.int64).cpu() for d in dst_list])
+    outs["_dst_all"] = dst_all             # dispatch 侧复用，省二次 allgather
     src_info = torch.full((NvS,), -1, dtype=torch.int64)
     for sr in range(R):
         v = dst_all[sr]
