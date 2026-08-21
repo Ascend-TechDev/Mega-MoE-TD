@@ -1,14 +1,14 @@
-# 分阶段核查 rank0：vm→fc1→act→fc2→combine_buf→out
+# 分阶段核查（真实中间张量）：vm→fc1→act→fc2→combine_buf→out
+# 用 op._saved 的实际 tensor 逐级比对，定位 flaky 的第一级。
 import functools
+import sys
 import pytest, torch
 import torch.distributed as dist
+sys.path.insert(0, '.')
 import mega_moe.moonep_ref  # noqa
 from mega_moe.ops.moonep_forward import MoonepForward
 from mega_moe.runtime.moonep_workspace import MoonepTopology, MoonepWorkspace
 from mega_moe.runtime.moonep_routing import build_moonep_segment_meta
-from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
-import sys
-sys.path.insert(0, '.')
 from tests.layer.test_moonep_forward import _reference, _silu, _S, _K, _EPN, _H, _F, _B, _TP
 
 def _worker(rank, world_size):
@@ -31,7 +31,7 @@ def _worker(rank, world_size):
     gu_all = torch.stack([(torch.randn(epn,_H,2*_F,generator=torch.Generator().manual_seed(500+r))*0.1).to(torch.bfloat16) for r in range(world_size)])
     dn_all = torch.stack([(torch.randn(epn,_H,_F,generator=torch.Generator().manual_seed(600+r))*0.1).to(torch.bfloat16) for r in range(world_size)])
     topo = MoonepTopology(S=_S,K=_K,E=E,R=world_size,B=_B,H=_H,F=_F,token_padding=_TP,dispatch_block_m=128)
-    heap = max(MoonepWorkspace.required_bytes(topo)*2, 256<<20)
+    heap = max(MoonepWorkspace.required_bytes(topo)*2,256<<20)
     with kit.aclshmem_session(rank, world_size, heap):
         op = MoonepForward(ep_group, max_tokens_per_rank=_S, hidden_size=_H, ffn_dim=_F,
                            top_k=_K, num_experts=E, num_slots=_B, token_padding=_TP, num_cores=8, block_size=128)
@@ -39,47 +39,66 @@ def _worker(rank, world_size):
             op.register_weights(gu_all[rank].to(device), dn_all[rank].to(device))
             out = op.forward(hs_l[rank].to(device), topk_l[rank].to(device), rw_l[rank].to(device))
             op.sync()
-            # 复算 planning 拿段表
             cu = op._outs["cu_seqlens"].cpu()
             seg_c, seg_o, _ = build_moonep_segment_meta(cu, op._outs["experts_to_copy"].cpu()[rank], rank, epn, E, _B)
-            rows_pad = int(seg_o[-1])
-            vm = op.ws.vm[:rows_pad].cpu().to(torch.float32)
-            gu_c = op.ws.gate_up.cpu().to(torch.float32)
-            dn_c = op.ws.down.cpu().to(torch.float32)
-            # 期望 vm：按 src_info 反推每行的 (sr, offv) → payload
+            rows_pad = int(seg_o[-1]); NvS = topo.NvS
             si = op._outs["src_info"][:rows_pad].cpu().to(torch.int64)
-            NvS = topo.NvS
+            # ---- stage0: vm（按 src_info 反推）----
+            vm = op.ws.vm[:rows_pad].cpu().to(torch.float32)
             vm_exp = torch.zeros(rows_pad, _H)
             for r0 in range(rows_pad):
                 info = int(si[r0])
-                sr, offv = info // NvS, info % NvS
-                vm_exp[r0] = hs_l[sr][offv // _K].to(torch.float32)
-            print(f"[rank{rank}] stage0 vm ok={torch.allclose(vm, vm_exp, atol=2e-2)}", flush=True)
-            # fc1/act/fc2 期望（按段）
+                if info < 0: continue
+                vm_exp[r0] = hs_l[info // NvS][info % NvS // _K].to(torch.float32)
+            s0 = torch.allclose(vm, vm_exp, atol=2e-2)
+            # ---- stage1: fc1（真实张量）----
+            fc1 = op._saved["fc1_out"][:rows_pad].cpu().to(torch.float32)
             seg_expert = torch.cat([torch.arange(rank*epn,(rank+1)*epn), op._outs["experts_to_copy"].cpu()[rank].to(torch.int64)])
-            for s0 in range(seg_c.numel()):
-                c0,o0 = int(seg_c[s0]), int(seg_o[s0])
+            fc1_ok = True; worst = 0.0
+            for s0i in range(seg_c.numel()):
+                c0,o0 = int(seg_c[s0i]), int(seg_o[s0i])
                 if c0==0: continue
-                e = int(seg_expert[s0])
-                gu = gu_all[e//epn, e%epn].to(torch.float32)
-                exp_fc1 = vm_exp[o0:o0+c0] @ gu
-                # act 权重按行（rw_recv）
-                w = op.ws.routing_weight_recv[o0:o0+c0].cpu()
-                gate, up = exp_fc1[:, :_F], exp_fc1[:, _F:]
-                exp_act = (_silu(gate)*up) * w[:,None]
-                dn = dn_all[e//epn, e%epn].to(torch.float32)
-                exp_fc2 = exp_act @ dn.T
-                print(f"[rank{rank}] seg{s0}(e{e}) fc1-like ok={torch.allclose(vm[o0:o0+c0] @ gu_c[s0], exp_fc1, atol=3e-2)}", flush=True)
-            # combine_buf 期望：buf[offv] = fc2(row of that entry)
-            # 直接验 out 每错 token 的 k 分量来源
+                e = int(seg_expert[s0i])
+                exp = vm_exp[o0:o0+c0] @ gu_all[e//epn,e%epn].to(torch.float32)
+                d = float((fc1[o0:o0+c0]-exp).abs().max()); worst=max(worst,d)
+                if d > 5e-2: fc1_ok = False
+            # ---- stage2: act ----
+            act = op._saved["act"][:rows_pad].cpu().to(torch.float32)
+            w = op.ws.routing_weight_recv[:rows_pad].cpu()
+            act_ok = True; worst_a = 0.0
+            for s0i in range(seg_c.numel()):
+                c0,o0 = int(seg_c[s0i]), int(seg_o[s0i])
+                if c0==0: continue
+                e = int(seg_expert[s0i])
+                f1 = fc1[o0:o0+c0]  # 用真实 fc1（隔离下游错误）
+                exp = (_silu(f1[:, :_F])*f1[:, _F:]) * w[o0:o0+c0,None].cpu()
+                d = float((act[o0:o0+c0]-exp).abs().max()); worst_a=max(worst_a,d)
+                if d > 5e-2: act_ok = False
+            # ---- stage3: fc2（真实张量，act 为基）----
+            fc2 = op._saved["fc2_out"][:rows_pad].cpu().to(torch.float32)
+            fc2_ok = True; worst_f = 0.0
+            for s0i in range(seg_c.numel()):
+                c0,o0 = int(seg_c[s0i]), int(seg_o[s0i])
+                if c0==0: continue
+                e = int(seg_expert[s0i])
+                exp = act[o0:o0+c0] @ dn_all[e//epn,e%epn].to(torch.float32).T
+                d = float((fc2[o0:o0+c0]-exp).abs().max()); worst_f=max(worst_f,d)
+                if d > 5e-2: fc2_ok = False
+            # ---- stage4: combine_buf（每条目行 == 源处 fc2 行）----
+            cb = op.ws.combine_buf.cpu().to(torch.float32)
+            cb_exp = torch.zeros_like(cb)
+            for r0 in range(rows_pad):
+                info = int(si[r0])
+                if info < 0: continue
+                offv = info % NvS
+                cb_exp[offv] = fc2[r0]
+            cb_ok = bool((cb-cb_exp).abs().max() < 5e-2)
+            # ---- stage5: out ----
             ref = _reference(topk_l[rank], rw_l[rank], hs_l[rank], gu_all, dn_all, epn, E)
             got = out.to(torch.float32).cpu()
-            bad = (got-ref).abs().max(dim=1).values > 0.5
-            nbad = int(bad.sum())
-            print(f"[rank{rank}] out bad_tokens={nbad}/{_S}", flush=True)
-            if nbad:
-                t0 = int(torch.nonzero(bad)[0])
-                print(f"[rank{rank}] first bad t={t0} topk={topk_l[rank][t0].tolist()} rw={rw_l[rank][t0].tolist()} got[:4]={got[t0,:4].tolist()} ref[:4]={ref[t0,:4].tolist()}", flush=True)
+            nbad = int((((got-ref).abs().max(dim=1).values) > 0.5).sum())
+            print(f"[rank{rank}] STAGES vm={s0} fc1={fc1_ok}({worst:.3f}) act={act_ok}({worst_a:.3f}) "
+                  f"fc2={fc2_ok}({worst_f:.3f}) cbuf={cb_ok} bad_out={nbad}", flush=True)
         finally:
             op.finalize()
 

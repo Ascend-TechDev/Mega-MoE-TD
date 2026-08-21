@@ -150,3 +150,34 @@ fc1 期望 = `vm @ gu[s]`（W 物理 [H,2F]，b[k,n]=phys[k,n]），不是
 | M0-M2 | oracle/smoke/planning/prefetch | ✅ |
 | M3 | zero_fill + segment/send/recv 元数据 + dispatch 融合 kernel（复用 classic FC1 GEMM，Seg 替换 EPR）；VM/权重逐位 + fc1 数值全绿 | ✅ 见本次提交 |
 | M4 | combine_push + topk_reduce + MoonepForward 组装 | 待启动 |
+
+## CASE-14 设备流资源耗尽（EE1023）——挂死强杀的驱动级残留
+
+- **现象**：所有卡 `SetDevice` 报 `Too many streams are created`；无进程
+  持有设备 fd；容器内 `npu-smi set -t reset` 不可用。
+- **根因**：aicore 超时被强杀的 run 泄漏驱动级流上下文，不随进程回收。
+- **解决**：宿主机侧复位 NPU 后恢复。**预防：控制并发 pytest 进程数；
+  挂死后先查设备状态再继续跑。**
+
+## CASE-15 融合 dispatch（push∥GEMM+信号）对 self-putmem 行非确定性脏读
+
+- **现象**：fc1 段级数值偶发错（同 seed 不同结果，M3 测试 6 跑 5 挂；
+  提交时通过属运气）。行级 dump 锁定：**坏行全部落在 dst==self 的行块**
+  （fence+signal 对自 putmem→cube 读的排序偶发失效；classic 同构生产
+  无恙，深层根因未明——待与 triton-ascend 侧对齐）。
+- **定位链**：真实中间量分阶段核查（VM 对/GEMM 错→排除散布）→ M3 独立
+  回测复现 flaky → 行级 dump 的 per_src 分桶锁定自源块。
+- **解决**：dispatch 改两段式 `push+fence+barrier → 无信号 plain GEMM`
+  （与 combine 的 FC2 模式同款）。M3 6/6 绿、L2 3/3 绿且逐位确定。
+  **融合流水（信号协议）留 M5 复原**（复原时优先查 self-putmem 语义）。
+
+---
+
+## 里程碑状态（更新）
+
+| # | 内容 | 状态 |
+|---|---|---|
+| M0-M3 | oracle/smoke/planning/prefetch/dispatch | ✅（M3 两段式修复后 6/6 稳定） |
+| M4a | **前向端到端**：MoonepForward 全链 + L2 对拍 | ✅ 3/3 绿且逐位确定（rank0 0.0165 / rank1 0.0136） |
+| M4b | 后向（B-1 dy散布+dgrad → B-4 autograd 封装） | 设计定稿 docs/moonep_backward_plan.md，实施启动 |
+| M5 | 性能基准 + 调优（含融合 dispatch 复原） | 待启动 |

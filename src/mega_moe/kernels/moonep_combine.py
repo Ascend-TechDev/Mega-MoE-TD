@@ -91,6 +91,9 @@ def moonep_combine_push(
                         combine_buf_ptr + offv * H,
                         fc2_ptr + r * H,
                         H * 2, sr)
+            # CASE-14：putmem 后必须 fence 再 barrier——barrier 不隐含 RMA
+            # 落地，否则对端 reduce 偶发读到旧行（跨 rank 漂移的数值错）
+            libshmem_device.fence()
     libshmem_device.barrier_all()
 
 
@@ -140,8 +143,8 @@ def launch_moonep_combine(
     block_n: int = 128,
     block_k: int = 128,
     output: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """FC2 + 推回 + 归约，返回 [S, H] bf16。"""
+):
+    """FC2 + 推回 + 归约，返回 (out [S,H] bf16, fc2_out [rows_pad,H])。"""
     from mega_moe.runtime.moonep_routing import build_moonep_segment_meta
 
     dev = activation.device
@@ -176,4 +179,4 @@ def launch_moonep_combine(
     moonep_topk_reduce[(1, 1, 1)](
         ws_combine_buf, output, N=N, K=K, H=H,
         BLOCK_T=8, BLOCK_H=block_h)
-    return output
+    return output, fc2_out

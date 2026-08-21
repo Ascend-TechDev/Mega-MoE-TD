@@ -147,12 +147,20 @@ class MoonepForward:
             self.num_cores, activation="swiglu")
 
         # 5) FC2 + 推回 + 归约
-        return launch_moonep_combine(
+        out, fc2_out = launch_moonep_combine(
             self.ws.combine_buf, act, self.ws.down, self._outs["src_info"],
             self._outs,
             rank=self.rank, epn=t.epn, E=t.E, B=t.B, NvS=t.NvS, K=t.K,
             H=t.H, F=t.F, num_cores=self.num_cores,
             block_m=self.block, block_n=self.block, block_k=self.block)
+
+        # 反向 saved 暂存（D2 决策：act 保存不重算；调试期也用于逐级核查）
+        self._saved = {
+            "rows_pad": rows_pad, "fc1_out": fc1_out, "act": act,
+            "fc2_out": fc2_out, "rw_recv": self.ws.routing_weight_recv,
+            "hidden": hs, "topk": topk, "rw": rw,
+        }
+        return out
 
     # ------------------------------------------------------------------
     def sync(self):

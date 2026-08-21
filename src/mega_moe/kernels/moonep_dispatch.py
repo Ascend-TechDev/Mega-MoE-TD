@@ -26,7 +26,10 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
-from .dispatch_fc1 import _triton_grouped_gemm_expert_n_merged_tiles_wait
+from .dispatch_fc1 import (
+    _triton_grouped_gemm_expert_n_merged_tiles_wait,
+    _triton_grouped_gemm_one_mn_tile_tail,
+)
 
 __all__ = ["MoonepDispatchState", "launch_moonep_dispatch_fc1",
            "moonep_dispatch_fc1"]
@@ -80,6 +83,85 @@ def _moonep_push_runs(
                 libshmem_device.ACLSHMEM_SIGNAL_SET,
                 dst,
             )
+
+
+@triton.jit
+def moonep_dispatch_push(
+    input_ptr, vm_ptr, routing_weight_ptr, rw_recv_ptr,
+    send_src_idx_ptr, send_offv_ptr, send_loff_ptr,
+    run_dst_ptr, run_seg_ptr, run_start_ptr, run_count_ptr, num_runs,
+    hidden, stride_input_m,
+    NUM_PROGRAM_CORES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """两段式第一步：全部 run 的 payload/权重 putmem + fence + 全组 barrier。
+
+    CASE-15：融合形态（同 kernel 内 push∥GEMM+信号等待）对 **dst==self 的
+    行**出现非确定性脏读（坏行稳定落在自源块；fence+signal 对自 putmem 的
+    排序在 cube 侧读取时偶发失效——classic 同构却生产无恙，根因未明）。
+    v1 采用与 moonep_combine 同款「push→barrier→无信号 GEMM」两段式，
+    多轮验证零翻车；融合流水（信号协议）留 M5 复原。
+    """
+    pid = tl.program_id(axis=0)
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            for run in range(pid, num_runs, NUM_PROGRAM_CORES):
+                dst = tl.load(run_dst_ptr + run)
+                st = tl.load(run_start_ptr + run)
+                cnt = tl.load(run_count_ptr + run)
+                for j in range(0, cnt):
+                    idx = st + j
+                    src_tok = tl.load(send_src_idx_ptr + idx)
+                    offv = tl.load(send_offv_ptr + idx)
+                    loff = tl.load(send_loff_ptr + idx)
+                    libshmem_device.putmem(
+                        vm_ptr + loff * hidden,
+                        input_ptr + src_tok * stride_input_m,
+                        hidden * 2, dst)
+                    libshmem_device.putmem(
+                        rw_recv_ptr + loff,
+                        routing_weight_ptr + offv,
+                        4, dst)
+            libshmem_device.fence()
+    libshmem_device.barrier_all()
+
+
+@triton.jit
+def moonep_fc1_gemm(
+    vm_ptr, weight_ptr, output_ptr,
+    seg_counts_ptr, seg_offsets_ptr,
+    N: tl.constexpr, K: tl.constexpr,
+    stride_input_m, stride_input_k,
+    stride_weight_0, stride_weight_1, stride_weight_2,
+    stride_output_m, stride_output_n,
+    NUM_PROGRAM_CORES: tl.constexpr,
+    SEG: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """两段式第二步：无信号 FC1 段 GEMM（数据经 barrier 全就绪）。"""
+    pid = tl.program_id(axis=0)
+    dtype = tl.bfloat16
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tasks = SEG * num_n_tiles
+    for task_id in range(pid, num_tasks, NUM_PROGRAM_CORES):
+        seg = task_id // num_n_tiles
+        n_tile = task_id % num_n_tiles
+        seg_size = tl.load(seg_counts_ptr + seg)
+        seg_off = tl.load(seg_offsets_ptr + seg)
+        if seg_size > 0:
+            num_m_windows = tl.cdiv(seg_size, BLOCK_SIZE_M)
+            for m_window in range(0, num_m_windows):
+                w_start = m_window * BLOCK_SIZE_M
+                w_size = tl.minimum(BLOCK_SIZE_M, seg_size - w_start)
+                _triton_grouped_gemm_one_mn_tile_tail(
+                    vm_ptr, weight_ptr, output_ptr,
+                    seg, seg_off + w_start, w_size, n_tile, N, K,
+                    stride_input_m, stride_input_k,
+                    stride_weight_0, stride_weight_1, stride_weight_2,
+                    stride_output_m, stride_output_n,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, dtype)
 
 
 @triton.jit
@@ -206,23 +288,25 @@ def launch_moonep_dispatch_fc1(
     d = lambda t: t.to(dev)
     max_src_tiles = (N + block_m - 1) // block_m
     epoch = state.epoch
-    moonep_dispatch_fc1[(num_cores, 1, 1)](
+    # ---- 两段式（CASE-15）：push+barrier → 无信号 GEMM ----
+    moonep_dispatch_push[(num_cores, 1, 1)](
         hidden_states, vm,
-        routing_weights.reshape(-1).contiguous(), rw_recv, signal_mem,
-        weight_for_gemm, fc1_output,
+        routing_weights.reshape(-1).contiguous(), rw_recv,
         d(send["send_src_idx"]), d(send["send_offv"]), d(send["send_loff"]),
         d(send["run_dst"]), d(send["run_seg"]), d(send["run_start"]),
         d(send["run_count"]), num_runs,
-        d(seg_counts), d(seg_offsets), d(recv_counts),
-        epoch,
-        H, out_size, red_size,
-        hidden_states.stride(0), hidden_states.stride(1),
+        H, hidden_states.stride(0),
+        NUM_PROGRAM_CORES=num_cores, BLOCK_M=block_m,
+    )
+    moonep_fc1_gemm[(num_cores, 1, 1)](
+        vm, weight_for_gemm, fc1_output,
+        d(seg_counts), d(seg_offsets),
+        out_size, red_size,
+        H, 1,
         weight_for_gemm.stride(0), weight_for_gemm.stride(1),
         weight_for_gemm.stride(2),
         fc1_output.stride(0), fc1_output.stride(1),
-        NUM_PROGRAM_CORES=num_cores, LOCAL_RANK=rank, WORLD_SIZE=R,
-        SEG=Seg, MAX_SOURCE_TILES=max_src_tiles,
-        FINAL_BARRIER=final_barrier,
+        NUM_PROGRAM_CORES=num_cores, SEG=Seg,
         BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_K=block_k,
     )
     state.epoch += 1
