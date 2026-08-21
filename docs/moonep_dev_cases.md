@@ -181,3 +181,20 @@ fc1 期望 = `vm @ gu[s]`（W 物理 [H,2F]，b[k,n]=phys[k,n]），不是
 | M4a | **前向端到端**：MoonepForward 全链 + L2 对拍 | ✅ 3/3 绿且逐位确定（rank0 0.0165 / rank1 0.0136） |
 | M4b | 后向（B-1 dy散布+dgrad → B-4 autograd 封装） | 设计定稿 docs/moonep_backward_plan.md，实施启动 |
 | M5 | 性能基准 + 调优（含融合 dispatch 复原） | 待启动 |
+
+## CASE-16 dw 归集：offv 空间是【每个源一份 [0,N)】，按 VM 属主遍历会叠槽
+
+- **现象**：dw 两 rank 结果完全相同且大错（8.0 量级）；dump 发现
+  rank0 的 dw 值 == rank1 的。
+- **根因**：dscale 在【接收方】，条目的 offv 是**其源 rank** 的 [0,N)
+  空间——遍历 (si, dscale) 对时不按 `si//NvS` 过滤源，R 份 offv 叠进
+  同一 N 槽、后写覆盖前写（结果恰为最后一个源的视角，两 rank 同构
+  同错）。
+- **解决**：过滤 `si//NvS == 本 rank` 再填充。
+- **预防**：dw 对拍（值对 = 映射错；值近似 = dtype 量化）。
+
+## CASE-17 反向 dgrad 的权重视图方向与前向相反（CASE-13 反向版）
+
+FC1 前向 b[k,n]=phys[k,n] 用 `gate_up.transpose`；FC1 **dgrad**
+gy=dAB@gu_phys.T 则须传 `gate_up` **原样**（stride_out=2F、red=1）。
+FC2 dgrad 同理用 `down.transpose`。纪律不变：以 b_ptrs 步长公式推导。

@@ -93,6 +93,7 @@ def moonep_dispatch_push(
     hidden, stride_input_m,
     NUM_PROGRAM_CORES: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    PUSH_RW: tl.constexpr,
 ):
     """两段式第一步：全部 run 的 payload/权重 putmem + fence + 全组 barrier。
 
@@ -101,6 +102,9 @@ def moonep_dispatch_push(
     排序在 cube 侧读取时偶发失效——classic 同构却生产无恙，根因未明）。
     v1 采用与 moonep_combine 同款「push→barrier→无信号 GEMM」两段式，
     多轮验证零翻车；融合流水（信号协议）留 M5 复原。
+
+    ``PUSH_RW=0``：跳过权重推送（反向 B-1 的 dy 散布复用本 kernel——
+    dy 逐行推到 dy_recv，布局与 dispatch payload 完全同构）。
     """
     pid = tl.program_id(axis=0)
     with al.scope(core_mode="vector", disable_auto_sync=True):
@@ -118,10 +122,11 @@ def moonep_dispatch_push(
                         vm_ptr + loff * hidden,
                         input_ptr + src_tok * stride_input_m,
                         hidden * 2, dst)
-                    libshmem_device.putmem(
-                        rw_recv_ptr + loff,
-                        routing_weight_ptr + offv,
-                        4, dst)
+                    if PUSH_RW:
+                        libshmem_device.putmem(
+                            rw_recv_ptr + loff,
+                            routing_weight_ptr + offv,
+                            4, dst)
             libshmem_device.fence()
     libshmem_device.barrier_all()
 
@@ -296,7 +301,7 @@ def launch_moonep_dispatch_fc1(
         d(send["run_dst"]), d(send["run_seg"]), d(send["run_start"]),
         d(send["run_count"]), num_runs,
         H, hidden_states.stride(0),
-        NUM_PROGRAM_CORES=num_cores, BLOCK_M=block_m,
+        NUM_PROGRAM_CORES=num_cores, BLOCK_M=block_m, PUSH_RW=1,
     )
     moonep_fc1_gemm[(num_cores, 1, 1)](
         vm, weight_for_gemm, fc1_output,

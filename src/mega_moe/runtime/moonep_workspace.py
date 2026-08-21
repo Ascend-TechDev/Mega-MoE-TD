@@ -102,6 +102,9 @@ class MoonepWorkspace:
         self.signal_mem = _alloc(
             (t.R * t.seg * t.max_src_tiles * 16,), torch.int32, "signal_mem")
         self.order0 = _alloc((t.N,), torch.int32, "order0")
+        # 反向（追加在既有分配之后，不扰动前面偏移）：
+        self.dy_recv = _alloc((t.rows_pad_max, t.H), torch.bfloat16, "dy_recv")
+        self.grad_buf = _alloc((t.N, t.H), torch.bfloat16, "grad_buf")
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -110,7 +113,8 @@ class MoonepWorkspace:
         t = topo
         elems_bf16 = (t.rows_pad_max * t.H
                       + t.seg * t.H * 2 * t.F + t.seg * t.H * t.F
-                      + t.N * t.H)
+                      + t.N * t.H
+                      + t.rows_pad_max * t.H + t.N * t.H)   # dy_recv/grad_buf
         elems_other = t.rows_pad_max * 4 + \
             t.R * t.seg * t.max_src_tiles * 16 * 4 + t.N * 4
         return elems_bf16 * 2 + elems_other
