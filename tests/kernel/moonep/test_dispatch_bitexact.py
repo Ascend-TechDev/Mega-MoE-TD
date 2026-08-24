@@ -86,7 +86,8 @@ def _worker(rank, world_size):
     heap = max(MoonepWorkspace.required_bytes(topo) * 2, 256 << 20)
     with kit.aclshmem_session(rank, world_size, heap):
         ws = MoonepWorkspace(topo, rank, device)
-        pbufs = MoonepPlanBuffers(N, device, order0=ws.order0)
+        pbufs = MoonepPlanBuffers(world_size, E, _B, N, NvS, device,
+                                  tpe_all=ws.tpe_all, src_info=ws.src_info)
         state = MoonepDispatchState()
         try:
             gen = torch.Generator().manual_seed(100 + rank)
@@ -113,7 +114,7 @@ def _worker(rank, world_size):
                                         device=device),
             }
             launch_moonep_planning(
-                pbufs, outs, topks[rank].to(device), tpes[rank].to(device),
+                pbufs, outs, topks[rank].to(device),
                 rank=rank, world_size=world_size, ep_group=ep_group,
                 S=_S, K=_K, E=E, B=_B, NvS=NvS, token_padding=_TP)
 

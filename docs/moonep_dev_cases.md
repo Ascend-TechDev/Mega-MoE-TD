@@ -198,3 +198,48 @@ fc1 期望 = `vm @ gu[s]`（W 物理 [H,2F]，b[k,n]=phys[k,n]），不是
 FC1 前向 b[k,n]=phys[k,n] 用 `gate_up.transpose`；FC1 **dgrad**
 gy=dAB@gu_phys.T 则须传 `gate_up` **原样**（stride_out=2F、red=1）。
 FC2 dgrad 同理用 `down.transpose`。纪律不变：以 b_ptrs 步长公式推导。
+
+## CASE-18（预留）B-3 复跑挂：连续两次 pytest 间 aclshmem/hccl 资源残留
+
+planning_b 全量回归（5 个 dist 用例单进程连跑）未复现；纪律保持：单文件
+串行、挂死后先查 npu-smi 再继续。
+
+## CASE-19 bisheng convert-hfusion-to-hivm 形状相关 legalization 失败（planning 单 kernel 化的边界）
+
+- **现象**：`moonep_plan_fused`（A~D 单 kernel）在 E=4/R=2 编译并逐位
+  通过；E8/R2、E8/R4、E16/R4、E4/R1、E128/R8、E256/R8 全部编译失败
+  （`ConvertLinalgIRToBinary ... Failed to run BiShengHIR pipeline`；
+  `--mlir-print-ir-after-failure` 定位到 convert-hfusion-to-hivm 的
+  "failed to legalize operation 'linalg.generic'"）。
+- **排除**：环境问题——tutorials 01-ascend-allgather-gemm 2 rank 全绿；
+  各 phase 单独/两两组合编译全过；onehot/cumsum 最小模式单卡全过。
+  CANN 8.5.0 自带 bishengir-compile 太旧（不认识 hivm.hir.custom）无法
+  交叉验证；实际生效的是 PATH 里本地构建的 AscendNPU-IR（无 TRITON_
+  NPU_COMPILER_PATH 时 wheel 不带 bishengir → which 解析）。
+- **触发规律**：多段共存效应，无单一维度。最小复现 = {B.0+B.1+C.1}
+  三段（任意两段 OK）；减法二分去掉 B.0 或 B.1 任一即过；A+B 同 kernel
+  在 E8R2B3/E16R4 挂而各自单独过；B.4 的 indexed gather/scatter 在
+  R=1 单段即挂。
+- **已试无效**：C.1 i32 化、BLOCK_HIST/BLOCK_E 全扫描、phase 重排、
+  tl.debug_barrier 切 fusion、prevec/autovec/simt_only/direct-hivm-
+  lowering 编译旋钮、gather 尾 barrier vs tables 头 barrier 位置。
+- **生效规避（当前三-kernel 形态的全部）**：拆 gather/tables/dst 三
+  kernel；B.0/alloc_cs 逐 rank 行 1D 累加替代 2D tl.cumsum；B.4 双路径
+  （E≤64 无 indexed 的分块 onehot 选择，大 E 用 indexed——E128/E256
+  生产形状 indexed 路径编译通过）；C.1 onehot/cumsum i32；B.1/B.2 贪心
+  循环 `if R > 1` 编译期剔除（R==1 不支持，实际使用无此形态）。
+- **定位/复现工具**：失败 cache 目录的 `.bcmlir` 直接喂 bishengir-
+  compile（flags 抄 `debug=True` warmup 打印的 cmd_list）+ `--mlir-
+  print-ir-after-failure`；最小复现三段 kernel 在 /tmp/dbg_core.py
+  （bring-up 会话产物，丢失可按本文重写）。详见
+  memory:bisheng-convert-hfusion-shape-bug。
+- **预防**：编译器修复前不改回单 kernel；golden 用例保留对 fused 的
+  逐位对拍锚点，修复后合回时零漂移。
+
+## 里程碑状态（更新）
+
+| # | 内容 | 状态 |
+|---|---|---|
+| M0-M4a/B-1/B-2 | 同前（oracle/planning/prefetch/dispatch/前向 e2e/反向 dx/dw） | ✅ |
+| **planning v2** | 单 kernel 化：kernel 内 tpe allgather（putmem+尾 barrier）+ B 七表冗余自算 + C.2 src_info symm_at 发布 + dedup；宿主 B 表/oracle 生产依赖/topk·tpe HCCL allgather/宿主 src_info 重建全部删除；rank0/1 分工与 order0 体系移除 | ✅ planning_b 分支：三-kernel 形态（CASE-19 规避）全绿（golden+单kernel锚点/ties4/b3tie/odd/determinism + planning/prefetch/dispatch/forward/backward 回归）；单 kernel 版保留为锚点待编译器修复 |
+| B-3 | wgrad+槽归并 | 代码完成未提交（dev_moonep 工作区，planning_b 开发期间 stash） |

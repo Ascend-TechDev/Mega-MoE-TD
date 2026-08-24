@@ -68,14 +68,16 @@ class MoonepTopology:
 class MoonepWorkspace:
     """按固定顺序持有全部对称张量；宿主侧生命周期管理。
 
-    分配序（1→7，全部 rank 一致）：
+    分配序（1→8，全部 rank 一致）：
         1 vm                 bf16 [rows_pad_max, H]   接收区（VM）
         2 routing_weight_recv fp32 [rows_pad_max]
         3 gate_up            bf16 [Seg, H, 2F]        行 [0,epn)=home，槽在后
         4 down               bf16 [Seg, H, F]         物理 [e, N=H, K=F]
         5 combine_buf        bf16 [N, H]              每 (token,slot) 一行
         6 signal_mem         int32 [R·Seg·max_src_tiles·16]
-        7 order0             int32 [N]                planning：rank1→rank0
+        7 dy_recv / 8 grad_buf                          反向（尾部追加）
+        尾部追加（planning v2）：tpe_all int32 [R,E]、src_info int32 [NvS]
+        （order0 已随 rank1 代算结构一并移除）
     """
 
     def __init__(self, topo: MoonepTopology, rank: int, device):
@@ -101,10 +103,13 @@ class MoonepWorkspace:
         self.combine_buf = _alloc((t.N, t.H), torch.bfloat16, "combine_buf")
         self.signal_mem = _alloc(
             (t.R * t.seg * t.max_src_tiles * 16,), torch.int32, "signal_mem")
-        self.order0 = _alloc((t.N,), torch.int32, "order0")
         # 反向（追加在既有分配之后，不扰动前面偏移）：
         self.dy_recv = _alloc((t.rows_pad_max, t.H), torch.bfloat16, "dy_recv")
         self.grad_buf = _alloc((t.N, t.H), torch.bfloat16, "grad_buf")
+        # planning v2（尾部追加）：kernel 内 tpe allgather 汇聚 + src_info
+        # 远端发布落点（注入 MoonepPlanBuffers）
+        self.tpe_all = _alloc((t.R, t.E), torch.int32, "tpe_all")
+        self.src_info = _alloc((t.NvS,), torch.int32, "src_info")
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -116,7 +121,8 @@ class MoonepWorkspace:
                       + t.N * t.H
                       + t.rows_pad_max * t.H + t.N * t.H)   # dy_recv/grad_buf
         elems_other = t.rows_pad_max * 4 + \
-            t.R * t.seg * t.max_src_tiles * 16 * 4 + t.N * 4
+            t.R * t.seg * t.max_src_tiles * 16 * 4 \
+            + t.R * t.E * 4 + t.NvS * 4      # tpe_all / src_info（planning v2）
         return elems_bf16 * 2 + elems_other
 
     # ------------------------------------------------------------------

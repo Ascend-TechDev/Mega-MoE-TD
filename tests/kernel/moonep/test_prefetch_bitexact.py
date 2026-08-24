@@ -105,8 +105,10 @@ def _worker(rank, world_size):
                                                   dn_local.to(device))
             del gu_local, dn_local
 
-            # planning（M1 Triton 链）
-            pbufs = MoonepPlanBuffers(N, device, order0=ws.order0)
+            # planning（Triton 链）
+            pbufs = MoonepPlanBuffers(world_size, E, _B, N, NvS, device,
+                                      tpe_all=ws.tpe_all,
+                                      src_info=ws.src_info)
             outs = {
                 "dst": torch.empty(N, dtype=torch.int32, device=device),
                 "cu_seqlens": torch.empty(E + _B, dtype=torch.int32,
@@ -122,7 +124,7 @@ def _worker(rank, world_size):
                                         device=device),
             }
             launch_moonep_planning(
-                pbufs, outs, topks[rank].to(device), tpes[rank].to(device),
+                pbufs, outs, topks[rank].to(device),
                 rank=rank, world_size=world_size, ep_group=ep_group,
                 S=_S, K=_K, E=E, B=_B, NvS=NvS, token_padding=_TP)
             assert torch.equal(outs["experts_to_copy"].cpu(), etc_ref.cpu()), \

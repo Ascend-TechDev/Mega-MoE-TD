@@ -2,8 +2,8 @@
 """L1：moonep Triton planning vs vendor oracle 全链 bit-exact 对拍（2 rank）。
 
 同输入（固定 seed 生成，显式喂两侧）跑：
-- NPU 侧：MoonepPlanBuffers + launch_moonep_planning（C.1 计数排序 kernel +
-  putmem 传 order0 + C.2 kernel + dedup kernel + 宿主 B 表/src_info）
+- NPU 侧：MoonepPlanBuffers + launch_moonep_planning（v2 三 kernel：gather
+  尾 barrier 的 tpe allgather + B 表冗余自算 + C.1/C.2/src_info/dedup）
 - oracle 侧：mega_moe.moonep_ref 的 SimTransport + PlanningKernel 编排（CPU）
 
 逐位比较六张表：dst / cu_seqlens / experts_to_copy / zero_fill_ranges /
@@ -77,7 +77,7 @@ def _run_case(rank, world_size, style):
 
     # ---- NPU 侧 ----
     with kit.aclshmem_session(rank, world_size, 256 * 1024 * 1024):
-        pbufs = MoonepPlanBuffers(N, device)
+        pbufs = MoonepPlanBuffers(world_size, E, B, N, NvS, device)
         outs = {
             "dst": torch.empty(N, dtype=torch.int32, device=device),
             "cu_seqlens": torch.empty(E + B, dtype=torch.int32, device=device),
@@ -90,7 +90,7 @@ def _run_case(rank, world_size, style):
         }
         try:
             launch_moonep_planning(
-                pbufs, outs, topks[rank].to(device), tpes[rank].to(device),
+                pbufs, outs, topks[rank].to(device),
                 rank=rank, world_size=world_size, ep_group=ep_group,
                 S=S, K=K, E=E, B=B, NvS=NvS, token_padding=tp,
             )
@@ -126,14 +126,6 @@ def test_planning_bitexact_r2(dist_test, style):
     import functools
 
     dist_test(functools.partial(_worker, style=style), world_size=2)
-
-
-@pytest.mark.dist
-@pytest.mark.npu
-def test_planning_bitexact_r1(dist_test):
-    import functools
-
-    dist_test(functools.partial(_worker, style="rand"), world_size=1)
 
 
 if __name__ == "__main__":

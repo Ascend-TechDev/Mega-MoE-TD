@@ -77,11 +77,12 @@ class MoonepForward:
         )
         self._device = f"npu:{self.rank}"
         self.ws = MoonepWorkspace(self.topo, self.rank, self._device)
-        self.pbufs = MoonepPlanBuffers(self.topo.N, self._device,
-                                       order0=self.ws.order0)
+        t = self.topo
+        self.pbufs = MoonepPlanBuffers(
+            t.R, t.E, t.B, t.N, t.NvS, self._device,
+            tpe_all=self.ws.tpe_all, src_info=self.ws.src_info)
         self.dstate = MoonepDispatchState()
         self._last_etc = None
-        t = self.topo
         self._outs = {
             "dst": torch.empty(t.N, dtype=torch.int32, device=self._device),
             "cu_seqlens": torch.empty(t.E + t.B, dtype=torch.int32,
@@ -115,11 +116,10 @@ class MoonepForward:
         topk = selected_experts.reshape(-1).to(torch.int32).contiguous()
         rw = routing_weights.reshape(-1).to(torch.float32).contiguous()
 
-        # 1) planning
+        # 1) planning（kernel 内 tpe allgather + B 表 + C/D，tpe 由 kernel
+        #    直方图自算）
         launch_moonep_planning(
             self.pbufs, self._outs, topk,
-            torch.bincount(topk.to(torch.int64), minlength=t.E)
-            .to(torch.int32).to(dev),
             rank=self.rank, world_size=t.R, ep_group=self.ep_group,
             S=t.S, K=t.K, E=t.E, B=t.B, NvS=t.NvS,
             token_padding=t.token_padding)
