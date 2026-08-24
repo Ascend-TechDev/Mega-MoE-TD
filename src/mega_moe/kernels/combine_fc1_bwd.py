@@ -140,12 +140,12 @@ def _kernel_combine_fc1_bwd_gemm_group(
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
                 wb = expert_id.to(tl.int64) * stride_we
                 for ks in range(0, K, BLOCK_K):
-                    mk = ok < (K - ks)
-                    ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
-                    a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
-                    bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-                    b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
-                    acc += tl.dot(a, b)
+                        mk = ok < (K - ks)
+                        ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
+                        a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+                        bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+                        b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+                        acc += tl.dot(a, b)
                 co = (row_start + om[:, None]) * N + (n_start + on_[None, :])
                 tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
                          mask=mm[:, None] & mn[None, :])
@@ -312,6 +312,14 @@ def _prepare_combine_fc1_bwd(saved, grad_fc1_output, grad_gate):
     return p
 
 
+def _push_block():
+    """Vector transport chunk width for the combine push/reduce kernels.
+    Default 4096 covers one full H=3584 row in a single RMA store (4x fewer,
+    4x larger transactions than the historical 1024 chunk). Env-tunable via
+    MOE_COMBINE_PUSH_BN."""
+    return int(os.environ.get("MOE_COMBINE_PUSH_BN", "4096"))
+
+
 def _combine_bwd_group_bounds(prep, group_experts, block_m):
     """Per-group Cube M-tile range and push src_pos range. Expert e occupies
     M-tiles [cum_tiles[e], cum_tiles[e+1]) — cum_tiles derived from
@@ -380,7 +388,8 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     device = peer_mem.device
     _gbm, _gbn, _gbk, _gns = _combine_gemm_tile()
     _g_num_tn = (prep["N"] + _gbn - 1) // _gbn
-    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk, num_warps=8)
+    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk,
+                num_warps=int(os.environ.get("MOE_COMBINE_GEMM_WARPS", "8")))
     if _gns > 0:
         _gkw["num_stages"] = _gns
     group_env = int(os.environ.get("MOE_COMBINE_BWD_GROUP_EXPERTS", "16"))
@@ -435,8 +444,8 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
                 hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
                 peer_mem, prep["grad_gate"], prep["H"],
                 FIRST_SRC_POS=fs[g], LAST_SRC_POS=ls[g],
-                BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
-                num_warps=8)
+                BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
+                        num_warps=8)
 
     # All group pushes are ordered on vector_stream; one barrier_all_vec (AICore
     # grid, separate launch) fences their cross-rank RMA before the caller's
@@ -453,7 +462,7 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
         prep["inv_sort"], peer_mem, output, grad_routing,
         prep["B"], prep["topk"], prep["H"],
         prep["stride_om"], prep["stride_on"],
-        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
+        BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
         num_warps=8)
     # tail_result is None when no cube_tail was given.
     return tail_result
@@ -468,13 +477,19 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
     wall time into its three components (the default pipeline overlaps phase 1
     and 2 across expert groups)."""
     _pt = os.environ.get("MOE_COMBINE_PHASE_TIMING") == "1"
+    # MOE_COMBINE_PHASE_SPLIT=1 additionally fences push and barrier separately,
+    # emitting 4 intervals (gemm/push/barrier/reduce) into
+    # saved["_combine_phase4_samples"] to attribute the push+barrier slice,
+    # while the 3-phase protocol samples stay unchanged.
+    _ps = _pt and os.environ.get("MOE_COMBINE_PHASE_SPLIT") == "1"
     if _pt:
-        _pev = [torch.npu.Event(enable_timing=True) for _ in range(4)]
+        _pev = [torch.npu.Event(enable_timing=True) for _ in range(5 if _ps else 4)]
         _pev[0].record()
     # phase 1: fc1 input-grad GEMM -> hidden_buf (Cube, all experts)
     _gbm, _gbn, _gbk, _gns = _combine_gemm_tile()
     _g_num_tn = (prep["N"] + _gbn - 1) // _gbn
-    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk, num_warps=8)
+    _gkw = dict(BLOCK_M=_gbm, BLOCK_N=_gbn, BLOCK_K=_gbk,
+                num_warps=int(os.environ.get("MOE_COMBINE_GEMM_WARPS", "8")))
     if _gns > 0:
         _gkw["num_stages"] = _gns
     tiles = _gemm_tile_maps(saved, _gbm)
@@ -493,22 +508,36 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
         hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
         peer_mem, prep["grad_gate"], prep["H"],
         FIRST_SRC_POS=0, LAST_SRC_POS=prep["M"],
-        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
+        BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
         num_warps=8)
+    # MOE_COMBINE_PHASE_SPLIT: fence push before the barrier (event 2).
+    if _ps:
+        _pev[2].record()
     _kernel_combine_fc1_bwd_barrier[(ncore(), 1, 1)]()
     if _pt:
-        _pev[2].record()
+        _pev[3 if _ps else 2].record()
     # phase 3: topk-sum reduce peer_mem -> grad_hidden (Vector)
     _kernel_combine_fc1_bwd_reduce[(nvec(), 1, 1)](
         prep["inv_sort"], peer_mem, output, grad_routing,
         prep["B"], prep["topk"], prep["H"],
         prep["stride_om"], prep["stride_on"],
-        BLOCK_N_PUSH=1024, GATE_PAD=GATE_PAD,
+        BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
         num_warps=8)
     if _pt:
-        _pev[3].record()
-        _pev[3].synchronize()
-        _iv = [_pev[i].elapsed_time(_pev[i + 1]) for i in range(3)]
+        _last = 4 if _ps else 3
+        _pev[_last].record()
+        _pev[_last].synchronize()
+        if _ps:
+            _iv4 = [_pev[i].elapsed_time(_pev[i + 1]) for i in range(4)]
+            _tmax4 = torch.tensor(_iv4, dtype=torch.float32, device=peer_mem.device)
+            dist.all_reduce(_tmax4, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+            saved.setdefault("_combine_phase4_samples", []).append(
+                [float(x) for x in _tmax4.cpu().tolist()])
+        _iv = [
+            _pev[0].elapsed_time(_pev[1]),          # gemm
+            _pev[1].elapsed_time(_pev[_last - 1]),  # push+barrier
+            _pev[_last - 1].elapsed_time(_pev[_last]),  # reduce
+        ]
         _tmax = torch.tensor(_iv, dtype=torch.float32, device=peer_mem.device)
         dist.all_reduce(_tmax, op=dist.ReduceOp.MAX, group=saved["ep_group"])
         saved.setdefault("_combine_phase_samples", []).append(
