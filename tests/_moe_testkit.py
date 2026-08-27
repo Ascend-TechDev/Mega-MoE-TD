@@ -82,7 +82,12 @@ def get_ash_ip_port():
     return f"tcp://{addr}:{port}"
 
 
-def init_aclshmem(rank, world_size, size_bytes, ip_port=None):
+def init_aclshmem(
+    rank,
+    world_size,
+    size_bytes,
+    ip_port=None,
+):
     """Initialize the ACLSHMEM symmetric heap for this rank.
 
     Caller is responsible for ``aclshmem_finalize()`` in a ``finally`` block.
@@ -257,9 +262,19 @@ class CaseContext:
 
 
 @contextlib.contextmanager
-def aclshmem_session(rank, world_size, size_bytes, ip_port=None) -> Iterator[None]:
+def aclshmem_session(
+    rank,
+    world_size,
+    size_bytes,
+    ip_port=None,
+) -> Iterator[None]:
     """Initialize and finalize one isolated ACLSHMEM session."""
-    init_aclshmem(rank, world_size, size_bytes, ip_port=ip_port)
+    init_aclshmem(
+        rank,
+        world_size,
+        size_bytes,
+        ip_port=ip_port,
+    )
     try:
         yield
     finally:

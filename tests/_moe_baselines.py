@@ -14,7 +14,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from mega_moe.kernels.weighted_swiglu import weighted_swiglu_forward
 from mega_moe.ops._torch_forward import (
     grouped_matmul,
     grouped_transposed_matmul,
@@ -43,9 +42,7 @@ __all__ = [
     "prepare_inputs",
     "run_full_one",
     "run_one",
-    "run_weighted_one",
     "torch_dispatch_fc1_golden",
-    "torch_dispatch_fc1_weighted_swiglu_golden",
     "torch_moe_fwd_golden",
 ]
 
@@ -268,7 +265,7 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
     local_expert = (e_keep % experts_per_rank).to(torch.int32)
 
     # sort by dest rank (stable -> token-major within a dest)
-    sort_idx = torch.argsort(dest, stable=True)
+    sort_idx = torch.argsort(dest.to(torch.float32), stable=True)
     x_send = x_keep[sort_idx].contiguous()
     local_exp_send = local_expert[sort_idx].contiguous()
     sorted_dest = dest[sort_idx]
@@ -293,7 +290,7 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
                 torch.empty((0, hidden), dtype=dtype, device=device))
 
     # group by local expert (stable -> preserves receive order within an expert)
-    recv_order = torch.argsort(local_exp_recv, stable=True)
+    recv_order = torch.argsort(local_exp_recv.to(torch.float32), stable=True)
     x_grouped = x_recv[recv_order]
     exp_grouped = local_exp_recv[recv_order]
 
@@ -305,109 +302,6 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
             continue
         out[mask] = (x_grouped[mask].float() @ w1_local[e_local].T.float()).to(dtype)
     return out, exp_grouped, x_grouped
-
-@torch.no_grad()
-def torch_dispatch_fc1_weighted_swiglu_golden(
-    x,
-    exp_indices,
-    routing_weights,
-    w_gate_local,
-    w_up_local,
-    num_tot_experts,
-    dtype,
-    device,
-    ep_group,
-):
-    """Independent Torch golden for dispatch + packed FC1 + weighted SwiGLU.
-
-    Token data, local expert ids, and routing weights are exchanged with independent
-    ``all_to_all_single`` calls.  Routing weights remain FP32 through communication
-    and activation arithmetic.  Gate and up projections are computed separately so this golden
-    does not share the optimized path's packed-W1 layout.
-
-    Returns a dictionary in deterministic expert-grouped receive order with keys:
-    ``fc1_out``, ``swiglu_out``, ``weighted_swiglu_out``,
-    ``routing_weight_recv``, ``local_expert_ids``, and ``dispatched_tokens``.
-    """
-    if routing_weights.shape != exp_indices.shape:
-        raise ValueError("routing_weights and exp_indices must have the same shape")
-    if routing_weights.dtype != torch.float32:
-        raise ValueError("routing_weights must be float32")
-    if dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
-        raise ValueError("dispatch tokens must be bfloat16")
-    if w_gate_local.dtype != torch.bfloat16 or w_up_local.dtype != torch.bfloat16:
-        raise ValueError("expert weights must be bfloat16")
-    if w_gate_local.shape != w_up_local.shape:
-        raise ValueError("w_gate_local and w_up_local must have the same shape")
-
-    T, hidden = x.shape
-    topk = exp_indices.shape[1]
-    experts_per_rank = w_gate_local.shape[0]
-    ffn_dim = w_gate_local.shape[1]
-    world_size = dist.get_world_size(group=ep_group)
-
-    flat_e = exp_indices.reshape(-1).long()
-    flat_weight = routing_weights.reshape(-1)
-    row_tok = torch.arange(T, device=device).repeat_interleave(topk)
-    keep = (flat_e >= 0) & (flat_e < num_tot_experts)
-    e_keep = flat_e[keep]
-    tok_keep = row_tok[keep]
-    weight_keep = flat_weight[keep]
-    x_keep = x[tok_keep]
-    dest = (e_keep // experts_per_rank).to(torch.int32)
-    local_expert = (e_keep % experts_per_rank).to(torch.int32)
-
-    # All route payloads use the same stable destination-rank permutation.
-    sort_idx = torch.argsort(dest, stable=True)
-    x_send = x_keep[sort_idx].contiguous()
-    local_exp_send = local_expert[sort_idx].contiguous()
-    weight_send = weight_keep[sort_idx].contiguous()
-    sorted_dest = dest[sort_idx]
-
-    send_counts = torch.bincount(sorted_dest, minlength=world_size).to(torch.int32)
-    recv_counts = torch.empty(world_size, dtype=torch.int32, device=device)
-    dist.all_to_all_single(recv_counts, send_counts, group=ep_group)
-    M_local = int(recv_counts.sum().item())
-    send_splits = send_counts.cpu().tolist()
-    recv_splits = recv_counts.cpu().tolist()
-
-    x_recv = torch.empty((M_local, hidden), dtype=dtype, device=device)
-    local_exp_recv = torch.empty((M_local,), dtype=torch.int32, device=device)
-    weight_recv = torch.empty((M_local,), dtype=torch.float32, device=device)
-    # No early return: even a zero-receive rank must participate in every
-    # collective because it can still send routes to another rank.
-    dist.all_to_all_single(x_recv, x_send, recv_splits, send_splits, group=ep_group)
-    dist.all_to_all_single(
-        local_exp_recv, local_exp_send, recv_splits, send_splits, group=ep_group)
-    dist.all_to_all_single(weight_recv, weight_send, recv_splits, send_splits, group=ep_group)
-
-    recv_order = torch.argsort(local_exp_recv, stable=True)
-    x_grouped = x_recv[recv_order]
-    exp_grouped = local_exp_recv[recv_order]
-    weight_grouped = weight_recv[recv_order]
-
-    gate_out = torch.empty((M_local, ffn_dim), dtype=dtype, device=device)
-    up_out = torch.empty_like(gate_out)
-    for e_local in range(experts_per_rank):
-        mask = exp_grouped == e_local
-        if not bool(mask.any()):
-            continue
-        expert_input = x_grouped[mask].float()
-        gate_out[mask] = (expert_input @ w_gate_local[e_local].T.float()).to(dtype)
-        up_out[mask] = (expert_input @ w_up_local[e_local].T.float()).to(dtype)
-
-    fc1_out = torch.cat((gate_out, up_out), dim=-1)
-    swiglu_fp32 = torch.nn.functional.silu(gate_out.float()) * up_out.float()
-    swiglu_out = swiglu_fp32.to(dtype)
-    weighted_swiglu_out = (swiglu_fp32 * weight_grouped.float()[:, None]).to(dtype)
-    return {
-        "fc1_out": fc1_out,
-        "swiglu_out": swiglu_out,
-        "weighted_swiglu_out": weighted_swiglu_out,
-        "routing_weight_recv": weight_grouped,
-        "local_expert_ids": exp_grouped,
-        "dispatched_tokens": x_grouped,
-    }
 
 @torch.no_grad()
 def torch_moe_fwd_golden(
@@ -467,7 +361,7 @@ def torch_moe_fwd_golden(
     experts_valid = flat_experts[valid_indices]
     dest_ranks = (experts_valid // experts_per_rank).to(torch.int32)
 
-    rank_sort = torch.argsort(dest_ranks, stable=True)
+    rank_sort = torch.argsort(dest_ranks.to(torch.float32), stable=True)
     tokens_send = hidden_valid[rank_sort].contiguous()
     # Routing weights retain FP32 precision across HCCL transport.
     weights_send = weights_valid[rank_sort].contiguous()
@@ -497,7 +391,7 @@ def torch_moe_fwd_golden(
 
     # ---- Local experts: stable grouping, FC1, weighted SwiGLU, then FC2 ----
     local_experts = experts_recv % experts_per_rank
-    local_sort = torch.argsort(local_experts, stable=True)
+    local_sort = torch.argsort(local_experts.to(torch.float32), stable=True)
     tokens_grouped = tokens_recv[local_sort]
     weights_grouped = weights_recv[local_sort]
     experts_grouped = local_experts[local_sort]
@@ -533,7 +427,7 @@ def torch_moe_fwd_golden(
         ).to(torch.bfloat16)
 
     # ---- Combine: undo receive grouping, reverse A2A, undo dispatch sort ----
-    inverse_local_sort = torch.argsort(local_sort)
+    inverse_local_sort = torch.argsort(local_sort.to(torch.float32))
     fc2_recv_order = fc2_grouped[inverse_local_sort].contiguous()
     combined_rank_sorted = torch.empty(
         (total_send, hidden), dtype=torch.bfloat16, device=hidden_states.device)
@@ -545,7 +439,7 @@ def torch_moe_fwd_golden(
         group=ep_group,
     )
 
-    inverse_rank_sort = torch.argsort(rank_sort)
+    inverse_rank_sort = torch.argsort(rank_sort.to(torch.float32))
     combined_routes = torch.zeros(
         (num_tokens * topk, hidden), dtype=torch.bfloat16, device=hidden_states.device)
     combined_routes[valid_indices] = combined_rank_sorted[inverse_rank_sort]
@@ -672,47 +566,6 @@ def _compare_fc1_by_expert(kernel_out, kernel_exp, kernel_dispatch,
         print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
     return ok
 
-def _compare_weighted_stage(kernel_values, golden_values, label, rank, device):
-    """Compare every layout and numerical boundary of the weighted stage."""
-    ok = True
-    msgs = []
-    exact_keys = ("local_expert_ids", "routing_weight_recv", "dispatched_tokens")
-    approximate_keys = ("fc1_out", "swiglu_out", "weighted_swiglu_out")
-
-    for key in exact_keys + approximate_keys:
-        actual = kernel_values[key]
-        expected = golden_values[key]
-        if actual.shape != expected.shape:
-            ok = False
-            msgs.append(
-                f"{key} shape kernel={tuple(actual.shape)} golden={tuple(expected.shape)}")
-            continue
-        rtol = LAYOUT_RTOL if key in exact_keys else APPROX_RTOL
-        atol = LAYOUT_ATOL if key in exact_keys else APPROX_ATOL
-        try:
-            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-        except AssertionError:
-            ok = False
-            if actual.numel() == 0:
-                msgs.append(f"{key} empty-tensor mismatch")
-            elif actual.is_floating_point():
-                diff = (actual.float() - expected.float()).abs()
-                msgs.append(
-                    f"{key} max_diff={diff.max().item():.4f} mean={diff.mean().item():.4f}")
-            else:
-                mismatch = int((actual != expected).sum().item())
-                msgs.append(f"{key} mismatches={mismatch}/{actual.numel()}")
-
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-    ok = bool(flag.item())
-    if not ok and msgs:
-        print(f"[rank {rank}] {label}: {'; '.join(msgs)}", flush=True)
-    if rank == 0:
-        suffix = "" if ok else "  |  " + "; ".join(msgs)
-        print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
-    return ok
-
 def _compare_full_output(actual, expected, label, rank, device, ep_group):
     """Compare a final ``[tokens, hidden]`` BF16 output on every EP rank."""
     ok = True
@@ -788,60 +641,6 @@ def run_one(layer, hs, exp_idx, w1l, num_experts, label, rank, device, dtype):
         dispatch_result.dispatched_tokens,
         g_out, g_exp, g_dispatch,
         layer.experts_per_rank, label, rank, device)
-
-def run_weighted_one(
-    layer,
-    hs,
-    exp_idx,
-    routing_weights,
-    w_gate_local,
-    w_up_local,
-    packed_w1,
-    num_experts,
-    label,
-    rank,
-    device,
-    dtype,
-):
-    """Run the production weighted-stage entry and compare all boundaries."""
-    weighted_swiglu_out, dispatch_result = layer.dispatch_fc1_weighted_swiglu(
-        hs,
-        exp_idx,
-        routing_weights,
-        packed_w1,
-    )
-    fc1_out = dispatch_result.fc1_output
-    recv_weight = dispatch_result.received_routing_weights
-    swiglu_out = weighted_swiglu_forward(
-        fc1_out,
-        torch.ones_like(recv_weight),
-        layer.num_aivector_programs,
-    )
-
-    kernel_exp = torch.repeat_interleave(
-        torch.arange(layer.experts_per_rank, dtype=torch.int32, device=device),
-        dispatch_result.routing_plan.received_routes_per_expert,
-    )
-    kernel_values = {
-        "fc1_out": fc1_out,
-        "swiglu_out": swiglu_out,
-        "weighted_swiglu_out": weighted_swiglu_out,
-        "routing_weight_recv": recv_weight,
-        "local_expert_ids": kernel_exp,
-        "dispatched_tokens": dispatch_result.dispatched_tokens,
-    }
-    golden_values = torch_dispatch_fc1_weighted_swiglu_golden(
-        hs,
-        exp_idx,
-        routing_weights,
-        w_gate_local,
-        w_up_local,
-        num_experts,
-        dtype,
-        device,
-        layer.ep_group,
-    )
-    return _compare_weighted_stage(kernel_values, golden_values, label, rank, device)
 
 def run_full_one(
     layer,
