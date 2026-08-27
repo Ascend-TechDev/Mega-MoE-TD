@@ -265,7 +265,7 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
     local_expert = (e_keep % experts_per_rank).to(torch.int32)
 
     # sort by dest rank (stable -> token-major within a dest)
-    sort_idx = torch.argsort(dest, stable=True)
+    sort_idx = torch.argsort(dest.to(torch.float32), stable=True)
     x_send = x_keep[sort_idx].contiguous()
     local_exp_send = local_expert[sort_idx].contiguous()
     sorted_dest = dest[sort_idx]
@@ -290,7 +290,7 @@ def torch_dispatch_fc1_golden(x, exp_indices, w1_local, num_tot_experts, dtype, 
                 torch.empty((0, hidden), dtype=dtype, device=device))
 
     # group by local expert (stable -> preserves receive order within an expert)
-    recv_order = torch.argsort(local_exp_recv, stable=True)
+    recv_order = torch.argsort(local_exp_recv.to(torch.float32), stable=True)
     x_grouped = x_recv[recv_order]
     exp_grouped = local_exp_recv[recv_order]
 
@@ -361,7 +361,7 @@ def torch_moe_fwd_golden(
     experts_valid = flat_experts[valid_indices]
     dest_ranks = (experts_valid // experts_per_rank).to(torch.int32)
 
-    rank_sort = torch.argsort(dest_ranks, stable=True)
+    rank_sort = torch.argsort(dest_ranks.to(torch.float32), stable=True)
     tokens_send = hidden_valid[rank_sort].contiguous()
     # Routing weights retain FP32 precision across HCCL transport.
     weights_send = weights_valid[rank_sort].contiguous()
@@ -391,7 +391,7 @@ def torch_moe_fwd_golden(
 
     # ---- Local experts: stable grouping, FC1, weighted SwiGLU, then FC2 ----
     local_experts = experts_recv % experts_per_rank
-    local_sort = torch.argsort(local_experts, stable=True)
+    local_sort = torch.argsort(local_experts.to(torch.float32), stable=True)
     tokens_grouped = tokens_recv[local_sort]
     weights_grouped = weights_recv[local_sort]
     experts_grouped = local_experts[local_sort]
@@ -427,7 +427,7 @@ def torch_moe_fwd_golden(
         ).to(torch.bfloat16)
 
     # ---- Combine: undo receive grouping, reverse A2A, undo dispatch sort ----
-    inverse_local_sort = torch.argsort(local_sort)
+    inverse_local_sort = torch.argsort(local_sort.to(torch.float32))
     fc2_recv_order = fc2_grouped[inverse_local_sort].contiguous()
     combined_rank_sorted = torch.empty(
         (total_send, hidden), dtype=torch.bfloat16, device=hidden_states.device)
@@ -439,7 +439,7 @@ def torch_moe_fwd_golden(
         group=ep_group,
     )
 
-    inverse_rank_sort = torch.argsort(rank_sort)
+    inverse_rank_sort = torch.argsort(rank_sort.to(torch.float32))
     combined_routes = torch.zeros(
         (num_tokens * topk, hidden), dtype=torch.bfloat16, device=hidden_states.device)
     combined_routes[valid_indices] = combined_rank_sorted[inverse_rank_sort]

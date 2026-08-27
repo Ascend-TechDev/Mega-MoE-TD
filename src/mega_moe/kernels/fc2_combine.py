@@ -153,17 +153,20 @@ def _fc2_gemm_one_mn_tile(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    WEIGHT_EXPERT_BASE: tl.constexpr,
 ):
     """Compute one FC2 M/N tile for the coarse expert-group schedule."""
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    rows = row_start + offs_m
+    row_start64 = row_start.to(tl.int64)
+    rows = row_start64 + offs_m.to(tl.int64)
     cols = n_tile * BLOCK_N + offs_n
     mask_m = offs_m < row_count
     mask_n = cols < N
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    weight_base = weight_ptr + expert_id.to(tl.int64) * stride_weight_e
+    weight_expert = expert_id.to(tl.int64) - WEIGHT_EXPERT_BASE
+    weight_base = weight_ptr + weight_expert * stride_weight_e
     for k_start in range(0, K, BLOCK_K):
         red = k_start + offs_k
         mask_k = red < K
@@ -221,6 +224,7 @@ def _kernel_fc2_expert_group(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    WEIGHT_EXPERT_BASE: tl.constexpr,
 ):
     """Cube-only FC2 for one contiguous expert group."""
     pid = tl.program_id(0)
@@ -262,6 +266,7 @@ def _kernel_fc2_expert_group(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_K,
+                        WEIGHT_EXPERT_BASE,
                     )
 
 
@@ -556,6 +561,7 @@ def prepare_fc2_device_put_metadata(
 def _launch_fc2_device_put_pipeline(
     weighted_activation: torch.Tensor,
     down_weight: torch.Tensor,
+    replica_down_weight: torch.Tensor,
     fc2_buf: torch.Tensor,
     peer_mem: torch.Tensor,
     received_routes_per_expert: torch.Tensor,
@@ -571,6 +577,9 @@ def _launch_fc2_device_put_pipeline(
     block_n: int,
     block_k: int,
     world_size: int,
+    home_experts_per_rank: int,
+    physical_experts_per_rank: int,
+    active_experts_per_rank: int,
     pipeline_group_experts: int,
     cube_stream,
     vector_stream,
@@ -578,6 +587,7 @@ def _launch_fc2_device_put_pipeline(
     group_events,
     start_event,
     done_event,
+    prefetch_done_event,
     activation_events,
     activation_fc1_output,
     activation_routing_weights,
@@ -585,6 +595,7 @@ def _launch_fc2_device_put_pipeline(
     activation_situ_beta: float = 1.0,
     activation_situ_linear_beta: float = 0.0,
     activation_has_linear_beta: bool = False,
+    pipeline_group_ids: tuple[int, ...] | None = None,
 ) -> None:
     """Overlap activation, coarse Cube groups, and device-put transport.
 
@@ -592,19 +603,37 @@ def _launch_fc2_device_put_pipeline(
     each completed expert group, and ``done_event`` gates the caller's
     reduction.
     """
-    experts_per_rank = down_weight.shape[0]
-    num_groups = (
+    experts_per_rank = active_experts_per_rank
+    num_dense_groups = (
         experts_per_rank + pipeline_group_experts - 1
     ) // pipeline_group_experts
+    if pipeline_group_ids is None:
+        scheduled_group_ids = range(num_dense_groups)
+    else:
+        # Events are compact step-local dependencies. Kernel group IDs remain
+        # physical so full-stride offsets and descriptors need no rewriting.
+        scheduled_group_ids = tuple(pipeline_group_ids)
+        if any(type(group_id) is not int for group_id in scheduled_group_ids):
+            raise TypeError("pipeline_group_ids must contain Python ints")
+        if scheduled_group_ids != tuple(sorted(set(scheduled_group_ids))):
+            raise ValueError(
+                "pipeline_group_ids must be strictly increasing and unique"
+            )
+        if any(
+            group_id < 0 or group_id >= num_dense_groups
+            for group_id in scheduled_group_ids
+        ):
+            raise ValueError("pipeline_group_ids contains an out-of-range group")
+    num_scheduled_groups = len(scheduled_group_ids)
     if num_vector_programs <= 0:
         raise ValueError("num_vector_programs must be positive")
     if cube_stream is None or vector_stream is None or transfer_stream is None:
         raise ValueError("FC2 pipeline streams must be provided")
-    if group_events is None or len(group_events) < num_groups:
+    if group_events is None or len(group_events) < num_scheduled_groups:
         raise ValueError("FC2 pipeline requires one event per expert group")
     if start_event is None or done_event is None:
         raise ValueError("FC2 pipeline start and completion events must be provided")
-    if activation_events is None or len(activation_events) < num_groups:
+    if activation_events is None or len(activation_events) < num_scheduled_groups:
         raise ValueError("FC2 production pipeline requires one activation event per expert group")
     if activation_fc1_output is None or activation_routing_weights is None:
         raise ValueError("FC2 production pipeline requires shadow activation inputs")
@@ -628,7 +657,7 @@ def _launch_fc2_device_put_pipeline(
     # as soon as its event fires; device-put transport follows Cube on the
     # independent transfer stream.
     with torch.npu.stream(vector_stream):
-        for group_id in range(num_groups):
+        for event_id, group_id in enumerate(scheduled_group_ids):
             _weighted_activation_expert_group_kernel[(num_vector_programs,)](
                 activation_fc1_output,
                 activation_routing_weights,
@@ -645,44 +674,80 @@ def _launch_fc2_device_put_pipeline(
                 GROUP_EXPERTS=pipeline_group_experts,
                 EXPERTS_PER_RANK=experts_per_rank,
             )
-            activation_events[group_id].record(vector_stream)
+            activation_events[event_id].record(vector_stream)
 
-    for group_id in range(num_groups):
+    replica_prefetch_waited = False
+    for event_id, group_id in enumerate(scheduled_group_ids):
         first_expert = group_id * pipeline_group_experts
         last_expert = min(first_expert + pipeline_group_experts, experts_per_rank)
-        cube_stream.wait_event(activation_events[group_id])
+        cube_stream.wait_event(activation_events[event_id])
         with torch.npu.stream(cube_stream):
-            _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
-                weighted_activation,
-                down_weight,
-                peer_mem,
-                received_routes_per_expert,
-                received_expert_offsets,
-                weighted_activation.stride(0),
-                weighted_activation.stride(1),
-                down_weight.stride(0),
-                down_weight.stride(1),
-                down_weight.stride(2),
-                N,
-                1,
-                GROUP_FIRST_EXPERT=first_expert,
-                GROUP_LAST_EXPERT=last_expert,
-                N=N,
-                K=K,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
-                BLOCK_K=block_k,
-                **(
-                    {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
-                    if block_m * block_n > 128 * 256
-                    else {}
-                ),
+            launch_options = (
+                {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
+                if block_m * block_n > 128 * 256
+                else {}
             )
-            group_events[group_id].record(cube_stream)
+            home_last = min(last_expert, home_experts_per_rank)
+            if first_expert < home_last:
+                _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
+                    weighted_activation,
+                    down_weight,
+                    peer_mem,
+                    received_routes_per_expert,
+                    received_expert_offsets,
+                    weighted_activation.stride(0),
+                    weighted_activation.stride(1),
+                    down_weight.stride(0),
+                    down_weight.stride(1),
+                    down_weight.stride(2),
+                    N,
+                    1,
+                    GROUP_FIRST_EXPERT=first_expert,
+                    GROUP_LAST_EXPERT=home_last,
+                    N=N,
+                    K=K,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    WEIGHT_EXPERT_BASE=0,
+                    **launch_options,
+                )
+            replica_first = max(first_expert, home_experts_per_rank)
+            if replica_first < last_expert:
+                if (
+                    prefetch_done_event is not None
+                    and not replica_prefetch_waited
+                ):
+                    cube_stream.wait_event(prefetch_done_event)
+                    replica_prefetch_waited = True
+                _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
+                    weighted_activation,
+                    replica_down_weight,
+                    peer_mem,
+                    received_routes_per_expert,
+                    received_expert_offsets,
+                    weighted_activation.stride(0),
+                    weighted_activation.stride(1),
+                    replica_down_weight.stride(0),
+                    replica_down_weight.stride(1),
+                    replica_down_weight.stride(2),
+                    N,
+                    1,
+                    GROUP_FIRST_EXPERT=replica_first,
+                    GROUP_LAST_EXPERT=last_expert,
+                    N=N,
+                    K=K,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    WEIGHT_EXPERT_BASE=home_experts_per_rank,
+                    **launch_options,
+                )
+            group_events[event_id].record(cube_stream)
 
     with torch.npu.stream(transfer_stream):
-        for group_id in range(num_groups):
-            transfer_stream.wait_event(group_events[group_id])
+        for event_id, group_id in enumerate(scheduled_group_ids):
+            transfer_stream.wait_event(group_events[event_id])
             _kernel_remote_put_transport_group[(put_worker_count, 1, 1)](
                 fc2_buf,
                 peer_mem,
@@ -703,6 +768,8 @@ def _launch_fc2_device_put_pipeline(
     # dedicated barrier-sized launch fences their RMA writes before the caller's
     # current stream is released and before local reduction reads them.
     with torch.npu.stream(transfer_stream):
+        if prefetch_done_event is not None:
+            transfer_stream.wait_event(prefetch_done_event)
         _kernel_remote_put_barrier[(num_program_cores, 1, 1)]()
 
     done_event.record(transfer_stream)
@@ -712,6 +779,7 @@ def _launch_fc2_device_put_pipeline(
 def _launch_fc2_combine(
     weighted_activation: torch.Tensor,
     down_weight: torch.Tensor,
+    replica_down_weight: torch.Tensor,
     fc2_buf: torch.Tensor,
     peer_mem: torch.Tensor,
     route_to_send: torch.Tensor,
@@ -732,6 +800,9 @@ def _launch_fc2_combine(
     block_n: int,
     block_k: int,
     world_size: int,
+    home_experts_per_rank: int,
+    physical_experts_per_rank: int,
+    active_experts_per_rank: int,
     pipeline_group_experts: int,
     pipeline_cube_stream,
     pipeline_vector_stream,
@@ -739,6 +810,7 @@ def _launch_fc2_combine(
     pipeline_group_events,
     pipeline_start_event,
     pipeline_done_event,
+    prefetch_done_event,
     pipeline_activation_events,
     activation_fc1_output,
     activation_routing_weights,
@@ -746,6 +818,7 @@ def _launch_fc2_combine(
     activation_situ_beta: float = 1.0,
     activation_situ_linear_beta: float = 0.0,
     activation_has_linear_beta: bool = False,
+    pipeline_group_ids: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Launch pipelined FC2, device-put transport, and local reduction."""
     if weighted_activation.ndim != 2 or down_weight.ndim != 3:
@@ -754,6 +827,23 @@ def _launch_fc2_combine(
         raise TypeError("weighted_activation and down_weight must use torch.bfloat16")
     if weighted_activation.shape[1] != down_weight.shape[2]:
         raise ValueError("weighted_activation K must match down_weight K")
+    if replica_down_weight.shape != down_weight.shape:
+        raise ValueError("replica_down_weight must match down_weight shape")
+    if replica_down_weight.dtype != down_weight.dtype:
+        raise TypeError("replica_down_weight must match down_weight dtype")
+    if down_weight.shape[0] != home_experts_per_rank:
+        raise ValueError("down_weight must contain home_experts_per_rank rows")
+    if physical_experts_per_rank not in (
+        home_experts_per_rank,
+        2 * home_experts_per_rank,
+    ):
+        raise ValueError(
+            "physical_experts_per_rank must describe home-only or fixed-B slots"
+        )
+    if not home_experts_per_rank <= active_experts_per_rank <= physical_experts_per_rank:
+        raise ValueError(
+            "active_experts_per_rank must be between the home and physical counts"
+        )
     M, K = weighted_activation.shape
     N = down_weight.shape[1]
     if (
@@ -780,7 +870,7 @@ def _launch_fc2_combine(
         raise ValueError(
             "symmetric combine workspace must not alias local FC2 rows"
         )
-    experts_per_rank = down_weight.shape[0]
+    experts_per_rank = physical_experts_per_rank
     if experts_per_rank <= 0:
         raise ValueError("down_weight must contain at least one local expert")
     if (
@@ -800,6 +890,7 @@ def _launch_fc2_combine(
     tensors = (
         weighted_activation,
         down_weight,
+        replica_down_weight,
         fc2_buf,
         peer_mem,
         route_to_send,
@@ -901,6 +992,7 @@ def _launch_fc2_combine(
     _launch_fc2_device_put_pipeline(
         weighted_activation,
         down_weight,
+        replica_down_weight,
         fc2_buf,
         peer_mem,
         received_routes_per_expert,
@@ -915,13 +1007,18 @@ def _launch_fc2_combine(
         block_n=block_n,
         block_k=block_k,
         world_size=world_size,
+        home_experts_per_rank=home_experts_per_rank,
+        physical_experts_per_rank=physical_experts_per_rank,
+        active_experts_per_rank=active_experts_per_rank,
         pipeline_group_experts=pipeline_group_experts,
+        pipeline_group_ids=pipeline_group_ids,
         cube_stream=pipeline_cube_stream,
         vector_stream=pipeline_vector_stream,
         transfer_stream=pipeline_transfer_stream,
         group_events=pipeline_group_events,
         start_event=pipeline_start_event,
         done_event=pipeline_done_event,
+        prefetch_done_event=prefetch_done_event,
         activation_events=pipeline_activation_events,
         activation_fc1_output=activation_fc1_output,
         activation_routing_weights=activation_routing_weights,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Extract readable full-forward and event-slice tables from benchmark JSON."""
+"""Extract classic, MoonEP, and event-slice tables from benchmark JSON."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from pathlib import Path
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results" / "forward"
 DEFAULT_PATTERNS = (
     "bench_forward_suite_w*.json",
+    "bench_moonep_forward_suite_w*.json",
     "bench_full_forward_*_grouped_routefp32_w*.json",
 )
 LEGACY_STAGES = (
@@ -115,7 +116,10 @@ def _load_entries(paths: list[Path]) -> list[dict]:
                 "correctness_gates", {}
             )
             status = correctness.get("status")
-            if status != "passed_before_timing":
+            if status not in {
+                "passed_before_timing",
+                "passed_before_and_after_timing",
+            }:
                 print(
                     f"warning: {path.name} entry {index} has correctness status {status!r}",
                     file=sys.stderr,
@@ -158,6 +162,8 @@ def _full_rows(entries: list[dict], stat: str) -> list[list[str]]:
     rows = []
     for entry in entries:
         metrics = entry["metrics"]
+        if any(key.startswith("triton_moonep_balanced_") for key in metrics):
+            continue
         ascend_full = _stat_value(metrics["ascend_full_direct_e2e_ms"], stat)
         grouped_full = _stat_value(metrics["torch_npu_grouped_hccl_full_direct_e2e_ms"], stat)
         rows.append(
@@ -174,11 +180,40 @@ def _full_rows(entries: list[dict], stat: str) -> list[list[str]]:
     return rows
 
 
+def _moonep_rows(entries: list[dict], stat: str) -> list[list[str]]:
+    rows = []
+    for entry in entries:
+        metrics = entry["metrics"]
+        balanced_key = "triton_moonep_balanced_full_direct_e2e_ms"
+        unbalanced_key = "triton_unbalanced_full_direct_e2e_ms"
+        if balanced_key not in metrics:
+            continue
+        balanced_ms = _stat_value(metrics[balanced_key], stat)
+        unbalanced_ms = _stat_value(metrics[unbalanced_key], stat)
+        rows.append(
+            [
+                str(entry.get("model", entry.get("model_profile", ""))),
+                str(entry["world_size"]),
+                str(entry.get("case_id", entry.get("config", ""))),
+                str(entry["tokens_per_rank"]),
+                _format_ms(balanced_ms),
+                _format_ms(unbalanced_ms),
+                _format_speedup(_speedup(unbalanced_ms, balanced_ms)),
+            ]
+        )
+    return rows
+
+
 def _stage_rows(entries: list[dict], stat: str) -> tuple[list[list[str]], list[str]]:
     rows = []
     skipped = []
     for entry in entries:
         diagnostics = entry.get("diagnostics")
+        if any(
+            key.startswith("triton_moonep_balanced_")
+            for key in entry.get("metrics", {})
+        ):
+            continue
         if not diagnostics:
             skipped.append(
                 f"{entry.get('model', entry.get('model_profile'))}/"
@@ -234,6 +269,7 @@ def main() -> int:
         paths = _expand_paths(args.files)
         entries = _load_entries(paths)
         full_rows = _full_rows(entries, args.stat)
+        moonep_rows = _moonep_rows(entries, args.stat)
         stage_rows, skipped_stages = _stage_rows(entries, args.stat)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -241,19 +277,34 @@ def main() -> int:
 
     printer = _print_markdown if args.format == "markdown" else _print_tsv
     if args.section in ("all", "full"):
-        printer(
-            f"Full forward ({args.stat})",
-            [
-                "Model",
-                "W",
-                "Case",
-                "tokens/rank",
-                "Ascend full/ms",
-                "Grouped full/ms",
-                "full speedup",
-            ],
-            full_rows,
-        )
+        if full_rows:
+            printer(
+                f"Full forward ({args.stat})",
+                [
+                    "Model",
+                    "W",
+                    "Case",
+                    "tokens/rank",
+                    "Ascend full/ms",
+                    "Grouped full/ms",
+                    "full speedup",
+                ],
+                full_rows,
+            )
+        if moonep_rows:
+            printer(
+                f"MoonEP balanced forward ({args.stat})",
+                [
+                    "Model",
+                    "W",
+                    "Case",
+                    "tokens/rank",
+                    "Balanced one-shot/ms",
+                    "Unbalanced/ms",
+                    "balanced speedup",
+                ],
+                moonep_rows,
+            )
     if args.section in ("all", "stages"):
         printer(
             f"Independent event slices ({args.stat})",
@@ -265,6 +316,12 @@ def main() -> int:
         print(f"warning: no four-stage diagnostics recorded for {case}", file=sys.stderr)
     if args.format == "markdown":
         print("> speedup = Grouped latency / Ascend latency; values greater than 1 mean Ascend is faster.")
+        if moonep_rows:
+            print(
+                "> MoonEP balanced speedup = unbalanced Triton latency / "
+                "balanced one-shot Triton latency; every balanced sample refills "
+                "replica weights and represents one layer forward."
+            )
         print("> Event slices are sampled independently and must not be added to reconstruct full E2E.")
     return 0
 
