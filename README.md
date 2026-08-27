@@ -105,10 +105,6 @@ python -m pytest \
 | 8K  | 79.312 ms | 149.837 ms | **1.889x** | ≈35.1 GiB |
 | 16K | 137.703 ms | 302.747 ms | **2.199x** | ≈53.5 GiB |
 
-- 2K/4K/8K 为 2026-08-08 复测；16K 沿用上一轮干净跑（本轮 16K 因 5/6 卡被并发 job 占用、HBM 不足 OOM，待空窗重跑）。
-- 加速比随 tokens/rank 上升：2K 1.57× → 4K 1.80× → 8K 1.89× → 16K 2.20×；短序列（2K）preprocess/launch 开销占比大，加速比最低。
-- 16K 进程显存约 50 GiB，总 HBM 约 53.5 GiB，仍有约 12 GiB 余量。
-- 16K 的 ASH 理论需求约 4.048 GiB，默认 4 GiB 不够，因此测试使用 5 GiB。
 
 主要 Ascend 阶段耗时如下，单位均为 ms：
 
@@ -132,7 +128,7 @@ python -m pytest \
 
 ### Backward
 
-两卡后向的计算加速比 `torch(ms) / triton(ms)`
+*两卡*后向的计算加速比 `torch(ms) / triton(ms)`
 
 | 模型 | tokens | torch/ms | triton/ms | Triton speedup |
 |---|---:|---:|---:|---:|
@@ -147,7 +143,7 @@ python -m pytest \
 
 #### Kimi-K3（八卡）
 
-完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL baseline）加速比 `torch(ms) / triton(ms)`：
+完整*八卡A3*后向`torch(ms) / triton(ms)`：
 
 | tokens/rank | torch/ms | triton/ms | bigop/ms | tri/torch | tri/bigop |
 |---:|---:|---:|---:|---:|---:|
