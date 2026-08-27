@@ -128,19 +128,6 @@ python -m pytest \
 
 ### Backward
 
-*两卡*后向的计算加速比 `torch(ms) / triton(ms)`
-
-| 模型 | tokens | torch/ms | triton/ms | Triton speedup |
-|---|---:|---:|---:|---:|
-| Qwen3-30B-A3B | 4096 | 45.1 | 28.7 | **1.57x** |
-| Qwen3-30B-A3B | 8192 | 56.6 | 111.6 | 0.51x |
-| Qwen3-30B-A3B | 16384 | 83.8 | 224.1 | 0.37x |
-| DeepSeek-MoE-16B | 4096 | 27.9 | 29.8 | 0.94x |
-| Qwen3-235B-A22B | 4096 | 63.4 | 79.6 | 0.80x |
-| Qwen3-Next-80B | 4096 | 136.4 | 31.4 | **4.34x** |
-| Qwen3-Omni-30B | 4096 | 37.7 | 12.4 | **3.04x** |
-| **平均** | | | | **1.65x** |
-
 #### Kimi-K3（八卡）
 
 完整*八卡A3*后向`torch(ms) / triton(ms)`：
