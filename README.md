@@ -149,8 +149,7 @@ python -m pytest \
 
 完整*八卡A3*后向（wgrad 走 torch；5 mega-op triton vs torch+HCCL baseline）加速比 `torch(ms) / triton(ms)`：
 
-| tokens/rank | torch/ms | triton/ms | triton/torch |
-|---:|---:|---:|---:|
-| 2K | 162 | 77| **2.11x** |
-| 4K | 205 | 138| **1.48x** |
-| 8K | 298| 251| **1.18x** |
+| tokens/rank | torch/ms | triton/ms | bigop/ms | tri/torch | tri/bigop |
+|---:|---:|---:|---:|---:|---:|
+| 2K  | 160.630 | 44.684 |  58.173 | **1.57x** | 1.29x |
+| 4K  | 200.162 | 78.22 |  88.392 | 1.11x | 1.12x |
