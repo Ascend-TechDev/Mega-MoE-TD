@@ -64,11 +64,17 @@ def _accumulate_pulled_chunk(
     acc_ptr,
     source_ptr,
     home_expert,
+    chunk_start,
     count,
     ELEMENTS_PER_EXPERT: tl.constexpr,
     ACC_BLOCK: tl.constexpr,
 ):
-    """acc[home_expert] += source[0:count] in fp32, one ACC_BLOCK slice at a time.
+    """acc[home_expert, chunk_start:] += source[0:count] in fp32.
+
+    ``source`` holds one RMA chunk of the slot (``count`` elements starting at
+    ``chunk_start`` inside the expert); the accumulator walk adds
+    ``chunk_start`` so a multi-chunk pull lands each chunk at its own offset —
+    a chunk-start of zero reproduces the historical single-chunk behavior.
 
     Both sides are walked contiguously: the accumulator is laid out exactly
     like the symmetric table it reduces (``[H, 2F]`` gate/up, ``[H, F]`` down),
@@ -78,7 +84,7 @@ def _accumulate_pulled_chunk(
     does not.
     """
     offsets = tl.arange(0, ACC_BLOCK)
-    acc_base = home_expert.to(tl.int64) * ELEMENTS_PER_EXPERT
+    acc_base = home_expert.to(tl.int64) * ELEMENTS_PER_EXPERT + chunk_start
     for start in range(0, count, ACC_BLOCK):
         local = start + offsets
         mask = local < count
@@ -120,13 +126,13 @@ def _pull_and_accumulate_one_table(
             source = slot_table_ptr + slot_base + chunk_start
             if peer == LOCAL_RANK:
                 _accumulate_pulled_chunk(
-                    acc_ptr, source, home_expert, count,
+                    acc_ptr, source, home_expert, chunk_start, count,
                     ELEMENTS_PER_EXPERT, ACC_BLOCK,
                 )
             else:
                 libshmem_device.getmem(staging_ptr, source, count * 2, peer)
                 _accumulate_pulled_chunk(
-                    acc_ptr, staging_ptr, home_expert, count,
+                    acc_ptr, staging_ptr, home_expert, chunk_start, count,
                     ELEMENTS_PER_EXPERT, ACC_BLOCK,
                 )
 
@@ -188,11 +194,12 @@ def _fused_accumulate_chunk(
     acc_ptr,
     source_ptr,
     home_expert,
+    chunk_start,
     count,
     elements_per_expert,
     ACC_BLOCK: tl.constexpr,
 ):
-    """acc[home_expert] += source[0:count] in fp32, contiguous walk.
+    """acc[home_expert, chunk_start:] += source[0:count] in fp32, contiguous walk.
 
     Runtime-elements twin of :func:`_accumulate_pulled_chunk`: the fused
     kernel drives its chunk loop with a runtime bound so the pull body is not
@@ -200,7 +207,9 @@ def _fused_accumulate_chunk(
     small for the Kimi-sized expert shapes.
     """
     offsets = tl.arange(0, ACC_BLOCK)
-    acc_base = home_expert.to(tl.int64) * elements_per_expert
+    acc_base = (
+        home_expert.to(tl.int64) * elements_per_expert + chunk_start
+    )
     for start in range(0, count, ACC_BLOCK):
         local = start + offsets
         mask = local < count
@@ -238,13 +247,13 @@ def _fused_pull_one_table(
             source = slot_table_ptr + slot_base + chunk_start
             if peer == LOCAL_RANK:
                 _fused_accumulate_chunk(
-                    acc_ptr, source, home_expert, count,
+                    acc_ptr, source, home_expert, chunk_start, count,
                     elements_per_expert, ACC_BLOCK,
                 )
             else:
                 libshmem_device.getmem(staging_row_ptr, source, count * 2, peer)
                 _fused_accumulate_chunk(
-                    acc_ptr, staging_row_ptr, home_expert, count,
+                    acc_ptr, staging_row_ptr, home_expert, chunk_start, count,
                     elements_per_expert, ACC_BLOCK,
                 )
 
@@ -268,7 +277,6 @@ def _fused_zero_rows(
 
 @triton.jit
 def _kernel_grad_reduce_transport(
-    pid,
     num_programs,
     acc_gate_up_ptr,
     acc_down_ptr,
@@ -312,6 +320,7 @@ def _kernel_grad_reduce_transport(
     rank arrives at all three ``barrier_all_vec`` calls unconditionally, even
     when this rank owns no replica and holds none (empty phase loops).
     """
+    pid = tl.program_id(axis=0)
     staging_gate_up_row = staging_gate_up_ptr + pid.to(tl.int64) * (
         GATE_UP_CHUNK_ELEMENTS
     )
@@ -680,7 +689,6 @@ def launch_grad_reduce_transport(
         device=device,
     )
     _kernel_grad_reduce_transport[(num_programs, 1, 1)](
-        0,
         num_programs,
         acc_gate_up,
         acc_down,
