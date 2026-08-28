@@ -87,17 +87,36 @@ def _grouped_wgrad_npu(grad_out, orig_in, expert_counts):
 # ============================================================================
 # 1.  5-op orchestrator
 # ============================================================================
-def moe_backward_triton(saved, dy, peer_mem):
+def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     """Run the 5 triton mega-ops end-to-end. peer_mem is ONE shared symmetric
     buffer at heap offset 0 (dl.symm_at only resolves correctly at offset 0 with
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
     gate (routing-weight) grad is computed on the host. Returns a dict of grads
-    matching the hand-written test baseline."""
+    matching the hand-written test baseline.
+
+    A MoonEP ``saved_phys`` (``use_moonep=True``) runs the same 5 ops over the
+    physical ``[home | replica]`` slot groups with a dual weight table per dgrad
+    GEMM, forced onto the serial schedule (no dual-stream / fused / wgrad-tail
+    overlap). The weight-grad ops then produce ``[epn + B, ...]`` physical
+    gradients. With ``grad_transport=None`` (M2) the returned canonical keys
+    carry the HOME segment ``[0, epn)`` and the replica segments ride along as
+    ``_replica_grad_gate_up`` / ``_replica_grad_down`` (bf16 views) for the
+    test-side owner-pull reduction oracle. Passing the transport borrowed from
+    ``FusedMoEForward.lend_replica_weight_tables_for_grad`` instead sinks those
+    replica segments into the forward's symmetric replica weight slots and
+    reduces every copy onto its owner, so the canonical weight-grad keys are the
+    final (owner-accumulated) values."""
     dy = dy.to(saved["fc1_1"].dtype)
+    use_moonep = bool(saved.get("use_moonep"))
+    if grad_transport is not None and not use_moonep:
+        raise ValueError("grad_transport requires a MoonEP saved_phys")
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
-    use_fused = os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
-    use_dual = os.environ.get("MOE_BWD_DUAL_STREAM", "1") != "0"  # step3(cube) ∥ step2(vec) on two engine-pure streams (DEFAULT ON; =0 disables)
+    use_fused = (not use_moonep) and os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
+    # MoonEP keeps the physical pipeline serial: the fused and dual-stream paths
+    # assume the home-layout wgrad backends and would interleave the physical
+    # group boundaries before the layout is proven.
+    use_dual = (not use_moonep) and os.environ.get("MOE_BWD_DUAL_STREAM", "1") != "0"  # step3(cube) ∥ step2(vec) on two engine-pure streams (DEFAULT ON; =0 disables)
     _trace = bool(os.environ.get("MOE_BWD_TRACE"))
     _r = saved["ep_rank"]
     def _t(tag):
@@ -120,7 +139,7 @@ def moe_backward_triton(saved, dy, peer_mem):
     # loop's 2.5x. Software-stream overlap is a confirmed dead end here. Real
     # cube/vector overlap has to live INSIDE one kernel via al.scope(core_mode=...)
     # — see the P0 signal/wait work. Default off; opt back in with MOE_WGRAD_STREAM=1.
-    use_side_stream = os.environ.get("MOE_WGRAD_STREAM") == "1"
+    use_side_stream = (not use_moonep) and os.environ.get("MOE_WGRAD_STREAM") == "1"
     ec = saved["expert_counts"]
     wgrad_stream = torch.npu.Stream() if use_side_stream else None
 
@@ -218,7 +237,7 @@ def moe_backward_triton(saved, dy, peer_mem):
     # restored with MOE_BWD_WGRAD_TAIL=0, and stays inline for the diagnostic
     # serial/stage-timing paths and the host-syncing torch wgrad backend.
     _wgrad_tail = (
-        not use_fused and not _stage_timing
+        not use_fused and not _stage_timing and not use_moonep
         and os.environ.get("MOE_BWD_COMBINE_SERIAL") != "1"
         and not use_torch_wgrad and not use_side_stream
         and os.environ.get("MOE_BWD_WGRAD_TAIL", "1") != "0"
@@ -261,6 +280,47 @@ def moe_backward_triton(saved, dy, peer_mem):
     # ensure side-stream wgrads finished before chunk/return
     if wgrad_stream is not None:
         wgrad_stream.synchronize()
+    if use_moonep:
+        # Physical wgrad groups: the canonical keys expose the home segment
+        # [0, epn) (owner semantics); the replica segments are handed to the
+        # caller so the reduction oracle (and, later, the symmetric-slot
+        # transport) can accumulate them onto their owners.
+        home_experts = int(saved["home_experts_per_rank"])
+        if grad_transport is not None:
+            # Sink the replica segments into the borrowed symmetric slots and
+            # owner-pull every copy back (seed = the local home segment in
+            # fp32). The three transport barriers are collective, so every rank
+            # reaches them through this same call.
+            grad_transport.sink(grad_fc1, grad_fc2)
+            grad_fc1_reduced, grad_fc2_reduced = grad_transport.reduce(
+                grad_fc1, grad_fc2
+            )
+            grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1_reduced, 2, dim=1)
+            return dict(
+                grad_hidden=grad_hidden,
+                grad_routing_weights=grad_routing_weights,
+                grad_fc1_1=grad_fc1_1, grad_fc1_2=grad_fc1_2,
+                grad_fc2=grad_fc2_reduced,
+                grad_swiglu=grad_swiglu, grad_fc1_output=grad_fc1_output,
+                grad_gate=grad_gate, grad_fc2_out_sorted=grad_fc2_out_sorted,
+                grad_fc1=grad_fc1,
+                _replica_grad_gate_up=grad_fc1[home_experts:],
+                _replica_grad_down=grad_fc2[home_experts:],
+                # pre-reduction seeds (views): what the owner started from
+                _home_grad_fc1=grad_fc1[:home_experts],
+                _home_grad_fc2=grad_fc2[:home_experts],
+            )
+        grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1[:home_experts], 2, dim=1)
+        return dict(
+            grad_hidden=grad_hidden, grad_routing_weights=grad_routing_weights,
+            grad_fc1_1=grad_fc1_1, grad_fc1_2=grad_fc1_2,
+            grad_fc2=grad_fc2[:home_experts],
+            grad_swiglu=grad_swiglu, grad_fc1_output=grad_fc1_output,
+            grad_gate=grad_gate, grad_fc2_out_sorted=grad_fc2_out_sorted,
+            grad_fc1=grad_fc1,
+            _replica_grad_gate_up=grad_fc1[home_experts:],
+            _replica_grad_down=grad_fc2[home_experts:],
+        )
     grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
     return dict(
         grad_hidden=grad_hidden, grad_routing_weights=grad_routing_weights,

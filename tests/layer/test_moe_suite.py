@@ -23,6 +23,12 @@ from mega_moe import (
     moe_backward_triton,
     pack_gate_up_weights,
 )
+from mega_moe.ops._moonep_torch_forward import (
+    build_physical_saved_from_plan,
+    gather_replica_weights_via_hccl,
+)
+from mega_moe.ops._torch_forward import moe_forward
+from mega_moe.kernels.common import all_gather_list
 import mega_moe.kernels.fc2_combine as fc2_combine_module
 from mega_moe.kernels.moonep_planning import launch_moonep_b0_b3
 from mega_moe.runtime.moonep_planning import (
@@ -46,8 +52,15 @@ from tests._moe_baselines import (
     prepare_inputs,
     run_full_one,
     run_one,
+    torch_moe_fwd_golden,
 )
-from tests._numeric import OUTPUT_ATOL, OUTPUT_RTOL
+from tests._numeric import (
+    GRAD_ATOL,
+    GRAD_RTOL,
+    OUTPUT_ATOL,
+    OUTPUT_RTOL,
+    assert_close,
+)
 
 
 def _forward_config(case: CaseSpec) -> MoEForwardConfig:
@@ -933,6 +946,1299 @@ def run_moonep_moderate_wide_forward_case(rank: int, world_size: int) -> None:
             op.finalize()
 
 
+def _assert_physical_saved_layout(saved_phys, tokens, topk):
+    """Check the saved_phys invariants the physical backward will rely on."""
+    if saved_phys["use_moonep"] is not True:
+        raise AssertionError("saved_phys must be flagged use_moonep")
+    expert_counts = saved_phys["expert_counts"]
+    if expert_counts.dtype != torch.int32:
+        raise AssertionError(f"expert_counts must be int32, got {expert_counts.dtype}")
+    if tuple(expert_counts.shape) != (saved_phys["physical_experts_per_rank"],):
+        raise AssertionError("expert_counts must cover every physical slot")
+    if int(expert_counts.sum().item()) != tokens * topk:
+        raise AssertionError("physical slot counts must conserve every route")
+    if saved_phys["M"] != saved_phys["total_recv"]:
+        raise AssertionError("saved M must equal total_recv")
+    for key in ("sort_idxs", "inv_sort", "local_sort_idxs", "inv_local"):
+        permutation = saved_phys[key]
+        expected = torch.arange(
+            permutation.numel(), dtype=torch.int64, device=permutation.device
+        )
+        if not torch.equal(torch.sort(permutation).values, expected):
+            raise AssertionError(f"saved_phys[{key!r}] is not a permutation")
+    if sum(saved_phys["splits_send_list"]) != tokens * topk:
+        raise AssertionError("send splits must conserve every route")
+    if sum(saved_phys["splits_recv_list"]) != tokens * topk:
+        raise AssertionError("receive splits must conserve every route")
+    if not torch.equal(
+        saved_phys["plan_recv_counts_by_source_expert"].to(torch.int64).sum(dim=0),
+        expert_counts.to(torch.int64),
+    ):
+        raise AssertionError("plan receive counts disagree with expert_counts")
+
+
+def _assert_replica_tables_match_owners(
+    rank,
+    experts_to_copy_cpu,
+    replica_gate_up,
+    replica_down,
+    home_gate_up,
+    home_down,
+    ep_group,
+):
+    """Compare the HCCL replica gather with an all-gather of the home tables."""
+    world_size = dist.get_world_size(ep_group)
+    experts_per_rank = home_gate_up.shape[0]
+    gate_up_tables = [torch.empty_like(home_gate_up) for _ in range(world_size)]
+    dist.all_gather(gate_up_tables, home_gate_up, group=ep_group)
+    down_tables = [torch.empty_like(home_down) for _ in range(world_size)]
+    dist.all_gather(down_tables, home_down, group=ep_group)
+    for slot, expert in enumerate(
+        experts_to_copy_cpu[rank].to(torch.int64).tolist()
+    ):
+        if expert < 0:
+            if bool((replica_gate_up[slot] != 0).any()) or bool(
+                (replica_down[slot] != 0).any()
+            ):
+                raise AssertionError("an empty replica slot must stay zero")
+            continue
+        owner = expert // experts_per_rank
+        local_row = expert % experts_per_rank
+        torch.testing.assert_close(
+            replica_gate_up[slot], gate_up_tables[owner][local_row]
+        )
+        torch.testing.assert_close(
+            replica_down[slot], down_tables[owner][local_row]
+        )
+
+
+def run_moonep_physical_forward_hot_expert_case(
+    rank: int,
+    world_size: int,
+) -> None:
+    """Replay an all-hot MoonEP plan in torch against the logical golden."""
+    if world_size not in (2, 4):
+        raise ValueError("the physical hot-expert case requires two or four ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("physical MoonEP forward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    experts_per_rank = num_experts // world_size
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=1)
+    ):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=1.0,
+                enable_moonep=True,
+            ),
+        )
+        try:
+            w_gate, w_up = make_gate_up_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            packed_w1 = pack_gate_up_weights(w_gate, w_up)
+            w2 = make_down_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            hs, _ = prepare_inputs(
+                tokens,
+                hidden,
+                num_experts,
+                topk,
+                dtype,
+                device,
+                seed=803 + rank,
+            )
+            expert_indices = torch.zeros(
+                (tokens, topk), dtype=torch.int32, device=device
+            )
+            routing_weights = torch.empty(
+                (tokens, topk), dtype=torch.float32, device=device
+            )
+            routing_weights[:, 0] = 0.25
+            routing_weights[:, 1] = 0.75
+
+            plan = op.build_routing_plan(expert_indices)
+            experts_to_copy_cpu = plan.experts_to_copy_cpu
+            if not bool((experts_to_copy_cpu == 0).any()):
+                raise AssertionError("the all-hot plan did not replicate expert 0")
+            replica_routes = plan.received_routes_per_expert[
+                experts_per_rank:
+            ].sum().clone()
+            dist.all_reduce(replica_routes, op=dist.ReduceOp.SUM, group=ep_group)
+            if int(replica_routes.item()) <= 0:
+                raise AssertionError(
+                    "the all-hot plan routed no traffic through replicas"
+                )
+
+            replica_gate_up, replica_down = gather_replica_weights_via_hccl(
+                experts_to_copy_cpu, packed_w1, w2, ep_group
+            )
+            _assert_replica_tables_match_owners(
+                rank,
+                experts_to_copy_cpu,
+                replica_gate_up,
+                replica_down,
+                packed_w1,
+                w2,
+                ep_group,
+            )
+
+            output, saved_phys = build_physical_saved_from_plan(
+                plan,
+                hs,
+                routing_weights,
+                packed_w1,
+                w2,
+                replica_gate_up,
+                replica_down,
+                ep_group=ep_group,
+            )
+            _assert_physical_saved_layout(saved_phys, tokens, topk)
+
+            expected = torch_moe_fwd_golden(
+                hs,
+                routing_weights,
+                expert_indices,
+                w_gate,
+                w_up,
+                w2,
+                num_experts,
+                ep_group,
+            )
+            assert_close(output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+        finally:
+            op.finalize()
+
+
+def run_moonep_physical_forward_moderate_wide_case(
+    rank: int,
+    world_size: int,
+) -> None:
+    """Replay the W8 moderate-wide MoonEP plan in torch against the golden."""
+    if world_size != 8:
+        raise ValueError("the moderate-wide physical case requires 8 ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("physical MoonEP forward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    experts_per_rank = num_experts // world_size
+    owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    torch.manual_seed(1801 + rank)
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=1)
+    ):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=1.0,
+                enable_moonep=True,
+            ),
+        )
+        try:
+            w_gate, w_up = make_gate_up_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            packed_w1 = pack_gate_up_weights(w_gate, w_up)
+            w2 = make_down_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            hidden_states = torch.randn(
+                (tokens, hidden), dtype=dtype, device=device
+            ).mul_(0.5).contiguous()
+            routing_weights = make_routing_weights(
+                tokens, topk, device, seed=1802 + rank
+            )
+
+            owner_period = torch.tensor(
+                [
+                    owner
+                    for owner, count in enumerate(owner_counts)
+                    for _ in range(count)
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+            route_ids = torch.arange(
+                tokens * topk, dtype=torch.int64, device=device
+            )
+            global_route_ids = route_ids + rank * tokens * topk
+            owners = owner_period[route_ids.remainder(len(owner_period))]
+            expert_indices = (
+                owners * experts_per_rank
+                + global_route_ids.remainder(experts_per_rank)
+            ).view(tokens, topk).to(torch.int32).contiguous()
+            sorted_per_token = torch.sort(expert_indices, dim=1).values
+            if bool(
+                (sorted_per_token[:, 1:] == sorted_per_token[:, :-1])
+                .any()
+                .item()
+            ):
+                raise AssertionError(
+                    "moderate-wide routes repeat an expert within a token"
+                )
+
+            plan = op.build_routing_plan(expert_indices)
+            copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
+            if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+                raise AssertionError(
+                    f"unexpected moderate-wide replica counts: {copy_counts}"
+                )
+
+            replica_gate_up, replica_down = gather_replica_weights_via_hccl(
+                plan.experts_to_copy_cpu, packed_w1, w2, ep_group
+            )
+            output, saved_phys = build_physical_saved_from_plan(
+                plan,
+                hidden_states,
+                routing_weights,
+                packed_w1,
+                w2,
+                replica_gate_up,
+                replica_down,
+                ep_group=ep_group,
+            )
+            _assert_physical_saved_layout(saved_phys, tokens, topk)
+            if copy_counts[rank] and not int(
+                saved_phys["expert_counts"][experts_per_rank:].sum().item()
+            ):
+                raise AssertionError(
+                    "a rank holding replicas executed no replica-slot traffic"
+                )
+
+            expected = torch_moe_fwd_golden(
+                hidden_states,
+                routing_weights,
+                expert_indices,
+                w_gate,
+                w_up,
+                w2,
+                num_experts,
+                ep_group,
+            )
+            assert_close(output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+        finally:
+            op.finalize()
+
+
+def _reduce_moonep_replica_wgrads(rank, saved_phys, triton_result, ep_group):
+    """Test-side stand-in for the M3 owner-pull replica grad reduce.
+
+    Every rank's replica weight-grad tables are gathered over HCCL and the ones
+    owned by this rank are accumulated, in (source rank, replica slot)
+    lexicographic order, in fp32 onto the physical home-segment seed. A logical
+    expert's routed rows partition exactly over the owner home slot plus every
+    replica slot holding it, so this reduction must reproduce the logical golden
+    weight grads.
+    """
+    home_experts = int(saved_phys["home_experts_per_rank"])
+    experts_to_copy = saved_phys["experts_to_copy_cpu"].to(torch.int64).tolist()
+    gate_up_tables = all_gather_list(
+        triton_result["_replica_grad_gate_up"], ep_group)
+    down_tables = all_gather_list(triton_result["_replica_grad_down"], ep_group)
+    grad_fc1 = torch.cat(
+        (triton_result["grad_fc1_1"], triton_result["grad_fc1_2"]), dim=1
+    ).float()
+    grad_fc2 = triton_result["grad_fc2"].float()
+    accumulated = 0
+    for source_rank, etc_row in enumerate(experts_to_copy):
+        for slot, expert in enumerate(etc_row):
+            if expert < 0 or expert // home_experts != rank:
+                continue
+            local_expert = expert % home_experts
+            grad_fc1[local_expert] += gate_up_tables[source_rank][slot].float()
+            grad_fc2[local_expert] += down_tables[source_rank][slot].float()
+            accumulated += 1
+    grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
+    return grad_fc1_1, grad_fc1_2, grad_fc2, accumulated
+
+
+def _assert_gradients_match_golden(
+    rank, triton_result, torch_result, ep_group, label
+):
+    """Compare the five canonical keys against the logical golden, collectively."""
+    all_ok, details = compare_backward_gradients(triton_result, torch_result)
+    flag = torch.tensor(
+        [1 if all_ok else 0], dtype=torch.int32, device=torch_result["grad_fc2"].device
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+    if rank == 0 and not bool(flag.item()):
+        print(f"{label} gradient details: {details}", flush=True)
+    if not bool(flag.item()):
+        raise AssertionError(
+            f"{label} physical backward mismatched the logical golden"
+        )
+
+
+def _assert_moonep_backward_matches_logical_golden(
+    rank, saved_phys, triton_result, torch_result, ep_group, label
+):
+    """Dual oracle for the physical 5-op backward against the logical golden.
+
+    ``grad_hidden`` / ``grad_routing_weights`` are per-route reductions and
+    compare directly, while the three weight-grad keys compare only after the
+    (source rank, slot)-ordered fp32 accumulation of every replica table onto
+    the home seed. A failing hidden/routing key therefore points at a dispatch
+    layout or transport bug, and a failing weight-grad key at a dual-table GEMM
+    or reduction bug.
+    """
+    grad_fc1_1, grad_fc1_2, grad_fc2, accumulated = _reduce_moonep_replica_wgrads(
+        rank, saved_phys, triton_result, ep_group)
+    merged = dict(triton_result)
+    merged.update(
+        grad_fc1_1=grad_fc1_1, grad_fc1_2=grad_fc1_2, grad_fc2=grad_fc2)
+    _assert_gradients_match_golden(rank, merged, torch_result, ep_group, label)
+    return accumulated
+
+
+def _assert_moonep_replica_grad_shapes(
+    triton_result, saved_phys, experts_per_rank, hidden, ffn
+):
+    """The replica segments must mirror the packed replica weight-table shapes."""
+    replica_slots = (
+        int(saved_phys["physical_experts_per_rank"]) - experts_per_rank
+    )
+    if tuple(triton_result["_replica_grad_gate_up"].shape) != (
+        replica_slots, 2 * ffn, hidden
+    ):
+        raise AssertionError(
+            "unexpected replica gate/up grad shape: "
+            f"{tuple(triton_result['_replica_grad_gate_up'].shape)}"
+        )
+    if tuple(triton_result["_replica_grad_down"].shape) != (
+        replica_slots, hidden, ffn
+    ):
+        raise AssertionError(
+            "unexpected replica down grad shape: "
+            f"{tuple(triton_result['_replica_grad_down'].shape)}"
+        )
+
+
+def run_moonep_backward_hot_expert_case(rank: int, world_size: int) -> None:
+    """Run the 5-op backward over an all-hot physical MoonEP plan (w2/w4)."""
+    if world_size not in (2, 4):
+        raise ValueError("the MoonEP hot-expert backward case requires two or four ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("physical MoonEP backward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    experts_per_rank = num_experts // world_size
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must be the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below allocates its own heap
+        # objects to build the routing plan.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=1.0,
+                    enable_moonep=True,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hs, _ = prepare_inputs(
+                    tokens,
+                    hidden,
+                    num_experts,
+                    topk,
+                    dtype,
+                    device,
+                    seed=903 + rank,
+                )
+                expert_indices = torch.zeros(
+                    (tokens, topk), dtype=torch.int32, device=device
+                )
+                routing_weights = torch.empty(
+                    (tokens, topk), dtype=torch.float32, device=device
+                )
+                routing_weights[:, 0] = 0.25
+                routing_weights[:, 1] = 0.75
+                torch.manual_seed(904 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+                plan = op.build_routing_plan(expert_indices)
+                replica_routes = plan.received_routes_per_expert[
+                    experts_per_rank:
+                ].sum().clone()
+                dist.all_reduce(
+                    replica_routes, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(replica_routes.item()) <= 0:
+                    raise AssertionError(
+                        "the all-hot plan routed no traffic through replicas"
+                    )
+
+                replica_gate_up, replica_down = gather_replica_weights_via_hccl(
+                    plan.experts_to_copy_cpu, packed_w1, w2, ep_group
+                )
+                output, saved_phys = build_physical_saved_from_plan(
+                    plan,
+                    hs,
+                    routing_weights,
+                    packed_w1,
+                    w2,
+                    replica_gate_up,
+                    replica_down,
+                    ep_group=ep_group,
+                )
+                _assert_physical_saved_layout(saved_phys, tokens, topk)
+
+                with torch.no_grad():
+                    _, home_saved = moe_forward(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    torch_result = backward_torch_baseline(home_saved, dy)
+                    triton_result = moe_backward_triton(
+                        saved_phys, dy, peer_mem
+                    )
+                _assert_moonep_replica_grad_shapes(
+                    triton_result, saved_phys, experts_per_rank, hidden, ffn
+                )
+                accumulated = _assert_moonep_backward_matches_logical_golden(
+                    rank,
+                    saved_phys,
+                    triton_result,
+                    torch_result,
+                    ep_group,
+                    "moonep-hot-expert-backward",
+                )
+                contributions = torch.tensor(
+                    [accumulated], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    contributions, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(contributions.item()) <= 0:
+                    raise AssertionError(
+                        "no owner accumulated a replica weight gradient"
+                    )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
+def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
+    """Run the 5-op backward over the W8 moderate-wide physical MoonEP plan."""
+    if world_size != 8:
+        raise ValueError("the moderate-wide MoonEP backward case requires 8 ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("physical MoonEP backward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    experts_per_rank = num_experts // world_size
+    owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    torch.manual_seed(1901 + rank)
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must be the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below allocates its own heap
+        # objects to build the routing plan.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=1.0,
+                    enable_moonep=True,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hidden_states = torch.randn(
+                    (tokens, hidden), dtype=dtype, device=device
+                ).mul_(0.5).contiguous()
+                routing_weights = make_routing_weights(
+                    tokens, topk, device, seed=1902 + rank
+                )
+                torch.manual_seed(1903 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+                owner_period = torch.tensor(
+                    [
+                        owner
+                        for owner, count in enumerate(owner_counts)
+                        for _ in range(count)
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                route_ids = torch.arange(
+                    tokens * topk, dtype=torch.int64, device=device
+                )
+                global_route_ids = route_ids + rank * tokens * topk
+                owners = owner_period[route_ids.remainder(len(owner_period))]
+                expert_indices = (
+                    owners * experts_per_rank
+                    + global_route_ids.remainder(experts_per_rank)
+                ).view(tokens, topk).to(torch.int32).contiguous()
+                sorted_per_token = torch.sort(expert_indices, dim=1).values
+                if bool(
+                    (sorted_per_token[:, 1:] == sorted_per_token[:, :-1])
+                    .any()
+                    .item()
+                ):
+                    raise AssertionError(
+                        "moderate-wide routes repeat an expert within a token"
+                    )
+
+                plan = op.build_routing_plan(expert_indices)
+                copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
+                if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+                    raise AssertionError(
+                        f"unexpected moderate-wide replica counts: {copy_counts}"
+                    )
+
+                replica_gate_up, replica_down = gather_replica_weights_via_hccl(
+                    plan.experts_to_copy_cpu, packed_w1, w2, ep_group
+                )
+                output, saved_phys = build_physical_saved_from_plan(
+                    plan,
+                    hidden_states,
+                    routing_weights,
+                    packed_w1,
+                    w2,
+                    replica_gate_up,
+                    replica_down,
+                    ep_group=ep_group,
+                )
+                _assert_physical_saved_layout(saved_phys, tokens, topk)
+
+                with torch.no_grad():
+                    _, home_saved = moe_forward(
+                        hidden_states,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    torch_result = backward_torch_baseline(home_saved, dy)
+                    triton_result = moe_backward_triton(
+                        saved_phys, dy, peer_mem
+                    )
+                _assert_moonep_replica_grad_shapes(
+                    triton_result, saved_phys, experts_per_rank, hidden, ffn
+                )
+                accumulated = _assert_moonep_backward_matches_logical_golden(
+                    rank,
+                    saved_phys,
+                    triton_result,
+                    torch_result,
+                    ep_group,
+                    "moonep-w8-moderate-wide-backward",
+                )
+                contributions = torch.tensor(
+                    [accumulated], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    contributions, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(contributions.item()) <= 0:
+                    raise AssertionError(
+                        "no owner accumulated a replica weight gradient"
+                    )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
+# ----------------------------------------------------------------------------
+# M3: symmetric replica slots + owner-pull reduction
+# ----------------------------------------------------------------------------
+
+def _assert_symmetric_replica_slots_match_owners(
+    rank,
+    experts_to_copy_cpu,
+    replica_gate_up,
+    replica_down,
+    home_gate_up,
+    home_down,
+    ep_group,
+):
+    """Check the FILLED slots of the symmetric tables against the home rows.
+
+    Unlike :func:`_assert_replica_tables_match_owners` the empty slots are
+    skipped: ``allocate_replica_weight_buffers`` does not zero the symmetric
+    heap and no kernel ever reads an empty slot, so its contents carry no
+    contract.  Returns the number of filled slots checked on this rank.
+    """
+    world_size = dist.get_world_size(ep_group)
+    experts_per_rank = home_gate_up.shape[0]
+    gate_up_tables = [torch.empty_like(home_gate_up) for _ in range(world_size)]
+    dist.all_gather(gate_up_tables, home_gate_up, group=ep_group)
+    down_tables = [torch.empty_like(home_down) for _ in range(world_size)]
+    dist.all_gather(down_tables, home_down, group=ep_group)
+    checked = 0
+    for slot, expert in enumerate(
+        experts_to_copy_cpu[rank].to(torch.int64).tolist()
+    ):
+        if expert < 0:
+            continue
+        owner = expert // experts_per_rank
+        local_row = expert % experts_per_rank
+        torch.testing.assert_close(
+            replica_gate_up[slot], gate_up_tables[owner][local_row]
+        )
+        torch.testing.assert_close(
+            replica_down[slot], down_tables[owner][local_row]
+        )
+        checked += 1
+    return checked
+
+
+def _reduce_symmetric_replica_wgrads(rank, transport, triton_result, ep_group):
+    """HCCL oracle for the symmetric transport: same order, independent path.
+
+    Seeds every owner's fp32 accumulator with the *pre-reduction* home segment
+    the backward reports and accumulates each rank's replica segment in
+    (source rank, slot) lexicographic order — the reduction the owner-pull
+    kernel has to reproduce on device.
+    """
+    home_experts = transport.experts_per_rank
+    experts_to_copy = transport.experts_to_copy_cpu.to(torch.int64).tolist()
+    gate_up_tables = all_gather_list(
+        triton_result["_replica_grad_gate_up"], ep_group)
+    down_tables = all_gather_list(
+        triton_result["_replica_grad_down"], ep_group)
+    grad_fc1 = triton_result["_home_grad_fc1"].float()
+    grad_fc2 = triton_result["_home_grad_fc2"].float()
+    accumulated = 0
+    for source_rank, etc_row in enumerate(experts_to_copy):
+        for slot, expert in enumerate(etc_row):
+            if expert < 0 or expert // home_experts != rank:
+                continue
+            local_expert = expert % home_experts
+            grad_fc1[local_expert] += gate_up_tables[source_rank][slot].float()
+            grad_fc2[local_expert] += down_tables[source_rank][slot].float()
+            accumulated += 1
+    grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)
+    return grad_fc1_1, grad_fc1_2, grad_fc2, accumulated
+
+
+def _assert_symmetric_transport_stages(
+    rank,
+    transport,
+    captured_slots,
+    triton_result,
+    ep_group,
+    label,
+):
+    """Assert the sink / owner-reduce / zero stages of one symmetric backward.
+
+    ``captured_slots`` holds the stream-ordered copies of the consumed slots
+    taken between the sink and the reduce, so the slots are compared bit-exactly
+    against the physical replica gradients before the reduction touched them.
+    The canonical weight-grad keys are then compared against the independent
+    HCCL oracle of :func:`_reduce_symmetric_replica_wgrads`, which accumulates
+    the very same replica gradients in the very same (source, slot) order in
+    fp32. Returns the number of replica contributions this owner accumulated.
+    """
+    consumed = transport.consumed_slots()
+    failures = []
+    if captured_slots["gate_up"].shape[0] != len(consumed):
+        failures.append("the sink capture did not cover every consumed slot")
+    for index, slot in enumerate(consumed):
+        if not torch.equal(
+            captured_slots["gate_up"][index],
+            triton_result["_replica_grad_gate_up"][slot].t(),
+        ):
+            failures.append(f"gate/up slot {slot} did not hold its sunk gradient")
+        if not torch.equal(
+            captured_slots["down"][index],
+            triton_result["_replica_grad_down"][slot],
+        ):
+            failures.append(f"down slot {slot} did not hold its sunk gradient")
+
+    reduced_fc1 = torch.cat(
+        (triton_result["grad_fc1_1"], triton_result["grad_fc1_2"]), dim=1
+    )
+    oracle_fc1_1, oracle_fc1_2, oracle_fc2, accumulated = (
+        _reduce_symmetric_replica_wgrads(rank, transport, triton_result, ep_group)
+    )
+    try:
+        assert_close(
+            reduced_fc1,
+            torch.cat((oracle_fc1_1, oracle_fc1_2), dim=1),
+            rtol=GRAD_RTOL,
+            atol=GRAD_ATOL,
+        )
+    except AssertionError as error:
+        failures.append(f"fc1 reduction disagreed with the oracle: {error}")
+    try:
+        assert_close(
+            triton_result["grad_fc2"], oracle_fc2, rtol=GRAD_RTOL, atol=GRAD_ATOL
+        )
+    except AssertionError as error:
+        failures.append(f"fc2 reduction disagreed with the oracle: {error}")
+
+    # The zeroing is the last transport stage; drain the stream before reading.
+    torch.npu.synchronize()
+    for slot in consumed:
+        if bool((transport.buffers.gate_up[slot] != 0).any()) or bool(
+            (transport.buffers.down[slot] != 0).any()
+        ):
+            failures.append(f"replica slot {slot} was not zeroed after the reduce")
+    # Rank-dependent failures must not strand a peer inside a collective above,
+    # so the verdict is shared before anybody raises.
+    flag = torch.tensor(
+        [0 if failures else 1], dtype=torch.int32, device=reduced_fc1.device
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+    if int(flag.item()) != 1:
+        raise AssertionError(f"{label}: " + "; ".join(failures))
+    return accumulated
+
+
+def _assert_forward_after_grad_transport(
+    op,
+    hidden_states,
+    expert_indices,
+    packed_w1,
+    w2,
+    routing_weights,
+    expected,
+    epoch_before_lend,
+    rank,
+    label,
+):
+    """Prove the zeroed slots cannot leak into a later forward.
+
+    The first post-backward forward must re-push (the lent hand-off invalidated
+    the cache) and the second must be a cache hit — a slot left holding a
+    gradient, or a slot zeroed after the push, only survives that second hit
+    unnoticed. Both outputs are compared against the same forward golden.
+    """
+    epoch_after_push = epoch_before_lend + 1
+    reloaded = op.forward(
+        hidden_states, expert_indices, packed_w1, w2, routing_weights
+    )
+    if op._replica_weight_epoch != epoch_after_push:
+        raise AssertionError(
+            f"{label}: the post-backward forward re-pushed "
+            f"{op._replica_weight_epoch - epoch_before_lend} times, expected 1"
+        )
+    if not op._replica_weight_cache_valid:
+        raise AssertionError(
+            f"{label}: the post-backward forward left the replica cache invalid"
+        )
+    assert_close(reloaded, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+
+    cached = op.forward(
+        hidden_states, expert_indices, packed_w1, w2, routing_weights
+    )
+    if op._replica_weight_epoch != epoch_after_push:
+        raise AssertionError(
+            f"{label}: the second post-backward forward was not a cache hit"
+        )
+    assert_close(cached, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+
+
+def run_moonep_backward_symmetric_hot_expert_case(
+    rank: int, world_size: int
+) -> None:
+    """Reduce the replica grads through the forward's own symmetric slots (w2/w4)."""
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the symmetric hot-expert backward case requires two or four ranks"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("symmetric MoonEP backward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    experts_per_rank = num_experts // world_size
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "moonep-symmetric-hot-expert-backward"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must be the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below allocates its own heap
+        # objects to build the routing plan.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=1.0,
+                    enable_moonep=True,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hs, _ = prepare_inputs(
+                    tokens,
+                    hidden,
+                    num_experts,
+                    topk,
+                    dtype,
+                    device,
+                    seed=953 + rank,
+                )
+                expert_indices = torch.zeros(
+                    (tokens, topk), dtype=torch.int32, device=device
+                )
+                routing_weights = torch.empty(
+                    (tokens, topk), dtype=torch.float32, device=device
+                )
+                routing_weights[:, 0] = 0.25
+                routing_weights[:, 1] = 0.75
+                torch.manual_seed(954 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+                expected = torch_moe_fwd_golden(
+                    hs,
+                    routing_weights,
+                    expert_indices,
+                    w_gate,
+                    w_up,
+                    w2,
+                    num_experts,
+                    ep_group,
+                )
+
+                # One production forward fills the symmetric replica tables via
+                # the owner-push; its output doubles as a free golden check.
+                produced = op.forward(
+                    hs, expert_indices, packed_w1, w2, routing_weights
+                )
+                assert_close(
+                    produced, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                )
+                if (
+                    op._replica_weight_buffers is None
+                    or not op._replica_weight_cache_valid
+                ):
+                    raise AssertionError(
+                        "the production forward did not publish replica weights"
+                    )
+                epoch_before_lend = op._replica_weight_epoch
+
+                # The plan has to be rebuilt AFTER the forward: forward reuses
+                # one planning workspace in place, so an earlier view is stale.
+                plan = op.build_routing_plan(expert_indices)
+                replica_routes = plan.received_routes_per_expert[
+                    experts_per_rank:
+                ].sum().clone()
+                dist.all_reduce(
+                    replica_routes, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(replica_routes.item()) <= 0:
+                    raise AssertionError(
+                        "the all-hot plan routed no traffic through replicas"
+                    )
+                checked_slots = _assert_symmetric_replica_slots_match_owners(
+                    rank,
+                    plan.experts_to_copy_cpu,
+                    op._replica_weight_buffers.gate_up,
+                    op._replica_weight_buffers.down,
+                    packed_w1,
+                    w2,
+                    ep_group,
+                )
+                slot_checks = torch.tensor(
+                    [checked_slots], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    slot_checks, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(slot_checks.item()) <= 0:
+                    raise AssertionError(
+                        "no rank filled a symmetric replica slot"
+                    )
+
+                # Replay the same plan in torch against the symmetric table
+                # views (no clone): the backward reads the weights in place.
+                output, saved_phys = build_physical_saved_from_plan(
+                    plan,
+                    hs,
+                    routing_weights,
+                    packed_w1,
+                    w2,
+                    op._replica_weight_buffers.gate_up,
+                    op._replica_weight_buffers.down,
+                    ep_group=ep_group,
+                )
+                _assert_physical_saved_layout(saved_phys, tokens, topk)
+                assert_close(
+                    output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                )
+
+                transport = op.lend_replica_weight_tables_for_grad()
+                if op._replica_weight_cache_valid is not False:
+                    raise AssertionError(
+                        "lending the replica tables must invalidate the cache"
+                    )
+                captured_slots = {}
+
+                def capture_sunk_slots(transport):
+                    # Stream-ordered copies taken between the sink and the
+                    # reduce, i.e. exactly what barrier #1 publishes.
+                    consumed = transport.consumed_slots()
+                    captured_slots["gate_up"] = transport.buffers.gate_up[
+                        consumed
+                    ]
+                    captured_slots["down"] = transport.buffers.down[consumed]
+
+                transport.post_sink_hook = capture_sunk_slots
+
+                with torch.no_grad():
+                    _, home_saved = moe_forward(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    torch_result = backward_torch_baseline(home_saved, dy)
+                    triton_result = moe_backward_triton(
+                        saved_phys, dy, peer_mem, grad_transport=transport
+                    )
+                _assert_moonep_replica_grad_shapes(
+                    triton_result, saved_phys, experts_per_rank, hidden, ffn
+                )
+                _assert_gradients_match_golden(
+                    rank, triton_result, torch_result, ep_group, label
+                )
+                accumulated = _assert_symmetric_transport_stages(
+                    rank,
+                    transport,
+                    captured_slots,
+                    triton_result,
+                    ep_group,
+                    label,
+                )
+                contributions = torch.tensor(
+                    [accumulated], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    contributions, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(contributions.item()) <= 0:
+                    raise AssertionError(
+                        "no owner pulled a replica weight gradient back"
+                    )
+                _assert_forward_after_grad_transport(
+                    op,
+                    hs,
+                    expert_indices,
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                    expected,
+                    epoch_before_lend,
+                    rank,
+                    label,
+                )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
+def run_moonep_backward_symmetric_moderate_wide_case(
+    rank: int, world_size: int
+) -> None:
+    """Reduce the replica grads through the symmetric slots (W8 moderate-wide)."""
+    if world_size != 8:
+        raise ValueError(
+            "the symmetric moderate-wide backward case requires 8 ranks"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("symmetric MoonEP backward requires NPU and ACLSHMEM")
+
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    experts_per_rank = num_experts // world_size
+    owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "moonep-symmetric-w8-moderate-wide-backward"
+    torch.manual_seed(1951 + rank)
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must be the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below allocates its own heap
+        # objects to build the routing plan.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=1.0,
+                    enable_moonep=True,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hidden_states = torch.randn(
+                    (tokens, hidden), dtype=dtype, device=device
+                ).mul_(0.5).contiguous()
+                routing_weights = make_routing_weights(
+                    tokens, topk, device, seed=1952 + rank
+                )
+                torch.manual_seed(1953 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+                owner_period = torch.tensor(
+                    [
+                        owner
+                        for owner, count in enumerate(owner_counts)
+                        for _ in range(count)
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                route_ids = torch.arange(
+                    tokens * topk, dtype=torch.int64, device=device
+                )
+                global_route_ids = route_ids + rank * tokens * topk
+                owners = owner_period[route_ids.remainder(len(owner_period))]
+                expert_indices = (
+                    owners * experts_per_rank
+                    + global_route_ids.remainder(experts_per_rank)
+                ).view(tokens, topk).to(torch.int32).contiguous()
+                sorted_per_token = torch.sort(expert_indices, dim=1).values
+                if bool(
+                    (sorted_per_token[:, 1:] == sorted_per_token[:, :-1])
+                    .any()
+                    .item()
+                ):
+                    raise AssertionError(
+                        "moderate-wide routes repeat an expert within a token"
+                    )
+                expected = torch_moe_fwd_golden(
+                    hidden_states,
+                    routing_weights,
+                    expert_indices,
+                    w_gate,
+                    w_up,
+                    w2,
+                    num_experts,
+                    ep_group,
+                )
+
+                produced = op.forward(
+                    hidden_states, expert_indices, packed_w1, w2, routing_weights
+                )
+                assert_close(
+                    produced, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                )
+                if (
+                    op._replica_weight_buffers is None
+                    or not op._replica_weight_cache_valid
+                ):
+                    raise AssertionError(
+                        "the production forward did not publish replica weights"
+                    )
+                epoch_before_lend = op._replica_weight_epoch
+
+                plan = op.build_routing_plan(expert_indices)
+                copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
+                if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+                    raise AssertionError(
+                        f"unexpected moderate-wide replica counts: {copy_counts}"
+                    )
+                # Ranks 0/1 hold no replica and may own none either: they still
+                # have to cross all three transport barriers.
+                _assert_symmetric_replica_slots_match_owners(
+                    rank,
+                    plan.experts_to_copy_cpu,
+                    op._replica_weight_buffers.gate_up,
+                    op._replica_weight_buffers.down,
+                    packed_w1,
+                    w2,
+                    ep_group,
+                )
+
+                output, saved_phys = build_physical_saved_from_plan(
+                    plan,
+                    hidden_states,
+                    routing_weights,
+                    packed_w1,
+                    w2,
+                    op._replica_weight_buffers.gate_up,
+                    op._replica_weight_buffers.down,
+                    ep_group=ep_group,
+                )
+                _assert_physical_saved_layout(saved_phys, tokens, topk)
+                assert_close(
+                    output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                )
+
+                transport = op.lend_replica_weight_tables_for_grad()
+                if op._replica_weight_cache_valid is not False:
+                    raise AssertionError(
+                        "lending the replica tables must invalidate the cache"
+                    )
+                captured_slots = {}
+
+                def capture_sunk_slots(transport):
+                    consumed = transport.consumed_slots()
+                    captured_slots["gate_up"] = transport.buffers.gate_up[
+                        consumed
+                    ]
+                    captured_slots["down"] = transport.buffers.down[consumed]
+
+                transport.post_sink_hook = capture_sunk_slots
+
+                with torch.no_grad():
+                    _, home_saved = moe_forward(
+                        hidden_states,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    torch_result = backward_torch_baseline(home_saved, dy)
+                    triton_result = moe_backward_triton(
+                        saved_phys, dy, peer_mem, grad_transport=transport
+                    )
+                _assert_moonep_replica_grad_shapes(
+                    triton_result, saved_phys, experts_per_rank, hidden, ffn
+                )
+                _assert_gradients_match_golden(
+                    rank, triton_result, torch_result, ep_group, label
+                )
+                accumulated = _assert_symmetric_transport_stages(
+                    rank,
+                    transport,
+                    captured_slots,
+                    triton_result,
+                    ep_group,
+                    label,
+                )
+                contributions = torch.tensor(
+                    [accumulated], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    contributions, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(contributions.item()) <= 0:
+                    raise AssertionError(
+                        "no owner pulled a replica weight gradient back"
+                    )
+                _assert_forward_after_grad_transport(
+                    op,
+                    hidden_states,
+                    expert_indices,
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                    expected,
+                    epoch_before_lend,
+                    rank,
+                    label,
+                )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
     if world_size != case.world_size:
         raise ValueError(f"worker world size does not match {case.case_id}")
@@ -1001,6 +2307,63 @@ def test_moonep_planning_matches_torch_at_e896_w8(dist_test):
 @pytest.mark.functional
 def test_moonep_moderate_wide_forward_w8(dist_test):
     dist_test(run_moonep_moderate_wide_forward_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_physical_forward_hot_expert(dist_test, world_size):
+    dist_test(
+        run_moonep_physical_forward_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_moonep_physical_forward_moderate_wide_w8(dist_test):
+    dist_test(
+        run_moonep_physical_forward_moderate_wide_case,
+        world_size=8,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_backward_hot_expert(dist_test, world_size):
+    dist_test(
+        run_moonep_backward_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_moonep_backward_moderate_wide_w8(dist_test):
+    dist_test(
+        run_moonep_backward_moderate_wide_case,
+        world_size=8,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_backward_symmetric_hot_expert(dist_test, world_size):
+    dist_test(
+        run_moonep_backward_symmetric_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_moonep_backward_symmetric_moderate_wide_w8(dist_test):
+    dist_test(
+        run_moonep_backward_symmetric_moderate_wide_case,
+        world_size=8,
+    )
 
 
 @pytest.mark.dist

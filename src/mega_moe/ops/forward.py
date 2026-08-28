@@ -998,6 +998,51 @@ class FusedMoEForward(torch.nn.Module):
             send_route_indices=send_route_indices,
         )
 
+    def lend_replica_weight_tables_for_grad(self):
+        """Hand the symmetric replica weight tables to a physical backward.
+
+        The M3 backward sinks its replica weight gradients into these same
+        slots, so the caller must not run another forward on this operator until
+        the borrowed transport has been reduced.  Lending therefore invalidates
+        the replica weight cache immediately and permanently: a gradient left in
+        a slot by an aborted backward can never be consumed as a weight, and the
+        next forward re-pushes every replica it needs.
+
+        Returns a :class:`mega_moe.runtime.replica_grad_transport.ReplicaGradTransport`
+        holding a *reference* to the live buffers plus cloned planning
+        snapshots (the routing workspace is reused in place, and a later
+        metadata-only ``build_routing_plan`` clears the operator's staged ETC).
+        """
+        if not self.enable_moonep:
+            raise RuntimeError("replica grad transport requires MoonEP")
+        if self._replica_weight_buffers is None:
+            raise RuntimeError("replica weight buffers have not been allocated")
+        if self._replica_weight_cache_key is None or not self._replica_weight_cache_valid:
+            raise RuntimeError(
+                "replica weights are not published; run a full forward before "
+                "lending the tables"
+            )
+        if self._replica_experts_cache is None:
+            raise RuntimeError("no replica layout snapshot is available to lend")
+
+        from ..runtime.replica_grad_transport import ReplicaGradTransport
+
+        experts_to_copy_cpu = self._replica_experts_cache.clone()
+        self._replica_weight_cache_valid = False
+        return ReplicaGradTransport(
+            buffers=self._replica_weight_buffers,
+            experts_to_copy_cpu=experts_to_copy_cpu,
+            experts_to_copy_device=experts_to_copy_cpu.to(
+                self.context.peer_mem.device
+            ),
+            rank=self.rank,
+            world_size=self.world_size,
+            experts_per_rank=self.experts_per_rank,
+            num_barrier_programs=self.num_aicore_programs,
+            gate_up_chunk_bytes=self.config.moonep_replica_gate_up_chunk_bytes,
+            down_chunk_bytes=self.config.moonep_replica_down_chunk_bytes,
+        )
+
     # ===================== FC2 + combine ============================
     def _fc2_combine_shadow_activation(
         self,
