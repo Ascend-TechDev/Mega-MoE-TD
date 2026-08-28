@@ -19,6 +19,21 @@ The stage order every EP rank must execute identically is
 
 with all three barriers launched unconditionally: a rank that owns no replica
 and holds none still has to arrive, otherwise the collective hangs.
+
+Two implementations of the cross-rank chain live here:
+
+* the *legacy* path — three standalone barrier launches around the
+  single-program owner-pull kernel and a host-side zero (:func:`launch_replica_grad_barrier`
+  + :func:`launch_owner_pull_accumulate` + :func:`zero_consumed_replica_slots`);
+* the *fused* path (:func:`launch_grad_reduce_transport`) — the whole
+  ``barrier #1 -> owner-pull -> barrier #2 -> zero -> barrier #3`` chain as
+  ONE kernel launch on the AICore-sized barrier grid, with the owner-pull
+  partitioned by home expert so the per-expert ``(peer, slot)`` accumulation
+  order (and therefore the fp32 result) stays bit-identical to the legacy
+  single-program walk.  This mirrors the persistent-CTA ``GradReduceKernel``
+  shape of the MoonEP reference (one kernel, internal grid barriers, local
+  zeroing after the readers' barrier); the in-kernel ``barrier_all_vec``
+  between real work phases follows the planning-kernel precedent.
 """
 
 import torch
@@ -168,6 +183,171 @@ def _kernel_owner_pull_accumulate(
         )
 
 
+@triton.jit
+def _fused_accumulate_chunk(
+    acc_ptr,
+    source_ptr,
+    home_expert,
+    count,
+    elements_per_expert,
+    ACC_BLOCK: tl.constexpr,
+):
+    """acc[home_expert] += source[0:count] in fp32, contiguous walk.
+
+    Runtime-elements twin of :func:`_accumulate_pulled_chunk`: the fused
+    kernel drives its chunk loop with a runtime bound so the pull body is not
+    unrolled once per (large) expert table, which keeps the JIT'd kernel
+    small for the Kimi-sized expert shapes.
+    """
+    offsets = tl.arange(0, ACC_BLOCK)
+    acc_base = home_expert.to(tl.int64) * elements_per_expert
+    for start in range(0, count, ACC_BLOCK):
+        local = start + offsets
+        mask = local < count
+        value = tl.load(source_ptr + local, mask=mask, other=0.0).to(tl.float32)
+        acc_offsets = acc_base + local.to(tl.int64)
+        accumulated = tl.load(acc_ptr + acc_offsets, mask=mask, other=0.0)
+        tl.store(acc_ptr + acc_offsets, accumulated + value, mask=mask)
+
+
+@triton.jit
+def _fused_pull_one_table(
+    acc_ptr,
+    slot_table_ptr,
+    staging_row_ptr,
+    peer,
+    slot,
+    home_expert,
+    elements_per_expert,
+    LOCAL_RANK: tl.constexpr,
+    CHUNK_ELEMENTS: tl.constexpr,
+    ACC_BLOCK: tl.constexpr,
+):
+    """Pull one replica slot of one table into this program's staging row.
+
+    Same chunked ``getmem`` -> staging -> fp32 accumulate contract as
+    :func:`_pull_and_accumulate_one_table`, except the chunk trip count is
+    dynamic (runtime ``elements_per_expert``) and the staging buffer is this
+    program's private row, so every program of the fused grid can pull a
+    different home expert concurrently without a staging race.
+    """
+    slot_base = slot.to(tl.int64) * elements_per_expert
+    for chunk_start in range(0, elements_per_expert, CHUNK_ELEMENTS):
+        count = tl.minimum(CHUNK_ELEMENTS, elements_per_expert - chunk_start)
+        if count > 0:
+            source = slot_table_ptr + slot_base + chunk_start
+            if peer == LOCAL_RANK:
+                _fused_accumulate_chunk(
+                    acc_ptr, source, home_expert, count,
+                    elements_per_expert, ACC_BLOCK,
+                )
+            else:
+                libshmem_device.getmem(staging_row_ptr, source, count * 2, peer)
+                _fused_accumulate_chunk(
+                    acc_ptr, staging_row_ptr, home_expert, count,
+                    elements_per_expert, ACC_BLOCK,
+                )
+
+
+@triton.jit
+def _fused_zero_rows(
+    slot_table_ptr,
+    slot,
+    elements_per_expert,
+    ACC_BLOCK: tl.constexpr,
+):
+    """Zero one slot row of one symmetric table with contiguous stores."""
+    base = slot.to(tl.int64) * elements_per_expert
+    offsets = tl.arange(0, ACC_BLOCK)
+    zeros = tl.zeros((ACC_BLOCK,), dtype=slot_table_ptr.dtype.element_ty)
+    for start in range(0, elements_per_expert, ACC_BLOCK):
+        local = start + offsets
+        mask = local < elements_per_expert
+        tl.store(slot_table_ptr + base + local.to(tl.int64), zeros, mask=mask)
+
+
+@triton.jit
+def _kernel_grad_reduce_transport(
+    pid,
+    num_programs,
+    acc_gate_up_ptr,
+    acc_down_ptr,
+    gate_up_slot_ptr,
+    down_slot_ptr,
+    desc_peer_ptr,
+    desc_slot_ptr,
+    desc_home_ptr,
+    home_offsets_ptr,
+    desc_count,
+    consumed_ptr,
+    consumed_count,
+    staging_gate_up_ptr,
+    staging_down_ptr,
+    gate_up_elements_per_expert,
+    down_elements_per_expert,
+    LOCAL_RANK: tl.constexpr,
+    EPN: tl.constexpr,
+    GATE_UP_CHUNK_ELEMENTS: tl.constexpr,
+    DOWN_CHUNK_ELEMENTS: tl.constexpr,
+    ACC_BLOCK: tl.constexpr,
+):
+    """One launch for the whole cross-rank replica grad transport.
+
+    Phases, mirroring the reference persistent ``GradReduceKernel``:
+
+    * barrier #1 publishes every rank's sunk slots (the host-side sink copies
+      are already stream-ordered ahead of this kernel);
+    * the owner-pull walks the *by-home-expert* descriptor list: program
+      ``pid`` owns home experts ``pid, pid + num_programs, ...``, and each
+      expert's descriptors stay in ``(peer, slot)`` lexicographic order, so
+      the fp32 accumulation is bit-identical to the legacy single-program
+      walk (per-expert contributions are disjoint rows of the accumulator,
+      which is what makes the partition legal for non-associative fp32);
+    * barrier #2 retires every reader before any slot is cleared;
+    * each rank zeroes only the slots it sank a gradient into;
+    * barrier #3 publishes the zeroing so the next forward's owner-push can
+      never race a stale gradient.
+
+    The grid MUST be the AICore-sized barrier grid — every program of every
+    rank arrives at all three ``barrier_all_vec`` calls unconditionally, even
+    when this rank owns no replica and holds none (empty phase loops).
+    """
+    staging_gate_up_row = staging_gate_up_ptr + pid.to(tl.int64) * (
+        GATE_UP_CHUNK_ELEMENTS
+    )
+    staging_down_row = staging_down_ptr + pid.to(tl.int64) * DOWN_CHUNK_ELEMENTS
+    # barrier #1: all ranks' sunk slots are visible to every peer.
+    libshmem_device.barrier_all_vec()
+    for home in range(pid, EPN, num_programs):
+        start = tl.load(home_offsets_ptr + home)
+        end = tl.load(home_offsets_ptr + home + 1)
+        for ordinal in range(start, end):
+            peer = tl.load(desc_peer_ptr + ordinal)
+            slot = tl.load(desc_slot_ptr + ordinal)
+            _fused_pull_one_table(
+                acc_gate_up_ptr, gate_up_slot_ptr, staging_gate_up_row,
+                peer, slot, home, gate_up_elements_per_expert,
+                LOCAL_RANK, GATE_UP_CHUNK_ELEMENTS, ACC_BLOCK,
+            )
+            _fused_pull_one_table(
+                acc_down_ptr, down_slot_ptr, staging_down_row,
+                peer, slot, home, down_elements_per_expert,
+                LOCAL_RANK, DOWN_CHUNK_ELEMENTS, ACC_BLOCK,
+            )
+    # barrier #2: every reader is done before any consumed slot is cleared.
+    libshmem_device.barrier_all_vec()
+    for i in range(pid, consumed_count, num_programs):
+        slot = tl.load(consumed_ptr + i)
+        _fused_zero_rows(
+            gate_up_slot_ptr, slot, gate_up_elements_per_expert, ACC_BLOCK
+        )
+        _fused_zero_rows(
+            down_slot_ptr, slot, down_elements_per_expert, ACC_BLOCK
+        )
+    # barrier #3: the zeroing is published before any next forward re-push.
+    libshmem_device.barrier_all_vec()
+
+
 def launch_replica_grad_barrier(num_programs: int) -> None:
     """Queue one AICore-sized collective fence for the replica grad transport."""
     _kernel_replica_grad_barrier[(num_programs, 1, 1)]()
@@ -212,6 +392,65 @@ def build_owner_pull_descriptors(experts_to_copy_cpu, rank, experts_per_rank):
         return torch.empty(0, dtype=torch.int32)
 
     return _as_tensor(peers), _as_tensor(slots), _as_tensor(homes)
+
+
+def build_owner_pull_descriptors_by_home(experts_to_copy_cpu, rank, experts_per_rank):
+    """Return by-home-expert pull descriptors for the fused transport kernel.
+
+    Produces ``(peer, slot, home, home_offsets)`` CPU int32 tensors where the
+    descriptor triples are grouped by local home expert (``home`` ascending)
+    and, inside every home expert, still ``(peer, slot)`` lexicographic — the
+    very same order the flat :func:`build_owner_pull_descriptors` scan yields,
+    so the fused per-expert accumulation reproduces the legacy fp32 result
+    bit-for-bit.  ``home_offsets`` has ``experts_per_rank + 1`` entries;
+    descriptor ``i`` belongs to home expert ``le`` iff
+    ``home_offsets[le] <= i < home_offsets[le + 1]``.
+    """
+    if experts_to_copy_cpu.device.type != "cpu":
+        raise ValueError("experts_to_copy_cpu must be a CPU tensor")
+    if experts_to_copy_cpu.dtype != torch.int32:
+        raise ValueError("experts_to_copy_cpu must use torch.int32")
+    if experts_to_copy_cpu.ndim != 2:
+        raise ValueError("experts_to_copy_cpu must have shape [world_size, B]")
+    world_size, replica_slots = experts_to_copy_cpu.shape
+    if replica_slots != experts_per_rank:
+        raise ValueError(
+            "the replica budget must equal experts_per_rank, got "
+            f"{replica_slots} slots for {experts_per_rank} home experts"
+        )
+    owner_start = rank * experts_per_rank
+    owner_end = owner_start + experts_per_rank
+    # One row-major (peer, slot) scan, bucketed per local home expert: the
+    # bucket append order preserves the lexicographic order inside each expert.
+    buckets: list[list[tuple[int, int]]] = [
+        [] for _ in range(experts_per_rank)
+    ]
+    for peer, row in enumerate(experts_to_copy_cpu.tolist()):
+        for slot, expert in enumerate(row):
+            if owner_start <= expert < owner_end:
+                buckets[expert - owner_start].append((peer, slot))
+    peers: list[int] = []
+    slots: list[int] = []
+    homes: list[int] = []
+    home_offsets = [0]
+    for local_expert, bucket in enumerate(buckets):
+        for peer, slot in bucket:
+            peers.append(peer)
+            slots.append(slot)
+            homes.append(local_expert)
+        home_offsets.append(len(peers))
+
+    def _as_tensor(values):
+        if values:
+            return torch.tensor(values, dtype=torch.int32)
+        return torch.empty(0, dtype=torch.int32)
+
+    return (
+        _as_tensor(peers),
+        _as_tensor(slots),
+        _as_tensor(homes),
+        torch.tensor(home_offsets, dtype=torch.int32),
+    )
 
 
 def zero_consumed_replica_slots(buffers, consumed_slots) -> None:
@@ -326,8 +565,150 @@ def launch_owner_pull_accumulate(
     )
 
 
+def launch_grad_reduce_transport(
+    *,
+    acc_gate_up,
+    acc_down,
+    gate_up_table,
+    down_table,
+    desc_peer,
+    desc_slot,
+    desc_home,
+    home_offsets,
+    consumed_idx,
+    rank,
+    num_programs,
+    gate_up_chunk_bytes,
+    down_chunk_bytes,
+    acc_block=_ACC_BLOCK,
+):
+    """Launch the whole cross-rank replica grad transport as ONE kernel.
+
+    Replaces the legacy launch sequence (barrier -> single-program owner-pull
+    -> barrier -> host zero -> barrier, six launches plus host work between
+    them) with a single AICore-sized launch whose internal
+    ``barrier_all_vec`` calls carry the two fences.  The owner-pull is
+    partitioned by home expert across the grid's programs; each program pulls
+    through its own staging row, sized ``chunk_bytes`` per program per table.
+
+    Args follow the legacy launcher's contract, plus the by-home-expert
+    descriptor columns from :func:`build_owner_pull_descriptors_by_home`
+    (with ``home_offsets``), and ``consumed_idx`` — the int32 device tensor of
+    replica slots this rank sank a gradient into (may be empty).  The
+    accumulators must already carry the fp32 home-segment seed in the tables'
+    per-expert layout, exactly as the legacy path requires.  ``num_programs``
+    must equal the physical AICore count (the barrier grid).
+    """
+    for name, accumulator in (
+        ("acc_gate_up", acc_gate_up), ("acc_down", acc_down)
+    ):
+        if accumulator.dtype != torch.float32 or not accumulator.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous fp32 tensor")
+    experts_per_rank, hidden_dim, ffn_packed = acc_gate_up.shape
+    if tuple(acc_down.shape) != (experts_per_rank, hidden_dim, ffn_packed // 2):
+        raise ValueError(
+            "the down accumulator must pack half the gate/up expert width, "
+            f"got {tuple(acc_down.shape)} for gate/up "
+            f"{tuple(acc_gate_up.shape)}"
+        )
+    for name, table, accumulator in (
+        ("gate_up_table", gate_up_table, acc_gate_up),
+        ("down_table", down_table, acc_down),
+    ):
+        if table.dtype != torch.bfloat16 or not table.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous bf16 table")
+        if table.device != accumulator.device or tuple(table.shape) != tuple(
+            accumulator.shape
+        ):
+            raise ValueError(
+                f"{name} has shape {tuple(table.shape)} on {table.device}, "
+                f"expected {tuple(accumulator.shape)} on {accumulator.device}"
+            )
+    for name, descriptor in (
+        ("desc_peer", desc_peer), ("desc_slot", desc_slot),
+        ("desc_home", desc_home),
+    ):
+        if descriptor.dtype != torch.int32 or descriptor.ndim != 1:
+            raise ValueError(f"{name} must be a 1-D int32 tensor")
+        if descriptor.device != acc_gate_up.device:
+            raise ValueError(f"{name} must live on the accumulator device")
+    if desc_peer.numel() != desc_slot.numel() or desc_peer.numel() != (
+        desc_home.numel()
+    ):
+        raise ValueError("the descriptor columns must have equal length")
+    if home_offsets.dtype != torch.int32 or home_offsets.ndim != 1:
+        raise ValueError("home_offsets must be a 1-D int32 tensor")
+    if home_offsets.device != acc_gate_up.device:
+        raise ValueError("home_offsets must live on the accumulator device")
+    if tuple(home_offsets.shape) != (experts_per_rank + 1,):
+        raise ValueError(
+            "home_offsets must have shape "
+            f"{(experts_per_rank + 1,)}, got {tuple(home_offsets.shape)}"
+        )
+    if consumed_idx.dtype != torch.int32 or consumed_idx.ndim != 1:
+        raise ValueError("consumed_idx must be a 1-D int32 tensor")
+    if consumed_idx.device != acc_gate_up.device:
+        raise ValueError("consumed_idx must live on the accumulator device")
+    if type(num_programs) is not int or num_programs <= 0:
+        raise ValueError("num_programs must be a positive integer")
+
+    device = acc_gate_up.device
+    gate_up_elements = int(acc_gate_up[0].numel())
+    down_elements = int(acc_down[0].numel())
+    for name, chunk_bytes in (
+        ("gate_up_chunk_bytes", gate_up_chunk_bytes),
+        ("down_chunk_bytes", down_chunk_bytes),
+    ):
+        if type(chunk_bytes) is not int or chunk_bytes <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    # One staging row per program per table; a program only ever pulls one
+    # chunk at a time, so the row is sized by the (validated) chunk geometry.
+    gate_up_chunk_elements = min(
+        gate_up_chunk_bytes // 2, gate_up_elements
+    )
+    down_chunk_elements = min(down_chunk_bytes // 2, down_elements)
+    if gate_up_chunk_elements <= 0 or down_chunk_elements <= 0:
+        raise ValueError("the staging chunk must hold at least one element")
+    staging_gate_up = torch.empty(
+        (num_programs, gate_up_chunk_elements),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    staging_down = torch.empty(
+        (num_programs, down_chunk_elements),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _kernel_grad_reduce_transport[(num_programs, 1, 1)](
+        0,
+        num_programs,
+        acc_gate_up,
+        acc_down,
+        gate_up_table,
+        down_table,
+        desc_peer,
+        desc_slot,
+        desc_home,
+        home_offsets,
+        int(desc_peer.numel()),
+        consumed_idx,
+        int(consumed_idx.numel()),
+        staging_gate_up,
+        staging_down,
+        gate_up_elements,
+        down_elements,
+        LOCAL_RANK=rank,
+        EPN=experts_per_rank,
+        GATE_UP_CHUNK_ELEMENTS=gate_up_chunk_elements,
+        DOWN_CHUNK_ELEMENTS=down_chunk_elements,
+        ACC_BLOCK=acc_block,
+    )
+
+
 __all__ = [
     "build_owner_pull_descriptors",
+    "build_owner_pull_descriptors_by_home",
+    "launch_grad_reduce_transport",
     "launch_owner_pull_accumulate",
     "launch_replica_grad_barrier",
     "zero_consumed_replica_slots",

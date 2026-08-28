@@ -11,15 +11,24 @@ its home experts back and accumulates them onto its home seed.
 Borrowing the tables is destructive — ``FusedMoEForward.lend_replica_weight_tables_for_grad``
 invalidates the replica weight cache at hand-off, so a gradient left in a slot
 can never be sold as a weight even if the backward aborts midway.
+
+By default :meth:`ReplicaGradTransport.reduce` launches the whole cross-rank
+chain (both fences, the owner-pull, the zeroing) as ONE kernel — see
+:func:`mega_moe.kernels.replica_grad_reduce.launch_grad_reduce_transport`.
+``MOONEP_GRAD_TRANSPORT=legacy`` restores the original host-orchestrated
+launch sequence.
 """
 
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+import os
 
 import torch
 
 from ..kernels.replica_grad_reduce import (
     build_owner_pull_descriptors,
+    build_owner_pull_descriptors_by_home,
+    launch_grad_reduce_transport,
     launch_owner_pull_accumulate,
     launch_replica_grad_barrier,
     zero_consumed_replica_slots,
@@ -51,6 +60,7 @@ class ReplicaGradTransport:
     num_barrier_programs: int
     gate_up_chunk_bytes: int = 16 * 1024 * 1024
     down_chunk_bytes: int = 4 * 1024 * 1024
+    transport_staging_chunk_bytes: int = 256 * 1024
     acc_block: int = 4096
     post_sink_hook: Optional[Callable[["ReplicaGradTransport"], None]] = None
     sunk: bool = field(default=False, compare=False)
@@ -141,13 +151,20 @@ class ReplicaGradTransport:
 
         * seed the fp32 accumulators with the physical home segments;
         * sink the replica segments (if the caller has not done it already);
-        * barrier #1 publishes the slots, the owner-pull kernel accumulates
-          every replica slot onto its owner's seed, barrier #2 retires the
-          readers, the consumed slots are zeroed, and barrier #3 publishes the
-          zeroing so the next forward's owner-push cannot race it.
+        * ONE fused kernel launch (default) carries barrier #1 (publish the
+          sunk slots), the owner-pull accumulation of every replica slot onto
+          its owner's seed (partitioned by home expert across the AICore-sized
+          grid, per-expert ``(peer, slot)`` order preserved), barrier #2
+          (retire the readers), the consumed-slot zeroing, and barrier #3
+          (publish the zeroing so the next forward's owner-push cannot race
+          it).  ``MOONEP_GRAD_TRANSPORT=legacy`` restores the original
+          host-orchestrated sequence (three standalone barrier launches
+          around a single-program owner-pull and a host-side zero);
+        * cast the fp32 accumulators back to bf16 in the gradient layout.
 
-        All three barriers are launched unconditionally: the descriptor count
-        is rank-dependent, but the barrier participation is not.
+        Barrier participation is rank-independent: every program of every
+        rank executes all three fences inside the fused kernel even when this
+        rank's descriptor and consumed-slot lists are empty.
         """
         if self.reduced:
             raise RuntimeError("the replica grad transport was already reduced")
@@ -166,44 +183,78 @@ class ReplicaGradTransport:
         if not self.sunk:
             self.sink(grad_fc1_phys, grad_fc2_phys)
 
-        desc_peer, desc_slot, desc_home = build_owner_pull_descriptors(
-            self.experts_to_copy_cpu, self.rank, home_experts
-        )
-        desc_peer = desc_peer.to(device)
-        desc_slot = desc_slot.to(device)
-        desc_home = desc_home.to(device)
-        gate_up_elements = int(acc_gate_up[0].numel())
-        down_elements = int(acc_down[0].numel())
         hidden_dim = self.down_expert_shape[0]
         ffn_dim = self.down_expert_shape[1]
         if self.gate_up_expert_shape != (hidden_dim, 2 * ffn_dim):
             raise ValueError("the borrowed gate/up and down tables disagree")
-        gate_up_chunk_elements, gate_up_num_chunks = replica_weight_push_geometry(
-            gate_up_elements, chunk_bytes=self.gate_up_chunk_bytes
-        )
-        down_chunk_elements, down_num_chunks = replica_weight_push_geometry(
-            down_elements, chunk_bytes=self.down_chunk_bytes
-        )
-
-        launch_replica_grad_barrier(self.num_barrier_programs)
-        launch_owner_pull_accumulate(
-            acc_gate_up=acc_gate_up,
-            acc_down=acc_down,
-            gate_up_table=self.buffers.gate_up,
-            down_table=self.buffers.down,
-            desc_peer=desc_peer,
-            desc_slot=desc_slot,
-            desc_home=desc_home,
-            rank=self.rank,
-            gate_up_chunk_elements=gate_up_chunk_elements,
-            gate_up_num_chunks=gate_up_num_chunks,
-            down_chunk_elements=down_chunk_elements,
-            down_num_chunks=down_num_chunks,
-            acc_block=self.acc_block,
-        )
-        launch_replica_grad_barrier(self.num_barrier_programs)
-        zero_consumed_replica_slots(self.buffers, self.consumed_slots())
-        launch_replica_grad_barrier(self.num_barrier_programs)
+        if os.environ.get("MOONEP_GRAD_TRANSPORT", "fused") == "legacy":
+            # Original orchestration: three standalone barrier launches
+            # around a single-program owner-pull and a host-side zero.
+            gate_up_elements = int(acc_gate_up[0].numel())
+            down_elements = int(acc_down[0].numel())
+            desc_peer, desc_slot, desc_home = build_owner_pull_descriptors(
+                self.experts_to_copy_cpu, self.rank, home_experts
+            )
+            desc_peer = desc_peer.to(device)
+            desc_slot = desc_slot.to(device)
+            desc_home = desc_home.to(device)
+            gate_up_chunk_elements, gate_up_num_chunks = (
+                replica_weight_push_geometry(
+                    gate_up_elements, chunk_bytes=self.gate_up_chunk_bytes
+                )
+            )
+            down_chunk_elements, down_num_chunks = replica_weight_push_geometry(
+                down_elements, chunk_bytes=self.down_chunk_bytes
+            )
+            launch_replica_grad_barrier(self.num_barrier_programs)
+            launch_owner_pull_accumulate(
+                acc_gate_up=acc_gate_up,
+                acc_down=acc_down,
+                gate_up_table=self.buffers.gate_up,
+                down_table=self.buffers.down,
+                desc_peer=desc_peer,
+                desc_slot=desc_slot,
+                desc_home=desc_home,
+                rank=self.rank,
+                gate_up_chunk_elements=gate_up_chunk_elements,
+                gate_up_num_chunks=gate_up_num_chunks,
+                down_chunk_elements=down_chunk_elements,
+                down_num_chunks=down_num_chunks,
+                acc_block=self.acc_block,
+            )
+            launch_replica_grad_barrier(self.num_barrier_programs)
+            zero_consumed_replica_slots(self.buffers, self.consumed_slots())
+            launch_replica_grad_barrier(self.num_barrier_programs)
+        else:
+            # Fused transport: one AICore-sized launch carries both fences,
+            # the by-home-expert owner-pull, and the consumed-slot zeroing.
+            fused_peer, fused_slot, fused_home, home_offsets = (
+                build_owner_pull_descriptors_by_home(
+                    self.experts_to_copy_cpu, self.rank, home_experts
+                )
+            )
+            consumed = self.consumed_slots()
+            consumed_idx = (
+                torch.tensor(consumed, dtype=torch.int32, device=device)
+                if consumed
+                else torch.empty(0, dtype=torch.int32, device=device)
+            )
+            launch_grad_reduce_transport(
+                acc_gate_up=acc_gate_up,
+                acc_down=acc_down,
+                gate_up_table=self.buffers.gate_up,
+                down_table=self.buffers.down,
+                desc_peer=fused_peer.to(device),
+                desc_slot=fused_slot.to(device),
+                desc_home=fused_home.to(device),
+                home_offsets=home_offsets.to(device),
+                consumed_idx=consumed_idx,
+                rank=self.rank,
+                num_programs=self.num_barrier_programs,
+                gate_up_chunk_bytes=self.transport_staging_chunk_bytes,
+                down_chunk_bytes=self.transport_staging_chunk_bytes,
+                acc_block=self.acc_block,
+            )
         self.reduced = True
         # Back to the gradient's [2F, H] layout the caller chunks gate from up.
         reduced_gate_up = torch.empty(
