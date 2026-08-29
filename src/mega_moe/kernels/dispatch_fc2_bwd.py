@@ -28,10 +28,17 @@ def _dispatch_static_maps(saved):
 
     The producer pushes grad buckets in (dst, expert) order and the consumer reads
     peer_mem expert-major contiguously, so every map here is expert-major (mirror
-    of forward dispatch_fc1), not the rank-major sort_idxs layout."""
+    of forward dispatch_fc1), not the rank-major sort_idxs layout.
+
+    A MoonEP ``saved_phys`` (``use_moonep``) already carries the physical
+    ``(destination, slot)`` plan metadata, so the bincount / argsort / all_gather
+    reconstruction below is skipped entirely (see
+    :func:`_dispatch_static_maps_moonep`)."""
     cache = saved.get("_dispatch_cache")
     if cache is not None:
         return cache
+    if saved.get("use_moonep"):
+        return _dispatch_static_maps_moonep(saved)
     device = f"npu:{saved['ep_rank']}"
     pe = saved["ep_rank"]; W = saved["world_size"]; H = saved["hidden_dim"]
     ep_group = saved["ep_group"]; total_send = saved["total_send"]
@@ -82,6 +89,65 @@ def _dispatch_static_maps(saved):
     return cache
 
 
+def _dispatch_static_maps_moonep(saved):
+    """Physical-slot dispatch maps consumed straight from the saved MoonEP plan.
+
+    ``saved_phys`` snapshots the planner's ``(destination, physical slot)``
+    bucket metadata, which is exactly the expert-major layout this step needs:
+
+    * ``plan_send_counts_by_rank_expert``  [W, epn+B]  per-(dst, slot) sends
+    * ``plan_send_bucket_starts``          [W*(epn+B)] send-order bucket starts
+    * ``plan_send_bucket_dst_starts``      [W*(epn+B)] receive-side offsets in
+      the destination's (slot, source) row order
+    * ``plan_recv_counts_by_source_expert`` [W, epn+B] + ``expert_counts`` /
+      ``plan_received_expert_offsets``     the receive-side slot tables
+    * ``sort_idxs`` (== plan send_route_indices)  send position -> flat route id
+
+    ``E`` therefore becomes the *physical* expert stride ``epn + B`` so the
+    bucket indexing and the ``_bwd_tile_signal_mem`` slot formula
+    ``(source * E + slot) * MAX_BWD_TILES + tile`` stay aligned on both the
+    producer and the consumer side. Only ``max_bwd_tiles`` still needs a
+    collective: it bounds the per-(source, slot) 64-row push tiles, which every
+    rank derives from its own plan send counts and MAX-reduces over the group.
+    """
+    device = f"npu:{saved['ep_rank']}"
+    ep_group = saved["ep_group"]
+    physical_experts = int(saved["physical_experts_per_rank"])
+    send_counts = saved["plan_send_counts_by_rank_expert"].to(device)
+    _local_max = torch.tensor(
+        [int(send_counts.max().item())], dtype=torch.int64, device=device
+    )
+    dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
+    cache = dict(
+        M=saved["M"], N=saved["ffn_dim"], K=saved["hidden_dim"], E=physical_experts,
+        fc2=saved["fc2"].contiguous(),
+        replica_fc2=saved["replica_down"].contiguous(),
+        home_experts=int(saved["home_experts_per_rank"]),
+        active_experts=int(saved["active_physical_experts_per_rank"]),
+        use_moonep=True,
+        total_send=saved["total_send"], H=saved["hidden_dim"],
+        total_recv=saved["total_recv"],
+        send_counts_re=send_counts.reshape(-1).contiguous(),
+        send_bucket_starts=(
+            saved["plan_send_bucket_starts"].to(device).contiguous()
+        ),
+        send_bucket_dst_starts=(
+            saved["plan_send_bucket_dst_starts"].to(device).contiguous()
+        ),
+        recv_per_expert=saved["expert_counts"].to(device).contiguous(),
+        recv_expert_offs=(
+            saved["plan_received_expert_offsets"].to(device).contiguous()
+        ),
+        bwd_expert_sort=saved["sort_idxs"].to(device).contiguous(),
+        recv_counts_re=(
+            saved["plan_recv_counts_by_source_expert"].to(device).contiguous()
+        ),
+        max_bwd_tiles=max(1, (int(_local_max.item()) + 63) // 64),
+    )
+    saved["_dispatch_cache"] = cache
+    return cache
+
+
 def _prepare_dispatch_fc2_bwd(saved, dy):
     """Build the expert-major gco (grad_combined_out_flat) for the per-tile
     signal/wait dispatch. Static maps are cached on `saved`; only the dy-dependent
@@ -109,15 +175,18 @@ def _fc2_bwd_gemm_one_mn_tile(
     expert_id, m_off, m_size, n_tile, N, K,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    WEIGHT_EXPERT_BASE: tl.constexpr,
     dtype: tl.constexpr,
 ):
     """fc2 input-grad GEMM one tile. A = peer_mem[m_off, H] CONTIGUOUS (no gather),
-    B = fc2[expert][H, ffn], out = grad_swiglu[m_off, ffn]."""
+    B = fc2[expert][H, ffn], out = grad_swiglu[m_off, ffn]. WEIGHT_EXPERT_BASE
+    re-bases the weight table (home table: base 0; replica table: base epn),
+    mirroring forward dispatch_fc1's dual-weight launches."""
     if m_size > 0:
         om = tl.arange(0, BLOCK_M); on_ = tl.arange(0, BLOCK_N); ok = tl.arange(0, BLOCK_K)
         m_offs = m_off + om; m_mask = om < m_size
         n_offs = n_tile * BLOCK_N + on_; n_mask = n_offs < N
-        wb = expert_id.to(tl.int64) * stride_we
+        wb = (expert_id.to(tl.int64) - WEIGHT_EXPERT_BASE) * stride_we
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for ks in range(0, K, BLOCK_K):
             k_offs = ks + ok; k_mask = k_offs < K
@@ -190,6 +259,8 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     TILE_M: tl.constexpr,
     WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    FIRST_EXPERT: tl.constexpr, LAST_EXPERT: tl.constexpr,
+    WEIGHT_EXPERT_BASE: tl.constexpr,
     MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
 ):
     """Consume merged expert M windows as their source tiles become ready. Adapted
@@ -200,6 +271,12 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     ONE value per epoch). Reuses the contiguous-read _fc2_bwd_gemm_one_mn_tile
     (stride_im=H, stride_ik=1).
 
+    FIRST_EXPERT/LAST_EXPERT/WEIGHT_EXPERT_BASE restrict the consumed expert
+    range to one weight table (forward dispatch_fc1's dual-launch pattern): the
+    home table serves slots [0, epn) and the replica table serves
+    [epn, active). EXPERTS_PER_RANK stays the physical slot stride of the
+    bucket/signal tables.
+
     BLOCK_M is the GEMM tile height AND the merged readiness window; TILE_M is
     the producer's push/signal tile height (64, matches the signal-slot layout).
     A BLOCK_M=128 window simply waits every 64-row source tile overlapping it
@@ -207,8 +284,9 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     unchanged, which decouples the GEMM L0A fill (a-tile [64,BK] bf16 = half of
     64KB L0A) from the transport tile granularity."""
     num_n_tiles = tl.cdiv(N, BLOCK_N)
-    num_tasks = EXPERTS_PER_RANK * num_n_tiles
-    for task_id in range(pid, num_tasks, ncore):
+    first_task = FIRST_EXPERT * num_n_tiles
+    last_task = LAST_EXPERT * num_n_tiles
+    for task_id in range(pid + first_task, last_task, ncore):
         expert_id = task_id // num_n_tiles
         n_tile = task_id % num_n_tiles
         expert_size = tl.load(recv_per_expert_ptr + expert_id)
@@ -257,7 +335,7 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                     ready_input_ptr, fc2_ptr, output_ptr,
                     expert_id, expert_off + window_start, window_size, n_tile, N, K,
                     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
-                    BLOCK_M, BLOCK_N, BLOCK_K, dtype)
+                    BLOCK_M, BLOCK_N, BLOCK_K, WEIGHT_EXPERT_BASE, dtype)
 
 
 @triton.jit(do_not_specialize=["signal_epoch"])
@@ -266,12 +344,17 @@ def kernel_dispatch_fc2_bwd_tile_signal(
     send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
     H: tl.constexpr, stride_gm,
     fc2_ptr, output_ptr,
+    replica_fc2_ptr,
     recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
-    N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    N, K,
+    stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
+    stride_rwe, stride_rwk, stride_rwn,
     signal_epoch,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     PUSH_BLOCK_M: tl.constexpr,
     WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    HOME_EXPERTS_PER_RANK: tl.constexpr, ACTIVE_EXPERTS_PER_RANK: tl.constexpr,
+    USE_REPLICA_WEIGHTS: tl.constexpr,
     MAX_BWD_TILES: tl.constexpr, LOCAL_RANK: tl.constexpr,
     BLOCK_H_PUSH: tl.constexpr,
 ):
@@ -281,7 +364,16 @@ def kernel_dispatch_fc2_bwd_tile_signal(
     core (all-core pipeline), fenced per source-tile — no barrier_all. Mirrors the
     verified ALL_CORE_PIPELINE + tile-readiness path of forward
     _kernel_dispatch_fc1. sub_vec_id()==0 gates the push (a mixed kernel has two
-    vector sub-cores that would otherwise duplicate the putmem)."""
+    vector sub-cores that would otherwise duplicate the putmem).
+
+    The Cube side runs one GEMM sweep per weight table (forward dispatch_fc1's
+    dual-launch pattern): the home table (fc2_ptr) serves slots
+    [0, HOME_EXPERTS_PER_RANK) and, when USE_REPLICA_WEIGHTS, the replica table
+    (replica_fc2_ptr, re-based at HOME_EXPERTS_PER_RANK) serves
+    [HOME_EXPERTS_PER_RANK, ACTIVE_EXPERTS_PER_RANK). EXPERTS_PER_RANK is the
+    physical slot stride of the bucket / signal-slot tables, so it equals
+    epn + B on the MoonEP path and epn otherwise (where the replica sweep is
+    compiled out and the behavior is unchanged)."""
     pid = tl.program_id(axis=0)
     num_cores = tl.num_programs(axis=0)
     dtype = tl.bfloat16
@@ -301,7 +393,22 @@ def kernel_dispatch_fc2_bwd_tile_signal(
             signal_epoch,
             N, K, stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
             BLOCK_M, BLOCK_N, BLOCK_K, PUSH_BLOCK_M,
-            WORLD_SIZE, EXPERTS_PER_RANK, MAX_BWD_TILES, dtype)
+            WORLD_SIZE, EXPERTS_PER_RANK,
+            0, HOME_EXPERTS_PER_RANK, 0,
+            MAX_BWD_TILES, dtype)
+        if USE_REPLICA_WEIGHTS:
+            _fc2_bwd_gemm_merged_tiles_wait(
+                pid, num_cores,
+                peer_mem_ptr, signal_mem_ptr, replica_fc2_ptr, output_ptr,
+                recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+                signal_epoch,
+                N, K, stride_im, stride_ik,
+                stride_rwe, stride_rwk, stride_rwn, stride_om, stride_on,
+                BLOCK_M, BLOCK_N, BLOCK_K, PUSH_BLOCK_M,
+                WORLD_SIZE, EXPERTS_PER_RANK,
+                HOME_EXPERTS_PER_RANK, ACTIVE_EXPERTS_PER_RANK,
+                HOME_EXPERTS_PER_RANK,
+                MAX_BWD_TILES, dtype)
 
 
 def _dispatch_gemm_tile():
@@ -324,6 +431,12 @@ def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
     EPR = prep["E"]
     MAX_BWD_TILES = prep["max_bwd_tiles"]
     fc2 = prep["fc2"]; H = prep["H"]; N = prep["N"]; K = prep["K"]
+    # Dual weight tables (MoonEP physical slots); the home-only path points the
+    # replica entry at the home table and compiles the second GEMM sweep out.
+    replica_fc2 = prep.get("replica_fc2", fc2)
+    home_experts = prep.get("home_experts", EPR)
+    active_experts = prep.get("active_experts", EPR)
+    use_replica_weights = prep.get("use_moonep", False)
     # Lazy-alloc one SET slot per (source, expert, tile). Slot layout must match
     # producer/consumer: (rank*EPR+expert)*MAX_BWD_TILES+tile, with rank as the
     # source id. 16 int32 elements per slot (= 64 bytes) mirrors the forward
@@ -346,12 +459,17 @@ def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
         prep["gco"], peer_mem, signal_mem,
         prep["send_bucket_starts"], prep["send_counts_re"], prep["send_bucket_dst_starts"],
         H, prep["gco"].stride(0),
-        fc2, out,
+        fc2, out, replica_fc2,
         prep["recv_per_expert"], prep["recv_expert_offs"], prep["recv_counts_re"],
         N, K, H, 1, fc2.stride(0), fc2.stride(1), fc2.stride(2), N, 1,
+        replica_fc2.stride(0), replica_fc2.stride(1), replica_fc2.stride(2),
         signal_epoch,
         BLOCK_M=gemm_bm, BLOCK_N=gemm_bn, BLOCK_K=gemm_bk, PUSH_BLOCK_M=64,
-        WORLD_SIZE=W, EXPERTS_PER_RANK=EPR, MAX_BWD_TILES=MAX_BWD_TILES,
+        WORLD_SIZE=W, EXPERTS_PER_RANK=EPR,
+        HOME_EXPERTS_PER_RANK=home_experts,
+        ACTIVE_EXPERTS_PER_RANK=active_experts,
+        USE_REPLICA_WEIGHTS=use_replica_weights,
+        MAX_BWD_TILES=MAX_BWD_TILES,
         LOCAL_RANK=saved["ep_rank"], BLOCK_H_PUSH=256, num_warps=8)
     return out
 

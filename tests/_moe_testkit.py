@@ -45,6 +45,7 @@ __all__ = [
     "get_ash_ip_port",
     "init_aclshmem",
     "make_peer_mem",
+    "make_moonep_backward_peer_mem",
     "make_pytest_params",
     "validate_timing_spec",
     "ash",
@@ -123,6 +124,35 @@ def make_peer_mem(saved, dtype, rank):
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=saved["ep_group"])
     peer_elems = int(t.item())
     return ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=rank)
+
+
+def make_moonep_backward_peer_mem(
+    total_recv,
+    total_send,
+    hidden_dim,
+    dtype,
+    rank,
+    ep_group,
+):
+    """Allocate the MoonEP backward peer_mem BEFORE any other symmetric buffer.
+
+    The MoonEP backward case must also build a ``FusedMoEForward`` (whose context
+    allocates its own symmetric heap objects) to produce the routing plan, so the
+    backward peer_mem has to be reserved first to sit at heap offset 0 for
+    ``dl.symm_at``. Sizing is passed explicitly because the physical
+    ``saved_phys`` (and its total_recv) only exists after the plan is built; a
+    dropless plan keeps ``total_recv == total_send == tokens * topk``. The
+    all_reduce MAX keeps the same size — and therefore the same subsequent heap
+    offsets (e.g. step1's signal_mem) — on every rank.
+    """
+    if ash is None:
+        raise RuntimeError("ACLSHMEM support is unavailable in this Python environment")
+    local_elems = max(int(total_recv), int(total_send)) * (hidden_dim + GATE_PAD)
+    t = torch.tensor([local_elems], dtype=torch.int64, device=f"npu:{rank}")
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=ep_group)
+    return ash.aclshmem_create_tensor(
+        [int(t.item())], dtype=dtype, device_id=rank
+    )
 
 
 @dataclass(frozen=True)

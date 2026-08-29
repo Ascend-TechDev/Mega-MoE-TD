@@ -68,7 +68,12 @@ def _gemm_tile_maps(saved, block_m):
     16KB vs 64KB L0A). These tables decouple the GEMM tile height from that
     meta: tiles are derived directly from expert_counts in `block_m` rows,
     expert-major, so the GEMM can use BM=128/256 while the push/reduce phases
-    keep their row-range group bounds."""
+    keep their row-range group bounds.
+
+    ``tile_home_bound`` is the first M-tile of the replica segment: tiles are
+    expert-major, so the MoonEP home slots [0, epn) own a contiguous tile
+    prefix and the dual-table GEMM split is one range cut. Without MoonEP the
+    bound covers every tile and the split is never taken."""
     cache_key = f"_combine_gemm_tiles_{block_m}"
     cached = saved.get(cache_key)
     if cached is not None:
@@ -76,6 +81,9 @@ def _gemm_tile_maps(saved, block_m):
     device = f"npu:{saved['ep_rank']}"
     counts = saved["expert_counts"].to(device)
     epr = counts.shape[0]
+    home_experts = (
+        int(saved["home_experts_per_rank"]) if saved.get("use_moonep") else epr
+    )
     tiles_per_expert = (counts.to(torch.int64) + block_m - 1) // block_m
     cum_tiles = torch.zeros(epr + 1, dtype=torch.int64, device=device)
     cum_tiles[1:] = tiles_per_expert.cumsum(0)
@@ -92,6 +100,7 @@ def _gemm_tile_maps(saved, block_m):
         tile_row0=row0.to(torch.int32).contiguous(),
         tile_rows=rows.contiguous(),
         num_tiles_m=int(tiles_per_expert.sum().item()),
+        tile_home_bound=int(cum_tiles[home_experts].item()),
     )
     saved[cache_key] = cached
     return cached
@@ -109,8 +118,13 @@ def _kernel_combine_fc1_bwd_gemm_group(
     N, K, num_tiles_n,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn,
     FIRST_TILE_M: tl.constexpr, LAST_TILE_M: tl.constexpr,
+    WEIGHT_EXPERT_BASE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
+    """One fc1 input-grad GEMM sweep over the M-tile range
+    [FIRST_TILE_M, LAST_TILE_M) against ONE weight table re-based at
+    WEIGHT_EXPERT_BASE (0 for the home fc1_combined table, epn for the replica
+    gate/up table) — the dual-launch pattern of forward dispatch_fc1."""
     pid = tl.program_id(axis=0)
     ncore = tl.num_programs(axis=0)
     with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -138,7 +152,7 @@ def _kernel_combine_fc1_bwd_gemm_group(
                 mm = om < rem
                 mn = on_ < (N - n_start)
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                wb = expert_id.to(tl.int64) * stride_we
+                wb = (expert_id.to(tl.int64) - WEIGHT_EXPERT_BASE) * stride_we
                 for ks in range(0, K, BLOCK_K):
                         mk = ok < (K - ks)
                         ao = (row_start + om[:, None]) * stride_im + (ks + ok[None, :]) * stride_ik
@@ -243,7 +257,13 @@ def _kernel_combine_fc1_bwd_reduce(
 def _combine_static_maps(saved):
     """Build the dy-independent combine push maps once and cache them on `saved`.
     Vectorized — no per-element Python writes (the old O(M) scalar-assign loop was
-    the dominant backward cost: ~265 ms/call)."""
+    the dominant backward cost: ~265 ms/call).
+
+    A MoonEP ``saved_phys`` reuses the same arrival-buffer algebra: its
+    ``splits_recv_list`` / ``inv_local`` are already physical semantics and the
+    reverse all-to-all still returns each arrival row to its offset inside the
+    source rank's plan send order, so only the group extent (``E``, the physical
+    slot count) and the second (replica) weight table change."""
     cache = saved.get("_combine_cache")
     if cache is not None:
         return cache
@@ -284,16 +304,30 @@ def _combine_static_maps(saved):
     num_tn = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     num_tm = int(saved["num_tiles_total"].item())
     fc1_combined = saved["fc1_combined"].contiguous()
+    if saved.get("use_moonep"):
+        # Physical groups: home slots [0, epn) read the legacy home table, the
+        # replica slots read the plan's packed replica gate/up table viewed as
+        # the same [B, 2*ffn, H] (K, N) layout (a stride-only transpose).
+        home_experts = int(saved["home_experts_per_rank"])
+        experts_total = int(saved["physical_experts_per_rank"])
+        replica_weight = saved["replica_gate_up"].transpose(1, 2)
+    else:
+        home_experts = saved["experts_per_rank"]
+        experts_total = saved["experts_per_rank"]
+        replica_weight = fc1_combined  # unused; keeps the launch code uniform
     cache = dict(
-        weight=fc1_combined,
+        weight=fc1_combined, replica_weight=replica_weight,
+        home_experts=home_experts,
         meta_expert_ids=saved["meta_expert_ids"].to(device), meta_split_cum=saved["meta_split_cum"].to(device),
         meta_tile_num=saved["meta_tile_num"].to(device), expert_counts=saved["expert_counts"].to(device),
-        M=M, N=H, K=fc1_combined.shape[1], E=saved["experts_per_rank"], num_tm=num_tm, num_tn=num_tn,
+        M=M, N=H, K=fc1_combined.shape[1], E=experts_total, num_tm=num_tm, num_tn=num_tn,
         inv_sort=inv_sort,
         write_rank_by_src=write_rank_by_src, write_off_by_src=write_off_by_src,
         split_size_cum_per_expert=saved["split_size_cum_per_expert"].to(device),
         H=H, B=saved["batch_size"], topk=saved["topk"],
         we=fc1_combined.stride(0), wk=fc1_combined.stride(1), wn=fc1_combined.stride(2),
+        rwe=replica_weight.stride(0), rwk=replica_weight.stride(1),
+        rwn=replica_weight.stride(2),
         stride_om=H, stride_on=1,
     )
     saved["_combine_cache"] = cache
@@ -370,6 +404,41 @@ def _ensure_combine_bwd_pipeline_runtime(saved, num_groups, device):
     )
 
 
+def _launch_combine_fc1_bwd_gemm_range(prep, tiles, hidden_buf, first_tile_m,
+                                       last_tile_m, num_tiles_n, gemm_kwargs):
+    """Issue the fc1 input-grad GEMM over M-tiles [first_tile_m, last_tile_m).
+
+    Tiles are expert-major, so the MoonEP home/replica weight-table split is one
+    range cut at ``tiles["tile_home_bound"]``: the home segment launches against
+    ``prep["weight"]`` (legacy home fc1_combined) and the replica segment against
+    ``prep["replica_weight"]`` re-based at ``prep["home_experts"]`` — the forward
+    dispatch_fc1 dual-launch pattern. Without MoonEP the bound covers every tile
+    and exactly one (home) launch runs, unchanged."""
+    home_bound = tiles["tile_home_bound"]
+    home_last = min(last_tile_m, home_bound)
+    if first_tile_m < home_last:
+        _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
+            prep["inp"], prep["weight"], hidden_buf,
+            tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
+            prep["N"], prep["K"], num_tiles_n,
+            prep["inp_stride_im"], prep["inp_stride_ik"],
+            prep["we"], prep["wk"], prep["wn"],
+            FIRST_TILE_M=first_tile_m, LAST_TILE_M=home_last,
+            WEIGHT_EXPERT_BASE=0,
+            **gemm_kwargs)
+    replica_first = max(first_tile_m, home_bound)
+    if replica_first < last_tile_m:
+        _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
+            prep["inp"], prep["replica_weight"], hidden_buf,
+            tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
+            prep["N"], prep["K"], num_tiles_n,
+            prep["inp_stride_im"], prep["inp_stride_ik"],
+            prep["rwe"], prep["rwk"], prep["rwn"],
+            FIRST_TILE_M=replica_first, LAST_TILE_M=last_tile_m,
+            WEIGHT_EXPERT_BASE=prep["home_experts"],
+            **gemm_kwargs)
+
+
 def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_routing, saved,
                                      cube_tail=None):
     """Two-stream expert-group pipeline mirroring the forward FC2 remote-store
@@ -419,14 +488,8 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
     tiles = _gemm_tile_maps(saved, _gbm)
     for g in range(num_groups):
         with torch.npu.stream(cube_stream):
-            _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
-                prep["inp"], prep["weight"], hidden_buf,
-                tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
-                prep["N"], prep["K"], _g_num_tn,
-                prep["inp_stride_im"], prep["inp_stride_ik"],
-                prep["we"], prep["wk"], prep["wn"],
-                FIRST_TILE_M=ftm[g], LAST_TILE_M=ltm[g],
-                **_gkw)
+            _launch_combine_fc1_bwd_gemm_range(
+                prep, tiles, hidden_buf, ftm[g], ltm[g], _g_num_tn, _gkw)
             group_events[g].record(cube_stream)
             if cube_tail is not None and g == num_groups - 1:
                 # After the last GEMM group the cube engine would idle while the
@@ -493,14 +556,8 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
     if _gns > 0:
         _gkw["num_stages"] = _gns
     tiles = _gemm_tile_maps(saved, _gbm)
-    _kernel_combine_fc1_bwd_gemm_group[(ncore(), 1, 1)](
-        prep["inp"], prep["weight"], hidden_buf,
-        tiles["tile_expert"], tiles["tile_row0"], tiles["tile_rows"],
-        prep["N"], prep["K"], _g_num_tn,
-        prep["inp_stride_im"], prep["inp_stride_ik"],
-        prep["we"], prep["wk"], prep["wn"],
-        FIRST_TILE_M=0, LAST_TILE_M=tiles["num_tiles_m"],
-        **_gkw)
+    _launch_combine_fc1_bwd_gemm_range(
+        prep, tiles, hidden_buf, 0, tiles["num_tiles_m"], _g_num_tn, _gkw)
     if _pt:
         _pev[1].record()
     # phase 2: reverse-A2A push hidden_buf -> peer_mem (Vector, all rows) + cross-rank fence
