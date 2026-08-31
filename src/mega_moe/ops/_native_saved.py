@@ -82,10 +82,12 @@ Stage H2 will add (through :func:`capture_activations` and
 :func:`assemble_native_saved`): the activation keys ``recv_hidden_sorted``
 (clone of the peer-memory view), ``recv_weights_sorted`` (bf16 cast),
 ``fc1_output``, ``swiglu_out_weighted`` (via the
-``_fc2_combine_shadow_activation`` two-tuple change), the zero-copy weight
-references ``fc1_1`` / ``fc1_2`` / ``fc2`` / ``fc1_combined``, and the input
-reference ``selected_experts``.  ``output`` / ``dy`` / ``num_experts`` /
-``gate`` / ``up`` / ``fc2_out`` are never saved (plan §3.1F).
+``_fc2_combine_shadow_activation`` two-tuple change), and the zero-copy weight
+references ``fc1_1`` / ``fc1_2`` / ``fc2`` / ``fc1_combined``.  The input
+reference ``selected_experts`` is captured from H1 on (held by reference like
+the replay oracle does; the home backward's step 1 rebuilds the expert-major
+mapping from it).  ``output`` / ``dy`` / ``num_experts`` / ``gate`` / ``up`` /
+``fc2_out`` are never saved (plan §3.1F).
 
 The MoonEP physical layout (Stage N) reuses this module: its plan metadata
 covers the physical ``[home | replica]`` slot range, so
@@ -314,13 +316,15 @@ def assemble_native_saved(
     *,
     hidden_states: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    selected_experts: torch.Tensor,
 ) -> dict:
     """T3 — assemble the native ``saved`` dict from the T1/T2 captures.
 
     ``activations`` is the :func:`capture_activations` result (``None`` until
-    Stage H2).  The defensive gate keys (``_routing_generation`` /
-    ``_owner_token``, python ints) let the backward reject a saved dict whose
-    operator has since replayed another plan.
+    Stage H2).  ``selected_experts`` is the forward input, held by reference
+    (same semantics as the replay oracle).  The defensive gate keys
+    (``_routing_generation`` / ``_owner_token``, python ints) let the backward
+    reject a saved dict whose operator has since replayed another plan.
     """
     saved = dict(snapshot)
     if activations is not None:
@@ -334,6 +338,7 @@ def assemble_native_saved(
         ep_rank=int(op.rank),
         ep_group=op.ep_group,
         experts_per_rank=int(op.experts_per_rank),
+        selected_experts=selected_experts,
         _routing_generation=int(plan.generation),
         _owner_token=id(op._routing_owner_token),
     )
