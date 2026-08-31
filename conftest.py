@@ -3,6 +3,7 @@
 
 import gc
 import os
+import traceback
 import queue
 import time
 
@@ -30,6 +31,12 @@ def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
         dist.barrier()
         fn(rank, world_size, *args)
     except Exception as error:
+        # Print at raise time: the parent only drains the queue after every
+        # worker exits, and a peer of a failed rank usually hangs inside a
+        # collective — without this the traceback stays invisible until the
+        # join deadline (or the watchdog) kills the session.
+        print(f"[rank {rank}] worker exception:", flush=True)
+        traceback.print_exc()
         error_queue.put((rank, error))
     finally:
         # Finalize deferred HCCL Work objects while the NPU runtime is still
