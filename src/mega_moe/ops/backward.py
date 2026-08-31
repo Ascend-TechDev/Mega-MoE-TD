@@ -15,6 +15,11 @@ Two things live here:
    backward is the fused triton path (the Ascend tutorial only ships a triton
    backward — forward is the private differentiable Torch implementation).
 
+3. :class:`MegaMoEFunction` — the merged native autograd Function (Stage H3,
+   plan §3.2.3): the fused forward with ``return_saved=True`` plus the 5 triton
+   mega-ops over that native saved dict, with routing-generation/owner gates
+   and the persistent signal_mem/epoch carried in a caller-owned ``state``.
+
 The 5 backward mega-ops (given dy [B,H]):
 
 1. ``dispatch_fc2_bwd``  — dispatch-A2A(home->expert) + fc2 input-grad
@@ -398,4 +403,141 @@ class MegaMoEBackwardFunction(torch.autograd.Function):
             None,                          # ep_group
             None,                          # topk
             None,                          # peer_mem
+        )
+
+
+# Persistent-backward state keys (plan §3.4). ``dispatch_fc2_bwd`` lazily
+# allocates the symmetric tile-signal buffer and bumps its SET-mode epoch
+# inside the *saved dict*. A Function whose saved dict is rebuilt on every
+# forward would leak one symmetric allocation per step and restart the epoch
+# at 1, reading residual signals from the shared buffer — so the caller-owned
+# ``state`` object carries both across steps and ``MegaMoEFunction`` injects /
+# writes them back around each backward.
+_BWD_SIGNAL_MEM_KEY = "_bwd_tile_signal_mem"
+_BWD_SIGNAL_EPOCH_KEY = "_bwd_tile_signal_epoch"
+
+
+class MegaMoEFunction(torch.autograd.Function):
+    """Fused EP-MoE with BOTH sides native (plan §3.2.3): the forward is the
+    fused operator run with ``return_saved=True`` and the backward is the 5
+    triton mega-ops over that native saved dict — no torch replay anywhere.
+
+    forward(ctx, op, hidden_states, routing_weights, selected_experts,
+            gate_up_weight, down_weight, peer_mem, state) -> output
+
+        op                FusedMoEForward          (not a tensor; no grad)
+        hidden_states     [B, H]                    (requires grad)
+        routing_weights   [B, topk]                 (requires grad)
+        selected_experts  [B, topk] int, global ids (no grad)
+        gate_up_weight    [E, H, 2F] packed Kimi    (requires grad)
+        down_weight       [E, H, F]                 (requires grad)
+        peer_mem          session-FIRST symmetric allocation (heap offset 0)
+        state             caller-owned namespace with ``signal_mem``/``epoch``
+
+    ``peer_mem`` must be passed explicitly — ``None`` raises and the Function
+    never falls back to ``op.context.peer_mem``: the receive buffer is a
+    single-in-flight resource whose lifecycle belongs to the caller (the
+    operator claims its own heap objects for planning and dispatch).
+
+    The native saved dict holds references to the forward *inputs* (the four
+    weight stride views, ``hidden_states``, ``selected_experts``), so weights
+    must not be mutated in place between ``apply`` and ``backward`` (plan
+    §3.4: standard save-for-backward assumption). They are stashed as plain
+    ctx attributes rather than ``save_for_backward`` on purpose — the saved
+    views alias the packed weight table, and the explicit version-counter
+    machinery would reject the legitimate "forward, optimizer step (replace
+    tensors), next forward" cadence of a training loop.
+
+    backward guards: the routing-generation / owner-token gates from §3.2.4
+    fire before any kernel launches — a saved dict whose operator has since
+    run another forward describes a plan whose single-in-flight workspace was
+    already overwritten, and running the backward on it would read garbage.
+    """
+
+    @staticmethod
+    def forward(ctx, op, hidden_states, routing_weights, selected_experts,
+                gate_up_weight, down_weight, peer_mem, state):
+        if peer_mem is None:
+            raise ValueError(
+                "MegaMoEFunction requires an explicit peer_mem argument (the "
+                "ACLSHMEM session's first symmetric allocation, heap offset "
+                "0); refusing to default to op.context.peer_mem"
+            )
+        with torch.no_grad():
+            output, saved = op(
+                hidden_states, selected_experts, gate_up_weight, down_weight,
+                routing_weights, return_saved=True)
+        ctx.moe_op = op
+        ctx.saved_moe = saved
+        ctx.peer_mem = peer_mem
+        ctx.moe_state = state
+        return output
+
+    @staticmethod
+    def backward(ctx, dy):
+        op = ctx.moe_op
+        saved = ctx.saved_moe
+        state = ctx.moe_state
+        # --- defensive gates (§3.2.4): capture must still be the operator's
+        # current routing plan. Both keys are plain python ints embedded by
+        # _native_saved (H1); a dict without them is not a native saved dict.
+        saved_generation = saved.get("_routing_generation")
+        saved_owner = saved.get("_owner_token")
+        if saved_generation is None or saved_owner is None:
+            raise ValueError(
+                "MegaMoEFunction.backward: the saved dict lacks the "
+                "_routing_generation/_owner_token gate keys — it was not "
+                "produced by a return_saved=True forward"
+            )
+        if saved_owner != id(op._routing_owner_token):
+            raise RuntimeError(
+                "MegaMoEFunction.backward: the saved dict belongs to a "
+                f"different operator instance (owner token {saved_owner} != "
+                f"{id(op._routing_owner_token)})"
+            )
+        if saved_generation != op._routing_generation:
+            raise RuntimeError(
+                "MegaMoEFunction.backward: saved routing generation "
+                f"{saved_generation} != operator generation "
+                f"{op._routing_generation} — the operator has run another "
+                "forward since this saved dict was captured, overwriting the "
+                "single-in-flight planning workspace it was cloned from"
+            )
+        # --- inject the persistent signal buffer / epoch into the fresh saved
+        # dict (plan §3.4). Epoch 0 means "never used" and must not be
+        # injected: a freshly zeroed SET-mode slot already satisfies wait(0),
+        # which would let a consumer race ahead of its producer.
+        signal_mem = getattr(state, "signal_mem", None) if state is not None else None
+        if signal_mem is not None:
+            saved[_BWD_SIGNAL_MEM_KEY] = signal_mem
+            epoch = int(getattr(state, "epoch", 0) or 0)
+            if epoch >= 1:
+                saved[_BWD_SIGNAL_EPOCH_KEY] = epoch
+        # --- the 5 fused mega-ops over the native saved dict.
+        grads = moe_backward_triton(saved, dy, ctx.peer_mem)
+        # --- write the (possibly freshly allocated) buffer and the bumped
+        # epoch back so the next step reuses them instead of leaking.
+        if state is not None:
+            persisted = saved.get(_BWD_SIGNAL_MEM_KEY)
+            if persisted is not None:
+                state.signal_mem = persisted
+                next_epoch = saved.get(_BWD_SIGNAL_EPOCH_KEY)
+                if next_epoch is not None:
+                    state.epoch = int(next_epoch)
+        # gate/up halves come back as [E, F, H] each; merge to the packed
+        # Kimi [E, H, 2F] layout of the gate_up_weight argument.
+        grad_gate_up = torch.cat(
+            (grads["grad_fc1_1"], grads["grad_fc1_2"]), dim=1
+        ).transpose(1, 2)
+        # match forward arg order: (op, hidden_states, routing_weights,
+        # selected_experts, gate_up_weight, down_weight, peer_mem, state)
+        return (
+            None,                           # op
+            grads["grad_hidden"],           # hidden_states
+            grads["grad_routing_weights"],  # routing_weights
+            None,                           # selected_experts (int idx)
+            grad_gate_up,                   # gate_up_weight
+            grads["grad_fc2"],              # down_weight
+            None,                           # peer_mem (non-grad buffer)
+            None,                           # state (host-side object)
         )
