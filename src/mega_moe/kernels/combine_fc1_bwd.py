@@ -303,7 +303,11 @@ def _combine_static_maps(saved):
 
     num_tn = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     num_tm = int(saved["num_tiles_total"].item())
-    fc1_combined = saved["fc1_combined"].contiguous()
+    # Stride view accepted as-is: the GEMM addresses the weight table through
+    # we/wk/wn, and the native saved hands over gate_up_weight.transpose(1, 2)
+    # (materializing it would copy ~4.6 GiB per step).  The replay's
+    # torch.cat output is already contiguous, so that path is unchanged.
+    fc1_combined = saved["fc1_combined"]
     if saved.get("use_moonep"):
         # Physical groups: home slots [0, epn) read the legacy home table, the
         # replica slots read the plan's packed replica gate/up table viewed as
