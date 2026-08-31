@@ -60,6 +60,7 @@ from tests._numeric import (
     OUTPUT_ATOL,
     OUTPUT_RTOL,
     assert_close,
+    diagnose,
 )
 
 # Stage H3 (master plan §3.2.3) adds the merged native-saved autograd Function
@@ -2290,8 +2291,9 @@ def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
 # backward's saved values directly; the torch replay
 # (``mega_moe.ops._torch_forward.moe_forward``, 39-key contract at
 # ``_torch_forward.py:283-306``) is demoted to the test oracle.  H1 covers the
-# metadata / permutation / scalar keys below, H2 will extend the same driver to
-# the activation keys, and H3 adds the autograd Function case.
+# metadata / permutation / scalar keys, H2 (same driver, below) extends the
+# comparison to the activation and weight-view keys, and H3 adds the autograd
+# Function case.
 # ----------------------------------------------------------------------------
 
 # Layout-convention-independent keys: the received route multiset
@@ -2341,15 +2343,50 @@ NATIVE_SAVED_SCALAR_KEYS = (
     "splits_recv_list",
 )
 
-# TODO(H2): once the T2/T3 activation capture lands, extend
-# _assert_native_saved_metadata to the full key-by-key contract:
-#   bit-for-bit (dispatch is a pure copy): recv_hidden_sorted [M, H] bf16
-#   rtol/atol 2e-2, fp32 compared:        fc1_output [M, 2F],
-#                                        swiglu_out_weighted [M, F],
-#                                        recv_weights_sorted [M]
-#   weight views (forward inputs):        fc1_1, fc1_2, fc2, fc1_combined
+# ---- Stage H2 (§3.1 D/F): activation keys ---------------------------------
+#
+# ``recv_hidden_sorted`` is the dispatched-token copy; both paths land in the
+# same (local expert, source, flat) receive row order (coordinator-verified
+# against the multi-source simulation), so it stays bit-for-bit.  A mismatch
+# here is a major signal — the message tags it as such and the assertion is
+# never relaxed.
+NATIVE_SAVED_H2_BITWISE_KEYS = ("recv_hidden_sorted",)
+
+# Computed activations.  These go through different GEMM kernels, so the plan
+# grants the single 2e-2 figure; the comparison runs in fp32 through
+# ``assert_close`` like every other numeric gate in this suite.  The native
+# ``recv_weights_sorted`` is the bf16 cast of the received routing weights,
+# matching the replay's ``flat_weights[...].to(dtype)`` bookkeeping.
+NATIVE_SAVED_H2_FLOAT_KEYS = (
+    "fc1_output",
+    "swiglu_out_weighted",
+    "recv_weights_sorted",
+)
+NATIVE_SAVED_H2_RTOL = 2e-2
+NATIVE_SAVED_H2_ATOL = 2e-2
+
+# Zero-copy weight references (§3.1 F).  The native side saves views of the
+# forward inputs — ``fc1_combined`` is ``gate_up_weight.transpose(1, 2)`` as a
+# stride view, ``fc1_1``/``fc1_2`` are slice-transpose views, ``fc2`` is the
+# down weight itself — while the replay side rebuilds its twins from the
+# unpacked weights (its ``fc1_combined`` is the contiguous ``cat`` product).
+# ``pack_gate_up_weights`` is the exact inverse of those views and both sides
+# of this harness are built from the same ``w_gate``/``w_up``/``w2`` tensors,
+# so values, dtype, and shape must agree bit-for-bit.  Aliasing the forward
+# input's storage is a hard gate (§3.1B zero-copy contract, coordinator
+# ruling: a silently materialized fc1_combined alone costs ~4.6 GiB of the
+# §3.5 memory budget); contiguity is only reported, because stride views are
+# legal.
+NATIVE_SAVED_H2_VIEW_KEYS = (
+    "fc1_1",
+    "fc1_2",
+    "fc1_combined",
+    "fc2",
+)
+
 # §3.1 F deliberately omits ``output``/``dy``/``fc2_out``/``gate``/``up``/
-# ``num_experts`` from the native saved; they stay replay-only.
+# ``num_experts`` from the native saved; they stay replay-only and are not
+# asserted here.
 
 
 def _inverse_permutation(permutation):
@@ -2441,6 +2478,108 @@ def _check_native_saved_tensor(native_saved, replay_saved, key, failures):
             f"{key}: {int(mismatch.sum().item())}/{mismatch.numel()} "
             "elements differ"
         )
+
+
+def _check_native_saved_float_tensor(
+    native_saved, replay_saved, key, rtol, atol, failures
+):
+    """One float activation key: present, same dtype/shape, within tolerance."""
+    native_value = native_saved.get(key)
+    if native_value is None:
+        failures.append(
+            f"{key}: missing from the native saved (H2 activation capture)"
+        )
+        return
+    replay_value = replay_saved[key]
+    if not isinstance(native_value, torch.Tensor):
+        failures.append(
+            f"{key}: native value is {type(native_value).__name__}, "
+            "expected a tensor"
+        )
+        return
+    if native_value.dtype != replay_value.dtype:
+        failures.append(
+            f"{key}: dtype native={native_value.dtype} "
+            f"replay={replay_value.dtype}"
+        )
+    if tuple(native_value.shape) != tuple(replay_value.shape):
+        failures.append(
+            f"{key}: shape native={tuple(native_value.shape)} "
+            f"replay={tuple(replay_value.shape)}"
+        )
+        return
+    try:
+        assert_close(native_value, replay_value, rtol=rtol, atol=atol)
+    except AssertionError:
+        failures.append(
+            f"{key}: {diagnose(native_value, replay_value)} exceeds "
+            f"rtol={rtol} atol={atol}"
+        )
+
+
+def _check_native_saved_weight_view(
+    native_saved, replay_saved, key, forward_input, input_name, failures, notes
+):
+    """One zero-copy weight-reference key: values, dtype, shape, and aliasing.
+
+    The native key is a view of the forward input (stride views are legal), so
+    contiguity is never asserted and only reported.  Storage aliasing of the
+    forward input is a hard gate (§3.1B zero-copy contract; §3.5's memory
+    saving is a core promise of the merge — a silently materialized
+    ``fc1_combined`` alone costs ~4.6 GiB).
+    """
+    native_value = native_saved.get(key)
+    if native_value is None:
+        failures.append(
+            f"{key}: missing from the native saved (H2 weight reference)"
+        )
+        return
+    replay_value = replay_saved[key]
+    if not isinstance(native_value, torch.Tensor):
+        failures.append(
+            f"{key}: native value is {type(native_value).__name__}, "
+            "expected a tensor"
+        )
+        return
+    if native_value.dtype != replay_value.dtype:
+        failures.append(
+            f"{key}: dtype native={native_value.dtype} "
+            f"replay={replay_value.dtype}"
+        )
+    if tuple(native_value.shape) != tuple(replay_value.shape):
+        failures.append(
+            f"{key}: shape native={tuple(native_value.shape)} "
+            f"replay={tuple(replay_value.shape)}"
+        )
+        return
+    native_cpu = native_value.detach().cpu()
+    replay_cpu = replay_value.detach().cpu()
+    if not torch.equal(native_cpu, replay_cpu):
+        mismatch = native_cpu != replay_cpu
+        failures.append(
+            f"{key}: weight reference differs from the replay weights "
+            f"({int(mismatch.sum().item())}/{mismatch.numel()} elements)"
+        )
+        return
+    if forward_input is None:
+        notes.append(
+            f"{key}: no forward input passed in; storage aliasing unchecked"
+        )
+        return
+    if (
+        native_value.untyped_storage().data_ptr()
+        != forward_input.untyped_storage().data_ptr()
+    ):
+        failures.append(
+            f"{key}: materialized weight reference violates the zero-copy "
+            f"contract (§3.1B) — it must alias the {input_name} forward "
+            "input storage"
+        )
+        return
+    notes.append(
+        f"{key}: zero-copy view of {input_name} "
+        f"(contiguous={native_value.is_contiguous()})"
+    )
 
 
 def _check_native_saved_scalar(native_saved, replay_saved, key, failures):
@@ -2639,14 +2778,61 @@ def _assert_native_saved_metadata(
     rank,
     world_size,
     label,
+    gate_up_weight=None,
+    down_weight=None,
 ):
-    """H1 verdict: every metadata/permutation/scalar key against the replay."""
+    """H1+H2 verdict: every native-saved key against the replay, key by key."""
     failures = []
     notes = []
     for key in NATIVE_SAVED_BITWISE_KEYS:
         _check_native_saved_tensor(native_saved, replay_saved, key, failures)
     for key in NATIVE_SAVED_SCALAR_KEYS:
         _check_native_saved_scalar(native_saved, replay_saved, key, failures)
+
+    # ---- H2 activations.  ``recv_hidden_sorted`` is a pure dispatch copy in
+    # the same receive row order on both paths, so any deviation is a major
+    # signal (the tag marks it; the assertion itself is never relaxed).
+    for key in NATIVE_SAVED_H2_BITWISE_KEYS:
+        h2_bitwise_failures = []
+        _check_native_saved_tensor(
+            native_saved, replay_saved, key, h2_bitwise_failures
+        )
+        for message in h2_bitwise_failures:
+            failures.append(
+                f"{message}  [MAJOR: {key} is a pure dispatch copy and must "
+                "match the replay bit-for-bit — report to the orchestrator, "
+                "do not relax the assertion]"
+            )
+    for key in NATIVE_SAVED_H2_FLOAT_KEYS:
+        _check_native_saved_float_tensor(
+            native_saved,
+            replay_saved,
+            key,
+            NATIVE_SAVED_H2_RTOL,
+            NATIVE_SAVED_H2_ATOL,
+            failures,
+        )
+
+    # ---- H2 zero-copy weight references.  fc1_1/fc1_2/fc1_combined alias the
+    # packed gate/up input, fc2 the down weight; both sides of this harness
+    # are built from the same weight tensors, so the values must be identical.
+    h2_view_inputs = {
+        "fc1_1": (gate_up_weight, "gate_up_weight"),
+        "fc1_2": (gate_up_weight, "gate_up_weight"),
+        "fc1_combined": (gate_up_weight, "gate_up_weight"),
+        "fc2": (down_weight, "down_weight"),
+    }
+    for key in NATIVE_SAVED_H2_VIEW_KEYS:
+        forward_input, input_name = h2_view_inputs[key]
+        _check_native_saved_weight_view(
+            native_saved,
+            replay_saved,
+            key,
+            forward_input,
+            input_name,
+            failures,
+            notes,
+        )
 
     native_group = native_saved.get("ep_group")
     if native_group is None:
@@ -2737,13 +2923,15 @@ def _assert_native_saved_metadata(
 def run_megamoe_native_saved_metadata_case(
     rank: int, world_size: int
 ) -> None:
-    """H1: home native saved metadata vs the torch replay, key by key (w2/w4).
+    """H1+H2: home native saved vs the torch replay, key by key (w2/w4).
 
     The same inputs drive the fused forward with ``return_saved=True`` and the
-    ``_torch_forward.moe_forward`` replay; every H1-scope key of the 39-key
-    replay contract must agree — bit-for-bit wherever the dispatch layout
-    permits it (counts, grouped-GEMM metadata, scalars, splits), and under the
-    documented convention check for the send/receive permutations.
+    ``_torch_forward.moe_forward`` replay; every native-saved key of the
+    39-key replay contract must agree — bit-for-bit wherever the dispatch
+    layout permits it (counts, grouped-GEMM metadata, scalars, splits,
+    ``recv_hidden_sorted``, and the weight references), the documented
+    convention check for the send/receive permutations, and the plan's 2e-2
+    tolerance for the computed activations.
     """
     if world_size not in (2, 4):
         raise ValueError(
@@ -2860,6 +3048,8 @@ def run_megamoe_native_saved_metadata_case(
                 rank,
                 world_size,
                 label,
+                gate_up_weight=packed_w1,
+                down_weight=w2,
             )
             if not output_matches:
                 print(
