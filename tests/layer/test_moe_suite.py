@@ -3124,9 +3124,13 @@ def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
     ):
         # peer_mem must stay the session's FIRST symmetric allocation
         # (dl.symm_at offset-0); the operator below claims its own heap
-        # objects for planning and dispatch.
+        # objects for planning and dispatch.  Rows must cover the worst-case
+        # per-rank receive: with receive_capacity_factor == world_size the
+        # fused plan is dropless, so a rank may receive up to every route in
+        # the world (tokens*topk*world_size), not just its own send share.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            tokens * topk * world_size, tokens * topk, hidden, dtype, rank,
+            ep_group,
         )
         try:
             op = FusedMoEForward(
