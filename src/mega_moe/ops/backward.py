@@ -106,6 +106,21 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     replica segments into the forward's symmetric replica weight slots and
     reduces every copy onto its owner, so the canonical weight-grad keys are the
     final (owner-accumulated) values."""
+    # Single-in-flight guard: the symmetric receive buffer is overwritten by
+    # the forward's FC2 staging and by step 1 below, so a saved dict whose
+    # recv_hidden_sorted still aliases it would silently read garbage.
+    recv_hidden_sorted = saved.get("recv_hidden_sorted")
+    if recv_hidden_sorted is None:
+        raise ValueError(
+            "saved is missing recv_hidden_sorted; the fused backward requires "
+            "the activation section (replay saved or return_saved=True)"
+        )
+    if recv_hidden_sorted.data_ptr() == peer_mem.data_ptr():
+        raise ValueError(
+            "saved['recv_hidden_sorted'] aliases peer_mem; the receive buffer "
+            "is single-in-flight and was overwritten after dispatch — the "
+            "forward must clone it in the T2 window"
+        )
     dy = dy.to(saved["fc1_1"].dtype)
     use_moonep = bool(saved.get("use_moonep"))
     if grad_transport is not None and not use_moonep:

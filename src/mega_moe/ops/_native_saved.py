@@ -78,16 +78,18 @@ Deliberate divergences from the replay oracle (both are contract-safe):
    order (or re-derive the replay from the plan's send order the way
    ``_moonep_torch_forward`` does), not the raw permutation arrays.
 
-Stage H2 will add (through :func:`capture_activations` and
-:func:`assemble_native_saved`): the activation keys ``recv_hidden_sorted``
-(clone of the peer-memory view), ``recv_weights_sorted`` (bf16 cast),
-``fc1_output``, ``swiglu_out_weighted`` (via the
-``_fc2_combine_shadow_activation`` two-tuple change), and the zero-copy weight
-references ``fc1_1`` / ``fc1_2`` / ``fc2`` / ``fc1_combined``.  The input
-reference ``selected_experts`` is captured from H1 on (held by reference like
-the replay oracle does; the home backward's step 1 rebuilds the expert-major
-mapping from it).  ``output`` / ``dy`` / ``num_experts`` / ``gate`` / ``up`` /
-``fc2_out`` are never saved (plan §3.1F).
+Stage H2 adds the remaining oracle keys: the activation section
+(``recv_hidden_sorted`` — the one materialized clone, taken in the dispatch
+window before FC2 staging overwrites the peer-memory view;
+``recv_weights_sorted`` — bf16 cast; ``fc1_output`` — reference) plus
+``swiglu_out_weighted``, which is produced inside
+``_fc2_combine_shadow_activation`` and returned through its opt-in
+``return_weighted_activation`` two-tuple, and the zero-copy weight references
+``fc1_1`` / ``fc1_2`` / ``fc2`` / ``fc1_combined`` (§3.1B, never materialized).
+The input reference ``selected_experts`` is captured from H1 on (held by
+reference like the replay oracle does; the home backward's step 1 rebuilds the
+expert-major mapping from it).  ``output`` / ``dy`` / ``num_experts`` / ``gate``
+/ ``up`` / ``fc2_out`` are never saved (plan §3.1F).
 
 The MoonEP physical layout (Stage N) reuses this module: its plan metadata
 covers the physical ``[home | replica]`` slot range, so
@@ -285,27 +287,56 @@ def snapshot_plan_metadata(op, plan: MoERoutingPlan) -> dict:
 
 
 def capture_activations(op, dispatch_result):
-    """T2 — snapshot the forward activations the backward needs (Stage H2).
+    """T2 — snapshot the forward activations the backward needs.
 
-    Intended call site: inside ``FusedMoEForward.forward`` between the
-    ``dispatch_fc1`` result and the ``_fc2_combine_shadow_activation`` launch
-    (the dispatch has completed, FC2 has not started).  Stage H2 captures:
+    Call site: inside ``FusedMoEForward.forward`` between the ``dispatch_fc1``
+    result and the ``_fc2_combine_shadow_activation`` launch.  The dispatch
+    kernel has completed on the current stream (its local dependencies are
+    covered by the expert readiness signals even with ``final_barrier=False``),
+    and FC2 has not started staging — this window is mandatory because FC2's
+    device-put workers and backward step 1 both overwrite the peer-memory
+    receive view.  Captured:
 
-    * ``recv_hidden_sorted``   — clone of ``dispatch_result.dispatched_tokens``
-      (the peer-memory view is overwritten by FC2 staging and by backward
-      step 1; this is the only required materialization);
-    * ``recv_weights_sorted``  — ``dispatch_result.received_routing_weights``
-      cast to bf16;
-    * ``fc1_output``           — view of ``dispatch_result.fc1_output``.
+    * ``recv_hidden_sorted``  — ``empty_like``+``copy_`` of
+      ``dispatch_result.dispatched_tokens`` (the one required materialization;
+      the caching allocator reuses the block across steps);
+    * ``recv_weights_sorted`` — ``dispatch_result.received_routing_weights``
+      (FP32 workspace) cast to the operator's BF16 activation dtype;
+    * ``fc1_output``          — reference to the freshly allocated FC1 output.
 
     ``swiglu_out_weighted`` is produced inside ``_fc2_combine_shadow_activation``
-    and rides that helper's two-tuple return change instead of this call.
-
-    Not implemented in Stage H1; the forward does not call it yet.
+    and rides that helper's two-tuple return instead of this call.
     """
-    raise NotImplementedError(
-        "native activation capture arrives with Stage H2"
-    )
+    dispatched_tokens = dispatch_result.dispatched_tokens
+    recv_hidden_sorted = torch.empty_like(dispatched_tokens)
+    recv_hidden_sorted.copy_(dispatched_tokens)
+    return {
+        "recv_hidden_sorted": recv_hidden_sorted,
+        "recv_weights_sorted": dispatch_result.received_routing_weights.to(
+            op.activation_dtype
+        ),
+        "fc1_output": dispatch_result.fc1_output,
+    }
+
+
+def _weight_reference_section(gate_up_weight, down_weight, ffn_dim: int) -> dict:
+    """Zero-copy weight references for the backward (plan §3.1B).
+
+    ``fc1_1`` / ``fc1_2`` / ``fc1_combined`` are stride views of the packed
+    ``[E, H, 2F]`` gate/up table and are never materialized (the replay
+    materializes ~2.3 GiB per half; the backward only reads ``fc1_1``'s dtype).
+    ``fc1_combined`` keeps the transposed stride view —
+    ``kernels/combine_fc1_bwd.py`` addresses it through explicit strides.
+    Layout check: ``pack_gate_up_weights`` packs gate first / up last along the
+    output dim, so ``dim=1`` of the transpose reads ``[gate F; up F]`` exactly
+    like the replay's ``cat([fc1_1, fc1_2], dim=1)``.
+    """
+    return {
+        "fc2": down_weight,
+        "fc1_combined": gate_up_weight.transpose(1, 2),
+        "fc1_1": gate_up_weight[:, :, :ffn_dim].transpose(1, 2),
+        "fc1_2": gate_up_weight[:, :, ffn_dim:].transpose(1, 2),
+    }
 
 
 def assemble_native_saved(
@@ -316,23 +347,30 @@ def assemble_native_saved(
     *,
     hidden_states: torch.Tensor,
     gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
     selected_experts: torch.Tensor,
 ) -> dict:
     """T3 — assemble the native ``saved`` dict from the T1/T2 captures.
 
-    ``activations`` is the :func:`capture_activations` result (``None`` until
-    Stage H2).  ``selected_experts`` is the forward input, held by reference
-    (same semantics as the replay oracle).  The defensive gate keys
-    (``_routing_generation`` / ``_owner_token``, python ints) let the backward
-    reject a saved dict whose operator has since replayed another plan.
+    ``activations`` is the :func:`capture_activations` result (plus the
+    ``swiglu_out_weighted`` entry the FC2 helper returns).  The weight
+    references (§3.1B) are zero-copy views of the forward inputs — the caller
+    must not mutate the weights between forward and backward (the standard
+    save-for-backward assumption).  ``selected_experts`` is the forward input,
+    held by reference (same semantics as the replay oracle).  The defensive
+    gate keys (``_routing_generation`` / ``_owner_token``, python ints) let the
+    backward reject a saved dict whose operator has since replayed another
+    plan.
     """
+    ffn_dim = int(gate_up_weight.shape[2] // 2)
     saved = dict(snapshot)
     if activations is not None:
         saved.update(activations)
+    saved.update(_weight_reference_section(gate_up_weight, down_weight, ffn_dim))
     saved.update(
         batch_size=int(hidden_states.shape[0]),
         hidden_dim=int(hidden_states.shape[1]),
-        ffn_dim=int(gate_up_weight.shape[2] // 2),
+        ffn_dim=ffn_dim,
         topk=int(op.top_k),
         world_size=int(op.world_size),
         ep_rank=int(op.rank),
