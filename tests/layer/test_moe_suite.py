@@ -62,6 +62,17 @@ from tests._numeric import (
     assert_close,
 )
 
+# Stage H3 (master plan §3.2.3) adds the merged native-saved autograd Function
+# and exports it from ``mega_moe.ops``.  Collection must stay working on a tree
+# without it, so the import degrades to ``None`` and the case skips.
+try:
+    from mega_moe.ops import MegaMoEFunction  # noqa: E402
+except ImportError:
+    try:
+        from mega_moe.ops.backward import MegaMoEFunction  # noqa: E402
+    except ImportError:
+        MegaMoEFunction = None
+
 
 def _forward_config(case: CaseSpec) -> MoEForwardConfig:
     return MoEForwardConfig(
@@ -2272,6 +2283,811 @@ def run_backward_case(rank: int, world_size: int, case: CaseSpec) -> None:
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+# ----------------------------------------------------------------------------
+# Stage H (master plan §3.1/§3.2): home-layout native-saved acceptance cases.
+#
+# The fused forward grows ``return_saved=True`` so one pass produces the
+# backward's saved values directly; the torch replay
+# (``mega_moe.ops._torch_forward.moe_forward``, 39-key contract at
+# ``_torch_forward.py:283-306``) is demoted to the test oracle.  H1 covers the
+# metadata / permutation / scalar keys below, H2 will extend the same driver to
+# the activation keys, and H3 adds the autograd Function case.
+# ----------------------------------------------------------------------------
+
+# Layout-convention-independent keys: the received route multiset
+# (``expert_counts`` comes from ``plan.received_routes_per_expert`` — the
+# MoERoutingPlan has no ``expert_counts`` field), the grouped-GEMM metadata
+# derived from it, and the input routes themselves.  These must match the
+# replay bit-for-bit.
+NATIVE_SAVED_BITWISE_KEYS = (
+    "expert_counts",
+    "split_size_cum_per_expert",
+    "meta_expert_ids",
+    "meta_split_cum",
+    "meta_tile_num",
+    "meta_tile_num_cum",
+    "num_tiles_total",
+    "selected_experts",
+)
+
+# Send/receive permutations.  The replay sorts sends by destination rank only
+# (``argsort(expert_ranks, stable=True)``) while the fused dispatch groups them
+# by (destination, local expert) bucket (``plan.send_route_indices``, built by
+# the float32 stable argsort at ``runtime/routing.py:645-668``); the arrival
+# buffers therefore differ (source-major/flat vs source-major/expert) and the
+# raw permutation values are only bitwise comparable when the native saved
+# adopts the replay convention.  Both conventions are valid for
+# ``moe_backward_triton`` — each is the exact inverse of its own dispatch order
+# — so the check accepts either, reports which one matched, and rejects a mix.
+NATIVE_SAVED_PERMUTATION_KEYS = (
+    ("sort_idxs", "inv_sort"),
+    ("local_sort_idxs", "inv_local"),
+)
+
+# Plain ints and per-rank split lists (§3.1 E; the native path builds the two
+# [world] D2H transfers itself).
+NATIVE_SAVED_SCALAR_KEYS = (
+    "batch_size",
+    "hidden_dim",
+    "ffn_dim",
+    "topk",
+    "world_size",
+    "ep_rank",
+    "experts_per_rank",
+    "M",
+    "total_send",
+    "total_recv",
+    "splits_send_list",
+    "splits_recv_list",
+)
+
+# TODO(H2): once the T2/T3 activation capture lands, extend
+# _assert_native_saved_metadata to the full key-by-key contract:
+#   bit-for-bit (dispatch is a pure copy): recv_hidden_sorted [M, H] bf16
+#   rtol/atol 2e-2, fp32 compared:        fc1_output [M, 2F],
+#                                        swiglu_out_weighted [M, F],
+#                                        recv_weights_sorted [M]
+#   weight views (forward inputs):        fc1_1, fc1_2, fc2, fc1_combined
+# §3.1 F deliberately omits ``output``/``dy``/``fc2_out``/``gate``/``up``/
+# ``num_experts`` from the native saved; they stay replay-only.
+
+
+def _inverse_permutation(permutation):
+    """Exact inverse of a permutation tensor (scatter, no argsort tie rules)."""
+    inverse = torch.empty_like(permutation)
+    inverse[permutation] = torch.arange(
+        permutation.numel(), dtype=permutation.dtype
+    )
+    return inverse
+
+
+def _stable_expert_major_send_order(selected_experts):
+    """Independent oracle for the fused dispatch send order (dropless input).
+
+    ``build_routing_plan`` stable-sorts the valid routes by global expert id in
+    float32 (``runtime/routing.py:645-668``); this recomputes that order from
+    the raw router output without touching any production helper.  The stable
+    tie rule (original flat order inside one expert bucket) is what keeps the
+    receive-side row order comparable with the replay.
+    """
+    flat = selected_experts.reshape(-1).to(torch.int64).cpu()
+    return torch.argsort(flat.to(torch.float32), stable=True)
+
+
+def _arrival_slot_receive_order(recv_counts_re, expert_counts_cpu):
+    """Independent oracle for the fused dispatch receive permutation.
+
+    The dispatch arrival buffer groups rows by source rank and, inside one
+    source, by local expert bucket; the grouped GEMMs need (local expert,
+    source) order.  Both layouts move whole (source, expert) blocks, so the
+    permutation is a block reshuffle; it is rebuilt here from the independently
+    gathered receive-count cube rather than from the production
+    ``_moonep_torch_forward._arrival_to_slot_permutation``.  Convention matches
+    the replay's ``local_sort_idxs``: ``sorted[i] == arrival[permutation[i]]``.
+    """
+    counts = recv_counts_re.to(torch.int64).cpu()
+    slot_starts = torch.zeros(counts.shape[1] + 1, dtype=torch.int64)
+    slot_starts[1:] = expert_counts_cpu.to(torch.int64).cumsum(0)
+    source_totals = counts.sum(dim=1)
+    source_starts = source_totals.cumsum(dim=0) - source_totals
+    within_source = counts.cumsum(dim=1) - counts
+    within_slot = counts.cumsum(dim=0) - counts
+    arrival_start = (source_starts.unsqueeze(1) + within_source).reshape(-1)
+    sorted_start = (slot_starts[:-1].unsqueeze(0) + within_slot).reshape(-1)
+    sizes = counts.reshape(-1)
+    total = int(sizes.sum())
+    permutation = torch.empty(total, dtype=torch.int64)
+    if total:
+        group_ids = torch.repeat_interleave(torch.arange(sizes.numel()), sizes)
+        group_base = sizes.cumsum(dim=0) - sizes
+        lanes = torch.arange(total) - group_base[group_ids]
+        permutation[sorted_start[group_ids] + lanes] = (
+            arrival_start[group_ids] + lanes
+        )
+    return permutation
+
+
+def _check_native_saved_tensor(native_saved, replay_saved, key, failures):
+    """One integer/index key: present, same dtype/shape, bit-for-bit values."""
+    native_value = native_saved.get(key)
+    if native_value is None:
+        failures.append(f"{key}: missing from the native saved")
+        return
+    replay_value = replay_saved[key]
+    if not isinstance(native_value, torch.Tensor):
+        failures.append(
+            f"{key}: native value is {type(native_value).__name__}, "
+            "expected a tensor"
+        )
+        return
+    if native_value.dtype != replay_value.dtype:
+        failures.append(
+            f"{key}: dtype native={native_value.dtype} "
+            f"replay={replay_value.dtype}"
+        )
+    if tuple(native_value.shape) != tuple(replay_value.shape):
+        failures.append(
+            f"{key}: shape native={tuple(native_value.shape)} "
+            f"replay={tuple(replay_value.shape)}"
+        )
+        return
+    # The replay keeps the meta_* family on the host while the native path
+    # keeps device tensors; compare both on the CPU.
+    native_cpu = native_value.detach().cpu()
+    replay_cpu = replay_value.detach().cpu()
+    if not torch.equal(native_cpu, replay_cpu):
+        mismatch = native_cpu != replay_cpu
+        failures.append(
+            f"{key}: {int(mismatch.sum().item())}/{mismatch.numel()} "
+            "elements differ"
+        )
+
+
+def _check_native_saved_scalar(native_saved, replay_saved, key, failures):
+    """One scalar / split-list key: present and exactly equal."""
+    native_value = native_saved.get(key)
+    if native_value is None:
+        failures.append(f"{key}: missing from the native saved")
+        return
+    replay_value = replay_saved[key]
+    if isinstance(replay_value, list) and isinstance(native_value, torch.Tensor):
+        native_value = native_value.detach().cpu().tolist()
+    elif isinstance(native_value, torch.Tensor):
+        if native_value.numel() != 1:
+            failures.append(
+                f"{key}: native scalar is a {tuple(native_value.shape)} tensor"
+            )
+            return
+        native_value = native_value.item()
+    if native_value != replay_value:
+        failures.append(
+            f"{key}: native={native_value!r} replay={replay_value!r}"
+        )
+
+
+def _check_native_saved_permutation_pair(
+    native_saved,
+    replay_saved,
+    key,
+    inverse_key,
+    expected_fused,
+    failures,
+    conventions,
+):
+    """One permutation pair against both legal dispatch conventions.
+
+    ``sort_idxs``/``local_sort_idxs`` must be a valid permutation equal to
+    either the replay layout (rank-major send, flat arrival) or the fused
+    dispatch layout ((destination, expert) send, bucket arrival), and the
+    matching ``inv_*`` key must be its exact inverse.  A value matching
+    neither layout, or the two pairs disagreeing on the layout, is a real
+    backward-breaking mismatch.
+    """
+    native_value = native_saved.get(key)
+    native_inverse = native_saved.get(inverse_key)
+    if native_value is None:
+        failures.append(f"{key}: missing from the native saved")
+        return
+    if native_inverse is None:
+        failures.append(f"{inverse_key}: missing from the native saved")
+        return
+    if not isinstance(native_value, torch.Tensor) or not isinstance(
+        native_inverse, torch.Tensor
+    ):
+        failures.append(f"{key}/{inverse_key}: expected tensors")
+        return
+    if native_value.dtype != replay_saved[key].dtype:
+        failures.append(
+            f"{key}: dtype native={native_value.dtype} "
+            f"replay={replay_saved[key].dtype}"
+        )
+    if tuple(native_value.shape) != tuple(replay_saved[key].shape):
+        failures.append(
+            f"{key}: shape native={tuple(native_value.shape)} "
+            f"replay={tuple(replay_saved[key].shape)}"
+        )
+        return
+    native_cpu = native_value.detach().to(torch.int64).cpu()
+    native_inverse_cpu = native_inverse.detach().to(torch.int64).cpu()
+    if not torch.equal(
+        torch.sort(native_cpu).values,
+        torch.arange(native_cpu.numel(), dtype=torch.int64),
+    ):
+        failures.append(
+            f"{key}: not a permutation of range({native_cpu.numel()})"
+        )
+        return
+    replay_cpu = replay_saved[key].detach().to(torch.int64).cpu()
+    expected_cpu = expected_fused.to(torch.int64).cpu()
+    if torch.equal(native_cpu, replay_cpu):
+        conventions[key] = "replay"
+        reference_inverse = (
+            replay_saved[inverse_key].detach().to(torch.int64).cpu()
+        )
+        convention_note = "matches the replay layout bit-for-bit"
+    elif torch.equal(native_cpu, expected_cpu):
+        conventions[key] = "fused"
+        reference_inverse = _inverse_permutation(expected_cpu)
+        convention_note = (
+            "matches the fused (destination, expert) dispatch layout "
+            "bit-for-bit; it legitimately differs from the replay rank-major "
+            "order"
+        )
+    else:
+        failures.append(
+            f"{key}: matches neither the replay rank-major permutation nor "
+            "the fused (destination, expert) send order ("
+            f"{int((native_cpu != expected_cpu).sum())} of "
+            f"{native_cpu.numel()} positions differ from the latter)"
+        )
+        return
+    if not torch.equal(native_inverse_cpu, reference_inverse):
+        failures.append(
+            f"{inverse_key}: is not the inverse of the {key} order "
+            f"({convention_note})"
+        )
+    return convention_note
+
+
+def _check_native_saved_plan_snapshots(
+    native_saved, expert_counts_cpu, failures, notes
+):
+    """Soft-check the §3.1 C plan snapshots (native-only, no replay twin).
+
+    The key spelling is not fixed by §3.1 C (MoERoutingPlan field names vs the
+    moonep ``plan_*`` precedent in ``_moonep_torch_forward``), so whichever
+    spelling is present gets the conservation invariants the backward relies
+    on; absence is only reported, because the home backward re-derives these
+    tables from ``selected_experts``.
+    """
+    receive_cube = next(
+        (
+            native_saved[name]
+            for name in (
+                "receive_counts_by_source_expert",
+                "plan_recv_counts_by_source_expert",
+            )
+            if name in native_saved
+        ),
+        None,
+    )
+    if receive_cube is not None:
+        received = receive_cube.detach().to(torch.int64).cpu().sum(dim=0)
+        if not torch.equal(received, expert_counts_cpu):
+            failures.append(
+                "plan receive counts disagree with expert_counts (checked as "
+                "receive_counts_by_source_expert / "
+                "plan_recv_counts_by_source_expert)"
+            )
+    else:
+        notes.append("no receive-count plan snapshot key found")
+
+    expert_offsets = next(
+        (
+            native_saved[name]
+            for name in (
+                "received_expert_offsets",
+                "plan_received_expert_offsets",
+            )
+            if name in native_saved
+        ),
+        None,
+    )
+    if expert_offsets is not None:
+        offsets = expert_offsets.detach().to(torch.int64).cpu()
+        expected_offsets = torch.zeros_like(offsets)
+        expected_offsets[1:] = expert_counts_cpu.cumsum(0)
+        if not torch.equal(offsets, expected_offsets):
+            failures.append(
+                "received_expert_offsets is not the cumsum of expert_counts"
+            )
+    else:
+        notes.append("no received-expert-offsets plan snapshot key found")
+
+    send_cube = next(
+        (
+            native_saved[name]
+            for name in (
+                "send_counts_by_rank_expert",
+                "plan_send_counts_by_rank_expert",
+            )
+            if name in native_saved
+        ),
+        None,
+    )
+    if send_cube is not None:
+        sent = send_cube.detach().to(torch.int64).cpu().sum(dim=1)
+        expected_sent = torch.tensor(
+            native_saved.get("splits_send_list", []), dtype=torch.int64
+        )
+        if tuple(sent.shape) != tuple(expected_sent.shape) or not torch.equal(
+            sent, expected_sent
+        ):
+            failures.append(
+                "send_counts_by_rank_expert per-destination totals disagree "
+                "with splits_send_list"
+            )
+    else:
+        notes.append("no send-count plan snapshot key found")
+
+
+def _assert_native_saved_metadata(
+    native_saved,
+    replay_saved,
+    expert_indices,
+    recv_counts_re,
+    rank,
+    world_size,
+    label,
+):
+    """H1 verdict: every metadata/permutation/scalar key against the replay."""
+    failures = []
+    notes = []
+    for key in NATIVE_SAVED_BITWISE_KEYS:
+        _check_native_saved_tensor(native_saved, replay_saved, key, failures)
+    for key in NATIVE_SAVED_SCALAR_KEYS:
+        _check_native_saved_scalar(native_saved, replay_saved, key, failures)
+
+    native_group = native_saved.get("ep_group")
+    if native_group is None:
+        failures.append("ep_group: missing from the native saved")
+    else:
+        try:
+            group_rank = dist.get_rank(native_group)
+            group_world = dist.get_world_size(native_group)
+        except (RuntimeError, ValueError) as exc:
+            failures.append(f"ep_group: unusable process group ({exc})")
+        else:
+            if group_rank != rank or group_world != world_size:
+                failures.append(
+                    "ep_group: native rank/world "
+                    f"({group_rank}/{group_world}) != worker "
+                    f"({rank}/{world_size})"
+                )
+
+    # Route conservation on the native scalars (mirrors the saved_phys
+    # invariants in _assert_physical_saved_layout).
+    if native_saved.get("M") != native_saved.get("total_recv"):
+        failures.append(
+            f"M={native_saved.get('M')!r} must equal "
+            f"total_recv={native_saved.get('total_recv')!r}"
+        )
+    expected_routes = replay_saved["batch_size"] * replay_saved["topk"]
+    for split_name, total_name in (
+        ("splits_send_list", "total_send"),
+        ("splits_recv_list", "total_recv"),
+    ):
+        splits = native_saved.get(split_name)
+        if isinstance(splits, list) and sum(splits) != native_saved.get(
+            total_name
+        ):
+            failures.append(
+                f"sum({split_name})={sum(splits)} must equal "
+                f"{total_name}={native_saved.get(total_name)!r}"
+            )
+    if native_saved.get("total_send") not in (None, expected_routes):
+        failures.append(
+            f"total_send={native_saved.get('total_send')!r} must conserve all "
+            f"{expected_routes} dropless routes"
+        )
+
+    expert_counts_cpu = replay_saved["expert_counts"].to(
+        torch.int64
+    ).cpu()
+    expected_fused = {
+        "sort_idxs": _stable_expert_major_send_order(expert_indices),
+        "local_sort_idxs": _arrival_slot_receive_order(
+            recv_counts_re, expert_counts_cpu
+        ),
+    }
+    conventions = {}
+    for key, inverse_key in NATIVE_SAVED_PERMUTATION_KEYS:
+        convention_note = _check_native_saved_permutation_pair(
+            native_saved,
+            replay_saved,
+            key,
+            inverse_key,
+            expected_fused[key],
+            failures,
+            conventions,
+        )
+        if convention_note is not None:
+            notes.append(f"{key}: {convention_note}")
+    if len(set(conventions.values())) > 1:
+        failures.append(
+            "sort_idxs and local_sort_idxs disagree on the dispatch layout "
+            f"({conventions}); the backward requires one layout"
+        )
+
+    _check_native_saved_plan_snapshots(
+        native_saved, expert_counts_cpu, failures, notes
+    )
+
+    ok = not failures
+    if not ok:
+        print(f"[rank {rank}] {label}: {'; '.join(failures)}", flush=True)
+    if rank == 0:
+        suffix = "" if ok else "  |  " + "; ".join(failures)
+        print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
+        for note in notes:
+            print(f"[NOTE] {label}: {note}", flush=True)
+    return ok
+
+
+def run_megamoe_native_saved_metadata_case(
+    rank: int, world_size: int
+) -> None:
+    """H1: home native saved metadata vs the torch replay, key by key (w2/w4).
+
+    The same inputs drive the fused forward with ``return_saved=True`` and the
+    ``_torch_forward.moe_forward`` replay; every H1-scope key of the 39-key
+    replay contract must agree — bit-for-bit wherever the dispatch layout
+    permits it (counts, grouped-GEMM metadata, scalars, splits), and under the
+    documented convention check for the send/receive permutations.
+    """
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the native saved metadata case requires two or four ranks"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("native saved metadata requires NPU and ACLSHMEM")
+
+    # Shape family of the registry case functional-bwd-small-h512-f256-k4
+    # (H=512, F=256, K=4, E=128) at the two smallest worlds; the receive
+    # capacity mirrors the functional forward smoke cases.
+    tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
+    experts_per_rank = num_experts // world_size
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = f"megamoe-native-saved-metadata-w{world_size}"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=1)
+    ):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=float(world_size),
+            ),
+        )
+        try:
+            w_gate, w_up = make_gate_up_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            packed_w1 = pack_gate_up_weights(w_gate, w_up)
+            w2 = make_down_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            hs, expert_indices = prepare_inputs(
+                tokens,
+                hidden,
+                num_experts,
+                topk,
+                dtype,
+                device,
+                seed=2003 + rank * 1000,
+            )
+            routing_weights = make_routing_weights(
+                tokens, topk, device, seed=2004 + rank * 1000
+            )
+            dist.barrier()
+
+            with torch.no_grad():
+                native_output, native_saved = op.forward(
+                    hs,
+                    expert_indices,
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                    return_saved=True,
+                )
+            dist.barrier()
+            with torch.no_grad():
+                _, replay_saved = moe_forward(
+                    hs,
+                    routing_weights,
+                    expert_indices,
+                    w_gate,
+                    w_up,
+                    w2,
+                    ep_group,
+                    topk,
+                    return_saved=True,
+                )
+
+            # return_saved must be capture-only: the fused output is still the
+            # replay output.  Folded into the collective verdict below rather
+            # than raised here so a single-rank mismatch cannot hang the
+            # following collective.
+            output_matches = True
+            try:
+                assert_close(
+                    native_output,
+                    replay_saved["output"],
+                    rtol=OUTPUT_RTOL,
+                    atol=OUTPUT_ATOL,
+                )
+            except AssertionError:
+                output_matches = False
+
+            # Independent receive-count cube for the fused-arrival oracle: my
+            # per-(destination, local expert) send counts gathered from every
+            # source, reindexed as [source, local expert] on this rank.
+            send_counts_re = torch.bincount(
+                expert_indices.reshape(-1).to(torch.int64),
+                minlength=world_size * experts_per_rank,
+            ).to(torch.int32)
+            all_send = torch.stack(
+                all_gather_list(send_counts_re, ep_group)
+            ).reshape(world_size, world_size, experts_per_rank)
+            recv_counts_re = all_send[:, rank, :].to(torch.int64).cpu()
+            if int(recv_counts_re.sum().item()) != replay_saved["total_recv"]:
+                raise AssertionError(
+                    "the independent receive-count cube does not conserve "
+                    f"total_recv={replay_saved['total_recv']}"
+                )
+
+            all_passed = _assert_native_saved_metadata(
+                native_saved,
+                replay_saved,
+                expert_indices,
+                recv_counts_re,
+                rank,
+                world_size,
+                label,
+            )
+            if not output_matches:
+                print(
+                    f"[rank {rank}] {label}: return_saved changed the forward "
+                    "output",
+                    flush=True,
+                )
+            all_passed = all_passed and output_matches
+            flag = torch.tensor(
+                [1 if all_passed else 0], dtype=torch.int32, device=device
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+            if not bool(flag.item()):
+                raise AssertionError(
+                    f"native saved metadata mismatched the replay: {label}"
+                )
+        finally:
+            op.finalize()
+
+
+def _megamoe_function_grads(leaves, ffn_dim):
+    """Map the Function's autograd grads onto the five canonical check keys.
+
+    ``grad_gate_up`` arrives in the Kimi ``[E, H, 2F]`` layout
+    (``cat(g1, g2, dim=1).transpose(1, 2)``); the canonical keys expect the
+    replay's ``[E, F, H]`` halves.
+    """
+    hidden_leaf, routing_leaf, gate_up_leaf, down_leaf = leaves
+    grad_gate_up = gate_up_leaf.grad
+    return dict(
+        grad_hidden=hidden_leaf.grad,
+        grad_routing_weights=routing_leaf.grad,
+        grad_fc1_1=grad_gate_up[:, :, :ffn_dim].transpose(1, 2),
+        grad_fc1_2=grad_gate_up[:, :, ffn_dim:].transpose(1, 2),
+        grad_fc2=down_leaf.grad,
+    )
+
+
+def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
+    """H3: the merged native-saved autograd Function against the eager golden.
+
+    ``MegaMoEFunction`` (§3.2.3) runs the fused forward with
+    ``return_saved=True`` and the 5-op triton backward inside one
+    ``torch.autograd.Function``:
+
+    * forward ``(ctx, op, hidden_states, routing_weights, selected_experts,
+      gate_up_weight, down_weight, peer_mem, state)`` -> ``output``;
+    * backward returns the 8-tuple in forward-argument order with
+      ``grad_gate_up`` already merged back to the Kimi ``[E, H, 2F]`` layout.
+
+    Verified: the four ``.grad`` tensors against the hand-written eager
+    backward golden; two consecutive backwards through one persistent
+    ``state`` reproduce every gradient bit-for-bit (signal_mem/epoch reuse);
+    and a plain forward after the backwards still matches the independent
+    forward golden.
+    """
+    if world_size != 2:
+        raise ValueError("the native autograd case requires exactly two ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("native autograd requires NPU and ACLSHMEM")
+    if MegaMoEFunction is None:
+        raise RuntimeError("MegaMoEFunction is unavailable")
+
+    tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "megamoe-native-autograd-w2"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must stay the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below claims its own heap
+        # objects for planning and dispatch.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=float(world_size),
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hs, expert_indices = prepare_inputs(
+                    tokens,
+                    hidden,
+                    num_experts,
+                    topk,
+                    dtype,
+                    device,
+                    seed=2103 + rank,
+                )
+                routing_weights = make_routing_weights(
+                    tokens, topk, device, seed=2104 + rank
+                )
+                torch.manual_seed(2105 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+                # Eager golden: the replay saved plus the hand-written 5-op
+                # backward baseline, on the plain (non-autograd) tensors.
+                with torch.no_grad():
+                    _, golden_saved = moe_forward(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    golden = backward_torch_baseline(golden_saved, dy)
+
+                # §3.2.3/§3.4: signal_mem/epoch live in a caller-owned state
+                # object, injected at backward entry and written back for
+                # cross-step reuse.
+                state = SimpleNamespace(signal_mem=None, epoch=0)
+
+                def run_function_step():
+                    hidden_leaf = hs.clone().requires_grad_(True)
+                    routing_leaf = routing_weights.clone().requires_grad_(True)
+                    gate_up_leaf = packed_w1.clone().requires_grad_(True)
+                    down_leaf = w2.clone().requires_grad_(True)
+                    output = MegaMoEFunction.apply(
+                        op,
+                        hidden_leaf,
+                        routing_leaf,
+                        expert_indices,
+                        gate_up_leaf,
+                        down_leaf,
+                        peer_mem,
+                        state,
+                    )
+                    output.backward(dy)
+                    return hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
+
+                dist.barrier()
+                first_grads = _megamoe_function_grads(
+                    run_function_step(), ffn
+                )
+                for name, value in first_grads.items():
+                    if value is None or tuple(value.shape) != tuple(
+                        golden[name].shape
+                    ):
+                        raise AssertionError(
+                            f"{label}: grad {name} shape "
+                            f"{None if value is None else tuple(value.shape)} "
+                            f"!= golden {tuple(golden[name].shape)}"
+                        )
+                all_ok, details = compare_backward_gradients(
+                    first_grads, golden
+                )
+                epoch_after_first = state.epoch
+                if state.signal_mem is None:
+                    raise AssertionError(
+                        f"{label}: the Function did not persist signal_mem in "
+                        "the caller state"
+                    )
+
+                # Epoch reuse: the second backward through the same persistent
+                # state must reproduce every gradient bit-for-bit.
+                second_grads = _megamoe_function_grads(
+                    run_function_step(), ffn
+                )
+                for name, again in second_grads.items():
+                    if not torch.equal(again, first_grads[name]):
+                        raise AssertionError(
+                            f"{label}: epoch reuse changed grad {name}"
+                        )
+                if state.epoch < epoch_after_first or state.epoch < 1:
+                    raise AssertionError(
+                        f"{label}: the Function did not advance/write back the "
+                        f"epoch (after first={epoch_after_first}, "
+                        f"after second={state.epoch})"
+                    )
+
+                # Backward then forward: the plain forward must still match the
+                # independent golden (mirrors _assert_forward_after_grad_transport).
+                expected = torch_moe_fwd_golden(
+                    hs,
+                    routing_weights,
+                    expert_indices,
+                    w_gate,
+                    w_up,
+                    w2,
+                    num_experts,
+                    ep_group,
+                )
+                assert_close(
+                    op.forward(
+                        hs, expert_indices, packed_w1, w2, routing_weights
+                    ),
+                    expected,
+                    rtol=OUTPUT_RTOL,
+                    atol=OUTPUT_ATOL,
+                )
+
+                flag = torch.tensor(
+                    [1 if all_ok else 0], dtype=torch.int32, device=device
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+                if rank == 0 and not bool(flag.item()):
+                    print(f"{label} gradient details: {details}", flush=True)
+                if not bool(flag.item()):
+                    raise AssertionError(
+                        f"{label}: Function grads mismatched the eager golden"
+                    )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 FUNCTIONAL_FORWARD_CASES = kit.make_pytest_params(
     select_cases(direction="forward", tags={"functional", "smoke"})
 )
@@ -2371,6 +3187,26 @@ def test_moonep_backward_symmetric_moderate_wide_w8(dist_test):
 @pytest.mark.parametrize("case", FUNCTIONAL_BACKWARD_CASES)
 def test_backward_suite(dist_test, case: CaseSpec):
     dist_test(run_backward_case, world_size=case.world_size, args=(case,))
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_megamoe_native_saved_metadata(dist_test, world_size):
+    dist_test(
+        run_megamoe_native_saved_metadata_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_megamoe_native_autograd(dist_test):
+    if MegaMoEFunction is None:
+        pytest.skip(
+            "H3 API pending: mega_moe does not export MegaMoEFunction yet"
+        )
+    dist_test(run_megamoe_native_autograd_case, world_size=2)
 
 
 # TODO: future work — when an all-directions session is introduced, finish and
