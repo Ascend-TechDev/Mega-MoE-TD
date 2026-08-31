@@ -259,7 +259,7 @@ def _benchmark_provenance(result_contract=RESULT_CONTRACT):
     )
     if result_contract == MOONEP_RESULT_CONTRACT:
         production_sources += (
-            PROJECT_ROOT / "src" / "mega_moe" / "runtime" / "balanced_routing.py",
+            PROJECT_ROOT / "src" / "mega_moe" / "kernels" / "balanced_routing.py",
             PROJECT_ROOT / "src" / "mega_moe" / "runtime" / "moonep_planning.py",
             PROJECT_ROOT
             / "src"
@@ -1511,8 +1511,8 @@ def _make_moonep_entry(
             "moonep": {
                 "enabled": True,
                 "direct_bucket_scatter": True,
-                "fused_balanced_count": MOONEP_FUSED_BALANCED_COUNT,
-                "fused_route_mapping": MOONEP_FUSED_ROUTE_MAPPING,
+                "fused_balanced_count": True,
+                "fused_route_mapping": True,
                 "replica_budget_B": case.num_experts // world_size,
                 "physical_experts_per_rank_P": 2 * case.num_experts // world_size,
                 "owner_routes_per_rank": owner_routes,
