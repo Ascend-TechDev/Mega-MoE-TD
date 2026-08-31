@@ -1342,6 +1342,7 @@ class FusedMoEForward(torch.nn.Module):
             None,
             hidden_states=hidden_states,
             gate_up_weight=gate_up_weight,
+            selected_experts=selected_experts,
         )
         return result, saved
 
