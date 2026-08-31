@@ -33,6 +33,7 @@ from ..runtime.replica_weight_prefetch import (
     replica_weight_push_geometry,
 )
 from ..runtime.workspace import create_moe_forward_context
+from ._native_saved import assemble_native_saved, snapshot_plan_metadata
 
 
 _FC2_PIPELINE_GROUP_EXPERTS = 16
@@ -1190,12 +1191,26 @@ class FusedMoEForward(torch.nn.Module):
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
         routing_weights: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_saved: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
         """Run the complete BF16 post-routing MoE forward.
 
         The caller provides selected experts and FP32 routing weights. Router
         matmul, softmax, and top-k selection are outside this boundary.
+
+        With ``return_saved=True`` the operator also returns the native
+        ``saved`` dict for the fused backward as ``(output, saved)``.  Stage H1
+        fills the metadata / permutation / scalar sections (see
+        :mod:`mega_moe.ops._native_saved`); the activation and weight-reference
+        keys arrive with Stage H2.  ``return_saved=False`` (default) keeps the
+        previous behavior exactly.
         """
+        if return_saved and self.enable_moonep:
+            raise NotImplementedError(
+                "native saved capture for the MoonEP layout arrives with "
+                "Stage N1; only the home layout is captured today"
+            )
         # Preserve the public validation order before routing launches any work.
         self._validate_dispatch_inputs(hidden_states, selected_experts)
         self._validate_gate_up_weight(gate_up_weight, hidden_states.device)
@@ -1262,6 +1277,13 @@ class FusedMoEForward(torch.nn.Module):
             selected_experts,
             moonep_plan_hook=moonep_plan_hook,
         )
+        # T1: snapshot the plan metadata right at the planning sync point,
+        # before any later stage can rewrite the shared planning workspace.
+        plan_snapshot = (
+            snapshot_plan_metadata(self, routing_plan)
+            if return_saved
+            else None
+        )
         if self.enable_moonep:
             replica_gate_up_weight, replica_down_weight = (
                 self._finish_replica_prefetch()
@@ -1309,7 +1331,19 @@ class FusedMoEForward(torch.nn.Module):
             replica_down_weight=replica_down_weight,
             prefetch_done_event=prefetch_done_event,
         )
-        return result
+        if not return_saved:
+            return result
+        # T3: assemble the native saved dict (metadata/permutation/scalars in
+        # H1; capture_activations' sections join here in Stage H2).
+        saved = assemble_native_saved(
+            self,
+            routing_plan,
+            plan_snapshot,
+            None,
+            hidden_states=hidden_states,
+            gate_up_weight=gate_up_weight,
+        )
+        return result, saved
 
 
 def pack_gate_up_weights(

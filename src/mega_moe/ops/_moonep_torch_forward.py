@@ -415,6 +415,7 @@ def build_physical_saved_from_plan(
 
 
 __all__ = [
+    "_arrival_to_slot_permutation",
     "build_physical_saved_from_plan",
     "gather_replica_weights_via_hccl",
 ]
