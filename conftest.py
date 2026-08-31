@@ -53,6 +53,14 @@ def run_dist_test(fn, world_size=2, backend="hccl", args=()):
     # a per-session port range instead (inherited by the spawned workers).
     base = 20000 + (os.getpid() % 200) * 64
     os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", f"{base}-{base + 63}")
+    # The TCPStore rendezvous port has the same shared-node collision
+    # problem: torch's default 29500 is claimed by other containers, and a
+    # failed bind surfaces as EADDRINUSE on rank 0 plus an HCCL
+    # RootInfoDetect hang or failure on the remaining ranks.  Pick a
+    # per-session port outside the HCCL range above (also inherited).
+    os.environ.setdefault(
+        "MASTER_PORT", str(40000 + (os.getpid() % 20000))
+    )
     context = mp.get_context("spawn")
     error_queue = context.Queue()
     spawn_context = mp.spawn(
