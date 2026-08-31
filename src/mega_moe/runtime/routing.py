@@ -11,10 +11,8 @@ from triton.language.extra.cann.extension import sub_vec_id
 from triton_dist.language.extra import libshmem_device
 
 from ..kernels.moonep_planning import launch_moonep_b0_b3
-from .balanced_routing import (
-    build_balanced_routing_metadata,
-    build_balanced_routing_metadata_inplace,
-)
+from ..kernels.balanced_routing import launch_balanced_routing_metadata
+from ..kernels.shmem_transport import mte_put
 from .workspace import MoEForwardContext
 
 
@@ -46,9 +44,7 @@ class MoERoutingPlan:
     send_route_indices: torch.Tensor | None = None
     experts_to_copy_cpu: torch.Tensor | None = None
     # Staged MoonEP callers must not pass a plan whose workspace views belong
-    # to another operator or to an earlier build.  These fields are populated
-    # by ``MoEForward.build_routing_plan`` and deliberately live at the end so
-    # existing positional construction remains source-compatible.
+    # to another operator or to an earlier build.
     owner_token: object | None = None
     generation: int = 0
     selected_experts_version: int = -1
@@ -76,14 +72,12 @@ def _publish_counts_and_build_metadata(
     if sub_vec_id() == 0:
         for peer_rank in range(WORLD_SIZE):
             if peer_rank != LOCAL_RANK:
-                libshmem_device.putmem(
+                mte_put(
                     local_row_ptr,
                     local_row_ptr,
-                    # The Triton symbol is dtype-specialized, but its generated
-                    # wrapper forwards this value to the void* ACLSHMEM API as a
-                    # byte count.
-                    NUM_BINS_PAD * 4,
+                    NUM_BINS_PAD,
                     peer_rank,
+                    BLOCK_ELEMENTS=NUM_BINS_PAD,
                 )
         libshmem_device.fence()
 
@@ -182,11 +176,12 @@ def _kernel_build_routing_metadata(
     if sub_vec_id() == 0:
         for peer_rank in range(WORLD_SIZE):
             if peer_rank != LOCAL_RANK:
-                libshmem_device.putmem(
+                mte_put(
                     local_row_ptr,
                     local_row_ptr,
-                    NUM_BINS_PAD * 4,
+                    NUM_BINS_PAD,
                     peer_rank,
+                    BLOCK_ELEMENTS=NUM_BINS_PAD,
                 )
 
     libshmem_device.barrier_all_vec()
@@ -302,11 +297,12 @@ def _kernel_publish_routing_counts_lower_bound(
     if sub_vec_id() == 0:
         for peer_rank in range(WORLD_SIZE):
             if peer_rank != LOCAL_RANK:
-                libshmem_device.putmem(
+                mte_put(
                     local_row_ptr,
                     local_row_ptr,
-                    NUM_BINS_PAD * 4,
+                    NUM_BINS_PAD,
                     peer_rank,
+                    BLOCK_ELEMENTS=NUM_BINS_PAD,
                 )
         libshmem_device.fence()
 
@@ -422,8 +418,6 @@ def _build_moonep_routing_plan(
     expert_order: torch.Tensor,
     sorted_experts: torch.Tensor,
     valid_route_mask: torch.Tensor,
-    fused_balanced_count: bool,
-    fused_route_mapping: bool,
     moonep_plan_hook: Optional[
         Callable[[torch.Tensor, torch.Tensor], None]
     ] = None,
@@ -493,9 +487,9 @@ def _build_moonep_routing_plan(
         row_stride=context.planning_num_bins,
     )
 
-    # ETC is the only planner table still needed on the host for owner-push
-    # cache bookkeeping.  The full tpe/allocation/prefix cube and inverse
-    # table remain device-resident.
+    # ETC is the only planner table still needed on the host for compact
+    # source/destination capacity sizing. The full count/allocation/prefix cube
+    # and inverse table remain device-resident.
     replica_counts_cpu = context.planning_replica_counts.cpu()
     experts_to_copy_cpu = context.planning_experts_to_copy.cpu().contiguous()
     max_replica_count = int(replica_counts_cpu.max().item())
@@ -504,7 +498,6 @@ def _build_moonep_routing_plan(
             "fixed replica budget cannot cover all remote allocated experts"
         )
 
-    device = sorted_experts.device
     tpe_all_device = planning_counts_all[:, :num_experts]
     experts_to_copy = context.planning_experts_to_copy
     alloc_cumsum = context.planning_alloc_cumsum
@@ -519,66 +512,26 @@ def _build_moonep_routing_plan(
     count_rows = context.metadata_counts_mem.view(
         world_size, context.metadata_num_bins
     )
-    if fused_route_mapping:
-        build_balanced_routing_metadata_inplace(
-            sorted_experts,
-            expert_order,
-            tpe_all_device,
-            alloc_cumsum,
-            inverse,
-            rank=context.rank,
-            top_k=selected_experts.shape[1],
-            count_rows=count_rows,
-            local_expert_starts=context.metadata_local_expert_starts,
-            send_token_indices=context.balanced_send_token_indices,
-            send_route_indices=context.balanced_send_route_indices,
-            send_bucket_starts=context.metadata_send_bucket_starts,
-            send_bucket_receive_offsets=(
-                context.metadata_send_bucket_dst_starts
-            ),
-            receive_counts_by_source_slot=context.metadata_recv_counts_re,
-            received_routes_per_slot=context.metadata_recv_per_expert,
-            received_slot_offsets=context.metadata_recv_expert_offs,
-        )
-        send_token_indices = context.balanced_send_token_indices[:num_valid]
-        send_route_indices = context.balanced_send_route_indices[:num_valid]
-    else:
-        # Reuse Mega's first stable expert sort, then place routes directly into
-        # their physical bucket intervals. The stable-sort implementation remains
-        # in the pure routing reference as an independently tested oracle.
-        balanced = build_balanced_routing_metadata(
-            selected_experts,
-            tpe_all_device,
-            alloc_cumsum,
-            inverse,
-            context.rank,
-            validate=False,
-            expert_order=expert_order,
-            sorted_experts=sorted_experts,
-            use_direct_bucket_scatter=True,
-            use_fused_count_cube=fused_balanced_count,
-        )
-        count_rows.zero_()
-        count_rows[:, :num_buckets].copy_(
-            balanced.balanced_counts.to(device=device)
-        )
-        context.metadata_send_bucket_starts.copy_(
-            balanced.send_bucket_starts.to(device=device)
-        )
-        context.metadata_send_bucket_dst_starts.copy_(
-            balanced.send_bucket_receive_offsets.to(device=device)
-        )
-        context.metadata_recv_counts_re.copy_(
-            balanced.receive_counts_by_source_slot.to(device=device)
-        )
-        context.metadata_recv_per_expert.copy_(
-            balanced.received_routes_per_slot.to(device=device)
-        )
-        context.metadata_recv_expert_offs.copy_(
-            balanced.received_slot_offsets.to(device=device)
-        )
-        send_token_indices = balanced.send_token_indices.to(device=device)
-        send_route_indices = balanced.send_route_indices.to(device=device)
+    launch_balanced_routing_metadata(
+        sorted_experts,
+        expert_order,
+        tpe_all_device,
+        alloc_cumsum,
+        inverse,
+        rank=context.rank,
+        top_k=selected_experts.shape[1],
+        count_rows=count_rows,
+        local_expert_starts=context.metadata_local_expert_starts,
+        send_token_indices=context.balanced_send_token_indices,
+        send_route_indices=context.balanced_send_route_indices,
+        send_bucket_starts=context.metadata_send_bucket_starts,
+        send_bucket_receive_offsets=context.metadata_send_bucket_dst_starts,
+        receive_counts_by_source_slot=context.metadata_recv_counts_re,
+        received_routes_per_slot=context.metadata_recv_per_expert,
+        received_slot_offsets=context.metadata_recv_expert_offs,
+    )
+    send_token_indices = context.balanced_send_token_indices[:num_valid]
+    send_route_indices = context.balanced_send_route_indices[:num_valid]
     # B.1/B.2 balance every destination to the common dropless source capacity.
     # The device planner has already validated that invariant.
     num_received_routes = num_valid
@@ -624,8 +577,6 @@ def build_routing_plan(
     moonep_plan_hook: Optional[
         Callable[[torch.Tensor, torch.Tensor], None]
     ] = None,
-    moonep_fused_balanced_count: bool = True,
-    moonep_fused_route_mapping: bool = True,
 ) -> MoERoutingPlan:
     """Build one stable, compact routing plan for dispatch and combine."""
     world_size = context.world_size
@@ -655,8 +606,6 @@ def build_routing_plan(
             stable_sort_indices,
             sorted_experts,
             valid_route_mask,
-            moonep_fused_balanced_count,
-            moonep_fused_route_mapping,
             moonep_plan_hook,
         )
     send_token_indices = kept_token_indices[stable_sort_indices].to(

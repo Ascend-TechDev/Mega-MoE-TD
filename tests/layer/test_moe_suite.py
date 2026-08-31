@@ -29,6 +29,9 @@ from mega_moe.runtime.moonep_planning import (
     build_inverse_experts_to_copy,
     plan_moonep_b0_b3,
 )
+from mega_moe.runtime.replica_weight_prefetch import (
+    replica_weight_push_geometry,
+)
 from benchmark.layer import bench_moe_suite as bench_module
 from mega_moe.kernels.weighted_swiglu import (
     _BLOCK_M as _WEIGHTED_BLOCK_M,
@@ -122,6 +125,24 @@ def test_moonep_moderate_wide_capacity_covers_hottest_owner():
     assert bench_module._moonep_receive_capacity_factor(
         8, "moderate-wide"
     ) == 27 / 16
+
+
+def test_replica_weight_udma_geometry_uses_one_kimi_request_per_panel():
+    gate_up_panel_elements = 3584 * 3072
+    down_panel_elements = (3584 // 2) * 3072
+    chunk_bytes = 64 * 1024 * 1024
+
+    assert replica_weight_push_geometry(
+        gate_up_panel_elements, chunk_bytes=chunk_bytes
+    )[1] == 1
+    assert replica_weight_push_geometry(
+        down_panel_elements, chunk_bytes=chunk_bytes
+    )[1] == 1
+    with pytest.raises(ValueError, match="UDMA 256 MiB"):
+        replica_weight_push_geometry(
+            gate_up_panel_elements,
+            chunk_bytes=256 * 1024 * 1024 + 2,
+        )
 
 
 def test_pack_gate_up_weights_returns_contiguous_kn_layout():
@@ -285,8 +306,8 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
                 f"{case.case_id}-full", rank, device,
             )
 
-            # Keep the asymmetric routing, all-drop and epoch-reuse coverage
-            # from the former forward test, but only on the representative S.
+            # Exercise asymmetric routing, all-drop, and epoch reuse on the
+            # representative small case.
             if case.model == "S":
                 skew = torch.full_like(expert_indices, world_size)
                 edge_weights = torch.zeros_like(routing_weights)
@@ -475,59 +496,12 @@ def run_moonep_hot_expert_case(
             )
             if not passed:
                 raise AssertionError("MoonEP hot-expert forward mismatched golden")
-            clean_output = bench_module.ascend_full_post_routing(
-                op,
-                hs,
-                expert_indices,
-                packed_w1,
-                w2,
-                routing_weights,
-            )
-            torch.npu.synchronize(device)
-            expected_experts = op._replica_experts_cache.clone()
-            replica_destinations = [
-                destination
-                for destination, row in enumerate(expected_experts)
-                if bool((row >= 0).any())
-            ]
-            for weight_name in ("down", "gate_up"):
-                for destination_rank in replica_destinations:
-                    bench_module._prove_replica_weight_consumption(
-                        op,
-                        expected_experts,
-                        hs,
-                        expert_indices,
-                        routing_weights,
-                        packed_w1,
-                        w2,
-                        clean_output,
-                        device,
-                        dist.group.WORLD,
-                        weight_name=weight_name,
-                        destination_rank=destination_rank,
-                    )
-            del clean_output
 
             # Routing metadata is backed by a single shared workspace.  Build
-            # the same plan twice through the full-forward hook contract so
-            # replica preparation/layout remain valid; only the first plan's
-            # generation is stale and must be rejected before a kernel launch.
-            def prepare_primary_plan(experts_to_copy_cpu, experts_to_copy_device):
-                op._begin_replica_prefetch(
-                    experts_to_copy_cpu,
-                    experts_to_copy_device,
-                    packed_w1,
-                    w2,
-                )
-
-            superseded_primary_plan = op.build_routing_plan(
-                expert_indices,
-                moonep_plan_hook=prepare_primary_plan,
-            )
-            current_primary_plan = op.build_routing_plan(
-                expert_indices,
-                moonep_plan_hook=prepare_primary_plan,
-            )
+            # the same plan twice; the first plan's generation is stale and
+            # must be rejected before a kernel launch.
+            superseded_primary_plan = op.build_routing_plan(expert_indices)
+            current_primary_plan = op.build_routing_plan(expert_indices)
             rejected_superseded_plan = False
             try:
                 op.dispatch_fc1(
@@ -555,10 +529,7 @@ def run_moonep_hot_expert_case(
             del current_primary_plan, superseded_primary_plan
 
             mutated_expert_indices = expert_indices.clone()
-            mutation_plan = op.build_routing_plan(
-                mutated_expert_indices,
-                moonep_plan_hook=prepare_primary_plan,
-            )
+            mutation_plan = op.build_routing_plan(mutated_expert_indices)
             mutated_expert_indices.add_(0)
             rejected_mutated_routes = False
             try:
@@ -668,8 +639,7 @@ def run_moonep_hot_expert_case(
                 raise AssertionError(
                     "MoonEP device planner did not restore the original route counts"
                 )
-            cached_weight_key = op._replica_weight_cache_key
-            cached_weight_epoch = op._replica_weight_epoch
+            repeat_epoch = op._replica_weight_epoch
             passed = run_full_one(
                 op,
                 hs,
@@ -680,23 +650,20 @@ def run_moonep_hot_expert_case(
                 packed_w1,
                 w2,
                 num_experts,
-                "moonep-hot-expert-cache-reuse",
+                "moonep-hot-expert-repeat-refill",
                 rank,
                 device,
             )
             if (
                 not passed
-                or op._replica_weight_cache_key != cached_weight_key
-                or op._replica_weight_epoch != cached_weight_epoch
-                or not op._replica_weight_cache_valid
+                or op._replica_weight_epoch != repeat_epoch + 1
                 or op._replica_prefetch_pending
             ):
-                raise AssertionError("MoonEP warm replica cache reuse failed")
+                raise AssertionError("MoonEP repeated replica refill failed")
             epoch_before_update = op._replica_weight_epoch
             if rank == 0:
-                # Change one owner's hot expert in place. Other ranks still see
-                # a local cache hit, so the EP-wide MIN decision must force all
-                # ranks through the same prefetch/barrier epoch.
+                # Change one owner's hot expert in place. Every rank must still
+                # publish and consume the next prefetch epoch.
                 packed_w1[0].add_(0.125)
                 w_gate[0].add_(0.125)
                 w_up[0].add_(0.125)
@@ -717,7 +684,6 @@ def run_moonep_hot_expert_case(
             if (
                 not passed
                 or op._replica_weight_epoch != epoch_before_update + 1
-                or not op._replica_weight_cache_valid
                 or op._replica_prefetch_pending
             ):
                 raise AssertionError(
@@ -1008,9 +974,3 @@ def test_moonep_moderate_wide_forward_w8(dist_test):
 @pytest.mark.parametrize("case", FUNCTIONAL_BACKWARD_CASES)
 def test_backward_suite(dist_test, case: CaseSpec):
     dist_test(run_backward_case, world_size=case.world_size, args=(case,))
-
-
-# TODO: future work — when an all-directions session is introduced, finish and
-# fully clean forward before starting backward; do not reuse operator, peer
-# memory, or ACLSHMEM heap.  Each parameterized node currently owns an isolated
-# lifecycle.

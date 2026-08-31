@@ -5,15 +5,13 @@ Ascend (CANN/NPU) fused EP MoE dispatch + FC1 kernel — default schedule only.
 Architecture:
 
   Phase 1 — In-kernel dispatch:
-    Each AI core iterates local tokens and uses ACLSHMEM ``putmem`` to write
-    them directly into remote ranks' symmetric memory (peer_mem).
+    Each AI core iterates local tokens and writes them through the remote
+    symmetric MTE mapping (peer_mem).
     This replaces host-side ``all_to_all_single``.
 
   The all-core pipeline runs Vector dispatch and Cube FC1 concurrently on
     every AI core.  A dispatch task notifies a source-local tile after its
     remote stores are visible; FC1 waits only for the tile it is about to use.
-
-This is the single-schedule counterpart of the former multi-strategy kernel.
 
 The Vector stream walks nonempty source/expert buckets (expert-major order)
 and publishes per-tile SET readiness slots; the Cube stream consumes merged
@@ -30,17 +28,230 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
-from .replica_weight_prefetch import (
-    _push_compact_replica_weight_descriptor,
-    _push_compact_replica_weight_descriptors,
+from .shmem_transport import mte_put
+from .shmem_udma import (
+    udma_bfloat16_put_nbi,
+    udma_bfloat16_put_signal_nbi,
+    udma_quiet,
 )
+
+
+@triton.jit
+def _submit_one_replica_panel_put_signal(
+    destination_ptr,
+    source_ptr,
+    panel_elements,
+    ready_address,
+    signal_epoch,
+    destination_rank,
+    CHUNK_ELEMENTS: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+):
+    """Push one panel and let its final WQE publish remote readiness."""
+    for chunk_id in tl.static_range(0, NUM_CHUNKS - 1):
+        chunk_start = chunk_id * CHUNK_ELEMENTS
+        chunk_elements = tl.minimum(
+            CHUNK_ELEMENTS,
+            panel_elements - chunk_start,
+        )
+        udma_bfloat16_put_nbi(
+            destination_ptr + chunk_start,
+            source_ptr + chunk_start,
+            chunk_elements,
+            destination_rank,
+        )
+    if NUM_CHUNKS > 1:
+        # UDMA WQEs are NO-ordering even on one QP.  Complete every prefix
+        # chunk before using the final chunk's notify as panel readiness.
+        udma_quiet(destination_rank)
+    final_chunk = NUM_CHUNKS - 1
+    final_start = final_chunk * CHUNK_ELEMENTS
+    final_elements = tl.minimum(
+        CHUNK_ELEMENTS,
+        panel_elements - final_start,
+    )
+    udma_bfloat16_put_signal_nbi(
+        destination_ptr + final_start,
+        source_ptr + final_start,
+        final_elements,
+        ready_address,
+        signal_epoch,
+        destination_rank,
+    )
+
+
+@triton.jit
+def _push_one_replica_panel_to_destination(
+    destination_rank,
+    panel_kind,
+    source_gate_up_ptr,
+    source_down_ptr,
+    source_ready_ptr,
+    replica_gate_up_ptr,
+    replica_down_ptr,
+    gate_up_ready_ptr,
+    down_ready_ptr,
+    consumed_epoch_ptr,
+    experts_to_copy_ptr,
+    source_slot_by_global_expert_ptr,
+    signal_epoch,
+    previous_epoch,
+    replica_slot_count,
+    LOCAL_RANK: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    GATE_PANEL_ELEMENTS: tl.constexpr,
+    GATE_CHUNK_ELEMENTS: tl.constexpr,
+    GATE_NUM_CHUNKS: tl.constexpr,
+    DOWN_PANEL_ELEMENTS: tl.constexpr,
+    DOWN_CHUNK_ELEMENTS: tl.constexpr,
+    DOWN_NUM_CHUNKS: tl.constexpr,
+):
+    """Submit one panel kind on a destination-owned QP without a hot-path quiet."""
+    replica_slot = 0
+    while replica_slot < replica_slot_count:
+        descriptor = destination_rank * EXPERTS_PER_RANK + replica_slot
+        global_expert = tl.load(experts_to_copy_ptr + descriptor)
+        owned = (
+            (global_expert >= 0)
+            & (global_expert // EXPERTS_PER_RANK == LOCAL_RANK)
+        )
+        if owned:
+            # The previous owner may differ from this rank after a plan switch.
+            # Waiting on the consumer-owned slot epoch makes remote destination
+            # reuse independent of owner identity.  Only panel 0 performs it;
+            # the remaining panels are ordered later on the same QP.
+            if (panel_kind == 0) & (previous_epoch > 0):
+                remote_consumed = libshmem_device.remote_ptr(
+                    consumed_epoch_ptr + replica_slot * 16,
+                    destination_rank,
+                )
+                libshmem_device.signal_wait_until(
+                    remote_consumed,
+                    libshmem_device.ACLSHMEM_CMP_EQ,
+                    previous_epoch,
+                )
+            source_slot = tl.load(
+                source_slot_by_global_expert_ptr + global_expert
+            )
+            libshmem_device.signal_wait_until(
+                source_ready_ptr + (source_slot * 4 + panel_kind) * 16,
+                libshmem_device.ACLSHMEM_CMP_EQ,
+                signal_epoch,
+            )
+            if panel_kind < 2:
+                panel = panel_kind
+                source_panel = (
+                    source_gate_up_ptr
+                    + source_slot * (2 * GATE_PANEL_ELEMENTS)
+                    + panel * GATE_PANEL_ELEMENTS
+                )
+                destination_panel = (
+                    replica_gate_up_ptr
+                    + replica_slot * (2 * GATE_PANEL_ELEMENTS)
+                    + panel * GATE_PANEL_ELEMENTS
+                )
+                ready_address = (
+                    gate_up_ready_ptr
+                    + (replica_slot * 2 + panel_kind) * 16
+                )
+                _submit_one_replica_panel_put_signal(
+                    destination_panel,
+                    source_panel,
+                    GATE_PANEL_ELEMENTS,
+                    ready_address,
+                    signal_epoch,
+                    destination_rank,
+                    GATE_CHUNK_ELEMENTS,
+                    GATE_NUM_CHUNKS,
+                )
+            else:
+                panel = panel_kind - 2
+                source_panel = (
+                    source_down_ptr
+                    + source_slot * (2 * DOWN_PANEL_ELEMENTS)
+                    + panel * DOWN_PANEL_ELEMENTS
+                )
+                destination_panel = (
+                    replica_down_ptr
+                    + replica_slot * (2 * DOWN_PANEL_ELEMENTS)
+                    + panel * DOWN_PANEL_ELEMENTS
+                )
+                ready_address = (
+                    down_ready_ptr + (replica_slot * 2 + panel) * 16
+                )
+                _submit_one_replica_panel_put_signal(
+                    destination_panel,
+                    source_panel,
+                    DOWN_PANEL_ELEMENTS,
+                    ready_address,
+                    signal_epoch,
+                    destination_rank,
+                    DOWN_CHUNK_ELEMENTS,
+                    DOWN_NUM_CHUNKS,
+                )
+        replica_slot += 1
+
+
+@triton.jit
+def _push_replica_weight_panels_for_destination(
+    destination_rank,
+    source_gate_up_ptr,
+    source_down_ptr,
+    source_ready_ptr,
+    replica_gate_up_ptr,
+    replica_down_ptr,
+    gate_up_ready_ptr,
+    down_ready_ptr,
+    consumed_epoch_ptr,
+    experts_to_copy_ptr,
+    source_slot_by_global_expert_ptr,
+    signal_epoch,
+    previous_epoch,
+    replica_slot_count,
+    LOCAL_RANK: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    GATE_PANEL_ELEMENTS: tl.constexpr,
+    GATE_CHUNK_ELEMENTS: tl.constexpr,
+    GATE_NUM_CHUNKS: tl.constexpr,
+    DOWN_PANEL_ELEMENTS: tl.constexpr,
+    DOWN_CHUNK_ELEMENTS: tl.constexpr,
+    DOWN_NUM_CHUNKS: tl.constexpr,
+):
+    """Push gate/up first and down last on one independent destination QP."""
+    for panel_kind in tl.static_range(0, 4):
+        _push_one_replica_panel_to_destination(
+            destination_rank,
+            panel_kind,
+            source_gate_up_ptr,
+            source_down_ptr,
+            source_ready_ptr,
+            replica_gate_up_ptr,
+            replica_down_ptr,
+            gate_up_ready_ptr,
+            down_ready_ptr,
+            consumed_epoch_ptr,
+            experts_to_copy_ptr,
+            source_slot_by_global_expert_ptr,
+            signal_epoch,
+            previous_epoch,
+            replica_slot_count,
+            LOCAL_RANK,
+            EXPERTS_PER_RANK,
+            GATE_PANEL_ELEMENTS,
+            GATE_CHUNK_ELEMENTS,
+            GATE_NUM_CHUNKS,
+            DOWN_PANEL_ELEMENTS,
+            DOWN_CHUNK_ELEMENTS,
+            DOWN_NUM_CHUNKS,
+        )
 
 
 @triton.jit(
     do_not_specialize=[
         "signal_epoch",
         "replica_weight_epoch",
-        "replica_down_descriptor_count",
+        "previous_replica_epoch",
+        "replica_slot_count",
     ]
 )
 def _kernel_dispatch_fc1(
@@ -53,12 +264,15 @@ def _kernel_dispatch_fc1(
     weight_ptr,
     replica_weight_ptr,
     replica_weight_ready_ptr,
-    down_weight_ptr,
     replica_down_weight_ptr,
-    experts_to_copy_ptr,
     replica_down_ready_ptr,
-    replica_down_descriptor_ids_ptr,
-    replica_down_descriptor_count,
+    source_gate_up_ptr,
+    source_down_ptr,
+    source_ready_ptr,
+    consumed_epoch_ptr,
+    experts_to_copy_ptr,
+    source_slot_by_global_expert_ptr,
+    replica_slot_count,
     output_ptr,
 
     # ---- Dispatch token metadata ----
@@ -75,6 +289,7 @@ def _kernel_dispatch_fc1(
 
     signal_epoch,
     replica_weight_epoch,
+    previous_replica_epoch,
 
     # ---- Dimensions ----
     hidden: tl.constexpr,
@@ -87,6 +302,10 @@ def _kernel_dispatch_fc1(
     stride_weight_0,
     stride_weight_1,
     stride_weight_2,
+    stride_replica_weight_0,
+    stride_replica_weight_panel,
+    stride_replica_weight_k,
+    stride_replica_weight_n,
     stride_output_m,
     stride_output_n,
 
@@ -96,17 +315,15 @@ def _kernel_dispatch_fc1(
     WORLD_SIZE: tl.constexpr,
     HOME_EXPERTS_PER_RANK: tl.constexpr,
     USE_REPLICA_WEIGHTS: tl.constexpr,
-    PREFETCH_REPLICA_DOWN: tl.constexpr,
+    PUSH_REPLICA_WEIGHTS: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     ACTIVE_EXPERTS_PER_RANK: tl.constexpr,
-    GATE_UP_WEIGHT_ELEMENTS_PER_EXPERT: tl.constexpr,
-    GATE_UP_CHUNK_ELEMENTS: tl.constexpr,
-    GATE_UP_NUM_WEIGHT_CHUNKS: tl.constexpr,
-    DOWN_WEIGHT_ELEMENTS_PER_EXPERT: tl.constexpr,
+    GATE_PANEL_ELEMENTS: tl.constexpr,
+    GATE_CHUNK_ELEMENTS: tl.constexpr,
+    GATE_NUM_CHUNKS: tl.constexpr,
+    DOWN_PANEL_ELEMENTS: tl.constexpr,
     DOWN_CHUNK_ELEMENTS: tl.constexpr,
-    DOWN_NUM_WEIGHT_CHUNKS: tl.constexpr,
-    DOWN_EARLY_PROGRAMS: tl.constexpr,
-    DOWN_EARLY_DESCRIPTORS_PER_PROGRAM: tl.constexpr,
+    DOWN_NUM_CHUNKS: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     FINAL_BARRIER: tl.constexpr,
     DISPATCH_BLOCK_SIZE_M: tl.constexpr,
@@ -125,9 +342,6 @@ def _kernel_dispatch_fc1(
     pid = tl.program_id(axis=0)
     dtype = tl.bfloat16
 
-    # All AI cores expose independent Vector and Cube instruction streams.
-    # The Vector side dispatches source-local tiles while the Cube side
-    # consumes independently-ready receive tiles on the same logical PID.
     with al.scope(core_mode="vector", disable_auto_sync=True):
         if sub_vec_id() == 0:
             _dispatch_count_derived_source_tiles(
@@ -142,71 +356,33 @@ def _kernel_dispatch_fc1(
                 LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                 ACTIVE_EXPERTS_PER_RANK,
                 MAX_SOURCE_TILES, DISPATCH_BLOCK_SIZE_M)
-            if (
-                PREFETCH_REPLICA_DOWN
-                & (replica_down_descriptor_count > 0)
-            ):
-                # Each first Vector subcore joins down prefetch immediately
-                # after its own complete dispatch assignment.  It handles only
-                # the descriptors excluded from the bounded early prefix.
-                _push_replica_down_remainder_after_dispatch(
-                    pid,
-                    NUM_PROGRAM_CORES,
-                    down_weight_ptr,
-                    replica_down_weight_ptr,
-                    experts_to_copy_ptr,
-                    replica_down_descriptor_ids_ptr,
-                    replica_down_descriptor_count,
-                    replica_down_ready_ptr,
-                    replica_weight_epoch,
-                    LOCAL_RANK,
-                    HOME_EXPERTS_PER_RANK,
-                    DOWN_WEIGHT_ELEMENTS_PER_EXPERT,
-                    DOWN_CHUNK_ELEMENTS,
-                    DOWN_NUM_WEIGHT_CHUNKS,
-                    DOWN_EARLY_PROGRAMS,
-                    DOWN_EARLY_DESCRIPTORS_PER_PROGRAM,
-                )
-        elif PREFETCH_REPLICA_DOWN:
-            # The second Vector subcore is otherwise idle in this mixed
-            # kernel.  MTE cache misses first push every gate/up descriptor and
-            # publish its per-slot epoch; only then may the bounded early down
-            # prefix use these workers.  Activation dispatch remains isolated
-            # on sub_vec0 and Cube home experts do not wait for replica weights.
-            if replica_down_descriptor_count > 0:
-                _push_compact_replica_weight_descriptors(
-                    pid,
-                    NUM_PROGRAM_CORES,
-                    weight_ptr,
-                    replica_weight_ptr,
-                    experts_to_copy_ptr,
-                    replica_down_descriptor_ids_ptr,
-                    replica_down_descriptor_count,
-                    replica_weight_ready_ptr,
-                    replica_weight_epoch,
-                    LOCAL_RANK,
-                    HOME_EXPERTS_PER_RANK,
-                    GATE_UP_WEIGHT_ELEMENTS_PER_EXPERT,
-                    GATE_UP_CHUNK_ELEMENTS,
-                    GATE_UP_NUM_WEIGHT_CHUNKS,
-                )
-                _prefetch_replica_down_while_dispatch(
-                    pid,
-                    down_weight_ptr,
-                    replica_down_weight_ptr,
-                    experts_to_copy_ptr,
-                    replica_down_descriptor_ids_ptr,
-                    replica_down_ready_ptr,
-                    replica_down_descriptor_count,
-                    replica_weight_epoch,
-                    LOCAL_RANK,
-                    HOME_EXPERTS_PER_RANK,
-                    DOWN_WEIGHT_ELEMENTS_PER_EXPERT,
-                    DOWN_CHUNK_ELEMENTS,
-                    DOWN_NUM_WEIGHT_CHUNKS,
-                    DOWN_EARLY_PROGRAMS,
-                    DOWN_EARLY_DESCRIPTORS_PER_PROGRAM,
-                )
+        elif pid < WORLD_SIZE:
+            if PUSH_REPLICA_WEIGHTS:
+                if pid != LOCAL_RANK:
+                    _push_replica_weight_panels_for_destination(
+                        pid,
+                        source_gate_up_ptr,
+                        source_down_ptr,
+                        source_ready_ptr,
+                        replica_weight_ptr,
+                        replica_down_weight_ptr,
+                        replica_weight_ready_ptr,
+                        replica_down_ready_ptr,
+                        consumed_epoch_ptr,
+                        experts_to_copy_ptr,
+                        source_slot_by_global_expert_ptr,
+                        replica_weight_epoch,
+                        previous_replica_epoch,
+                        replica_slot_count,
+                        LOCAL_RANK,
+                        HOME_EXPERTS_PER_RANK,
+                        GATE_PANEL_ELEMENTS,
+                        GATE_CHUNK_ELEMENTS,
+                        GATE_NUM_CHUNKS,
+                        DOWN_PANEL_ELEMENTS,
+                        DOWN_CHUNK_ELEMENTS,
+                        DOWN_NUM_CHUNKS,
+                    )
     with al.scope(core_mode="cube", disable_auto_sync=True):
         _triton_grouped_gemm_expert_n_merged_tiles_wait(
             pid, NUM_PROGRAM_CORES,
@@ -216,6 +392,7 @@ def _kernel_dispatch_fc1(
             signal_epoch, replica_weight_epoch,
             N, K, stride_input_m, stride_input_k,
             stride_weight_0, stride_weight_1, stride_weight_2,
+            0, False,
             stride_output_m, stride_output_n,
             DISPATCH_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_M,
             BLOCK_SIZE_N, BLOCK_SIZE_K,
@@ -230,7 +407,9 @@ def _kernel_dispatch_fc1(
                 recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
                 signal_epoch, replica_weight_epoch,
                 N, K, stride_input_m, stride_input_k,
-                stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_replica_weight_0, stride_replica_weight_n,
+                stride_replica_weight_k,
+                stride_replica_weight_panel, True,
                 stride_output_m, stride_output_n,
                 DISPATCH_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_M,
                 BLOCK_SIZE_N, BLOCK_SIZE_K,
@@ -245,90 +424,6 @@ def _kernel_dispatch_fc1(
     # readiness, and the later combine kernel has its own rank-wide barrier.
     if FINAL_BARRIER:
         libshmem_device.barrier_all()
-
-
-@triton.jit
-def _prefetch_replica_down_while_dispatch(
-    pid,
-    local_weight_ptr,
-    replica_weight_ptr,
-    experts_to_copy_ptr,
-    descriptor_ids_ptr,
-    ready_mem_ptr,
-    descriptor_count,
-    signal_epoch,
-    LOCAL_RANK: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
-    WEIGHT_ELEMENTS_PER_EXPERT: tl.constexpr,
-    CHUNK_ELEMENTS: tl.constexpr,
-    NUM_WEIGHT_CHUNKS: tl.constexpr,
-    EARLY_PROGRAMS: tl.constexpr,
-    EARLY_DESCRIPTORS_PER_PROGRAM: tl.constexpr,
-):
-    """Prefetch a bounded, peer-interleaved descriptor prefix."""
-    if pid < EARLY_PROGRAMS:
-        for early_round in tl.static_range(
-            0, EARLY_DESCRIPTORS_PER_PROGRAM
-        ):
-            descriptor_ordinal = pid + early_round * EARLY_PROGRAMS
-            if descriptor_ordinal < descriptor_count:
-                _push_compact_replica_weight_descriptor(
-                    descriptor_ordinal,
-                    local_weight_ptr,
-                    replica_weight_ptr,
-                    experts_to_copy_ptr,
-                    descriptor_ids_ptr,
-                    ready_mem_ptr,
-                    signal_epoch,
-                    LOCAL_RANK,
-                    EXPERTS_PER_RANK,
-                    WEIGHT_ELEMENTS_PER_EXPERT,
-                    CHUNK_ELEMENTS,
-                    NUM_WEIGHT_CHUNKS,
-                )
-
-
-@triton.jit
-def _push_replica_down_remainder_after_dispatch(
-    pid,
-    num_programs: tl.constexpr,
-    local_weight_ptr,
-    replica_weight_ptr,
-    experts_to_copy_ptr,
-    descriptor_ids_ptr,
-    descriptor_count,
-    ready_mem_ptr,
-    signal_epoch,
-    LOCAL_RANK: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
-    WEIGHT_ELEMENTS_PER_EXPERT: tl.constexpr,
-    CHUNK_ELEMENTS: tl.constexpr,
-    NUM_WEIGHT_CHUNKS: tl.constexpr,
-    EARLY_PROGRAMS: tl.constexpr,
-    EARLY_DESCRIPTORS_PER_PROGRAM: tl.constexpr,
-):
-    """Statically stripe the non-early descriptors over dispatch workers."""
-    early_capacity: tl.constexpr = (
-        EARLY_PROGRAMS * EARLY_DESCRIPTORS_PER_PROGRAM
-    )
-    early_count = tl.minimum(descriptor_count, early_capacity)
-    descriptor_ordinal = early_count + pid
-    while descriptor_ordinal < descriptor_count:
-        _push_compact_replica_weight_descriptor(
-            descriptor_ordinal,
-            local_weight_ptr,
-            replica_weight_ptr,
-            experts_to_copy_ptr,
-            descriptor_ids_ptr,
-            ready_mem_ptr,
-            signal_epoch,
-            LOCAL_RANK,
-            EXPERTS_PER_RANK,
-            WEIGHT_ELEMENTS_PER_EXPERT,
-            CHUNK_ELEMENTS,
-            NUM_WEIGHT_CHUNKS,
-        )
-        descriptor_ordinal += num_programs
 
 
 @triton.jit
@@ -398,13 +493,20 @@ def _dispatch_one_source_tile_task(
             src_idx64 = src_idx.to(tl.int64)
             src_base = input_ptr + src_idx64 * stride_input_m
             dst_base = peer_mem_ptr + dst_offs * stride_input_m
-            libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
+            mte_put(
+                dst_base,
+                src_base,
+                hidden,
+                dst_rank,
+                BLOCK_ELEMENTS=4096,
+            )
             route_idx = tl.load(send_route_idx_ptr + send_idx)
-            libshmem_device.putmem(
+            mte_put(
                 routing_weight_recv_ptr + dst_offs,
                 routing_weight_ptr + route_idx,
-                4,
+                1,
                 dst_rank,
+                BLOCK_ELEMENTS=1,
             )
 
         libshmem_device.fence()
@@ -496,6 +598,8 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
     N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
+    stride_weight_panel,
+    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     DISPATCH_BLOCK_SIZE_M: tl.constexpr,
     GEMM_BLOCK_SIZE_M: tl.constexpr,
@@ -530,8 +634,10 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
         if expert_size > 0:
             if WAIT_REPLICA_WEIGHTS:
                 replica_slot = expert_id - WEIGHT_EXPERT_BASE
+                weight_panel = (n_tile * BLOCK_SIZE_N) // (N // 2)
                 weight_ready_token = dl.wait(
-                    replica_weight_ready_ptr + replica_slot * 16,
+                    replica_weight_ready_ptr
+                    + (replica_slot * 2 + weight_panel) * 16,
                     1,
                     "gpu",
                     "acquire",
@@ -597,6 +703,7 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
                     window_size, n_tile, N, K,
                     stride_input_m, stride_input_k,
                     stride_weight_0, stride_weight_1, stride_weight_2,
+                    stride_weight_panel, PACKED_N_PANELS,
                     stride_output_m, stride_output_n,
                     GEMM_BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                     WEIGHT_EXPERT_BASE, dtype)
@@ -608,6 +715,8 @@ def _triton_grouped_gemm_one_mn_tile(
     expert_id, m_off, m_size, n_tile, N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
+    stride_weight_panel,
+    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -641,11 +750,23 @@ def _triton_grouped_gemm_one_mn_tile(
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
-            b_ptrs = (
-                weight_base
-                + k_offs[:, None] * stride_weight_2
-                + n_offs[None, :] * stride_weight_1
-            )
+            if PACKED_N_PANELS:
+                panel_n: tl.constexpr = N // 2
+                panel_n_tiles: tl.constexpr = panel_n // BLOCK_SIZE_N
+                panel = n_tile // panel_n_tiles
+                panel_offsets = n_offs - panel * panel_n
+                b_ptrs = (
+                    weight_base
+                    + panel * stride_weight_panel
+                    + k_offs[:, None] * stride_weight_2
+                    + panel_offsets[None, :] * stride_weight_1
+                )
+            else:
+                b_ptrs = (
+                    weight_base
+                    + k_offs[:, None] * stride_weight_2
+                    + n_offs[None, :] * stride_weight_1
+                )
             b = tl.load(
                 b_ptrs,
                 mask=k_mask[:, None] & n_mask[None, :],
@@ -671,6 +792,8 @@ def _triton_grouped_gemm_one_mn_tile_tail(
     expert_id, m_off, m_size, n_tile, N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
+    stride_weight_panel,
+    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -686,6 +809,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M // 4, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -695,6 +819,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M // 2, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -704,6 +829,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -714,6 +840,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 16, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -723,6 +850,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
+                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -732,6 +860,7 @@ def _triton_grouped_gemm_one_mn_tile_tail(
             expert_id, m_off, m_size, n_tile, N, K,
             stride_input_m, stride_input_k,
             stride_weight_0, stride_weight_1, stride_weight_2,
+            stride_weight_panel, PACKED_N_PANELS,
             stride_output_m, stride_output_n,
             BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
             WEIGHT_EXPERT_BASE, dtype)

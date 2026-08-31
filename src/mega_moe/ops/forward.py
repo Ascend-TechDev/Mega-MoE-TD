@@ -13,10 +13,8 @@ import torch.distributed
 
 from ..config import MoEForwardConfig
 from ..kernels.dispatch_fc1 import _kernel_dispatch_fc1
-from ..kernels.replica_weight_prefetch import (
-    _kernel_compact_local_replica_descriptors,
-)
 from ..kernels.fc2_combine import (
+    _FC2_REPLICA_READY_GROUP_EXPERTS,
     _fc2_reduce_block_n,
     _launch_fc2_combine,
     _validate_putmem_descriptor_capacity,
@@ -29,9 +27,13 @@ from ..runtime.routing import (
 )
 from ..runtime.replica_weight_prefetch import (
     allocate_replica_weight_buffers,
-    fence_replica_weight_prefetch_async,
+    fence_replica_panel_pushes_async,
+    launch_replica_source_pack_async,
+    publish_replica_consumed_async,
     replica_weight_push_geometry,
+    wait_previous_replica_consumed_async,
 )
+from ..runtime.udma_pipe_s import udma_pipe_s_bisheng_options
 from ..runtime.workspace import create_moe_forward_context
 
 
@@ -117,10 +119,6 @@ class FusedMoEForward(torch.nn.Module):
         )
         self.num_aicore_programs = self.config.num_aicore_programs
         self.num_aivector_programs = self.config.num_aivector_programs
-        self._fc2_pipeline_group_experts = min(
-            _FC2_PIPELINE_GROUP_EXPERTS, self.physical_experts_per_rank
-        )
-        # Preserve the target repository optional SiTU-GLU activation.
         self.activation = self.config.activation
         self.situ_beta = self.config.situ_beta
         self.situ_linear_beta = self.config.situ_linear_beta
@@ -155,6 +153,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_pipeline_transfer_stream = None
         self._combine_pipeline_group_events = []
         self._combine_pipeline_activation_events = []
+        self._combine_pipeline_replica_ready_events = []
         self._combine_pipeline_start_event = None
         self._combine_pipeline_done_event = None
         self._route_to_send = None
@@ -164,18 +163,13 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_row_count = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
-        self._replica_weight_cache_key = None
-        self._replica_weight_cache_valid = False
-        self._replica_experts_cache = None
         self._replica_prepared_experts_cpu = None
-        self._replica_weight_source_refs = None
         self._replica_prefetch_stream = None
-        self._replica_dispatch_done_event = None
-        self._replica_prefetch_done_event = None
+        self._replica_descriptor_ready_event = None
         self._replica_prefetch_pending = False
-        self._replica_step_has_replicas = False
+        self._replica_previous_epoch = 0
+        self._active_replica_previous_epoch = 0
         self._replica_step_prepared = False
-        self._replica_down_descriptor_count = 0
         self._replica_weight_epoch = 1
         self._active_replica_weight_epoch = 1
         self._forward_stream = None
@@ -192,12 +186,21 @@ class FusedMoEForward(torch.nn.Module):
         # Grouped FC2 may still have work queued on its dedicated Cube, Vector,
         # and transfer streams. Drain every stream before releasing
         # any symmetric allocation they can still reference.
-        if self.context.peer_mem is not None:
-            torch.npu.synchronize(self.context.peer_mem.device)
+        device = (
+            self.context.peer_mem.device
+            if self.context.peer_mem is not None
+            else None
+        )
+        if device is not None and self.enable_moonep:
+            fence_replica_panel_pushes_async(
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+        if device is not None:
+            torch.npu.synchronize(device)
         if self.enable_moonep:
-            # Quiesce owner-push RMA before freeing any symmetric destination
-            # table.  This is a teardown-only collective; normal forwards keep
-            # the overlap path free of a host synchronization.
+            # The explicit QP drain above makes destination deallocation safe;
+            # keep allocation order collective across the complete SHMEM world.
             torch.distributed.barrier(group=self.ep_group)
         if self._combine_fc2_storage is not None:
             import shmem as ash
@@ -207,18 +210,13 @@ class FusedMoEForward(torch.nn.Module):
         if self._replica_weight_buffers is not None:
             self._replica_weight_buffers.finalize()
             self._replica_weight_buffers = None
-        self._replica_weight_cache_key = None
-        self._replica_weight_cache_valid = False
-        self._replica_experts_cache = None
         self._replica_prepared_experts_cpu = None
-        self._replica_weight_source_refs = None
         self._replica_prefetch_stream = None
-        self._replica_dispatch_done_event = None
-        self._replica_prefetch_done_event = None
+        self._replica_descriptor_ready_event = None
         self._replica_prefetch_pending = False
-        self._replica_step_has_replicas = False
+        self._replica_previous_epoch = 0
+        self._active_replica_previous_epoch = 0
         self._replica_step_prepared = False
-        self._replica_down_descriptor_count = 0
         self._replica_weight_epoch = 1
         self._active_replica_weight_epoch = 1
         self._forward_stream = None
@@ -229,6 +227,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_pipeline_transfer_stream = None
         self._combine_pipeline_group_events = []
         self._combine_pipeline_activation_events = []
+        self._combine_pipeline_replica_ready_events = []
         self._combine_pipeline_start_event = None
         self._combine_pipeline_done_event = None
         self._route_to_send = None
@@ -242,19 +241,81 @@ class FusedMoEForward(torch.nn.Module):
         self,
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
+        experts_to_copy_cpu: torch.Tensor,
     ) -> None:
-        """Allocate fixed-B symmetric tables before routing collectives."""
+        """Grow local owner staging/symmetric destinations to plan demand."""
         if not self.enable_moonep:
             return
-        if self._replica_weight_buffers is None:
-            self._replica_weight_buffers = allocate_replica_weight_buffers(
-                gate_up_weight,
-                down_weight,
+        if tuple(experts_to_copy_cpu.shape) != (
+            self.world_size,
+            self.experts_per_rank,
+        ):
+            raise ValueError("experts_to_copy_cpu has an invalid shape")
+        replica_capacity = int(
+            (experts_to_copy_cpu >= 0).sum(dim=1).max().item()
+        )
+        owner_unique_counts = []
+        for owner_rank in range(self.world_size):
+            owner_start = owner_rank * self.experts_per_rank
+            owner_values = experts_to_copy_cpu[
+                (experts_to_copy_cpu >= owner_start)
+                & (
+                    experts_to_copy_cpu
+                    < owner_start + self.experts_per_rank
+                )
+            ]
+            owner_unique_counts.append(int(torch.unique(owner_values).numel()))
+        source_capacity = max(owner_unique_counts, default=0)
+        if source_capacity <= 0 or replica_capacity <= 0:
+            return
+
+        buffers = self._replica_weight_buffers
+        has_capacity = (
+            buffers is not None
+            and not buffers.closed
+            and buffers.source_capacity >= source_capacity
+            and buffers.replica_capacity >= replica_capacity
+            and buffers.hidden_size == gate_up_weight.shape[1]
+            and buffers.ffn_size == down_weight.shape[2]
+        )
+        if has_capacity:
+            return
+
+        device = gate_up_weight.device
+        if buffers is not None:
+            prefetch_stream = self._replica_prefetch_stream
+            consumed_epoch = self.context.replica_consumed_epoch
+            if prefetch_stream is None or consumed_epoch is None:
+                raise RuntimeError("replica panel push runtime is not initialized")
+            with torch.npu.stream(prefetch_stream):
+                wait_previous_replica_consumed_async(
+                    buffers.previous_experts_to_copy,
+                    consumed_epoch,
+                    self._replica_previous_epoch,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    experts_per_rank=self.experts_per_rank,
+                )
+            fence_replica_panel_pushes_async(
                 rank=self.rank,
                 world_size=self.world_size,
             )
-            torch.npu.synchronize(gate_up_weight.device)
+            torch.npu.synchronize(device)
             torch.distributed.barrier(group=self.ep_group)
+            buffers.finalize()
+            self._replica_previous_epoch = 0
+            self._active_replica_previous_epoch = 0
+
+        self._replica_weight_buffers = allocate_replica_weight_buffers(
+            gate_up_weight,
+            down_weight,
+            source_capacity=source_capacity,
+            replica_capacity=replica_capacity,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        torch.npu.synchronize(device)
+        torch.distributed.barrier(group=self.ep_group)
 
     def _begin_replica_prefetch(
         self,
@@ -263,126 +324,91 @@ class FusedMoEForward(torch.nn.Module):
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
     ) -> None:
-        """Prepare one cache-miss owner-push after ETC/weight readiness."""
+        """Prepare compact owner panels for PUTs fused into dispatch/FC1."""
         if not self.enable_moonep:
             return
-        if self._replica_weight_buffers is None:
-            raise RuntimeError("replica buffers must be allocated before planning")
-        if self._replica_prefetch_pending and not self._replica_weight_cache_valid:
+        if self._replica_prefetch_pending:
             raise RuntimeError(
                 "replica prefetch is still in flight after an incomplete forward; "
                 "finalize and recreate the operator"
             )
 
         has_replica = int(bool((experts_to_copy_cpu >= 0).any().item()))
-        self._replica_step_has_replicas = bool(has_replica)
         self._replica_step_prepared = True
         self._replica_prepared_experts_cpu = experts_to_copy_cpu.clone()
         if not has_replica:
             self._replica_prefetch_pending = False
-            self._replica_down_descriptor_count = 0
             return
-
-        weight_key = (
-            gate_up_weight.data_ptr(),
-            gate_up_weight._version,
-            down_weight.data_ptr(),
-            down_weight._version,
-        )
-        if self.config.moonep_enable_replica_cache:
-            local_cache_hit = (
-                self._replica_weight_cache_valid
-                and weight_key == self._replica_weight_cache_key
-                and self._replica_experts_cache is not None
-                and torch.equal(
-                    experts_to_copy_cpu, self._replica_experts_cache
-                )
-                and self._replica_weight_source_refs is not None
-                and self._replica_weight_source_refs[0] is gate_up_weight
-                and self._replica_weight_source_refs[1] is down_weight
-            )
-            cache_flag = torch.tensor(
-                [int(local_cache_hit)],
-                dtype=torch.int32,
-                device=gate_up_weight.device,
-            )
-            torch.distributed.all_reduce(
-                cache_flag,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.ep_group,
-            )
-            if bool(cache_flag.item()):
-                self._replica_prefetch_pending = False
-                self._replica_down_descriptor_count = 0
-                return
 
         device = gate_up_weight.device
         if self._replica_prefetch_stream is None:
             self._replica_prefetch_stream = torch.npu.Stream(device=device)
-            self._replica_dispatch_done_event = torch.npu.Event()
-            self._replica_prefetch_done_event = torch.npu.Event()
+            self._replica_descriptor_ready_event = torch.npu.Event()
+        self._ensure_replica_weight_buffers(
+            gate_up_weight,
+            down_weight,
+            experts_to_copy_cpu,
+        )
+        buffers = self._replica_weight_buffers
+        if buffers is None:
+            raise RuntimeError("replica buffers were not allocated for an active plan")
+        source_slot_by_global_expert_cpu = torch.full(
+            (self.world_size * self.experts_per_rank,),
+            -1,
+            dtype=torch.int32,
+        )
+        owner_start = self.rank * self.experts_per_rank
+        owner_values = experts_to_copy_cpu[
+            (experts_to_copy_cpu >= owner_start)
+            & (experts_to_copy_cpu < owner_start + self.experts_per_rank)
+        ]
+        requested = torch.unique(owner_values, sorted=True)
+        source_slot_by_global_expert_cpu[requested.to(torch.int64)] = torch.arange(
+            requested.numel(), dtype=torch.int32
+        )
+        buffers.source_slot_by_global_expert.copy_(
+            source_slot_by_global_expert_cpu,
+            non_blocking=True,
+        )
         epoch = self._replica_weight_epoch
         if epoch >= torch.iinfo(torch.int32).max:
             raise RuntimeError(
                 "replica weight readiness epoch exhausted; recreate the operator"
             )
-        # Count and compact only owner-local remote copies.  The mixed MTE
-        # dispatch/FC1 kernel consumes this list directly.
-        local_owner_start = self.rank * self.experts_per_rank
-        local_owner_end = local_owner_start + self.experts_per_rank
-        locally_owned = (
-            (experts_to_copy_cpu >= local_owner_start)
-            & (experts_to_copy_cpu < local_owner_end)
-        )
-        local_copy_count = int(
-            locally_owned.sum().item()
-            - locally_owned[self.rank].sum().item()
-        )
-        descriptor_workspace = self.context.replica_down_descriptors
-        if descriptor_workspace is None:
-            raise RuntimeError("MoonEP down-prefetch descriptors are not allocated")
-        if local_copy_count > descriptor_workspace.numel():
-            raise RuntimeError("MoonEP down-prefetch descriptor workspace exhausted")
-        self._replica_down_descriptor_count = local_copy_count
-        # Compact the tiny ETC list on device in slot-major/peer-interleaved
-        # order.  The current stream makes it visible to the following mixed
-        # kernel without any host nonzero or H2D descriptor copy.
-        _kernel_compact_local_replica_descriptors[1, 1, 1](
-            experts_to_copy_device,
-            descriptor_workspace,
-            LOCAL_RANK=self.rank,
-            WORLD_SIZE=self.world_size,
-            EXPERTS_PER_RANK=self.experts_per_rank,
-        )
         self._replica_prefetch_pending = True
-        self._replica_weight_cache_valid = False
         self._active_replica_weight_epoch = epoch
+        self._active_replica_previous_epoch = self._replica_previous_epoch
         self._replica_weight_epoch += 1
-        self._replica_weight_cache_key = weight_key
-        self._replica_experts_cache = experts_to_copy_cpu.clone()
-        self._replica_weight_source_refs = (gate_up_weight, down_weight)
-    def _finish_replica_prefetch(self):
-        """Return replica views; kernel-side signals preserve slot overlap."""
-        if not self.enable_moonep:
-            return None, None
-        return self._replica_weight_buffers.gate_up, self._replica_weight_buffers.down
-
-    def _fence_replica_prefetch_after_dispatch(self, device):
-        """Fence fused gate/down RMA after the mixed kernel completes."""
-        if not self._replica_prefetch_pending:
-            return None
-        current_stream = torch.npu.current_stream(device)
-        dispatch_done_event = self._replica_dispatch_done_event
+        source_ready = self.context.replica_source_ready
+        consumed_epoch = self.context.replica_consumed_epoch
+        descriptor_ready_event = self._replica_descriptor_ready_event
         prefetch_stream = self._replica_prefetch_stream
-        done_event = self._replica_prefetch_done_event
-        dispatch_done_event.record(current_stream)
+        if source_ready is None or consumed_epoch is None:
+            raise RuntimeError("MoonEP panel lifecycle tables are not allocated")
+        if descriptor_ready_event is None or prefetch_stream is None:
+            raise RuntimeError("MoonEP replica panel push runtime is not initialized")
+        descriptor_ready_event.record(torch.npu.current_stream(device))
         with torch.npu.stream(prefetch_stream):
-            prefetch_stream.wait_event(dispatch_done_event)
-            fence_replica_weight_prefetch_async(
-                num_barrier_programs=self.num_aicore_programs
+            prefetch_stream.wait_event(descriptor_ready_event)
+            wait_previous_replica_consumed_async(
+                buffers.previous_experts_to_copy,
+                consumed_epoch,
+                self._replica_previous_epoch,
+                rank=self.rank,
+                world_size=self.world_size,
+                experts_per_rank=self.experts_per_rank,
             )
-            done_event.record(prefetch_stream)
-        return done_event
+            launch_replica_source_pack_async(
+                gate_up_weight,
+                down_weight,
+                buffers,
+                source_ready,
+                epoch,
+                rank=self.rank,
+                num_vector_programs=self.num_aivector_programs,
+            )
+            buffers.previous_experts_to_copy.copy_(experts_to_copy_device)
+        self._replica_previous_epoch = epoch
 
     def _ensure_combine_buffers(self):
         """Allocate reusable local workspaces for FC2 and route restoration."""
@@ -422,7 +448,6 @@ class FusedMoEForward(torch.nn.Module):
         self,
         group_experts: int,
         active_experts_per_rank: int,
-        active_group_ids: tuple[int, ...] | None = None,
     ):
         """Create reusable streams/events for the coarse FC2 pipeline."""
         device = self.context.peer_mem.device
@@ -433,14 +458,25 @@ class FusedMoEForward(torch.nn.Module):
             self._combine_pipeline_start_event = torch.npu.Event()
             self._combine_pipeline_done_event = torch.npu.Event()
         num_groups = (
-            len(active_group_ids)
-            if active_group_ids is not None
-            else (active_experts_per_rank + group_experts - 1) // group_experts
-        )
+            active_experts_per_rank + group_experts - 1
+        ) // group_experts
         while len(self._combine_pipeline_group_events) < num_groups:
             self._combine_pipeline_group_events.append(torch.npu.Event())
         while len(self._combine_pipeline_activation_events) < num_groups:
             self._combine_pipeline_activation_events.append(torch.npu.Event())
+        num_replica_ready_groups = (
+            max(0, active_experts_per_rank - self.experts_per_rank)
+            + _FC2_REPLICA_READY_GROUP_EXPERTS
+            - 1
+        ) // _FC2_REPLICA_READY_GROUP_EXPERTS
+        num_replica_ready_events = 2 * num_replica_ready_groups
+        while (
+            len(self._combine_pipeline_replica_ready_events)
+            < num_replica_ready_events
+        ):
+            self._combine_pipeline_replica_ready_events.append(
+                torch.npu.Event()
+            )
 
     def _validate_topk_indices(self, selected_experts: torch.Tensor):
         if selected_experts.ndim != 2:
@@ -550,12 +586,6 @@ class FusedMoEForward(torch.nn.Module):
             self.context,
             selected_experts,
             moonep_plan_hook=moonep_plan_hook,
-            moonep_fused_balanced_count=(
-                self.config.moonep_fused_balanced_count
-            ),
-            moonep_fused_route_mapping=(
-                self.config.moonep_fused_route_mapping
-            ),
         )
         plan.owner_token = self._routing_owner_token
         plan.generation = generation
@@ -565,7 +595,7 @@ class FusedMoEForward(torch.nn.Module):
     def _prepare_combine_metadata(
         self,
         dispatch_result: DispatchFC1Result,
-    ) -> dict:
+    ) -> torch.Tensor:
         """Build device-put FC2 descriptors and the route inverse."""
         self._ensure_combine_buffers()
         plan = dispatch_result.routing_plan
@@ -584,8 +614,6 @@ class FusedMoEForward(torch.nn.Module):
         route_to_send = self._route_to_send[:num_routes]
         build_route_to_send(send_route_indices, route_to_send)
 
-        pipeline_group_experts = self._fc2_pipeline_group_experts
-
         prepare_fc2_device_put_metadata(
             self.context.metadata_counts_mem,
             plan.received_expert_offsets,
@@ -598,10 +626,7 @@ class FusedMoEForward(torch.nn.Module):
             experts_per_rank=self.physical_experts_per_rank,
             num_bins_pad=self.context.metadata_num_bins,
         )
-        return {
-            "route_to_send": route_to_send,
-            "pipeline_group_experts": pipeline_group_experts,
-        }
+        return route_to_send
 
     # ===================== dispatch + FC1 ===========================
     def dispatch_fc1(
@@ -616,9 +641,6 @@ class FusedMoEForward(torch.nn.Module):
         replica_fc1_weight: Optional[torch.Tensor] = None,
         replica_weight_ready: Optional[torch.Tensor] = None,
         replica_weight_epoch: int = 0,
-        down_weight_to_prefetch: Optional[torch.Tensor] = None,
-        replica_down_weight_to_prefetch: Optional[torch.Tensor] = None,
-        replica_down_ready: Optional[torch.Tensor] = None,
         final_barrier: bool = True,
     ) -> DispatchFC1Result:
         """Dispatch routes and execute local-expert FC1 in one overlap kernel.
@@ -716,26 +738,51 @@ class FusedMoEForward(torch.nn.Module):
         weight_for_gemm = fc1_weight.transpose(-1, -2)
         if replica_fc1_weight is None:
             replica_weight_for_gemm = weight_for_gemm
+            replica_weight_strides = (
+                weight_for_gemm.stride(0),
+                0,
+                weight_for_gemm.stride(2),
+                weight_for_gemm.stride(1),
+            )
         else:
-            if replica_fc1_weight.shape != fc1_weight.shape:
-                raise ValueError("replica_fc1_weight must match fc1_weight shape")
+            required_replica_capacity = (
+                active_experts_per_rank - self.experts_per_rank
+            )
+            expected_tail = (
+                2,
+                self.hidden_size,
+                fc1_weight.shape[2] // 2,
+            )
             if (
-                replica_fc1_weight.dtype != fc1_weight.dtype
+                replica_fc1_weight.ndim != 4
+                or tuple(replica_fc1_weight.shape[1:]) != expected_tail
+                or replica_fc1_weight.shape[0] < required_replica_capacity
+                or replica_fc1_weight.dtype != fc1_weight.dtype
                 or replica_fc1_weight.device != fc1_weight.device
                 or not replica_fc1_weight.is_contiguous()
             ):
                 raise ValueError(
-                    "replica_fc1_weight must be a contiguous tensor matching "
-                    "fc1_weight dtype and device"
+                    "replica_fc1_weight must be contiguous packed "
+                    "[capacity, 2, hidden, ffn] on the FC1 device"
                 )
-            replica_weight_for_gemm = replica_fc1_weight.transpose(-1, -2)
+            replica_weight_for_gemm = replica_fc1_weight
+            replica_weight_strides = (
+                replica_fc1_weight.stride(0),
+                replica_fc1_weight.stride(1),
+                replica_fc1_weight.stride(2),
+                replica_fc1_weight.stride(3),
+            )
 
         _, output_size, reduction_size = weight_for_gemm.shape
         block_n = self.config.fc1_gemm_block_size_n
         block_k = self.config.fc1_gemm_block_size_k
         dispatch_block_m = self.config.dispatch_fc1_block_size_m
         gemm_block_m = self.config.fc1_gemm_block_size_m
-        if output_size % block_n or reduction_size % block_k:
+        if (
+            output_size % block_n
+            or (self.enable_moonep and (output_size // 2) % block_n)
+            or reduction_size % block_k
+        ):
             raise ValueError(
                 "FC1 block_n and block_k must divide the output and reduction dimensions"
             )
@@ -768,31 +815,35 @@ class FusedMoEForward(torch.nn.Module):
             :num_received_routes * hidden_size
         ].view(num_received_routes, hidden_size)
         signal_epoch = self._tile_signal_epoch
-        down_push_args = (
-            down_weight_to_prefetch,
-            replica_down_weight_to_prefetch,
-            replica_down_ready,
-        )
-        prefetch_replica_down = any(arg is not None for arg in down_push_args)
-        if prefetch_replica_down and not all(arg is not None for arg in down_push_args):
-            raise ValueError(
-                "down_weight_to_prefetch, replica_down_weight_to_prefetch, "
-                "and replica_down_ready must be provided together"
-            )
-        down_weight_elements = 1
+        # Home-only specializations compile the panel-push branch out and never
+        # dereference these placeholders.
+        push_replica_weights = False
+        replica_down_weight_for_push = fc1_weight
+        replica_down_ready_for_push = self.context.signal_mem
+        source_gate_up_for_push = fc1_weight
+        source_down_for_push = fc1_weight
+        source_ready_for_push = self.context.signal_mem
+        consumed_epoch_for_push = self.context.signal_mem
+        experts_to_copy_for_push = send_route_indices
+        source_slot_for_push = send_route_indices
+        replica_slot_count = 0
+        gate_panel_elements = 1
+        gate_chunk_elements = 1
+        gate_num_chunks = 1
+        down_panel_elements = 1
         down_chunk_elements = 1
         down_num_chunks = 1
-        gate_up_weight_elements = 1
-        gate_up_chunk_elements = 1
-        gate_up_num_chunks = 1
-        down_weight_for_push = fc1_weight
-        replica_down_weight_for_push = fc1_weight
-        experts_to_copy_for_push = send_route_indices
-        down_ready_for_push = self.context.signal_mem
-        down_descriptor_ids_for_push = self.context.signal_mem
-        down_descriptor_count = 0
         if self.enable_moonep:
-            if self._replica_weight_buffers is None or not self._replica_step_prepared:
+            has_active_replicas = (
+                active_experts_per_rank > self.experts_per_rank
+            )
+            if (
+                not self._replica_step_prepared
+                or (
+                    has_active_replicas
+                    and self._replica_weight_buffers is None
+                )
+            ):
                 raise RuntimeError(
                     "MoonEP dispatch requires replica preparation by full forward"
                 )
@@ -822,47 +873,20 @@ class FusedMoEForward(torch.nn.Module):
                 replica_weight_ready.dtype != torch.int32
                 or replica_weight_ready.device != device
                 or not replica_weight_ready.is_contiguous()
-                or replica_weight_ready.numel() < self.replica_budget * 16
+                or replica_weight_ready.numel() < 2 * self.replica_budget * 16
             ):
                 raise ValueError(
-                    "replica_weight_ready must provide 16 contiguous int32 "
-                    "values per replica slot on the input device"
+                    "replica_weight_ready must provide two 16-int32 panel "
+                    "signals per replica slot on the input device"
                 )
-            if prefetch_replica_down:
-                expected_prefix = (self.experts_per_rank, hidden_size)
-                for name, weight in (
-                    ("down_weight_to_prefetch", down_weight_to_prefetch),
-                    (
-                        "replica_down_weight_to_prefetch",
-                        replica_down_weight_to_prefetch,
-                    ),
-                ):
-                    if (
-                        weight.ndim != 3
-                        or tuple(weight.shape[:2]) != expected_prefix
-                        or weight.dtype != self.activation_dtype
-                        or weight.device != device
-                        or not weight.is_contiguous()
-                    ):
-                        raise ValueError(
-                            f"{name} must be contiguous BF16 [experts, hidden, ffn] "
-                            "on the input device"
-                        )
-                if replica_down_weight_to_prefetch.shape != down_weight_to_prefetch.shape:
-                    raise ValueError(
-                        "replica_down_weight_to_prefetch must match "
-                        "down_weight_to_prefetch shape"
+            if has_active_replicas:
+                if not self._replica_prefetch_pending:
+                    raise RuntimeError(
+                        "MoonEP replica panel PUTs were not prepared for this dispatch"
                     )
-                if (
-                    replica_down_ready.dtype != torch.int32
-                    or replica_down_ready.device != device
-                    or not replica_down_ready.is_contiguous()
-                    or replica_down_ready.numel() < self.replica_budget * 16
-                ):
-                    raise ValueError(
-                        "replica_down_ready must provide 16 contiguous int32 "
-                        "values per replica slot on the input device"
-                    )
+                buffers = self._replica_weight_buffers
+                if buffers is None:
+                    raise RuntimeError("MoonEP replica buffers are not allocated")
                 experts_to_copy_for_push = routing_plan.experts_to_copy
                 if (
                     experts_to_copy_for_push is None
@@ -873,28 +897,45 @@ class FusedMoEForward(torch.nn.Module):
                     or not experts_to_copy_for_push.is_contiguous()
                 ):
                     raise ValueError(
-                        "MoonEP down prefetch requires its contiguous device ETC table"
+                        "MoonEP fused push requires its contiguous device ETC table"
                     )
-                down_weight_for_push = down_weight_to_prefetch
-                replica_down_weight_for_push = replica_down_weight_to_prefetch
-                down_ready_for_push = replica_down_ready
-                down_descriptor_ids_for_push = (
-                    self.context.replica_down_descriptors
-                )
-                down_descriptor_count = self._replica_down_descriptor_count
-                if down_descriptor_ids_for_push is None:
+                replica_down_ready_for_push = self.context.replica_down_ready
+                source_ready_for_push = self.context.replica_source_ready
+                consumed_epoch_for_push = self.context.replica_consumed_epoch
+                if any(
+                    value is None
+                    for value in (
+                        replica_down_ready_for_push,
+                        source_ready_for_push,
+                        consumed_epoch_for_push,
+                    )
+                ):
                     raise RuntimeError(
-                        "MoonEP down-prefetch descriptors are not allocated"
+                        "MoonEP fused push lifecycle tables are not allocated"
                     )
-                down_weight_elements = (
-                    down_weight_to_prefetch.numel() // self.experts_per_rank
-                )
-                gate_up_weight_elements = (
-                    fc1_weight.numel() // self.experts_per_rank
-                )
-                gate_up_chunk_elements, gate_up_num_chunks = (
+                if (
+                    replica_down_ready_for_push.dtype != torch.int32
+                    or replica_down_ready_for_push.device != device
+                    or not replica_down_ready_for_push.is_contiguous()
+                    or replica_down_ready_for_push.numel()
+                    < 2 * self.replica_budget * 16
+                ):
+                    raise ValueError(
+                        "replica_down_ready must provide two 16-int32 panel "
+                        "signals per replica slot on the input device"
+                    )
+                source_gate_up_for_push = buffers.source_gate_up
+                source_down_for_push = buffers.source_down
+                replica_down_weight_for_push = buffers.down
+                source_slot_for_push = buffers.source_slot_by_global_expert
+                replica_slot_count = buffers.replica_capacity
+                gate_panel_elements = buffers.hidden_size * buffers.ffn_size
+                down_panel_elements = (
+                    buffers.hidden_size // 2
+                ) * buffers.ffn_size
+                gate_chunk_elements, gate_num_chunks = (
                     replica_weight_push_geometry(
-                        gate_up_weight_elements,
+                        gate_panel_elements,
                         chunk_bytes=(
                             self.config.moonep_replica_gate_up_chunk_bytes
                         ),
@@ -902,19 +943,28 @@ class FusedMoEForward(torch.nn.Module):
                 )
                 down_chunk_elements, down_num_chunks = (
                     replica_weight_push_geometry(
-                        down_weight_elements,
+                        down_panel_elements,
                         chunk_bytes=(
                             self.config.moonep_replica_down_chunk_bytes
                         ),
                     )
                 )
+                push_replica_weights = True
         else:
-            if prefetch_replica_down:
-                raise ValueError("replica down prefetch requires MoonEP")
             # The home-only specialization never dereferences this pointer.
             replica_weight_ready = self.context.signal_mem
             replica_weight_epoch = 0
-        _kernel_dispatch_fc1[self.num_aicore_programs, 1, 1](
+        compiler_options = {}
+        if push_replica_weights:
+            compiler_options["bisheng_options"] = (
+                udma_pipe_s_bisheng_options()
+            )
+        if gemm_block_m * block_n > 128 * 256:
+            compiler_options["limit_auto_multi_buffer_of_local_buffer"] = (
+                "no-l0c"
+            )
+        dispatch_program_cores = self.num_aicore_programs
+        _kernel_dispatch_fc1[dispatch_program_cores, 1, 1](
             hidden_states,
             self.context.peer_mem,
             routing_weights,
@@ -923,12 +973,15 @@ class FusedMoEForward(torch.nn.Module):
             weight_for_gemm,
             replica_weight_for_gemm,
             replica_weight_ready,
-            down_weight_for_push,
             replica_down_weight_for_push,
+            replica_down_ready_for_push,
+            source_gate_up_for_push,
+            source_down_for_push,
+            source_ready_for_push,
+            consumed_epoch_for_push,
             experts_to_copy_for_push,
-            down_ready_for_push,
-            down_descriptor_ids_for_push,
-            down_descriptor_count,
+            source_slot_for_push,
+            replica_slot_count,
             output,
             routing_plan.send_token_indices,
             send_route_indices,
@@ -940,6 +993,7 @@ class FusedMoEForward(torch.nn.Module):
             routing_plan.receive_counts_by_source_expert,
             signal_epoch,
             replica_weight_epoch,
+            self._active_replica_previous_epoch,
             hidden_size,
             output_size,
             reduction_size,
@@ -948,39 +1002,33 @@ class FusedMoEForward(torch.nn.Module):
             weight_for_gemm.stride(0),
             weight_for_gemm.stride(1),
             weight_for_gemm.stride(2),
+            replica_weight_strides[0],
+            replica_weight_strides[1],
+            replica_weight_strides[2],
+            replica_weight_strides[3],
             output.stride(0),
             output.stride(1),
-            NUM_PROGRAM_CORES=self.num_aicore_programs,
+            NUM_PROGRAM_CORES=dispatch_program_cores,
             LOCAL_RANK=self.rank,
             WORLD_SIZE=self.world_size,
             HOME_EXPERTS_PER_RANK=self.experts_per_rank,
             USE_REPLICA_WEIGHTS=self.enable_moonep,
-            PREFETCH_REPLICA_DOWN=prefetch_replica_down,
+            PUSH_REPLICA_WEIGHTS=push_replica_weights,
             EXPERTS_PER_RANK=self.physical_experts_per_rank,
             ACTIVE_EXPERTS_PER_RANK=active_experts_per_rank,
-            GATE_UP_WEIGHT_ELEMENTS_PER_EXPERT=gate_up_weight_elements,
-            GATE_UP_CHUNK_ELEMENTS=gate_up_chunk_elements,
-            GATE_UP_NUM_WEIGHT_CHUNKS=gate_up_num_chunks,
-            DOWN_WEIGHT_ELEMENTS_PER_EXPERT=down_weight_elements,
+            GATE_PANEL_ELEMENTS=gate_panel_elements,
+            GATE_CHUNK_ELEMENTS=gate_chunk_elements,
+            GATE_NUM_CHUNKS=gate_num_chunks,
+            DOWN_PANEL_ELEMENTS=down_panel_elements,
             DOWN_CHUNK_ELEMENTS=down_chunk_elements,
-            DOWN_NUM_WEIGHT_CHUNKS=down_num_chunks,
-            DOWN_EARLY_PROGRAMS=(
-                self.config.moonep_replica_down_early_programs
-            ),
-            DOWN_EARLY_DESCRIPTORS_PER_PROGRAM=(
-                self.config.moonep_replica_down_early_descriptors_per_program
-            ),
+            DOWN_NUM_CHUNKS=down_num_chunks,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             FINAL_BARRIER=final_barrier,
             DISPATCH_BLOCK_SIZE_M=dispatch_block_m,
             GEMM_BLOCK_SIZE_M=gemm_block_m,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
-            **(
-                {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
-                if gemm_block_m * block_n > 128 * 256
-                else {}
-            ),
+            **compiler_options,
         )
         self._tile_signal_epoch += 1
 
@@ -1004,7 +1052,7 @@ class FusedMoEForward(torch.nn.Module):
         down_weight: torch.Tensor,
         dispatch_result: DispatchFC1Result,
         replica_down_weight: Optional[torch.Tensor] = None,
-        prefetch_done_event=None,
+        replica_prefetch_active: bool = False,
     ) -> torch.Tensor:
         """Produce grouped activation while FC2 consumes earlier groups."""
         packed_dim = dispatch_result.fc1_output.shape[1]
@@ -1019,6 +1067,17 @@ class FusedMoEForward(torch.nn.Module):
         plan = dispatch_result.routing_plan
         if replica_down_weight is None:
             replica_down_weight = down_weight
+        if self.enable_moonep:
+            replica_down_ready = self.context.replica_down_ready
+            if replica_down_ready is None:
+                raise RuntimeError(
+                    "MoonEP replica down-weight readiness table is not allocated"
+                )
+            replica_weight_epoch = self._active_replica_weight_epoch
+        else:
+            # The home-only specialization never dereferences this pointer.
+            replica_down_ready = self.context.signal_mem
+            replica_weight_epoch = 0
         if weighted_activation.device != self.context.peer_mem.device:
             raise ValueError(
                 "weighted_activation must be on the operator's NPU device"
@@ -1048,14 +1107,21 @@ class FusedMoEForward(torch.nn.Module):
                 "[experts_per_rank, hidden_size, ffn_size]"
             )
         if (
-            replica_down_weight.shape != expected_weight_shape
+            replica_down_weight.ndim != 3
+            or tuple(replica_down_weight.shape[1:])
+            != (self.hidden_size, ffn_size)
+            or replica_down_weight.shape[0]
+            < (
+                plan.active_physical_experts_per_rank
+                - self.experts_per_rank
+            )
             or replica_down_weight.dtype != down_weight.dtype
             or replica_down_weight.device != down_weight.device
             or not replica_down_weight.is_contiguous()
         ):
             raise ValueError(
-                "replica_down_weight must be a contiguous tensor matching "
-                "down_weight shape, dtype, and device"
+                "replica_down_weight must provide contiguous [capacity, hidden, "
+                "ffn] panels for every active replica slot"
             )
 
         output = torch.empty(
@@ -1070,25 +1136,29 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "FC2 block_n and block_k must divide the output and reduction dimensions"
             )
-        combine_metadata = self._prepare_combine_metadata(dispatch_result)
+        route_to_send = self._prepare_combine_metadata(dispatch_result)
         # FC2 stages destination-local rows in symmetric GM. Device-put workers
         # move each source segment into send order before top-k reduction.
         fc2_workspace = self._combine_fc2_buf[:plan.num_sent_routes]
-        pipeline_group_experts = combine_metadata["pipeline_group_experts"]
+        pipeline_group_experts = min(
+            _FC2_PIPELINE_GROUP_EXPERTS,
+            self.physical_experts_per_rank,
+        )
         reduce_block_n = _fc2_reduce_block_n(num_received_routes)
         active_experts_per_rank = plan.active_physical_experts_per_rank
         self._ensure_group_pipeline_runtime(
             pipeline_group_experts,
             active_experts_per_rank,
-            None,
         )
         _launch_fc2_combine(
             weighted_activation,
             down_weight,
             replica_down_weight,
+            replica_down_ready,
+            replica_weight_epoch,
             fc2_workspace,
             self.context.peer_mem,
-            combine_metadata["route_to_send"],
+            route_to_send,
             output,
             plan.received_routes_per_expert,
             plan.received_expert_offsets,
@@ -1109,15 +1179,17 @@ class FusedMoEForward(torch.nn.Module):
             physical_experts_per_rank=self.physical_experts_per_rank,
             active_experts_per_rank=active_experts_per_rank,
             pipeline_group_experts=pipeline_group_experts,
-            pipeline_group_ids=None,
             pipeline_cube_stream=self._combine_pipeline_cube_stream,
             pipeline_vector_stream=self._combine_pipeline_vector_stream,
             pipeline_transfer_stream=self._combine_pipeline_transfer_stream,
             pipeline_group_events=self._combine_pipeline_group_events,
             pipeline_start_event=self._combine_pipeline_start_event,
             pipeline_done_event=self._combine_pipeline_done_event,
-            prefetch_done_event=prefetch_done_event,
+            replica_prefetch_active=replica_prefetch_active,
             pipeline_activation_events=self._combine_pipeline_activation_events,
+            pipeline_replica_ready_events=(
+                self._combine_pipeline_replica_ready_events
+            ),
             activation_fc1_output=dispatch_result.fc1_output,
             activation_routing_weights=dispatch_result.received_routing_weights,
             activation_id=0 if self.activation == "swiglu" else 1,
@@ -1130,10 +1202,30 @@ class FusedMoEForward(torch.nn.Module):
             activation_has_linear_beta=self.situ_linear_beta is not None,
         )
         if self._replica_prefetch_pending:
-            # This flag also records that both symmetric tables hold a valid
-            # published epoch for correctness/debug consumers.  Disabling the
-            # cache skips only the next-step collective hit lookup above.
-            self._replica_weight_cache_valid = True
+            buffers = self._replica_weight_buffers
+            consumed_epoch = self.context.replica_consumed_epoch
+            experts_to_copy = plan.experts_to_copy
+            if (
+                buffers is None
+                or consumed_epoch is None
+                or experts_to_copy is None
+            ):
+                raise RuntimeError(
+                    "MoonEP consumed-epoch publication is not initialized"
+                )
+            # The caller stream already waits on FC2's done event.  Active
+            # zero-token slots additionally wait for down panel 1 here, so the
+            # same consumed epoch safely releases both the owner's staging and
+            # the consumer's symmetric destination across plan changes.
+            publish_replica_consumed_async(
+                experts_to_copy,
+                replica_down_ready,
+                consumed_epoch,
+                replica_weight_epoch,
+                buffers.replica_capacity,
+                rank=self.rank,
+                experts_per_rank=self.experts_per_rank,
+            )
             self._replica_prefetch_pending = False
         return output
 
@@ -1191,6 +1283,7 @@ class FusedMoEForward(torch.nn.Module):
         ffn_size = gate_up_weight.shape[2] // 2
         if (
             gate_up_weight.shape[2] % self.config.fc1_gemm_block_size_n
+            or ffn_size % self.config.fc1_gemm_block_size_n
             or self.hidden_size % self.config.fc1_gemm_block_size_k
             or self.hidden_size % self.config.fc2_gemm_block_size_n
             or ffn_size % self.config.fc2_gemm_block_size_k
@@ -1198,10 +1291,8 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "configured FC1/FC2 N and K tiles must divide the weight dimensions"
             )
-        # Symmetric replica allocations must be complete before any rank enters
-        # the routing count exchange.  The planner then starts owner-push RMA
-        # as soon as its ETC device copy is queued.
-        self._ensure_replica_weight_buffers(gate_up_weight, down_weight)
+        # Routing determines the exact compact owner/destination capacities;
+        # the plan hook grows symmetric source staging only when required.
         self._ensure_combine_buffers()
         if self.enable_moonep:
             def moonep_plan_hook(experts_to_copy_cpu, experts_to_copy_device):
@@ -1218,11 +1309,16 @@ class FusedMoEForward(torch.nn.Module):
             moonep_plan_hook=moonep_plan_hook,
         )
         if self.enable_moonep:
-            replica_gate_up_weight, replica_down_weight = (
-                self._finish_replica_prefetch()
-            )
+            if self._replica_weight_buffers is None:
+                replica_gate_up_weight, replica_down_weight = (
+                    None,
+                    down_weight,
+                )
+            else:
+                replica_gate_up_weight = self._replica_weight_buffers.gate_up
+                replica_down_weight = self._replica_weight_buffers.down
         else:
-            replica_gate_up_weight, replica_down_weight = gate_up_weight, down_weight
+            replica_gate_up_weight, replica_down_weight = None, down_weight
         dispatch_result = self.dispatch_fc1(
             hidden_states,
             selected_experts,
@@ -1236,33 +1332,16 @@ class FusedMoEForward(torch.nn.Module):
                 else None
             ),
             replica_weight_epoch=self._active_replica_weight_epoch,
-            down_weight_to_prefetch=(
-                down_weight
-                if self._replica_prefetch_pending
-                else None
-            ),
-            replica_down_weight_to_prefetch=(
-                replica_down_weight
-                if self._replica_prefetch_pending
-                else None
-            ),
-            replica_down_ready=(
-                self.context.replica_down_ready
-                if self._replica_prefetch_pending
-                else None
-            ),
             final_barrier=False,
         )
-        prefetch_done_event = self._fence_replica_prefetch_after_dispatch(
-            hidden_states.device
-        )
+        replica_prefetch_active = self._replica_prefetch_pending
         # Produce expert-major activation groups on FC2's otherwise-idle
         # Vector stream while the Cube stream consumes earlier groups.
         result = self._fc2_combine_shadow_activation(
             down_weight,
             dispatch_result,
             replica_down_weight=replica_down_weight,
-            prefetch_done_event=prefetch_done_event,
+            replica_prefetch_active=replica_prefetch_active,
         )
         return result
 

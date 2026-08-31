@@ -100,7 +100,13 @@ def init_aclshmem(
     attr.n_ranks = world_size
     attr.local_mem_size = size_bytes
     attr.ip_port = ip_port if ip_port is not None else get_ash_ip_port()
-    attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    # MTE handles latency-sensitive dispatch/signals while the large MoonEP
+    # replica-weight puts explicitly use the low-level PIPE_S UDMA path.
+    # SHMEM 1.6 accepts the combined engine mask even though pybind's enum does
+    # not expose a named MTE_UDMA member.
+    attr.option_attr.data_op_engine_type = ash.OpEngineType(
+        ash.OpEngineType.MTE.value | ash.OpEngineType.UDMA.value
+    )
     if ash.aclshmem_init(attr) != 0:
         raise RuntimeError("aclshmem_init failed")
 

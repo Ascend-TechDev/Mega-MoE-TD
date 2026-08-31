@@ -31,7 +31,8 @@ class MoEForwardContext:
     signal_mem: Optional[torch.Tensor] = None
     replica_gate_ready: Optional[torch.Tensor] = None
     replica_down_ready: Optional[torch.Tensor] = None
-    replica_down_descriptors: Optional[torch.Tensor] = None
+    replica_source_ready: Optional[torch.Tensor] = None
+    replica_consumed_epoch: Optional[torch.Tensor] = None
     row_token_indices: Optional[torch.Tensor] = None
     row_route_indices: Optional[torch.Tensor] = None
     planning_counts_mem: Optional[torch.Tensor] = None
@@ -71,7 +72,8 @@ class MoEForwardContext:
             self.signal_mem = None
         self.replica_gate_ready = None
         self.replica_down_ready = None
-        self.replica_down_descriptors = None
+        self.replica_source_ready = None
+        self.replica_consumed_epoch = None
         if self.planning_counts_mem is not None:
             ash.aclshmem_free_tensor(self.planning_counts_mem)
             self.planning_counts_mem = None
@@ -163,11 +165,23 @@ def create_moe_forward_context(
     # Dispatch readiness and replica-weight readiness share one eagerly
     # initialized symmetric allocation.  A slot occupies 16 int32 values to
     # match the ACLSHMEM signal ABI used by the existing dispatch pipeline.
-    dispatch_signal_slots = (
+    # Replica weights use two output-N panels.  ``source_ready`` is published
+    # locally by the owner after packing gate/up[0:2] and down[0:2].  The
+    # consumer-owned ``consumed_epoch`` proves both that the final panel arrived
+    # and that FC2 has finished using the destination slot, so either the old
+    # staging owner or a new owner can safely reuse it without a global fence.
+    dispatch_tile_signal_slots = (
         world_size * physical_experts_per_rank * max_source_tiles
     )
-    replica_signal_slots = 2 * replica_budget
-    signal_slots = dispatch_signal_slots + replica_signal_slots
+    replica_panel_signal_slots = 4 * replica_budget
+    replica_source_signal_slots = 4 * replica_budget
+    replica_consumed_signal_slots = replica_budget
+    replica_signal_slots = (
+        replica_panel_signal_slots
+        + replica_source_signal_slots
+        + replica_consumed_signal_slots
+    )
+    signal_slots = dispatch_tile_signal_slots + replica_signal_slots
     context.signal_mem = ash.aclshmem_create_tensor(
         [signal_slots * 16],
         dtype=torch.int32,
@@ -175,13 +189,21 @@ def create_moe_forward_context(
     )
     context.signal_mem.zero_()
     if replica_budget:
-        gate_start = dispatch_signal_slots * 16
-        down_start = gate_start + replica_budget * 16
+        gate_start = dispatch_tile_signal_slots * 16
+        down_start = gate_start + 2 * replica_budget * 16
+        source_start = down_start + 2 * replica_budget * 16
+        consumed_start = source_start + 4 * replica_budget * 16
         context.replica_gate_ready = context.signal_mem[
             gate_start:down_start
         ]
         context.replica_down_ready = context.signal_mem[
-            down_start:down_start + replica_budget * 16
+            down_start:source_start
+        ]
+        context.replica_source_ready = context.signal_mem[
+            source_start:consumed_start
+        ]
+        context.replica_consumed_epoch = context.signal_mem[
+            consumed_start:consumed_start + replica_budget * 16
         ]
 
     num_dispatch_buckets = world_size * physical_experts_per_rank
@@ -233,13 +255,6 @@ def create_moe_forward_context(
             world_size, dtype=torch.int32, device=device
         )
         context.metadata_local_expert_starts = torch.empty(
-            num_experts, dtype=torch.int32, device=device
-        )
-        # Compact owner-local down-copy descriptors are ordinary
-        # (non-symmetric) workspace.  A single owner can supply replicas to
-        # every peer, so reserve the complete ETC-table cardinality rather than
-        # only one rank's replica budget.
-        context.replica_down_descriptors = torch.empty(
             num_experts, dtype=torch.int32, device=device
         )
     context.metadata_send_bucket_starts = torch.empty(

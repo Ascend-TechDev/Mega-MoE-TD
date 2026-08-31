@@ -13,6 +13,13 @@ dependencies = []
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+mega_moe = [
+    "kernels/csrc/*.cpp",
+    "kernels/csrc/shmem_compat/host_device/*.h",
+    "kernels/csrc/shmem_compat/device/.keep",
+]
+
 [tool.pytest.ini_options]
 markers = [
     "dist: requires a multi-rank Ascend HCCL/ACLSHMEM run",

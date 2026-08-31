@@ -63,9 +63,6 @@ The remaining environment variables are runtime knobs only:
     MOE_BACKWARD_BENCH_RESULTS_DIR=/tmp/... # optional backward result directory
     MOE_FUSED_ASH_SIZE_GB=6             # ACLSHMEM heap size, not shape selection
                                        # MoonEP Kimi cases require at least 16
-    MOE_MOONEP_FUSED_BALANCED_COUNT=0   # A/B: restore scatter_add count cube
-    MOE_MOONEP_FUSED_ROUTE_MAPPING=0    # A/B: restore Torch route mapping
-    MOE_MOONEP_ENABLE_REPLICA_CACHE=1   # A/B: include collective cache check
 """
 
 import hashlib
@@ -237,20 +234,6 @@ BENCH_ITERS = FORWARD_TIMING.iterations
 # slices exercise the same schedule, but are not part of every E2E run.
 RUN_BREAKDOWN = os.environ.get("MOE_FULL_BENCH_BREAKDOWN", "0") == "1"
 G_ASH_SIZE_GB = int(os.environ.get("MOE_FUSED_ASH_SIZE_GB", "6"))
-MOONEP_FUSED_BALANCED_COUNT = (
-    os.environ.get("MOE_MOONEP_FUSED_BALANCED_COUNT", "1") != "0"
-)
-MOONEP_FUSED_ROUTE_MAPPING = (
-    os.environ.get("MOE_MOONEP_FUSED_ROUTE_MAPPING", "1") != "0"
-)
-MOONEP_ENABLE_REPLICA_CACHE = (
-    os.environ.get("MOE_MOONEP_ENABLE_REPLICA_CACHE", "1") != "0"
-)
-if MOONEP_FUSED_ROUTE_MAPPING and not MOONEP_FUSED_BALANCED_COUNT:
-    raise ValueError(
-        "MOE_MOONEP_FUSED_ROUTE_MAPPING requires "
-        "MOE_MOONEP_FUSED_BALANCED_COUNT"
-    )
 RESULTS_DIR = os.environ.get(
     "MOE_FULL_BENCH_RESULTS_DIR",
     str(PROJECT_ROOT / "results" / "forward"),
@@ -747,10 +730,8 @@ def _make_forward_op(
     ep_group,
     *,
     enable_moonep,
-    moonep_replica_gate_up_chunk_bytes=16 * 1024 * 1024,
-    moonep_replica_down_chunk_bytes=4 * 1024 * 1024,
-    moonep_replica_down_early_programs=8,
-    moonep_replica_down_early_descriptors_per_program=2,
+    moonep_replica_gate_up_chunk_bytes=64 * 1024 * 1024,
+    moonep_replica_down_chunk_bytes=64 * 1024 * 1024,
 ):
     config = MoEForwardConfig(
         receive_capacity_factor=case.capacity_factor,
@@ -761,15 +742,6 @@ def _make_forward_op(
         moonep_replica_down_chunk_bytes=(
             moonep_replica_down_chunk_bytes
         ),
-        moonep_replica_down_early_programs=(
-            moonep_replica_down_early_programs
-        ),
-        moonep_replica_down_early_descriptors_per_program=(
-            moonep_replica_down_early_descriptors_per_program
-        ),
-        moonep_fused_balanced_count=MOONEP_FUSED_BALANCED_COUNT,
-        moonep_fused_route_mapping=MOONEP_FUSED_ROUTE_MAPPING,
-        moonep_enable_replica_cache=MOONEP_ENABLE_REPLICA_CACHE,
     )
     return FusedMoEForward(
         ep_group,
@@ -790,16 +762,8 @@ def _measure_moonep_forward_e2e(
     routing_weights,
     packed_w1,
     down_weight,
-    *,
-    force_replica_refill: bool = False,
 ):
     def run_forward():
-        if force_replica_refill:
-            # A production layer is invoked once, so each statistical sample
-            # must start from the same non-resident replica-weight state.  Keep
-            # compiled kernels and allocated buffers, but never reuse weights
-            # from a preceding benchmark sample.
-            op._replica_weight_cache_valid = False
         return ascend_full_post_routing(
             op,
             hidden_states,
@@ -825,167 +789,6 @@ def _measure_moonep_forward_e2e(
     return kit.TimingResult(
         _sample_rank_max(local_samples, device, ep_group)
     )
-
-
-def _assert_replica_prefetch_state(
-    op,
-    expected_experts,
-    expected_epoch,
-    device,
-    ep_group,
-    label,
-):
-    """Collectively prove that a forward consumed a concrete replica cache."""
-    ok = True
-    message = ""
-    try:
-        if not op._replica_weight_cache_valid:
-            raise AssertionError("replica cache is not valid")
-        if op._replica_prefetch_pending:
-            raise AssertionError("replica prefetch remains pending")
-        if op._replica_weight_epoch != expected_epoch:
-            raise AssertionError(
-                f"epoch={op._replica_weight_epoch}, expected={expected_epoch}"
-            )
-        if op._active_replica_weight_epoch != expected_epoch - 1:
-            raise AssertionError(
-                "active replica epoch does not match the published ready slots"
-            )
-        cached = op._replica_experts_cache
-        if cached is None or not torch.equal(cached, expected_experts):
-            raise AssertionError("cached experts_to_copy differs from the plan")
-        active_epoch = expected_epoch - 1
-        local_row = expected_experts[op.rank]
-        occupied_slots = torch.where(local_row >= 0)[0].tolist()
-        gate_epochs = op.context.replica_gate_ready.view(-1, 16)[:, 0].cpu()
-        down_epochs = op.context.replica_down_ready.view(-1, 16)[:, 0].cpu()
-        for slot in occupied_slots:
-            if (
-                int(gate_epochs[slot].item()) != active_epoch
-                or int(down_epochs[slot].item()) != active_epoch
-            ):
-                raise AssertionError(
-                    f"replica slot {slot} did not publish epoch {active_epoch}"
-                )
-    except AssertionError as exc:
-        ok = False
-        message = str(exc)
-    flag = torch.tensor([int(ok)], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
-    if not bool(flag.item()):
-        raise AssertionError(f"{label} replica prefetch state failed: {message}")
-
-
-def _assert_collective_difference(
-    actual, expected, device, name, ep_group
-):
-    """Require one poisoned destination to affect a global output."""
-    finite = (
-        torch.isfinite(actual).all() & torch.isfinite(expected).all()
-    ).to(torch.int32).reshape(1)
-    dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=ep_group)
-    if not bool(finite.item()):
-        raise AssertionError(f"{name} produced a non-finite output")
-    max_difference = (actual.float() - expected.float()).abs().max()
-    dist.all_reduce(max_difference, op=dist.ReduceOp.MAX, group=ep_group)
-    if float(max_difference.item()) <= 1e-3:
-        raise AssertionError(
-            f"{name} did not change the global output"
-        )
-
-
-def _prove_replica_weight_consumption(
-    op,
-    expected_experts,
-    hidden_states,
-    selected_experts,
-    routing_weights,
-    packed_w1,
-    down_weight,
-    clean_output,
-    device,
-    ep_group,
-    *,
-    weight_name,
-    destination_rank,
-):
-    """Poison one cached table, prove execution reads it, then refill it."""
-    buffers = op._replica_weight_buffers
-    if buffers is None:
-        raise AssertionError("replica buffers were not allocated")
-    if weight_name == "gate_up":
-        replica_weight = buffers.gate_up
-    elif weight_name == "down":
-        replica_weight = buffers.down
-    else:
-        raise ValueError("weight_name must be gate_up or down")
-
-    occupied_slots = (
-        torch.where(expected_experts[destination_rank] >= 0)[0].tolist()
-        if op.rank == destination_rank
-        else []
-    )
-    for slot in occupied_slots:
-        replica_weight[slot].zero_()
-    torch.npu.synchronize(device)
-    dist.barrier(group=ep_group)
-
-    poisoned = ascend_full_post_routing(
-        op,
-        hidden_states,
-        selected_experts,
-        packed_w1,
-        down_weight,
-        routing_weights,
-    )
-    _assert_collective_difference(
-        poisoned,
-        clean_output,
-        device,
-        f"MoonEP replica {weight_name} execution proof on rank {destination_rank}",
-        ep_group,
-    )
-    torch.npu.synchronize(device)
-    del poisoned
-
-    refill_epoch = op._replica_weight_epoch
-    op._replica_weight_cache_valid = False
-    restored = ascend_full_post_routing(
-        op,
-        hidden_states,
-        selected_experts,
-        packed_w1,
-        down_weight,
-        routing_weights,
-    )
-    _assert_close_collective(
-        restored,
-        clean_output,
-        device,
-        f"MoonEP replica {weight_name} rank {destination_rank} refill",
-        ep_group,
-    )
-    torch.npu.synchronize(device)
-    del restored
-    _assert_replica_prefetch_state(
-        op,
-        expected_experts,
-        refill_epoch + 1,
-        device,
-        ep_group,
-        f"replica {weight_name} rank {destination_rank} refill",
-    )
-
-
-def _summary_experts_to_copy(summary, experts_per_rank):
-    rows = summary["copied_experts_by_rank"]
-    table = torch.full(
-        (len(rows), experts_per_rank), -1, dtype=torch.int32
-    )
-    for destination, experts in enumerate(rows):
-        for slot, expert in enumerate(experts):
-            table[destination, slot] = expert
-    return table
 
 
 def _finalize_forward_op(op, device, ep_group):
@@ -1594,13 +1397,18 @@ def _moonep_protocol():
             "implementation": {
                 "direct_bucket_scatter": True,
                 "clear_gain_target_enforced": False,
+                "dispatch_transport": "per-route MTE PUT plus software signal",
+                "routing_weight_transport": (
+                    "per-route MTE PUT covered by dispatch tile signal"
+                ),
+                "dispatch_precedes_replica_panels": False,
             },
             "forward": {
                 **MOONEP_FORWARD_TIMING.as_dict(),
                 "sample_scope": "one synchronized full forward call",
                 "includes": (
-                    "device planning, ETC D2H, weight-cache checks, collectives, "
-                    "NPU kernels, and final device synchronization"
+                    "device planning, ETC D2H, collectives, NPU kernels, and "
+                    "final device synchronization"
                 ),
             },
         }
@@ -1668,26 +1476,9 @@ def _make_moonep_entry(
                 "comparisons": [
                     "unbalanced Triton vs logical golden",
                     "MoonEP balanced Triton vs logical golden",
-                    "t4k: each planned replica destination poisoned changes output, then refill restores it",
-                    "t4k: gate/up and down tables are both consumed by FC1/FC2",
                     "MoonEP output after timing vs logical golden",
                     "unbalanced A1 and A2 outputs after timing vs logical golden",
                 ],
-                "replica_execution_proof": {
-                    "status": (
-                        "passed_for_every_planned_destination"
-                        if case.tokens == 4096
-                        else "not_repeated_in_this_case"
-                    ),
-                    "method": (
-                        "zero cached gate/up and down weights one destination "
-                        "at a time; require output change; refill and restore"
-                    ),
-                    "suite_coverage": (
-                        "the t4k case proves the shared FC1/FC2 replica path; "
-                        "t8k/t16k retain per-case logical golden and replica metadata gates"
-                    ),
-                },
                 "rtol": 5e-2,
                 "atol": 5e-2,
             },
@@ -1700,10 +1491,8 @@ def _make_moonep_entry(
                 "clock": "host_wall",
                 "sample_scope": "one synchronized full forward call",
                 "includes": (
-                    "device MoonEP planning, ETC D2H, optional weight-cache "
-                    "checks, "
-                    "HCCL/ACLSHMEM collectives, NPU kernels, and final device "
-                    "synchronization"
+                    "device MoonEP planning, ETC D2H, HCCL/ACLSHMEM "
+                    "collectives, NPU kernels, and final device synchronization"
                 ),
                 "clear_gain_target": MOONEP_CLEAR_GAIN_RATIO,
             },
@@ -1724,7 +1513,6 @@ def _make_moonep_entry(
                 "direct_bucket_scatter": True,
                 "fused_balanced_count": MOONEP_FUSED_BALANCED_COUNT,
                 "fused_route_mapping": MOONEP_FUSED_ROUTE_MAPPING,
-                "replica_cache_enabled": MOONEP_ENABLE_REPLICA_CACHE,
                 "replica_budget_B": case.num_experts // world_size,
                 "physical_experts_per_rank_P": 2 * case.num_experts // world_size,
                 "owner_routes_per_rank": owner_routes,
@@ -1987,7 +1775,6 @@ def run_moonep_forward_benchmark(
                     "primary Kimi workload did not produce the expected remote "
                     "route and replica assignment"
                 )
-            primary_epoch_before = balanced_op._replica_weight_epoch
             actual = ascend_full_post_routing(
                 balanced_op,
                 hidden_states,
@@ -2004,50 +1791,8 @@ def run_moonep_forward_benchmark(
                 ep_group,
             )
             torch.npu.synchronize(device)
-            primary_expected = _summary_experts_to_copy(
-                balanced_summary, experts_per_rank
-            )
-            _assert_replica_prefetch_state(
-                balanced_op,
-                primary_expected,
-                primary_epoch_before + 1,
-                device,
-                ep_group,
-                "primary balanced forward",
-            )
-            replica_destinations = [
-                destination
-                for destination, row in enumerate(primary_expected)
-                if bool((row >= 0).any())
-            ]
-            # The poison proof intentionally relies on the next forward using
-            # the already-populated replica table.  With cache bypass enabled,
-            # every forward refills that table and therefore repairs the poison
-            # before FC1/FC2 consume it; the independent golden above remains
-            # the correctness oracle for that one-shot mode.
-            if case.tokens == 4096 and MOONEP_ENABLE_REPLICA_CACHE:
-                _log_moonep_phase(
-                    rank, case, "proving replica FC2 and FC1 weight consumption"
-                )
-                for weight_name in ("down", "gate_up"):
-                    for destination_rank in replica_destinations:
-                        _prove_replica_weight_consumption(
-                            balanced_op,
-                            primary_expected,
-                            hidden_states,
-                            selected_experts,
-                            routing_weights,
-                            packed_w1,
-                            down_weight,
-                            actual,
-                            device,
-                            ep_group,
-                            weight_name=weight_name,
-                            destination_rank=destination_rank,
-                        )
             del actual
 
-            sample_epoch_before = balanced_op._replica_weight_epoch
             _log_moonep_phase(rank, case, "measuring MoonEP balanced pass B")
             balanced_result = _measure_moonep_forward_e2e(
                 device,
@@ -2058,7 +1803,6 @@ def run_moonep_forward_benchmark(
                 routing_weights,
                 packed_w1,
                 down_weight,
-                force_replica_refill=True,
             )
             after_timing_actual = ascend_full_post_routing(
                 balanced_op,
@@ -2077,17 +1821,6 @@ def run_moonep_forward_benchmark(
             )
             torch.npu.synchronize(device)
             del after_timing_actual
-            _assert_replica_prefetch_state(
-                balanced_op,
-                primary_expected,
-                sample_epoch_before
-                + MOONEP_FORWARD_TIMING.warmup
-                + MOONEP_FORWARD_TIMING.iterations
-                + (0 if MOONEP_ENABLE_REPLICA_CACHE else 1),
-                device,
-                ep_group,
-                "one-shot balanced samples",
-            )
         finally:
             _finalize_forward_op(balanced_op, device, ep_group)
 
@@ -2164,6 +1897,11 @@ def run_moonep_forward_benchmark(
     ) / statistics.median(measured["balanced_samples_ms"])
     del expected
     torch.npu.empty_cache()
+    # Complete the distributed benchmark before rank 0 performs local result
+    # I/O.  A stale/incompatible result file may deliberately make
+    # ``_upsert_result`` fail; placing that failure before a collective strands
+    # every other worker in the final barrier.
+    dist.barrier(group=ep_group)
     if rank == 0:
         _log_moonep_phase(rank, case, "writing correctness and performance result")
         entry = _make_moonep_entry(
@@ -2185,7 +1923,6 @@ def run_moonep_forward_benchmark(
             entry,
             entry["protocol"],
         )
-    dist.barrier(group=ep_group)
 
 def _backward_gate(saved, dy, peer_mem):
     from mega_moe import moe_backward_triton
@@ -2386,9 +2123,3 @@ def test_bench_backward_case(dist_test, spec: CaseSpec):
         world_size=spec.world_size,
         args=(spec,),
     )
-
-
-# TODO: future work — when an explicit all-directions session is introduced,
-# finish and fully clean forward before starting backward, while still keeping
-# operator, peer memory, and ACLSHMEM heaps distinct.  Each parameterized case
-# currently owns and finalizes its own session.

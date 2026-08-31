@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
+from .shmem_transport import mte_put
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
@@ -145,7 +146,7 @@ def _dispatch_grad_source_tiles(
     BLOCK_M: tl.constexpr,
     BLOCK_H_PUSH: tl.constexpr,
 ):
-    """Per-(dst,expert,tile) putmem + fence + signal_op SET. Adapted from forward
+    """Per-(dst,expert,tile) MTE put + fence + signal_op SET. Adapted from forward
     _dispatch_one_source_tile_task (dispatch_fc1.py:710-762): the staging buffer
     (gco) is already expert-major contiguous, so each BLOCK_M tile is one bulk
     putmem (no per-token gather). Expert-major work order so every dst receives
@@ -163,10 +164,13 @@ def _dispatch_grad_source_tiles(
         for source_tile in range(num_source_tiles):
             tile_start = source_tile * BLOCK_M
             tile_count = tl.minimum(BLOCK_M, task_count - tile_start)
-            libshmem_device.putmem(
+            mte_put(
                 peer_mem_ptr + (task_dst_start + tile_start) * H,
                 gco_ptr + (task_start + tile_start) * stride_gm,
-                tile_count * H * 2, dst_rank)
+                tile_count * H,
+                dst_rank,
+                BLOCK_ELEMENTS=8192,
+            )
             libshmem_device.fence()
             signal_slot = (
                 (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_BWD_TILES

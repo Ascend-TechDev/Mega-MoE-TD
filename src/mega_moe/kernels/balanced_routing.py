@@ -1,9 +1,14 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Small-grid device kernels for MoonEP balanced-routing metadata."""
+"""MoonEP balanced-routing metadata kernels and launcher."""
 
+import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
+
+
+_ROUTE_BLOCK_SIZE = 256
+_MAX_ROUTE_PROGRAMS = 64
 
 
 @triton.jit
@@ -337,59 +342,150 @@ def _kernel_map_balanced_routes(
             )
 
 
-@triton.jit
-def _kernel_scatter_balanced_routes(
-    scatter_positions_ptr,
-    valid_route_ids_ptr,
-    expert_order_ptr,
-    buckets_in_expert_order_ptr,
-    final_order_ptr,
-    balanced_buckets_ptr,
-    num_routes,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Scatter the two aligned route arrays with a deliberately small grid."""
-    pid = tl.program_id(axis=0)
-    num_programs = tl.num_programs(axis=0)
-    num_tiles = tl.cdiv(num_routes, BLOCK_SIZE)
+def launch_balanced_routing_metadata(
+    sorted_experts: torch.Tensor,
+    expert_order: torch.Tensor,
+    tpe_all: torch.Tensor,
+    alloc_cumsum: torch.Tensor,
+    inverse_experts_to_copy: torch.Tensor,
+    *,
+    rank: int,
+    top_k: int,
+    count_rows: torch.Tensor,
+    local_expert_starts: torch.Tensor,
+    send_token_indices: torch.Tensor,
+    send_route_indices: torch.Tensor,
+    send_bucket_starts: torch.Tensor,
+    send_bucket_receive_offsets: torch.Tensor,
+    receive_counts_by_source_slot: torch.Tensor,
+    received_routes_per_slot: torch.Tensor,
+    received_slot_offsets: torch.Tensor,
+) -> None:
+    """Queue the MoonEP count, metadata, and route-map kernels."""
+    if sorted_experts.device.type != "npu":
+        raise ValueError("balanced routing is only available on NPU")
+    world_size, num_experts = (int(value) for value in tpe_all.shape)
+    if num_experts % world_size:
+        raise ValueError("num_experts must be divisible by world_size")
+    experts_per_rank = num_experts // world_size
+    physical_slots = 2 * experts_per_rank
+    num_buckets = world_size * physical_slots
+    num_routes = int(sorted_experts.numel())
+    if not 0 <= rank < world_size or top_k <= 0:
+        raise ValueError("rank and top_k must describe the active EP input")
 
-    with al.scope(core_mode="vector", disable_auto_sync=True):
-        for tile_id in range(pid, num_tiles, num_programs):
-            route_offset = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-            mask = route_offset < num_routes
-            destination_offset = tl.load(
-                scatter_positions_ptr + route_offset,
-                mask=mask,
-                other=0,
-            )
-            expert_order_offset = tl.load(
-                expert_order_ptr + route_offset,
-                mask=mask,
-                other=0,
-            )
-            route_id = tl.load(
-                valid_route_ids_ptr + expert_order_offset,
-                mask=mask,
-                other=0,
-            )
-            bucket = tl.load(
-                buckets_in_expert_order_ptr + route_offset,
-                mask=mask,
-                other=0,
-            )
-            # Direct-scatter validation guarantees that destination offsets are
-            # unique, so the two stores need no atomics.
-            tl.store(final_order_ptr + destination_offset, route_id, mask=mask)
-            tl.store(
-                balanced_buckets_ptr + destination_offset,
-                bucket,
-                mask=mask,
-            )
+    expected = {
+        "expert_order": ((num_routes,), None),
+        "alloc_cumsum": ((num_experts, world_size), torch.int32),
+        "inverse_experts_to_copy": (
+            (world_size, num_experts),
+            torch.int32,
+        ),
+        "count_rows": ((world_size, count_rows.shape[1]), torch.int32),
+        "local_expert_starts": ((num_experts,), torch.int32),
+        "send_bucket_starts": ((num_buckets,), torch.int32),
+        "send_bucket_receive_offsets": ((num_buckets,), torch.int32),
+        "receive_counts_by_source_slot": (
+            (world_size, physical_slots),
+            torch.int32,
+        ),
+        "received_routes_per_slot": ((physical_slots,), torch.int32),
+        "received_slot_offsets": ((physical_slots + 1,), torch.int32),
+    }
+    tensors = {
+        "expert_order": expert_order,
+        "alloc_cumsum": alloc_cumsum,
+        "inverse_experts_to_copy": inverse_experts_to_copy,
+        "count_rows": count_rows,
+        "local_expert_starts": local_expert_starts,
+        "send_bucket_starts": send_bucket_starts,
+        "send_bucket_receive_offsets": send_bucket_receive_offsets,
+        "receive_counts_by_source_slot": receive_counts_by_source_slot,
+        "received_routes_per_slot": received_routes_per_slot,
+        "received_slot_offsets": received_slot_offsets,
+    }
+    device = sorted_experts.device
+    for name, tensor in tensors.items():
+        shape, dtype = expected[name]
+        if tuple(tensor.shape) != shape or (
+            dtype is not None and tensor.dtype != dtype
+        ):
+            raise ValueError(f"{name} has an incompatible shape or dtype")
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}")
+    if count_rows.shape[1] < num_buckets:
+        raise ValueError("count row stride is smaller than the bucket count")
+    for name, tensor in (
+        ("send_token_indices", send_token_indices),
+        ("send_route_indices", send_route_indices),
+    ):
+        if (
+            tensor.ndim != 1
+            or tensor.numel() < num_routes
+            or tensor.dtype != torch.int32
+            or tensor.device != device
+        ):
+            raise ValueError(f"{name} cannot hold every balanced route")
+
+    block_e = min(32, triton.next_power_of_2(num_experts))
+    while num_experts % block_e:
+        block_e //= 2
+    block_slots = triton.next_power_of_2(physical_slots)
+    _kernel_build_balanced_count_cube[(world_size, 1, 1)](
+        tpe_all,
+        alloc_cumsum,
+        inverse_experts_to_copy,
+        count_rows,
+        local_expert_starts,
+        R=world_size,
+        E=num_experts,
+        EPN=experts_per_rank,
+        LOCAL_RANK=rank,
+        TPE_ROW_STRIDE=tpe_all.stride(0),
+        COUNT_ROW_STRIDE=count_rows.stride(0),
+        BLOCK_E=block_e,
+        BLOCK_SLOTS=block_slots,
+        STORE_LOCAL_STARTS=True,
+    )
+    _kernel_finalize_balanced_metadata[(world_size, 1, 1)](
+        count_rows,
+        send_bucket_starts,
+        send_bucket_receive_offsets,
+        receive_counts_by_source_slot,
+        received_routes_per_slot,
+        received_slot_offsets,
+        R=world_size,
+        EPN=experts_per_rank,
+        LOCAL_RANK=rank,
+        COUNT_ROW_STRIDE=count_rows.stride(0),
+        BLOCK_SLOTS=block_slots,
+    )
+    if num_routes:
+        num_programs = min(
+            _MAX_ROUTE_PROGRAMS,
+            triton.cdiv(num_routes, _ROUTE_BLOCK_SIZE),
+        )
+        _kernel_map_balanced_routes[(num_programs, 1, 1)](
+            sorted_experts,
+            expert_order,
+            tpe_all,
+            alloc_cumsum,
+            inverse_experts_to_copy,
+            local_expert_starts,
+            send_bucket_starts,
+            send_token_indices,
+            send_route_indices,
+            num_routes,
+            R=world_size,
+            E=num_experts,
+            EPN=experts_per_rank,
+            TOP_K=top_k,
+            LOCAL_RANK=rank,
+            TPE_ROW_STRIDE=tpe_all.stride(0),
+            BLOCK_ROUTES=_ROUTE_BLOCK_SIZE,
+        )
 
 
 __all__ = [
-    "_kernel_build_balanced_count_cube",
-    "_kernel_finalize_balanced_metadata",
-    "_kernel_map_balanced_routes",
-    "_kernel_scatter_balanced_routes",
+    "launch_balanced_routing_metadata",
 ]
