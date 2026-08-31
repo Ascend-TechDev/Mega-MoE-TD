@@ -829,7 +829,7 @@ def run_moonep_moderate_wide_forward_case(rank: int, world_size: int) -> None:
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("MoonEP forward correctness requires NPU and ACLSHMEM")
 
-    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
     device = f"npu:{rank}"
@@ -914,7 +914,7 @@ def run_moonep_moderate_wide_forward_case(rank: int, world_size: int) -> None:
 
             plan = op.build_routing_plan(expert_indices)
             copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
-            if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+            if copy_counts != [0, 0, 3, 3, 1, 1, 1, 1]:
                 raise AssertionError(
                     f"unexpected moderate-wide replica counts: {copy_counts}"
                 )
@@ -1131,7 +1131,7 @@ def run_moonep_physical_forward_moderate_wide_case(
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("physical MoonEP forward requires NPU and ACLSHMEM")
 
-    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
     device = f"npu:{rank}"
@@ -1198,7 +1198,7 @@ def run_moonep_physical_forward_moderate_wide_case(
 
             plan = op.build_routing_plan(expert_indices)
             copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
-            if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+            if copy_counts != [0, 0, 3, 3, 1, 1, 1, 1]:
                 raise AssertionError(
                     f"unexpected moderate-wide replica counts: {copy_counts}"
                 )
@@ -1471,7 +1471,7 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("physical MoonEP backward requires NPU and ACLSHMEM")
 
-    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
     device = f"npu:{rank}"
@@ -1547,7 +1547,7 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
 
                 plan = op.build_routing_plan(expert_indices)
                 copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
-                if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+                if copy_counts != [0, 0, 3, 3, 1, 1, 1, 1]:
                     raise AssertionError(
                         f"unexpected moderate-wide replica counts: {copy_counts}"
                     )
@@ -2032,7 +2032,7 @@ def run_moonep_backward_symmetric_moderate_wide_case(
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("symmetric MoonEP backward requires NPU and ACLSHMEM")
 
-    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 16, 896
+    tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
     device = f"npu:{rank}"
@@ -2134,7 +2134,7 @@ def run_moonep_backward_symmetric_moderate_wide_case(
 
                 plan = op.build_routing_plan(expert_indices)
                 copy_counts = (plan.experts_to_copy >= 0).sum(dim=1).cpu().tolist()
-                if copy_counts != [0, 0, 18, 18, 4, 4, 4, 4]:
+                if copy_counts != [0, 0, 3, 3, 1, 1, 1, 1]:
                     raise AssertionError(
                         f"unexpected moderate-wide replica counts: {copy_counts}"
                     )

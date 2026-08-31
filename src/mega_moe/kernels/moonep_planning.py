@@ -16,7 +16,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.cann.extension as al
 from triton_dist.language.extra import libshmem_device
 
 
@@ -222,7 +221,7 @@ def _kernel_moonep_b3(
     EPN: tl.constexpr,
     B: tl.constexpr,
 ):
-    """Select remote experts and build ETC plus its inverse in one sort."""
+    """Select remote experts and build ETC plus its inverse in one pass."""
     destination = tl.program_id(axis=0)
     offs_e = tl.arange(0, BE)
     valid_e = offs_e < E
@@ -237,34 +236,35 @@ def _kernel_moonep_b3(
     replica_count = tl.sum((remote_counts > 0).to(tl.int32), axis=0)
     tl.store(replica_counts_ptr + destination, replica_count)
 
-    # Sorting count*(E+1)+expert_id descending reproduces both MoonEP rules:
-    # larger allocations win, and equal allocations choose the larger expert.
+    # Taking the top-B of count*(E+1)+expert_id reproduces both MoonEP
+    # rules: larger allocations win, and equal allocations choose the larger
+    # expert. Keys are unique, so iterative argmax equals a descending sort;
+    # al.sort is avoided because its device runtime only links on A5.
     key_base: tl.constexpr = E + 1
     keys = tl.where(
         remote_counts > 0,
         remote_counts * key_base + offs_e,
         -1,
     )
-    sorted_keys = al.sort(keys, dim=0, descending=True)
-    decoded = sorted_keys - (sorted_keys // key_base) * key_base
-    selected = tl.where(sorted_keys >= 0, decoded, -1).to(tl.int32)
-    selected_lanes = offs_e < B
-    tl.store(
-        experts_to_copy_ptr + destination * B + offs_e,
-        selected,
-        mask=selected_lanes,
-    )
-
+    slot_of = tl.full((BE,), -1, tl.int32)
+    for slot in range(B):
+        best = tl.max(keys, axis=0)
+        top = tl.argmax(keys, axis=0)
+        expert = tl.where(best >= 0, top, -1)
+        tl.store(
+            experts_to_copy_ptr + destination * B + slot,
+            expert.to(tl.int32),
+        )
+        # Record the slot and knock the winner out arithmetically: vector
+        # tl.where and data-dependent scalar stores inside a loop are both
+        # rejected by this build's TritonToLinalg pass.
+        hit = ((offs_e == top) & (best >= 0)).to(tl.int64)
+        slot_of = slot_of + hit.to(tl.int32) * (slot - slot_of)
+        keys = keys - hit * (keys + 1)
     tl.store(
         inverse_ptr + destination * E + offs_e,
-        tl.full((BE,), -1, tl.int32),
+        slot_of,
         mask=valid_e,
-    )
-    selected_valid = selected_lanes & (selected >= 0)
-    tl.store(
-        inverse_ptr + destination * E + selected,
-        offs_e,
-        mask=selected_valid,
     )
 
 

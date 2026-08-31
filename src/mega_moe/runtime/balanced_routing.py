@@ -154,6 +154,60 @@ def _validate_inputs(
     return world_size, num_experts, experts_per_rank
 
 
+def _derive_experts_to_copy(
+    inverse_experts_to_copy: torch.Tensor,
+    *,
+    world_size: int,
+    num_experts: int,
+    experts_per_rank: int,
+) -> torch.Tensor:
+    """Recover the dest-major replica expert list from the inverse table."""
+    device = inverse_experts_to_copy.device
+    slots = torch.arange(experts_per_rank, device=device)
+    expert_ids = torch.arange(num_experts, device=device)
+    match = inverse_experts_to_copy[:, None, :] == slots[None, :, None]
+    return (
+        torch.where(match, expert_ids[None, None, :], -1)
+        .max(dim=2)
+        .values.to(torch.int32)
+    )
+
+
+def _repair_count_cube_head(
+    counts: torch.Tensor,
+    tpe_all: torch.Tensor,
+    alloc_cumsum: torch.Tensor,
+    *,
+    world_size: int,
+    experts_per_rank: int,
+) -> None:
+    """Recompute the home slot-0 column the vector-core kernel cannot land.
+
+    The 910B1 vector store engine drops the first four bytes of every
+    destination's slice window, so the cell at ``destination * 2 * EPN``
+    reads back as zero no matter which lane carries it or in which order.
+    Regular torch writes go through the ACL path and stick, and this column
+    is two small gathers on planning tables that are already resident.
+    """
+    device = counts.device
+    dest = torch.arange(world_size, device=device)
+    head_expert = dest * experts_per_rank
+    alloc_hi = alloc_cumsum[head_expert, dest]
+    alloc_lo = torch.zeros_like(alloc_hi)
+    alloc_lo[1:] = alloc_cumsum[head_expert[1:], dest[:-1]]
+    source_count = tpe_all[:, head_expert]
+    source_lo = source_count.cumsum(dim=0) - source_count
+    overlap = (
+        torch.minimum(source_lo + source_count, alloc_hi)
+        - torch.maximum(source_lo, alloc_lo)
+    ).clamp_(min=0)
+    physical_slots = 2 * experts_per_rank
+    cube = counts[:, : world_size * physical_slots].view(
+        world_size, world_size, physical_slots
+    )
+    cube[:, :, 0] = overlap
+
+
 def _build_balanced_count_cube(
     tpe_all: torch.Tensor,
     alloc_cumsum: torch.Tensor,
@@ -164,6 +218,7 @@ def _build_balanced_count_cube(
     experts_per_rank: int,
     validate: bool = True,
     use_fused_npu: bool = True,
+    experts_to_copy: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Derive ``[source, destination, physical slot]`` counts by intervals."""
     device = tpe_all.device
@@ -173,6 +228,13 @@ def _build_balanced_count_cube(
             _kernel_build_balanced_count_cube,
         )
 
+        if experts_to_copy is None:
+            experts_to_copy = _derive_experts_to_copy(
+                inverse_experts_to_copy,
+                world_size=world_size,
+                num_experts=num_experts,
+                experts_per_rank=experts_per_rank,
+            )
         counts = torch.empty(
             (world_size, world_size * physical_slots),
             dtype=torch.int32,
@@ -184,7 +246,7 @@ def _build_balanced_count_cube(
         _kernel_build_balanced_count_cube[(world_size, 1, 1)](
             tpe_all,
             alloc_cumsum,
-            inverse_experts_to_copy,
+            experts_to_copy,
             counts,
             counts,
             R=world_size,
@@ -196,6 +258,13 @@ def _build_balanced_count_cube(
             BLOCK_E=block_e,
             BLOCK_SLOTS=triton.next_power_of_2(physical_slots),
             STORE_LOCAL_STARTS=False,
+        )
+        _repair_count_cube_head(
+            counts,
+            tpe_all,
+            alloc_cumsum,
+            world_size=world_size,
+            experts_per_rank=experts_per_rank,
         )
         if validate and not torch.equal(
             counts.sum(dim=1), tpe_all.to(torch.int64).sum(dim=1)
@@ -307,6 +376,7 @@ def build_balanced_routing_metadata_inplace(
     tpe_all: torch.Tensor,
     alloc_cumsum: torch.Tensor,
     inverse_experts_to_copy: torch.Tensor,
+    experts_to_copy: torch.Tensor,
     *,
     rank: int,
     top_k: int,
@@ -340,6 +410,7 @@ def build_balanced_routing_metadata_inplace(
             (world_size, num_experts),
             torch.int32,
         ),
+        "experts_to_copy": ((world_size, experts_per_rank), torch.int32),
         "count_rows": ((world_size, count_rows.shape[1]), torch.int32),
         "local_expert_starts": ((num_experts,), torch.int32),
         "send_bucket_starts": ((num_buckets,), torch.int32),
@@ -355,6 +426,7 @@ def build_balanced_routing_metadata_inplace(
         "expert_order": expert_order,
         "alloc_cumsum": alloc_cumsum,
         "inverse_experts_to_copy": inverse_experts_to_copy,
+        "experts_to_copy": experts_to_copy,
         "count_rows": count_rows,
         "local_expert_starts": local_expert_starts,
         "send_bucket_starts": send_bucket_starts,
@@ -399,7 +471,7 @@ def build_balanced_routing_metadata_inplace(
     _kernel_build_balanced_count_cube[(world_size, 1, 1)](
         tpe_all,
         alloc_cumsum,
-        inverse_experts_to_copy,
+        experts_to_copy,
         count_rows,
         local_expert_starts,
         R=world_size,
@@ -411,6 +483,16 @@ def build_balanced_routing_metadata_inplace(
         BLOCK_E=block_e,
         BLOCK_SLOTS=block_slots,
         STORE_LOCAL_STARTS=True,
+    )
+    # The vector core cannot land the first cell of each destination slice
+    # (see _repair_count_cube_head); patch that column before finalize reads
+    # the cube on device.
+    _repair_count_cube_head(
+        count_rows,
+        tpe_all,
+        alloc_cumsum,
+        world_size=world_size,
+        experts_per_rank=experts_per_rank,
     )
     _kernel_finalize_balanced_metadata[(world_size, 1, 1)](
         count_rows,

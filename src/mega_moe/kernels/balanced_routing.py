@@ -10,7 +10,7 @@ import triton.language.extra.cann.extension as al
 def _kernel_build_balanced_count_cube(
     tpe_all_ptr,
     alloc_cumsum_ptr,
-    inverse_ptr,
+    experts_to_copy_ptr,
     counts_ptr,
     local_expert_starts_ptr,
     R: tl.constexpr,
@@ -30,81 +30,87 @@ def _kernel_build_balanced_count_cube(
     with al.scope(core_mode="vector", disable_auto_sync=True):
         # A destination program owns these slots for every source, so clearing
         # and populating them in the same program needs no cross-core barrier.
+        # Masked lanes still form their physical address on this backend;
+        # clamp every padded lane into its table before it reaches a pointer
+        # (_kernel_map_balanced_routes keeps its gather lanes in range for
+        # the same reason).
         slot_offsets = tl.arange(0, BLOCK_SLOTS)
         valid_slot = slot_offsets < physical_slots
+        safe_slot_offsets = tl.minimum(slot_offsets, physical_slots - 1)
         destination_base = destination * physical_slots
         for source in tl.static_range(0, R):
             tl.store(
                 counts_ptr
                 + source * COUNT_ROW_STRIDE
                 + destination_base
-                + slot_offsets,
+                + safe_slot_offsets,
                 tl.zeros((BLOCK_SLOTS,), dtype=tl.int32),
                 mask=valid_slot,
             )
 
-        for expert_base in tl.static_range(0, E, BLOCK_E):
-            expert = expert_base + tl.arange(0, BLOCK_E)
-            valid_expert = expert < E
-            allocation_hi = tl.load(
-                alloc_cumsum_ptr + expert * R + destination,
-                mask=valid_expert,
-                other=0,
+        # Contiguous populate.  The 910B1 vector core drops masked and
+        # data-dependent store offsets (the original expert-blocked scatter
+        # faults or races at small-EPN shapes), so every store below is a
+        # plain unmasked write to "own slice + lane", with the home/replica
+        # choice folded into the VALUE via arithmetic selects.  Lanes past
+        # 2*EPN fold back onto the slice tail as duplicate writers of a
+        # value they already hold, because BLOCK_SLOTS can exceed
+        # 2*EPN and spilling into the next destination's head slots races
+        # with that program's stores.
+        lane = tl.arange(0, BLOCK_SLOTS)
+        off = lane - ((lane >= 2 * EPN).to(tl.int32)) * (
+            BLOCK_SLOTS - 2 * EPN
+        )
+        home_sel = (off < EPN).to(tl.int32)
+        rep_sel = ((off >= EPN) & (off < 2 * EPN)).to(tl.int32)
+        home_expert = destination * EPN + tl.minimum(off, EPN - 1)
+        copied_idx = tl.maximum(tl.minimum(off - EPN, EPN - 1), 0)
+        copied = tl.load(
+            experts_to_copy_ptr + destination * EPN + copied_idx
+        )
+        safe_copied = tl.maximum(copied, 0)
+        sel_expert = home_sel * home_expert + rep_sel * safe_copied
+        keep = home_sel + rep_sel * (copied >= 0).to(tl.int32)
+        previous_destination = tl.maximum(destination - 1, 0)
+        allocation_hi = tl.load(
+            alloc_cumsum_ptr + sel_expert * R + destination
+        )
+        allocation_lo = tl.load(
+            alloc_cumsum_ptr + sel_expert * R + previous_destination,
+            mask=(destination > 0) & (lane >= 0),
+            other=0,
+        )
+        source_lo = tl.zeros((BLOCK_SLOTS,), dtype=tl.int32)
+        for source in tl.static_range(0, R):
+            source_count = tl.load(
+                tpe_all_ptr + source * TPE_ROW_STRIDE + sel_expert
             )
-            previous_destination = tl.maximum(destination - 1, 0)
-            allocation_lo = tl.load(
-                alloc_cumsum_ptr + expert * R + previous_destination,
-                mask=valid_expert & (destination > 0),
-                other=0,
+            source_hi = source_lo + source_count
+            overlap = tl.maximum(
+                tl.minimum(source_hi, allocation_hi)
+                - tl.maximum(source_lo, allocation_lo),
+                0,
             )
-
-            owner = expert // EPN
-            replica_slot = tl.load(
-                inverse_ptr + destination * E + expert,
-                mask=valid_expert,
-                other=-1,
+            # A home slot names exactly one home expert.  B.3 also assigns
+            # every replica slot to exactly one remote expert, so these
+            # stores are unique and atomics would only add serialization.
+            tl.store(
+                counts_ptr
+                + source * COUNT_ROW_STRIDE
+                + destination_base
+                + off,
+                overlap * keep,
             )
-            is_home = owner == destination
-            mapped = valid_expert & (is_home | (replica_slot >= 0))
-            physical_slot = tl.where(
-                is_home,
-                expert - owner * EPN,
-                EPN + replica_slot,
-            )
-
-            source_lo = tl.zeros((BLOCK_E,), dtype=tl.int32)
-            for source in tl.static_range(0, R):
-                source_count = tl.load(
-                    tpe_all_ptr + source * TPE_ROW_STRIDE + expert,
-                    mask=valid_expert,
-                    other=0,
-                )
-                source_hi = source_lo + source_count
-                overlap = tl.maximum(
-                    tl.minimum(source_hi, allocation_hi)
-                    - tl.maximum(source_lo, allocation_lo),
-                    0,
-                )
-                # A home slot names exactly one home expert.  B.3 also assigns
-                # every replica slot to exactly one remote expert, so these
-                # stores are unique and atomics would only add serialization.
-                tl.store(
-                    counts_ptr
-                    + source * COUNT_ROW_STRIDE
-                    + destination_base
-                    + physical_slot,
-                    overlap,
-                    mask=mapped,
-                )
-                source_lo = source_hi
+            source_lo = source_hi
 
         if STORE_LOCAL_STARTS:
             running = 0
             for expert_base in tl.static_range(0, E, BLOCK_E):
                 expert = expert_base + tl.arange(0, BLOCK_E)
                 valid_expert = expert < E
+                safe_expert = tl.minimum(expert, E - 1)
                 local_count = tl.load(
-                    tpe_all_ptr + LOCAL_RANK * TPE_ROW_STRIDE + expert,
+                    tpe_all_ptr + LOCAL_RANK * TPE_ROW_STRIDE + safe_expert,
                     mask=valid_expert,
                     other=0,
                 )
@@ -114,7 +120,7 @@ def _kernel_build_balanced_count_cube(
                     - local_count
                 )
                 tl.store(
-                    local_expert_starts_ptr + expert,
+                    local_expert_starts_ptr + safe_expert,
                     local_start,
                     mask=valid_expert & (destination == 0),
                 )
@@ -143,12 +149,17 @@ def _kernel_finalize_balanced_metadata(
         source = tl.arange(0, R)
         slot = tl.arange(0, BLOCK_SLOTS)
         valid_slot = slot < physical_slots
+        # Masked tail lanes still form their physical address on this
+        # backend; clamp them into the cube so the padded lanes of the last
+        # row cannot read past the buffer (_kernel_map_balanced_routes keeps
+        # its gather lanes in range for the same reason).
+        safe_slot = tl.minimum(slot, physical_slots - 1)
         destination_base = destination * physical_slots
         counts = tl.load(
             counts_ptr
             + source[:, None] * COUNT_ROW_STRIDE
             + destination_base
-            + slot[None, :],
+            + safe_slot[None, :],
             mask=valid_slot[None, :],
             other=0,
         )
@@ -162,7 +173,7 @@ def _kernel_finalize_balanced_metadata(
                 counts_ptr
                 + LOCAL_RANK * COUNT_ROW_STRIDE
                 + previous_destination * physical_slots
-                + slot,
+                + safe_slot,
                 mask=valid_slot,
                 other=0,
             )
@@ -177,7 +188,7 @@ def _kernel_finalize_balanced_metadata(
             - local_counts
         )
         tl.store(
-            send_bucket_starts_ptr + destination_base + slot,
+            send_bucket_starts_ptr + destination_base + safe_slot,
             send_starts,
             mask=valid_slot,
         )
@@ -188,7 +199,7 @@ def _kernel_finalize_balanced_metadata(
             tl.where(source[:, None] < LOCAL_RANK, counts, 0), axis=0
         )
         tl.store(
-            send_bucket_receive_offsets_ptr + destination_base + slot,
+            send_bucket_receive_offsets_ptr + destination_base + safe_slot,
             slot_start + source_prefix,
             mask=valid_slot,
         )
@@ -197,17 +208,17 @@ def _kernel_finalize_balanced_metadata(
         tl.store(
             receive_counts_ptr
             + source[:, None] * physical_slots
-            + slot[None, :],
+            + safe_slot[None, :],
             counts,
             mask=is_local_destination & valid_slot[None, :],
         )
         tl.store(
-            received_per_slot_ptr + slot,
+            received_per_slot_ptr + safe_slot,
             total_by_slot,
             mask=is_local_destination & valid_slot,
         )
         tl.store(
-            received_slot_offsets_ptr + slot,
+            received_slot_offsets_ptr + safe_slot,
             slot_start,
             mask=is_local_destination & valid_slot,
         )

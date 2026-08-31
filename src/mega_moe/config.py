@@ -65,6 +65,25 @@ def _detect_physical_aivector_core_count() -> Optional[int]:
     return count if type(count) is int and count > 0 else None
 
 
+def _detect_fc_gemm_accumulator_budget() -> Optional[int]:
+    """Return the active device's FP32 Cube-accumulator element budget.
+
+    The 910B family carries a 128KB L0C, so one M*N FP32 accumulator tile
+    must stay within 32768 elements there; a 256x256 tile needs 256KB and
+    the backend rejects it with a Cc-overflow compile error.  ``None``
+    keeps the 256x256-validated defaults on every other arch.
+    """
+    try:
+        from triton.backends.ascend.driver import NPUUtils
+
+        arch = NPUUtils().get_arch()
+    except Exception:
+        return None
+    if isinstance(arch, str) and arch.startswith("Ascend910B"):
+        return 32768
+    return None
+
+
 @dataclass(frozen=True)
 class MoEForwardConfig:
     """Stage-specific launch and tiling parameters.
@@ -190,6 +209,23 @@ class MoEForwardConfig:
                 f"{_MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS} elements on the current "
                 "Ascend backend"
             )
+
+        budget = _detect_fc_gemm_accumulator_budget()
+        if budget is not None:
+            # 910B parts expose half the L0C the 256x256 defaults were sized
+            # for; shrink the N tiles (keeping the validated 256-row M
+            # windows) until each FP32 accumulator fits the smaller Cube
+            # cache instead of failing in codegen.
+            for m_name, n_name in (
+                ("fc1_gemm_block_size_m", "fc1_gemm_block_size_n"),
+                ("fc2_combine_block_size_m", "fc2_gemm_block_size_n"),
+            ):
+                n_tile = getattr(self, n_name)
+                m_tile = getattr(self, m_name)
+                while m_tile * n_tile > budget and n_tile > 16:
+                    n_tile //= 2
+                if n_tile != getattr(self, n_name):
+                    object.__setattr__(self, n_name, n_tile)
 
         if self.receive_capacity_factor is not None and self.receive_capacity_factor < 1.0:
             raise ValueError("receive_capacity_factor must be at least 1")

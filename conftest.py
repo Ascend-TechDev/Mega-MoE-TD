@@ -2,11 +2,17 @@
 """Repository-wide pytest setup for the standalone Mega-MoE tutorial."""
 
 import os
+import queue
+import time
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+# Workers must finish within this budget; a full error_queue pipe must never
+# be able to wedge the join (drained continuously below).
+_DIST_TEST_TIMEOUT_S = int(os.environ.get("DIST_TEST_TIMEOUT_S", 900))
 
 
 def _worker_wrapper(rank, world_size, backend, fn, args, error_queue):
@@ -33,16 +39,35 @@ def run_dist_test(fn, world_size=2, backend="hccl", args=()):
     """Run a worker function in an isolated multi-process HCCL world."""
     context = mp.get_context("spawn")
     error_queue = context.Queue()
-    mp.spawn(
+    spawn_context = mp.spawn(
         _worker_wrapper,
         args=(world_size, backend, fn, args, error_queue),
         nprocs=world_size,
-        join=True,
+        join=False,
     )
 
+    # Drain while joining: a rank that puts a large error message can block
+    # its queue feeder on a full pipe and then never exit, which deadlocks
+    # a plain join-before-drain wait.
     errors = []
-    while not error_queue.empty():
-        errors.append(error_queue.get())
+
+    def drain() -> None:
+        while True:
+            try:
+                errors.append(error_queue.get_nowait())
+            except queue.Empty:
+                return
+
+    deadline = time.monotonic() + _DIST_TEST_TIMEOUT_S
+    try:
+        while not spawn_context.join(timeout=5):
+            drain()
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    f"dist workers did not finish within {_DIST_TEST_TIMEOUT_S}s"
+                )
+    finally:
+        drain()
     if errors:
         messages = "\n".join(f"[rank {rank}] {error}" for rank, error in errors)
         pytest.fail(f"distributed worker failure:\n{messages}")
