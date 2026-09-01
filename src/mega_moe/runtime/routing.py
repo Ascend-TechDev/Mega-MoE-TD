@@ -526,6 +526,7 @@ def _build_moonep_routing_plan(
             tpe_all_device,
             alloc_cumsum,
             inverse,
+            experts_to_copy,
             rank=context.rank,
             top_k=selected_experts.shape[1],
             count_rows=count_rows,

@@ -15,6 +15,13 @@ Two things live here:
    backward is the fused triton path (the Ascend tutorial only ships a triton
    backward — forward is the private differentiable Torch implementation).
 
+3. :class:`MegaMoEFunction` — the Stage H3 merged autograd Function: its
+   ``forward`` runs the *fused* operator with ``return_saved=True`` (the
+   native saved dict of :mod:`mega_moe.ops._native_saved` rides along with the
+   forward pass — no torch replay), and its ``backward`` runs the same 5
+   mega-ops on that dict, behind the generation/owner gates and with the
+   persistent tile-signal ``state`` injection (master plan §3.2.3/§3.4).
+
 The 5 backward mega-ops (given dy [B,H]):
 
 1. ``dispatch_fc2_bwd``  — dispatch-A2A(home->expert) + fc2 input-grad
@@ -106,6 +113,21 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     replica segments into the forward's symmetric replica weight slots and
     reduces every copy onto its owner, so the canonical weight-grad keys are the
     final (owner-accumulated) values."""
+    # Single-in-flight guard: the symmetric receive buffer is overwritten by
+    # the forward's FC2 staging and by step 1 below, so a saved dict whose
+    # recv_hidden_sorted still aliases it would silently read garbage.
+    recv_hidden_sorted = saved.get("recv_hidden_sorted")
+    if recv_hidden_sorted is None:
+        raise ValueError(
+            "saved is missing recv_hidden_sorted; the fused backward requires "
+            "the activation section (replay saved or return_saved=True)"
+        )
+    if recv_hidden_sorted.data_ptr() == peer_mem.data_ptr():
+        raise ValueError(
+            "saved['recv_hidden_sorted'] aliases peer_mem; the receive buffer "
+            "is single-in-flight and was overwritten after dispatch — the "
+            "forward must clone it in the T2 window"
+        )
     dy = dy.to(saved["fc1_1"].dtype)
     use_moonep = bool(saved.get("use_moonep"))
     if grad_transport is not None and not use_moonep:
@@ -142,6 +164,14 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     use_side_stream = (not use_moonep) and os.environ.get("MOE_WGRAD_STREAM") == "1"
     ec = saved["expert_counts"]
     wgrad_stream = torch.npu.Stream() if use_side_stream else None
+    # Step-2 activation derivative: differentiate the same gated activation the
+    # forward ran (SwiGLU default, SiTU-GLU for the Kimi hidden_act="situ"
+    # path). Older saved dicts without the keys keep the SwiGLU derivative.
+    _act_kwargs = dict(
+        activation=saved.get("activation", "swiglu"),
+        situ_beta=saved.get("situ_beta"),
+        situ_linear_beta=saved.get("situ_linear_beta"),
+    )
 
     def _run_wgrad(fn, *args):
         if wgrad_stream is None:
@@ -175,7 +205,7 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         grad_fc1_output, grad_gate, grad_fc2 = fused_swiglu_bwd_fc2_wgrad(
             grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec,
-            saved["split_size_cum_per_expert"])
+            saved["split_size_cum_per_expert"], **_act_kwargs)
         _t("step2+step3 fused done")
     elif use_dual:
         # step3 (fc2 wgrad, pure Cube via npu_grouped_matmul) ∥ step2 (swiglu,
@@ -202,7 +232,8 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         with torch.npu.stream(s_vec):
             s_vec.wait_event(ev1)
             grad_fc1_output, grad_gate = swiglu_bwd_triton(
-                grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])  # step2, pure Vector
+                grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
+                **_act_kwargs)  # step2, pure Vector
             ev_vec.record(s_vec)
         cur.wait_event(ev_cube)
         cur.wait_event(ev_vec)
@@ -225,7 +256,8 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         _t("step3-fc2_wgrad launched (side stream)")
         # step 2: swiglu backward (main stream; overlaps with step3 wgrad cube)
         grad_fc1_output, grad_gate = swiglu_bwd_triton(
-            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
+            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
+            **_act_kwargs)
         if _stage_timing:
             _sev[3].record()
         _t("step2-swiglu done")
@@ -383,4 +415,134 @@ class MegaMoEBackwardFunction(torch.autograd.Function):
             None,                          # ep_group
             None,                          # topk
             None,                          # peer_mem
+        )
+
+
+# ============================================================================
+# 3.  merged native-saved autograd.Function  (master plan §3.2.3, Stage H3)
+# ============================================================================
+class MegaMoEFunction(torch.autograd.Function):
+    """One-pass fused EP-MoE whose backward runs on the native saved dict.
+
+    ``forward`` calls :class:`mega_moe.ops.forward.FusedMoEForward` with
+    ``return_saved=True`` — the backward's saved values are captured inside
+    the fused pass itself (no torch replay, no HCCL re-dispatch).  ``backward``
+    runs :func:`moe_backward_triton` on that dict.
+
+    Args (``apply``, in order):
+
+        op                ``FusedMoEForward`` that will run the pass (and, for
+                          the MoonEP layout, lends the replica grad transport)
+        hidden_states     ``[B, H]``                                (grad)
+        routing_weights   ``[B, topk]`` contiguous FP32             (grad)
+        selected_experts  ``[B, topk]`` int expert ids              (no grad)
+        gate_up_weight    packed ``[E_p, H, 2F]`` gate/up table     (grad)
+        down_weight       ``[E_p, H, F]``                           (grad)
+        peer_mem          shared symmetric buffer at heap offset 0 — must be
+                          the session's FIRST symmetric allocation.  ``None``
+                          is rejected: the buffer is caller-owned and we never
+                          fall back to ``op.context.peer_mem``.
+        state             caller-owned persistent namespace carrying the
+                          backward's cross-step runtime state (``signal_mem`` /
+                          ``epoch``): injected at backward entry, written back
+                          after the launch.  Without it every step would
+                          re-allocate symmetric tile-signal slots (symmetric
+                          heap leak) and restart the SET epoch at 1 (stale
+                          signal values would read as fresh).  ``None`` keeps
+                          one-shot semantics for a single backward.
+
+    Gates (§3.2 item 4): the saved dict embeds ``_routing_generation`` /
+    ``_owner_token`` python ints; ``backward`` rejects a saved whose plan a
+    later forward of this operator has already superseded — or that belongs to
+    another operator instance — instead of silently reading the rewritten
+    planning workspace.  ``moe_backward_triton`` additionally asserts the
+    single-in-flight receive buffer (``recv_hidden_sorted`` must not alias
+    ``peer_mem``).
+    """
+
+    @staticmethod
+    def forward(ctx, op, hidden_states, routing_weights, selected_experts,
+                gate_up_weight, down_weight, peer_mem, state):
+        if peer_mem is None:
+            raise ValueError(
+                "peer_mem must be passed explicitly: the backward symmetric "
+                "buffer must be the session's first ACLSHMEM allocation and "
+                "cannot default to op.context.peer_mem"
+            )
+        with torch.no_grad():
+            output, saved = op.forward(
+                hidden_states,
+                selected_experts,
+                gate_up_weight,
+                down_weight,
+                routing_weights,
+                return_saved=True,
+            )
+        # The saved intermediates are freshly computed views/clones (not the
+        # forward inputs), and the weight views must stay pinned until the
+        # backward — stash on ctx instead of save_for_backward, mirroring
+        # MegaMoEBackwardFunction.
+        ctx.op = op
+        ctx.saved = saved
+        ctx.peer_mem = peer_mem
+        ctx.state = state
+        return output
+
+    @staticmethod
+    def backward(ctx, dy):
+        op = ctx.op
+        saved = ctx.saved
+        if (
+            saved.get("_owner_token") != id(op._routing_owner_token)
+            or saved.get("_routing_generation") != op._routing_generation
+        ):
+            wrong_owner = (
+                saved.get("_owner_token") != id(op._routing_owner_token)
+            )
+            raise RuntimeError(
+                "the saved dict belongs to "
+                + ("another operator instance" if wrong_owner
+                   else "a routing plan this operator has already superseded")
+                + "; run backward before the next forward on the operator"
+            )
+        # §3.4 state injection: reuse the persistent symmetric tile-signal
+        # slots and keep the SET epoch monotonically advancing.  The first
+        # epoch must be >= 1 — a freshly zeroed slot already reads as 0.
+        if ctx.state is not None:
+            if getattr(ctx.state, "signal_mem", None) is not None:
+                saved["_bwd_tile_signal_mem"] = ctx.state.signal_mem
+            saved["_bwd_tile_signal_epoch"] = max(
+                int(getattr(ctx.state, "epoch", 0)), 1
+            )
+        # MoonEP physical saved (Stage N): sink the replica weight gradients
+        # into the borrowed symmetric tables and owner-pull every copy — the
+        # §3.3 autograd-side transport hookup.  Lending invalidates the
+        # replica weight cache, so no forward may run on this operator until
+        # the borrowed transport has been reduced.
+        grad_transport = None
+        if saved.get("use_moonep"):
+            grad_transport = op.lend_replica_weight_tables_for_grad()
+        grads = moe_backward_triton(saved, dy, ctx.peer_mem,
+                                    grad_transport=grad_transport)
+        # Write the lazily allocated signal memory and the bumped epoch back
+        # so the next step reuses both.
+        if ctx.state is not None:
+            ctx.state.signal_mem = saved.get("_bwd_tile_signal_mem")
+            ctx.state.epoch = saved.get("_bwd_tile_signal_epoch", 1)
+        # The wgrad halves are [E, F, H]; merge back into the packed Kimi
+        # [E, H, 2F] layout of the gate_up_weight input.
+        grad_gate_up = torch.cat(
+            (grads["grad_fc1_1"], grads["grad_fc1_2"]), dim=1
+        ).transpose(1, 2)
+        # apply-argument order: (op, hidden_states, routing_weights,
+        # selected_experts, gate_up_weight, down_weight, peer_mem, state)
+        return (
+            None,                           # op
+            grads["grad_hidden"],           # hidden_states
+            grads["grad_routing_weights"],  # routing_weights
+            None,                           # selected_experts
+            grad_gate_up,                   # gate_up_weight
+            grads["grad_fc2"],              # down_weight
+            None,                           # peer_mem
+            None,                           # state
         )

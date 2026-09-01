@@ -33,6 +33,11 @@ from ..runtime.replica_weight_prefetch import (
     replica_weight_push_geometry,
 )
 from ..runtime.workspace import create_moe_forward_context
+from ._native_saved import (
+    assemble_native_saved,
+    capture_activations,
+    snapshot_plan_metadata,
+)
 
 
 _FC2_PIPELINE_GROUP_EXPERTS = 16
@@ -1050,8 +1055,16 @@ class FusedMoEForward(torch.nn.Module):
         dispatch_result: DispatchFC1Result,
         replica_down_weight: Optional[torch.Tensor] = None,
         prefetch_done_event=None,
-    ) -> torch.Tensor:
-        """Produce grouped activation while FC2 consumes earlier groups."""
+        *,
+        return_weighted_activation: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Produce grouped activation while FC2 consumes earlier groups.
+
+        With ``return_weighted_activation=True`` also returns the shadowed
+        ``weighted_activation`` buffer (native-saved ``swiglu_out_weighted``);
+        the default keeps the historical single return value for the existing
+        stage-level callers (the layer benchmark drives this helper directly).
+        """
         packed_dim = dispatch_result.fc1_output.shape[1]
         if packed_dim <= 0 or packed_dim % 2:
             raise ValueError("FC1 output dimension must be a positive even value")
@@ -1180,6 +1193,8 @@ class FusedMoEForward(torch.nn.Module):
             # cache skips only the next-step collective hit lookup above.
             self._replica_weight_cache_valid = True
             self._replica_prefetch_pending = False
+        if return_weighted_activation:
+            return output, weighted_activation
         return output
 
     # ===================== full forward ================================
@@ -1190,12 +1205,26 @@ class FusedMoEForward(torch.nn.Module):
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
         routing_weights: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_saved: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
         """Run the complete BF16 post-routing MoE forward.
 
         The caller provides selected experts and FP32 routing weights. Router
         matmul, softmax, and top-k selection are outside this boundary.
+
+        With ``return_saved=True`` the operator also returns the native
+        ``saved`` dict for the fused backward as ``(output, saved)`` — the
+        full home-layout contract (metadata / permutation / scalar /
+        activation / weight-reference sections, see
+        :mod:`mega_moe.ops._native_saved`).  ``return_saved=False`` (default)
+        keeps the previous behavior exactly.
         """
+        if return_saved and self.enable_moonep:
+            raise NotImplementedError(
+                "native saved capture for the MoonEP layout arrives with "
+                "Stage N1; only the home layout is captured today"
+            )
         # Preserve the public validation order before routing launches any work.
         self._validate_dispatch_inputs(hidden_states, selected_experts)
         self._validate_gate_up_weight(gate_up_weight, hidden_states.device)
@@ -1262,6 +1291,13 @@ class FusedMoEForward(torch.nn.Module):
             selected_experts,
             moonep_plan_hook=moonep_plan_hook,
         )
+        # T1: snapshot the plan metadata right at the planning sync point,
+        # before any later stage can rewrite the shared planning workspace.
+        plan_snapshot = (
+            snapshot_plan_metadata(self, routing_plan)
+            if return_saved
+            else None
+        )
         if self.enable_moonep:
             replica_gate_up_weight, replica_down_weight = (
                 self._finish_replica_prefetch()
@@ -1301,15 +1337,40 @@ class FusedMoEForward(torch.nn.Module):
         prefetch_done_event = self._fence_replica_prefetch_after_dispatch(
             hidden_states.device
         )
+        # T2: snapshot the activations between dispatch completion and the FC2
+        # launch — FC2's device-put staging overwrites the peer-memory receive
+        # view, so this is the only window for the recv_hidden_sorted clone.
+        activations = (
+            capture_activations(self, dispatch_result) if return_saved else None
+        )
         # Produce expert-major activation groups on FC2's otherwise-idle
         # Vector stream while the Cube stream consumes earlier groups.
-        result = self._fc2_combine_shadow_activation(
+        combine_result = self._fc2_combine_shadow_activation(
             down_weight,
             dispatch_result,
             replica_down_weight=replica_down_weight,
             prefetch_done_event=prefetch_done_event,
+            return_weighted_activation=return_saved,
         )
-        return result
+        if not return_saved:
+            return combine_result
+        result, weighted_activation = combine_result
+        # swiglu_out_weighted is shadowed inside the FC2 pipeline and joins the
+        # saved dict through the helper's two-tuple return (same buffer the
+        # pipeline fully writes before the combine completes).
+        activations["swiglu_out_weighted"] = weighted_activation
+        # T3: assemble the native saved dict.
+        saved = assemble_native_saved(
+            self,
+            routing_plan,
+            plan_snapshot,
+            activations,
+            hidden_states=hidden_states,
+            gate_up_weight=gate_up_weight,
+            down_weight=down_weight,
+            selected_experts=selected_experts,
+        )
+        return result, saved
 
 
 def pack_gate_up_weights(

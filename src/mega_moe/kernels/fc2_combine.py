@@ -333,46 +333,6 @@ def _kernel_remote_put_barrier():
 
 
 @triton.jit
-def _split_route_rows_16(rows):
-    """Split a 16-element route lookup into scalar values."""
-    rows_even, rows_odd = tl.split(rows.reshape((8, 2)))
-    rows_0mod4, rows_2mod4 = tl.split(rows_even.reshape((4, 2)))
-    rows_1mod4, rows_3mod4 = tl.split(rows_odd.reshape((4, 2)))
-
-    rows_0mod8, rows_4mod8 = tl.split(rows_0mod4.reshape((2, 2)))
-    rows_2mod8, rows_6mod8 = tl.split(rows_2mod4.reshape((2, 2)))
-    rows_1mod8, rows_5mod8 = tl.split(rows_1mod4.reshape((2, 2)))
-    rows_3mod8, rows_7mod8 = tl.split(rows_3mod4.reshape((2, 2)))
-
-    row_0, row_8 = tl.split(rows_0mod8)
-    row_4, row_12 = tl.split(rows_4mod8)
-    row_2, row_10 = tl.split(rows_2mod8)
-    row_6, row_14 = tl.split(rows_6mod8)
-    row_1, row_9 = tl.split(rows_1mod8)
-    row_5, row_13 = tl.split(rows_5mod8)
-    row_3, row_11 = tl.split(rows_3mod8)
-    row_7, row_15 = tl.split(rows_7mod8)
-    return (
-        row_0,
-        row_1,
-        row_2,
-        row_3,
-        row_4,
-        row_5,
-        row_6,
-        row_7,
-        row_8,
-        row_9,
-        row_10,
-        row_11,
-        row_12,
-        row_13,
-        row_14,
-        row_15,
-    )
-
-
-@triton.jit
 def _kernel_local_topk_reduce(
     fc2_buf_ptr,
     route_to_send_ptr,
@@ -399,55 +359,20 @@ def _kernel_local_topk_reduce(
         for token_id in range(pid, batch_size, ncore):
             token_id64 = token_id.to(tl.int64)
             route_base = token_id * TOPK
-            if TOPK <= 16:
-                route_offsets = tl.arange(0, 16)
-                safe_route_offsets = tl.where(route_offsets < TOPK, route_offsets, 0)
-                (
-                    row_0,
-                    row_1,
-                    row_2,
-                    row_3,
-                    row_4,
-                    row_5,
-                    row_6,
-                    row_7,
-                    row_8,
-                    row_9,
-                    row_10,
-                    row_11,
-                    row_12,
-                    row_13,
-                    row_14,
-                    row_15,
-                ) = _split_route_rows_16(
-                    tl.load(route_to_send_ptr + route_base + safe_route_offsets)
+            # Scalar route loads keep the send-row indices in single-result
+            # ops; the multi-result tl.split de-interleave they replace trips
+            # this build's TritonToLinalg UseAnalysis on meta computation.
+            route_rows = ()
+            for slot in tl.static_range(0, TOPK):
+                route_rows = route_rows + (
+                    tl.load(route_to_send_ptr + route_base + slot),
                 )
             for col_start in range(0, N, BLOCK_N_REDUCE):
                 cols = col_start + reduce_cols
                 mask_n = cols < N
                 acc = tl.zeros((BLOCK_N_REDUCE,), dtype=tl.float32)
                 for topk_slot in tl.static_range(0, TOPK):
-                    if TOPK <= 16:
-                        send_row = (
-                            row_0,
-                            row_1,
-                            row_2,
-                            row_3,
-                            row_4,
-                            row_5,
-                            row_6,
-                            row_7,
-                            row_8,
-                            row_9,
-                            row_10,
-                            row_11,
-                            row_12,
-                            row_13,
-                            row_14,
-                            row_15,
-                        )[topk_slot]
-                    else:
-                        send_row = tl.load(route_to_send_ptr + route_base + topk_slot)
+                    send_row = route_rows[topk_slot]
                     valid = (send_row >= 0) & (send_row < num_send)
                     safe_row = tl.where(valid, send_row, 0).to(tl.int64)
                     values = tl.load(
