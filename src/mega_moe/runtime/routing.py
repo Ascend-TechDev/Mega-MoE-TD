@@ -419,7 +419,7 @@ def _build_moonep_routing_plan(
     sorted_experts: torch.Tensor,
     valid_route_mask: torch.Tensor,
     moonep_plan_hook: Optional[
-        Callable[[torch.Tensor, torch.Tensor], None]
+        Callable[[torch.Tensor], None]
     ] = None,
 ) -> MoERoutingPlan:
     """Map the stable logical-expert order onto MoonEP physical buckets."""
@@ -487,9 +487,8 @@ def _build_moonep_routing_plan(
         row_stride=context.planning_num_bins,
     )
 
-    # ETC is the only planner table still needed on the host for compact
-    # source/destination capacity sizing. The full count/allocation/prefix cube
-    # and inverse table remain device-resident.
+    # ETC is copied to host for plan validation and destination capacity sizing;
+    # the full count/allocation/prefix cube remains device-resident.
     replica_counts_cpu = context.planning_replica_counts.cpu()
     experts_to_copy_cpu = context.planning_experts_to_copy.cpu().contiguous()
     max_replica_count = int(replica_counts_cpu.max().item())
@@ -504,7 +503,7 @@ def _build_moonep_routing_plan(
     inverse = context.planning_inverse_experts_to_copy
     active_physical_experts_per_rank = experts_per_rank + max_replica_count
     if moonep_plan_hook is not None:
-        moonep_plan_hook(experts_to_copy_cpu, experts_to_copy)
+        moonep_plan_hook(experts_to_copy_cpu)
     # Every rank has the same raw count cube and deterministic allocation, so
     # it can derive the complete balanced cube locally.  This preserves the
     # two distinct count meanings without a second RMA publication/barrier.
@@ -575,7 +574,7 @@ def build_routing_plan(
     selected_experts: torch.Tensor,
     *,
     moonep_plan_hook: Optional[
-        Callable[[torch.Tensor, torch.Tensor], None]
+        Callable[[torch.Tensor], None]
     ] = None,
 ) -> MoERoutingPlan:
     """Build one stable, compact routing plan for dispatch and combine."""

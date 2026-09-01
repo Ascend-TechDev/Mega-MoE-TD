@@ -1,5 +1,5 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Owner-staging lifecycle for dispatch-fused MoonEP panel pushes."""
+"""Lifecycle helpers for dispatch-fused MoonEP panel pushes."""
 
 from dataclasses import dataclass
 from math import prod
@@ -100,43 +100,23 @@ def _validate_local_weight_pair(
 
 @dataclass
 class ReplicaWeightBuffers:
-    """Ordinary compact owner staging plus symmetric consumer destinations."""
+    """Current model sources and symmetric consumer destinations."""
 
-    source_gate_up_mem: Optional[torch.Tensor]
-    source_down_mem: Optional[torch.Tensor]
+    source_gate_up: Optional[torch.Tensor]
+    source_down: Optional[torch.Tensor]
     gate_up_mem: Optional[torch.Tensor]
     down_mem: Optional[torch.Tensor]
-    previous_experts_to_copy: Optional[torch.Tensor]
-    source_slot_by_global_expert: Optional[torch.Tensor]
-    source_capacity: int
     replica_capacity: int
-    experts_per_rank: int
     hidden_size: int
     ffn_size: int
 
     @property
     def closed(self) -> bool:
         return (
-            self.source_gate_up_mem is None
-            or self.source_down_mem is None
+            self.source_gate_up is None
+            or self.source_down is None
             or self.gate_up_mem is None
             or self.down_mem is None
-        )
-
-    @property
-    def source_gate_up(self) -> torch.Tensor:
-        if self.source_gate_up_mem is None:
-            raise RuntimeError("replica source staging has been finalized")
-        return self.source_gate_up_mem.view(
-            self.source_capacity, 2, self.hidden_size, self.ffn_size
-        )
-
-    @property
-    def source_down(self) -> torch.Tensor:
-        if self.source_down_mem is None:
-            raise RuntimeError("replica source staging has been finalized")
-        return self.source_down_mem.view(
-            self.source_capacity, self.hidden_size, self.ffn_size
         )
 
     @property
@@ -144,7 +124,7 @@ class ReplicaWeightBuffers:
         if self.gate_up_mem is None:
             raise RuntimeError("replica destination buffers have been finalized")
         return self.gate_up_mem.view(
-            self.replica_capacity, 2, self.hidden_size, self.ffn_size
+            self.replica_capacity, self.hidden_size, 2 * self.ffn_size
         )
 
     @property
@@ -156,13 +136,11 @@ class ReplicaWeightBuffers:
         )
 
     def finalize(self) -> None:
-        """Collectively release symmetric destinations; ordinary staging drops."""
+        """Collectively release symmetric destinations and drop source aliases."""
         import shmem as ash
 
-        self.previous_experts_to_copy = None
-        self.source_slot_by_global_expert = None
-        self.source_down_mem = None
-        self.source_gate_up_mem = None
+        self.source_down = None
+        self.source_gate_up = None
         if self.down_mem is not None:
             ash.aclshmem_free_tensor(self.down_mem)
             self.down_mem = None
@@ -175,14 +153,12 @@ def allocate_replica_weight_buffers(
     gate_up_weight: torch.Tensor,
     down_weight: torch.Tensor,
     *,
-    source_capacity: int,
     replica_capacity: int,
     rank: int,
     world_size: int,
 ) -> ReplicaWeightBuffers:
-    """Allocate local compact staging and equal-sized symmetric destinations."""
+    """Allocate symmetric destinations while retaining model source aliases."""
     _require_positive_int("world_size", world_size)
-    _require_positive_int("source_capacity", source_capacity)
     _require_positive_int("replica_capacity", replica_capacity)
     if type(rank) is not int or not 0 <= rank < world_size:
         raise ValueError("rank must be an integer in [0, world_size)")
@@ -193,8 +169,6 @@ def allocate_replica_weight_buffers(
         gate_up_elements,
         down_elements,
     ) = _validate_local_weight_pair(gate_up_weight, down_weight)
-    if source_capacity > experts_per_rank:
-        raise ValueError("source_capacity cannot exceed experts_per_rank")
     if replica_capacity > experts_per_rank:
         raise ValueError("replica_capacity cannot exceed experts_per_rank")
 
@@ -205,17 +179,6 @@ def allocate_replica_weight_buffers(
             "replica prefetch requires the EP group to match the ACLSHMEM world"
         )
 
-    device = gate_up_weight.device
-    source_gate_up_mem = torch.empty(
-        source_capacity * gate_up_elements,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    source_down_mem = torch.empty(
-        source_capacity * down_elements,
-        dtype=torch.bfloat16,
-        device=device,
-    )
     gate_up_mem = ash.aclshmem_create_tensor(
         [replica_capacity * gate_up_elements],
         dtype=torch.bfloat16,
@@ -232,58 +195,19 @@ def allocate_replica_weight_buffers(
         raise
 
     return ReplicaWeightBuffers(
-        source_gate_up_mem=source_gate_up_mem,
-        source_down_mem=source_down_mem,
+        source_gate_up=gate_up_weight,
+        source_down=down_weight,
         gate_up_mem=gate_up_mem,
         down_mem=down_mem,
-        previous_experts_to_copy=torch.full(
-            (world_size, experts_per_rank),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        ),
-        source_slot_by_global_expert=torch.empty(
-            world_size * experts_per_rank,
-            dtype=torch.int32,
-            device=device,
-        ),
-        source_capacity=source_capacity,
         replica_capacity=replica_capacity,
-        experts_per_rank=experts_per_rank,
         hidden_size=hidden_size,
         ffn_size=ffn_size,
     )
 
 
-def wait_previous_replica_consumed_async(
-    previous_experts_to_copy: torch.Tensor,
-    consumed_epoch: torch.Tensor,
-    previous_epoch: int,
-    *,
-    rank: int,
-    world_size: int,
-    experts_per_rank: int,
-) -> None:
-    """Wait until prior consumers release every staging source used by owner."""
-    if previous_epoch <= 0:
-        return
-    from mega_moe.kernels.replica_weight_prefetch import (
-        _kernel_wait_previous_replica_consumed,
-    )
-
-    _kernel_wait_previous_replica_consumed[(1, 1, 1)](
-        previous_experts_to_copy,
-        consumed_epoch,
-        previous_epoch,
-        experts_per_rank,
-        LOCAL_RANK=rank,
-        WORLD_SIZE=world_size,
-        EXPERTS_PER_RANK=experts_per_rank,
-    )
-
-
 def publish_replica_consumed_async(
     experts_to_copy: torch.Tensor,
+    gate_ready: torch.Tensor,
     down_ready: torch.Tensor,
     consumed_epoch: torch.Tensor,
     signal_epoch: int,
@@ -292,13 +216,14 @@ def publish_replica_consumed_async(
     rank: int,
     experts_per_rank: int,
 ) -> None:
-    """Publish consumer slot reuse only after every final panel is usable."""
+    """Publish consumer slot reuse after all replica panels are ready."""
     from mega_moe.kernels.replica_weight_prefetch import (
         _kernel_publish_replica_consumed,
     )
 
     _kernel_publish_replica_consumed[(1, 1, 1)](
         experts_to_copy,
+        gate_ready,
         down_ready,
         consumed_epoch,
         signal_epoch,
@@ -322,49 +247,10 @@ def fence_replica_panel_pushes_async(*, rank: int, world_size: int) -> None:
     )
 
 
-def launch_replica_source_pack_async(
-    gate_up_weight: torch.Tensor,
-    down_weight: torch.Tensor,
-    buffers: ReplicaWeightBuffers,
-    source_ready: torch.Tensor,
-    signal_epoch: int,
-    *,
-    rank: int,
-    num_vector_programs: int,
-) -> None:
-    """Queue parallel owner packing and per-panel source-ready publication."""
-    _require_positive_int("num_vector_programs", num_vector_programs)
-    from mega_moe.kernels.replica_weight_prefetch import (
-        _kernel_pack_requested_replica_weight_panels,
-    )
-
-    _kernel_pack_requested_replica_weight_panels[
-        (num_vector_programs, 1, 1)
-    ](
-        gate_up_weight,
-        down_weight,
-        buffers.source_gate_up,
-        buffers.source_down,
-        buffers.source_slot_by_global_expert,
-        source_ready,
-        signal_epoch,
-        NUM_PROGRAMS=num_vector_programs,
-        LOCAL_RANK=rank,
-        EXPERTS_PER_RANK=buffers.experts_per_rank,
-        HIDDEN_SIZE=buffers.hidden_size,
-        FFN_SIZE=buffers.ffn_size,
-        COPY_BLOCK_ELEMENTS=4096,
-        GATE_BLOCK_K=16,
-        GATE_BLOCK_N=256,
-    )
-
-
 __all__ = [
     "ReplicaWeightBuffers",
     "allocate_replica_weight_buffers",
     "fence_replica_panel_pushes_async",
-    "launch_replica_source_pack_async",
     "publish_replica_consumed_async",
     "replica_weight_push_geometry",
-    "wait_previous_replica_consumed_async",
 ]

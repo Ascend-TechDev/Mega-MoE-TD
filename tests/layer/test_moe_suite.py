@@ -127,8 +127,8 @@ def test_moonep_moderate_wide_capacity_covers_hottest_owner():
     ) == 27 / 16
 
 
-def test_replica_weight_udma_geometry_uses_one_kimi_request_per_panel():
-    gate_up_panel_elements = 3584 * 3072
+def test_replica_weight_udma_geometry_uses_kimi_payloads():
+    gate_up_panel_elements = 2 * 3584 * 3072
     down_panel_elements = (3584 // 2) * 3072
     chunk_bytes = 64 * 1024 * 1024
 

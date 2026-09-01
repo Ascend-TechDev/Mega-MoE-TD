@@ -81,130 +81,16 @@ def _submit_one_replica_panel_put_signal(
 
 
 @triton.jit
-def _push_one_replica_panel_to_destination(
-    destination_rank,
-    panel_kind,
-    source_gate_up_ptr,
-    source_down_ptr,
-    source_ready_ptr,
-    replica_gate_up_ptr,
-    replica_down_ptr,
-    gate_up_ready_ptr,
-    down_ready_ptr,
-    consumed_epoch_ptr,
-    experts_to_copy_ptr,
-    source_slot_by_global_expert_ptr,
-    signal_epoch,
-    previous_epoch,
-    replica_slot_count,
-    LOCAL_RANK: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
-    GATE_PANEL_ELEMENTS: tl.constexpr,
-    GATE_CHUNK_ELEMENTS: tl.constexpr,
-    GATE_NUM_CHUNKS: tl.constexpr,
-    DOWN_PANEL_ELEMENTS: tl.constexpr,
-    DOWN_CHUNK_ELEMENTS: tl.constexpr,
-    DOWN_NUM_CHUNKS: tl.constexpr,
-):
-    """Submit one panel kind on a destination-owned QP without a hot-path quiet."""
-    replica_slot = 0
-    while replica_slot < replica_slot_count:
-        descriptor = destination_rank * EXPERTS_PER_RANK + replica_slot
-        global_expert = tl.load(experts_to_copy_ptr + descriptor)
-        owned = (
-            (global_expert >= 0)
-            & (global_expert // EXPERTS_PER_RANK == LOCAL_RANK)
-        )
-        if owned:
-            # The previous owner may differ from this rank after a plan switch.
-            # Waiting on the consumer-owned slot epoch makes remote destination
-            # reuse independent of owner identity.  Only panel 0 performs it;
-            # the remaining panels are ordered later on the same QP.
-            if (panel_kind == 0) & (previous_epoch > 0):
-                remote_consumed = libshmem_device.remote_ptr(
-                    consumed_epoch_ptr + replica_slot * 16,
-                    destination_rank,
-                )
-                libshmem_device.signal_wait_until(
-                    remote_consumed,
-                    libshmem_device.ACLSHMEM_CMP_EQ,
-                    previous_epoch,
-                )
-            source_slot = tl.load(
-                source_slot_by_global_expert_ptr + global_expert
-            )
-            libshmem_device.signal_wait_until(
-                source_ready_ptr + (source_slot * 4 + panel_kind) * 16,
-                libshmem_device.ACLSHMEM_CMP_EQ,
-                signal_epoch,
-            )
-            if panel_kind < 2:
-                panel = panel_kind
-                source_panel = (
-                    source_gate_up_ptr
-                    + source_slot * (2 * GATE_PANEL_ELEMENTS)
-                    + panel * GATE_PANEL_ELEMENTS
-                )
-                destination_panel = (
-                    replica_gate_up_ptr
-                    + replica_slot * (2 * GATE_PANEL_ELEMENTS)
-                    + panel * GATE_PANEL_ELEMENTS
-                )
-                ready_address = (
-                    gate_up_ready_ptr
-                    + (replica_slot * 2 + panel_kind) * 16
-                )
-                _submit_one_replica_panel_put_signal(
-                    destination_panel,
-                    source_panel,
-                    GATE_PANEL_ELEMENTS,
-                    ready_address,
-                    signal_epoch,
-                    destination_rank,
-                    GATE_CHUNK_ELEMENTS,
-                    GATE_NUM_CHUNKS,
-                )
-            else:
-                panel = panel_kind - 2
-                source_panel = (
-                    source_down_ptr
-                    + source_slot * (2 * DOWN_PANEL_ELEMENTS)
-                    + panel * DOWN_PANEL_ELEMENTS
-                )
-                destination_panel = (
-                    replica_down_ptr
-                    + replica_slot * (2 * DOWN_PANEL_ELEMENTS)
-                    + panel * DOWN_PANEL_ELEMENTS
-                )
-                ready_address = (
-                    down_ready_ptr + (replica_slot * 2 + panel) * 16
-                )
-                _submit_one_replica_panel_put_signal(
-                    destination_panel,
-                    source_panel,
-                    DOWN_PANEL_ELEMENTS,
-                    ready_address,
-                    signal_epoch,
-                    destination_rank,
-                    DOWN_CHUNK_ELEMENTS,
-                    DOWN_NUM_CHUNKS,
-                )
-        replica_slot += 1
-
-
-@triton.jit
 def _push_replica_weight_panels_for_destination(
     destination_rank,
     source_gate_up_ptr,
     source_down_ptr,
-    source_ready_ptr,
     replica_gate_up_ptr,
     replica_down_ptr,
     gate_up_ready_ptr,
     down_ready_ptr,
     consumed_epoch_ptr,
     experts_to_copy_ptr,
-    source_slot_by_global_expert_ptr,
     signal_epoch,
     previous_epoch,
     replica_slot_count,
@@ -217,33 +103,71 @@ def _push_replica_weight_panels_for_destination(
     DOWN_CHUNK_ELEMENTS: tl.constexpr,
     DOWN_NUM_CHUNKS: tl.constexpr,
 ):
-    """Push gate/up first and down last on one independent destination QP."""
-    for panel_kind in tl.static_range(0, 4):
-        _push_one_replica_panel_to_destination(
-            destination_rank,
-            panel_kind,
-            source_gate_up_ptr,
-            source_down_ptr,
-            source_ready_ptr,
-            replica_gate_up_ptr,
-            replica_down_ptr,
-            gate_up_ready_ptr,
-            down_ready_ptr,
-            consumed_epoch_ptr,
-            experts_to_copy_ptr,
-            source_slot_by_global_expert_ptr,
-            signal_epoch,
-            previous_epoch,
-            replica_slot_count,
-            LOCAL_RANK,
-            EXPERTS_PER_RANK,
-            GATE_PANEL_ELEMENTS,
-            GATE_CHUNK_ELEMENTS,
-            GATE_NUM_CHUNKS,
-            DOWN_PANEL_ELEMENTS,
-            DOWN_CHUNK_ELEMENTS,
-            DOWN_NUM_CHUNKS,
-        )
+    """Push model-layout gate/up once, then the two contiguous down panels."""
+    for panel_kind in tl.static_range(0, 3):
+        replica_slot = 0
+        while replica_slot < replica_slot_count:
+            descriptor = destination_rank * EXPERTS_PER_RANK + replica_slot
+            global_expert = tl.load(experts_to_copy_ptr + descriptor)
+            owned = (
+                (global_expert >= 0)
+                & (global_expert // EXPERTS_PER_RANK == LOCAL_RANK)
+            )
+            if owned:
+                if (panel_kind == 0) & (previous_epoch > 0):
+                    remote_consumed = libshmem_device.remote_ptr(
+                        consumed_epoch_ptr + replica_slot * 16,
+                        destination_rank,
+                    )
+                    libshmem_device.signal_wait_until(
+                        remote_consumed,
+                        libshmem_device.ACLSHMEM_CMP_EQ,
+                        previous_epoch,
+                    )
+                owner_local_expert = global_expert % EXPERTS_PER_RANK
+                if panel_kind == 0:
+                    gate_up_elements: tl.constexpr = 2 * GATE_PANEL_ELEMENTS
+                    source_panel = (
+                        source_gate_up_ptr
+                        + owner_local_expert * gate_up_elements
+                    )
+                    destination_panel = (
+                        replica_gate_up_ptr
+                        + replica_slot * gate_up_elements
+                    )
+                    _submit_one_replica_panel_put_signal(
+                        destination_panel,
+                        source_panel,
+                        gate_up_elements,
+                        gate_up_ready_ptr + replica_slot * 16,
+                        signal_epoch,
+                        destination_rank,
+                        GATE_CHUNK_ELEMENTS,
+                        GATE_NUM_CHUNKS,
+                    )
+                else:
+                    panel = panel_kind - 1
+                    source_panel = (
+                        source_down_ptr
+                        + owner_local_expert * (2 * DOWN_PANEL_ELEMENTS)
+                        + panel * DOWN_PANEL_ELEMENTS
+                    )
+                    destination_panel = (
+                        replica_down_ptr
+                        + replica_slot * (2 * DOWN_PANEL_ELEMENTS)
+                        + panel * DOWN_PANEL_ELEMENTS
+                    )
+                    _submit_one_replica_panel_put_signal(
+                        destination_panel,
+                        source_panel,
+                        DOWN_PANEL_ELEMENTS,
+                        down_ready_ptr + (replica_slot * 2 + panel) * 16,
+                        signal_epoch,
+                        destination_rank,
+                        DOWN_CHUNK_ELEMENTS,
+                        DOWN_NUM_CHUNKS,
+                    )
+            replica_slot += 1
 
 
 @triton.jit(
@@ -268,10 +192,8 @@ def _kernel_dispatch_fc1(
     replica_down_ready_ptr,
     source_gate_up_ptr,
     source_down_ptr,
-    source_ready_ptr,
     consumed_epoch_ptr,
     experts_to_copy_ptr,
-    source_slot_by_global_expert_ptr,
     replica_slot_count,
     output_ptr,
 
@@ -303,7 +225,6 @@ def _kernel_dispatch_fc1(
     stride_weight_1,
     stride_weight_2,
     stride_replica_weight_0,
-    stride_replica_weight_panel,
     stride_replica_weight_k,
     stride_replica_weight_n,
     stride_output_m,
@@ -363,14 +284,12 @@ def _kernel_dispatch_fc1(
                         pid,
                         source_gate_up_ptr,
                         source_down_ptr,
-                        source_ready_ptr,
                         replica_weight_ptr,
                         replica_down_weight_ptr,
                         replica_weight_ready_ptr,
                         replica_down_ready_ptr,
                         consumed_epoch_ptr,
                         experts_to_copy_ptr,
-                        source_slot_by_global_expert_ptr,
                         replica_weight_epoch,
                         previous_replica_epoch,
                         replica_slot_count,
@@ -392,7 +311,6 @@ def _kernel_dispatch_fc1(
             signal_epoch, replica_weight_epoch,
             N, K, stride_input_m, stride_input_k,
             stride_weight_0, stride_weight_1, stride_weight_2,
-            0, False,
             stride_output_m, stride_output_n,
             DISPATCH_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_M,
             BLOCK_SIZE_N, BLOCK_SIZE_K,
@@ -409,7 +327,6 @@ def _kernel_dispatch_fc1(
                 N, K, stride_input_m, stride_input_k,
                 stride_replica_weight_0, stride_replica_weight_n,
                 stride_replica_weight_k,
-                stride_replica_weight_panel, True,
                 stride_output_m, stride_output_n,
                 DISPATCH_BLOCK_SIZE_M, GEMM_BLOCK_SIZE_M,
                 BLOCK_SIZE_N, BLOCK_SIZE_K,
@@ -598,8 +515,6 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
     N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
-    stride_weight_panel,
-    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     DISPATCH_BLOCK_SIZE_M: tl.constexpr,
     GEMM_BLOCK_SIZE_M: tl.constexpr,
@@ -634,10 +549,9 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
         if expert_size > 0:
             if WAIT_REPLICA_WEIGHTS:
                 replica_slot = expert_id - WEIGHT_EXPERT_BASE
-                weight_panel = (n_tile * BLOCK_SIZE_N) // (N // 2)
                 weight_ready_token = dl.wait(
                     replica_weight_ready_ptr
-                    + (replica_slot * 2 + weight_panel) * 16,
+                    + replica_slot * 16,
                     1,
                     "gpu",
                     "acquire",
@@ -703,7 +617,6 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
                     window_size, n_tile, N, K,
                     stride_input_m, stride_input_k,
                     stride_weight_0, stride_weight_1, stride_weight_2,
-                    stride_weight_panel, PACKED_N_PANELS,
                     stride_output_m, stride_output_n,
                     GEMM_BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                     WEIGHT_EXPERT_BASE, dtype)
@@ -715,8 +628,6 @@ def _triton_grouped_gemm_one_mn_tile(
     expert_id, m_off, m_size, n_tile, N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
-    stride_weight_panel,
-    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -750,23 +661,11 @@ def _triton_grouped_gemm_one_mn_tile(
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
-            if PACKED_N_PANELS:
-                panel_n: tl.constexpr = N // 2
-                panel_n_tiles: tl.constexpr = panel_n // BLOCK_SIZE_N
-                panel = n_tile // panel_n_tiles
-                panel_offsets = n_offs - panel * panel_n
-                b_ptrs = (
-                    weight_base
-                    + panel * stride_weight_panel
-                    + k_offs[:, None] * stride_weight_2
-                    + panel_offsets[None, :] * stride_weight_1
-                )
-            else:
-                b_ptrs = (
-                    weight_base
-                    + k_offs[:, None] * stride_weight_2
-                    + n_offs[None, :] * stride_weight_1
-                )
+            b_ptrs = (
+                weight_base
+                + k_offs[:, None] * stride_weight_2
+                + n_offs[None, :] * stride_weight_1
+            )
             b = tl.load(
                 b_ptrs,
                 mask=k_mask[:, None] & n_mask[None, :],
@@ -792,8 +691,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
     expert_id, m_off, m_size, n_tile, N, K,
     stride_input_m, stride_input_k,
     stride_weight_0, stride_weight_1, stride_weight_2,
-    stride_weight_panel,
-    PACKED_N_PANELS: tl.constexpr,
     stride_output_m, stride_output_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -809,7 +706,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
-                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M // 4, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -819,7 +715,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
-                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M // 2, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -829,7 +724,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
-                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -840,7 +734,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
-                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 16, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -850,7 +743,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
                 expert_id, m_off, m_size, n_tile, N, K,
                 stride_input_m, stride_input_k,
                 stride_weight_0, stride_weight_1, stride_weight_2,
-                stride_weight_panel, PACKED_N_PANELS,
                 stride_output_m, stride_output_n,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 WEIGHT_EXPERT_BASE, dtype)
@@ -860,7 +752,6 @@ def _triton_grouped_gemm_one_mn_tile_tail(
             expert_id, m_off, m_size, n_tile, N, K,
             stride_input_m, stride_input_k,
             stride_weight_0, stride_weight_1, stride_weight_2,
-            stride_weight_panel, PACKED_N_PANELS,
             stride_output_m, stride_output_n,
             BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
             WEIGHT_EXPERT_BASE, dtype)

@@ -4,7 +4,7 @@ It uses torch_npu Level1/PipeUtilization collection, one trace per rank, and
 offline ``analyse`` after all distributed workers have finalized.
 
 The trace records three consecutive fresh replica epochs. Replica weights
-change every forward, so owner staging reuse waits for the preceding epoch's
+change every forward, and destination reuse waits for the preceding epoch's
 per-consumer acknowledgements. Kernel compilation and buffer allocation are
 completed before profiling.
 
@@ -343,10 +343,12 @@ if __name__ == "__main__":
                     profile_config.replica_down_chunk_mib
                 ),
                 "replica_transport": (
-                    "dispatch-fused owner-push UDMA PIPE_S PUT_SIGNAL, "
-                    "one QP per destination, gate/up before down"
+                    "dispatch-fused owner-push UDMA PIPE_S PUT_SIGNAL from "
+                    "contiguous model layout, gate/up before down"
                 ),
-                "replica_staging": "compact owner-packed local source",
+                "replica_staging": (
+                    "none; current model weights are source aliases"
+                ),
                 "replica_reuse": "consumer-owned consumed epoch per slot",
                 "dispatch_transport": "MTE direct symmetric mapping",
                 "profile_steps": [
