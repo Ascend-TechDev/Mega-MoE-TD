@@ -90,7 +90,7 @@ python -m pytest \
   -m dist -v -s
 ```
 
-### 整网测试（kimi k3 mock 训练）
+### A2/A3整网测试（kimi k3 mock 训练）
 
 通过宿主仓
 [MindSpeed-MM_MoonEP](https://gitcode.com/jzhoujg/MindSpeed-MM_MoonEP.git)
