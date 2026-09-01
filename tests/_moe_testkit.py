@@ -140,10 +140,17 @@ def make_moonep_backward_peer_mem(
     allocates its own symmetric heap objects) to produce the routing plan, so the
     backward peer_mem has to be reserved first to sit at heap offset 0 for
     ``dl.symm_at``. Sizing is passed explicitly because the physical
-    ``saved_phys`` (and its total_recv) only exists after the plan is built; a
-    dropless plan keeps ``total_recv == total_send == tokens * topk``. The
-    all_reduce MAX keeps the same size — and therefore the same subsequent heap
-    offsets (e.g. step1's signal_mem) — on every rank.
+    ``saved_phys`` (and its total_recv) only exists after the plan is built.
+    The recv argument must budget for WORST-CASE routing imbalance: per-rank
+    ``total_recv`` is data-dependent (it counts every global token-slot whose
+    expert lands on this rank), NOT ``tokens * topk`` — under random imbalance
+    a dropless plan can drive it up to ``tokens * topk * world_size``, and an
+    undersized buffer first overflows silently in the FORWARD (raw-pointer
+    writes, no bounds check) and then raises on a single rank in the backward
+    ``.view()`` — which leaves the peer rank spinning in its kernel (the
+    "one rank vanishes, no traceback" hang form). The all_reduce MAX keeps
+    the same size — and therefore the same subsequent heap offsets (e.g.
+    step1's signal_mem) — on every rank.
     """
     if ash is None:
         raise RuntimeError("ACLSHMEM support is unavailable in this Python environment")

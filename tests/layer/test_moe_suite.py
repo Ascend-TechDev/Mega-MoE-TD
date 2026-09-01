@@ -1364,7 +1364,11 @@ def run_moonep_backward_hot_expert_case(rank: int, world_size: int) -> None:
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -1498,7 +1502,11 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -1838,7 +1846,11 @@ def run_moonep_backward_symmetric_hot_expert_case(
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -2060,7 +2072,11 @@ def run_moonep_backward_symmetric_moderate_wide_case(
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -3126,7 +3142,11 @@ def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
         # (dl.symm_at offset-0); the operator below claims its own heap
         # objects for planning and dispatch.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
