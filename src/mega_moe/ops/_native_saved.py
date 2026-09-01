@@ -367,6 +367,11 @@ def assemble_native_saved(
     if activations is not None:
         saved.update(activations)
     saved.update(_weight_reference_section(gate_up_weight, down_weight, ffn_dim))
+    # Activation config for the step-2 derivative: the fused forward selects
+    # SwiGLU or SiTU-GLU at construction, and the backward must differentiate
+    # the same one (op lifts the fields in __init__).
+    _situ_beta = getattr(op, "situ_beta", None)
+    _situ_linear_beta = getattr(op, "situ_linear_beta", None)
     saved.update(
         batch_size=int(hidden_states.shape[0]),
         hidden_dim=int(hidden_states.shape[1]),
@@ -377,6 +382,11 @@ def assemble_native_saved(
         ep_group=op.ep_group,
         experts_per_rank=int(op.experts_per_rank),
         selected_experts=selected_experts,
+        activation=str(getattr(op, "activation", None) or "swiglu"),
+        situ_beta=1.0 if _situ_beta is None else float(_situ_beta),
+        situ_linear_beta=(
+            None if _situ_linear_beta is None else float(_situ_linear_beta)
+        ),
         _routing_generation=int(plan.generation),
         _owner_token=id(op._routing_owner_token),
     )

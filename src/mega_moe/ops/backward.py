@@ -164,6 +164,14 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     use_side_stream = (not use_moonep) and os.environ.get("MOE_WGRAD_STREAM") == "1"
     ec = saved["expert_counts"]
     wgrad_stream = torch.npu.Stream() if use_side_stream else None
+    # Step-2 activation derivative: differentiate the same gated activation the
+    # forward ran (SwiGLU default, SiTU-GLU for the Kimi hidden_act="situ"
+    # path). Older saved dicts without the keys keep the SwiGLU derivative.
+    _act_kwargs = dict(
+        activation=saved.get("activation", "swiglu"),
+        situ_beta=saved.get("situ_beta"),
+        situ_linear_beta=saved.get("situ_linear_beta"),
+    )
 
     def _run_wgrad(fn, *args):
         if wgrad_stream is None:
@@ -197,7 +205,7 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         grad_fc1_output, grad_gate, grad_fc2 = fused_swiglu_bwd_fc2_wgrad(
             grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
             grad_fc2_out_sorted, saved["swiglu_out_weighted"], ec,
-            saved["split_size_cum_per_expert"])
+            saved["split_size_cum_per_expert"], **_act_kwargs)
         _t("step2+step3 fused done")
     elif use_dual:
         # step3 (fc2 wgrad, pure Cube via npu_grouped_matmul) ∥ step2 (swiglu,
@@ -224,7 +232,8 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         with torch.npu.stream(s_vec):
             s_vec.wait_event(ev1)
             grad_fc1_output, grad_gate = swiglu_bwd_triton(
-                grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])  # step2, pure Vector
+                grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
+                **_act_kwargs)  # step2, pure Vector
             ev_vec.record(s_vec)
         cur.wait_event(ev_cube)
         cur.wait_event(ev_vec)
@@ -247,7 +256,8 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         _t("step3-fc2_wgrad launched (side stream)")
         # step 2: swiglu backward (main stream; overlaps with step3 wgrad cube)
         grad_fc1_output, grad_gate = swiglu_bwd_triton(
-            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"])
+            grad_swiglu, saved["fc1_output"], saved["recv_weights_sorted"],
+            **_act_kwargs)
         if _stage_timing:
             _sev[3].record()
         _t("step2-swiglu done")

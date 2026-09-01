@@ -120,23 +120,43 @@ def fc2_input_grad(grad_fc2_out_sorted, saved):
 
 
 def swiglu_bwd(grad_swiglu, saved):
-    """Step 2: SwiGLU backward.
-    fwd: swiglu_out = silu(gate)*up ; swiglu_out_weighted = swiglu_out * scale (scale=recv_weights_sorted)
-      dGate = grad_swiglu * silu'(gate) * up * scale
-      dUp   = grad_swiglu * silu(gate)  * scale
-      dScale = sum(silu(gate)*up*grad_swiglu)  (per row)  => grad of recv_weights_sorted
+    """Step 2: SwiGLU/SiTU-GLU backward (activation from ``saved``).
+    fwd: swiglu_out = act(gate) * v(up) ; swiglu_out_weighted = swiglu_out * scale (scale=recv_weights_sorted)
+      SwiGLU:  act = silu(gate), v = up
+      SiTU:    act = beta*tanh(gate/beta)*sigmoid(gate), v = linear_beta*tanh(up/linear_beta) (or up)
+      dGate = grad_swiglu * act'(gate) * v * scale
+      dUp   = grad_swiglu * act(gate)  * v' * scale
+      dScale = sum(act(gate)*v*grad_swiglu)  (per row)  => grad of recv_weights_sorted
     Returns grad_fc1_output [M,2*ffn] (=cat[dGate,dUp]), grad_gate [M]."""
     gate = saved["gate"].float()
     up = saved["up"].float()
     scale = saved["recv_weights_sorted"].float().unsqueeze(-1)
     g = grad_swiglu.float()
-    sigmoid_g = torch.sigmoid(gate)
-    silu_g = gate * sigmoid_g
-    silu_prime = silu_g * (1 - sigmoid_g) + sigmoid_g          # d/dgate silu(gate)
-    dGate = g * silu_prime * up * scale
-    dUp = g * silu_g * scale
+    if saved.get("activation", "swiglu") == "situglu":
+        beta = float(saved.get("situ_beta") or 1.0)
+        linear_beta = saved.get("situ_linear_beta")
+        t = torch.tanh(gate / beta)
+        sigmoid_g = torch.sigmoid(gate)
+        act_g = beta * t * sigmoid_g
+        act_prime = (1 - t * t) * sigmoid_g + beta * t * sigmoid_g * (1 - sigmoid_g)
+        if linear_beta is not None:
+            linear_beta = float(linear_beta)
+            tu = torch.tanh(up / linear_beta)
+            v = linear_beta * tu
+            v_prime = 1 - tu * tu
+        else:
+            v = up
+            v_prime = torch.ones_like(up)
+    else:
+        sigmoid_g = torch.sigmoid(gate)
+        act_g = gate * sigmoid_g
+        act_prime = act_g * (1 - sigmoid_g) + sigmoid_g       # d/dgate silu(gate)
+        v = up
+        v_prime = torch.ones_like(up)
+    dGate = g * act_prime * v * scale
+    dUp = g * act_g * v_prime * scale
     grad_fc1_output = torch.cat([dGate, dUp], dim=-1).to(grad_swiglu.dtype)
-    grad_gate = (silu_g * up * g).sum(dim=-1).to(grad_swiglu.dtype)   # dscale, [M]
+    grad_gate = (act_g * v * g).sum(dim=-1).to(grad_swiglu.dtype)   # dscale, [M]
     return grad_fc1_output, grad_gate
 
 

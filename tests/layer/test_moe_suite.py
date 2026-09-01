@@ -3282,6 +3282,174 @@ def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
+    """SiTU-GLU backward parity: the H3 recipe with ``activation="situglu``.
+
+    Kimi-K3 runs ``hidden_act="situ"`` (β=4.0, lβ=25.0), so the fused
+    backward's step-2 derivative must be the SiTU one, not silu'.  Same
+    lifecycle and verdict discipline as ``run_megamoe_native_autograd_case``;
+    the eager golden is made SiTU-consistent by re-deriving the replay's
+    weighted activation from the SAME pre-activation halves (fp32 SiTU, fp32
+    route scale, bf16 store — the operator's numeric path) and telling the
+    baseline which activation to differentiate.  A silu-derived backward
+    cannot pass this golden: the SiTU derivative differs at every element.
+    """
+    if world_size != 2:
+        raise ValueError("the situglu autograd case requires exactly two ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("situglu autograd requires NPU and ACLSHMEM")
+    if MegaMoEFunction is None:
+        raise RuntimeError("MegaMoEFunction is unavailable")
+
+    tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "megamoe-situglu-autograd-w2"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # See the native autograd case: first symmetric allocation, rows sized
+        # for the worst-case dropless receive (tokens*topk*world_size).
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk * world_size, tokens * topk, hidden, dtype, rank,
+            ep_group,
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=float(world_size),
+                    activation="situglu",
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hs, expert_indices = prepare_inputs(
+                    tokens, hidden, num_experts, topk, dtype, device,
+                    seed=2203 + rank,
+                )
+                routing_weights = make_routing_weights(
+                    tokens, topk, device, seed=2204 + rank
+                )
+                torch.manual_seed(2205 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+                # Eager golden: the replay saved (silu) converted to SiTU — the
+                # replay's dispatch metadata, halves and weights are
+                # activation-independent; only swiglu_out_weighted and the
+                # differentiated activation change.
+                with torch.no_grad():
+                    _, golden_saved = moe_forward(
+                        hs, routing_weights, expert_indices, w_gate, w_up, w2,
+                        ep_group, topk, return_saved=True,
+                    )
+                    gate = golden_saved["gate"].float()
+                    up = golden_saved["up"].float()
+                    situ_a = (
+                        situ_beta
+                        * torch.tanh(gate / situ_beta)
+                        * torch.sigmoid(gate)
+                    )
+                    up_v = situ_linear_beta * torch.tanh(
+                        up / situ_linear_beta
+                    )
+                    golden_saved["swiglu_out_weighted"] = (
+                        situ_a
+                        * up_v
+                        * golden_saved["recv_weights_sorted"]
+                        .float()
+                        .unsqueeze(-1)
+                    ).to(dtype)
+                    golden_saved["activation"] = "situglu"
+                    golden_saved["situ_beta"] = situ_beta
+                    golden_saved["situ_linear_beta"] = situ_linear_beta
+                    golden = backward_torch_baseline(golden_saved, dy)
+
+                state = SimpleNamespace(signal_mem=None, epoch=0)
+
+                def run_function_step():
+                    hidden_leaf = hs.clone().requires_grad_(True)
+                    routing_leaf = routing_weights.clone().requires_grad_(True)
+                    gate_up_leaf = packed_w1.clone().requires_grad_(True)
+                    down_leaf = w2.clone().requires_grad_(True)
+                    output = MegaMoEFunction.apply(
+                        op, hidden_leaf, routing_leaf, expert_indices,
+                        gate_up_leaf, down_leaf, peer_mem, state,
+                    )
+                    output.backward(dy)
+                    return hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
+
+                dist.barrier()
+                first_grads = _megamoe_function_grads(
+                    run_function_step(), ffn
+                )
+                for name, value in first_grads.items():
+                    if value is None or tuple(value.shape) != tuple(
+                        golden[name].shape
+                    ):
+                        raise AssertionError(
+                            f"{label}: grad {name} shape "
+                            f"{None if value is None else tuple(value.shape)} "
+                            f"!= golden {tuple(golden[name].shape)}"
+                        )
+                all_ok, details = compare_backward_gradients(
+                    first_grads, golden
+                )
+                epoch_after_first = state.epoch
+                if state.signal_mem is None:
+                    raise AssertionError(
+                        f"{label}: the Function did not persist signal_mem in "
+                        "the caller state"
+                    )
+
+                # Epoch reuse must stay bitwise on the SiTU derivative too.
+                second_grads = _megamoe_function_grads(
+                    run_function_step(), ffn
+                )
+                for name, again in second_grads.items():
+                    if not torch.equal(again, first_grads[name]):
+                        raise AssertionError(
+                            f"{label}: epoch reuse changed grad {name}"
+                        )
+                if state.epoch < epoch_after_first or state.epoch < 1:
+                    raise AssertionError(
+                        f"{label}: the Function did not advance/write back the "
+                        f"epoch (after first={epoch_after_first}, "
+                        f"after second={state.epoch})"
+                    )
+
+                flag = torch.tensor(
+                    [1 if all_ok else 0], dtype=torch.int32, device=device
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+                if rank == 0 and not bool(flag.item()):
+                    print(f"{label} gradient details: {details}", flush=True)
+                if not bool(flag.item()):
+                    raise AssertionError(
+                        f"{label}: situglu Function grads mismatched the "
+                        "SiTU eager golden"
+                    )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 FUNCTIONAL_FORWARD_CASES = kit.make_pytest_params(
     select_cases(direction="forward", tags={"functional", "smoke"})
 )
@@ -3401,6 +3569,16 @@ def test_megamoe_native_autograd(dist_test):
             "H3 API pending: mega_moe does not export MegaMoEFunction yet"
         )
     dist_test(run_megamoe_native_autograd_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_megamoe_situglu_autograd(dist_test):
+    if MegaMoEFunction is None:
+        pytest.skip(
+            "H3 API pending: mega_moe does not export MegaMoEFunction yet"
+        )
+    dist_test(run_megamoe_situglu_autograd_case, world_size=2)
 
 
 # TODO: future work — when an all-directions session is introduced, finish and
