@@ -359,20 +359,21 @@ def _kernel_local_topk_reduce(
         for token_id in range(pid, batch_size, ncore):
             token_id64 = token_id.to(tl.int64)
             route_base = token_id * TOPK
-            # Scalar route loads keep the send-row indices in single-result
-            # ops; the multi-result tl.split de-interleave they replace trips
-            # this build's TritonToLinalg UseAnalysis on meta computation.
-            route_rows = ()
-            for slot in tl.static_range(0, TOPK):
-                route_rows = route_rows + (
-                    tl.load(route_to_send_ptr + route_base + slot),
-                )
             for col_start in range(0, N, BLOCK_N_REDUCE):
                 cols = col_start + reduce_cols
                 mask_n = cols < N
                 acc = tl.zeros((BLOCK_N_REDUCE,), dtype=tl.float32)
                 for topk_slot in tl.static_range(0, TOPK):
-                    send_row = route_rows[topk_slot]
+                    # Scalar route loads keep the send-row indices in
+                    # single-result ops: the multi-result tl.split
+                    # de-interleave they replace trips 910B1's
+                    # TritonToLinalg UseAnalysis, while caching the scalars
+                    # in a Python tuple carried across tl.static_range
+                    # iterations fails the 950DT frontend with NameError.
+                    # Load straight into the consumer; the re-loads hit L1.
+                    send_row = tl.load(
+                        route_to_send_ptr + route_base + topk_slot
+                    )
                     valid = (send_row >= 0) & (send_row < num_send)
                     safe_row = tl.where(valid, send_row, 0).to(tl.int64)
                     values = tl.load(
