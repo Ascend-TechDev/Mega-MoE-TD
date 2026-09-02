@@ -126,35 +126,26 @@ bash examples/kimi_k3/finetune_kimik3.sh
 
 #### Kimi-K3
 
-完整*八卡* post-routing forward 的加速比为 `Grouped baseline / Ascend candidate`：
+模型配置：总专家数 `896`，每个 token 选择 `top-k=16` 个专家。
 
-| tokens/rank | Ascend full | Grouped baseline | 加速比 | 观测 HBM/卡 |
+完整 *950DT 八卡* Mega-MoE-TD forward 的 median耗时对比如下。加速比定义为
+`Megatron moe-permute-fusion / Mega-MoE-TD`
+
+| tokens/rank | Mega-MoE-TD | Megatron moe-permute-fusion | Grouped Torch | Megatron / Mega-MoE-TD | |
+|---:|---:|---:|---:|---:|---:|
+| 4K | 16.801 ms | 19.634 ms | 22.198 ms | **1.169x** | 
+| 8K | 28.022 ms | 32.653 ms | 42.501 ms | **1.165x** | 
+| 16K | 51.171 ms | 66.506 ms | 85.922 ms | **1.300x** |
+
+
+Mega-MoE-TD 的主要阶段 median 耗时 如下：
+
+| tokens/rank | Preprocess | Dispatch+FC1 | Weighted SwiGLU + FC2+Combine | E2E |
 |---:|---:|---:|---:|---:|
-| 2K  | 27.525 ms | 43.207 ms | **1.570x** | — |
-| 4K  | 44.709 ms | 80.422 ms | **1.799x** | ≈22.4 GiB |
-| 8K  | 79.312 ms | 149.837 ms | **1.889x** | ≈35.1 GiB |
-| 16K | 137.703 ms | 302.747 ms | **2.199x** | ≈53.5 GiB |
+| 4K | 0.912 ms | 9.712 ms | 6.694 ms | 16.801 ms |
+| 8K | 0.946 ms | 16.635 ms | 11.085 ms | 28.022 ms |
+| 16K | 0.946 ms | 30.770 ms | 19.878 ms | 51.171 ms |
 
-
-主要 Ascend 阶段耗时如下，单位均为 ms：
-
-| tokens/rank | preprocess | dispatch+FC1 | weighted SwiGLU | FC2+combine |
-|---:|---:|---:|---:|---:|
-| 4K | 5.031 | 19.221 | 2.257 | 16.491 |
-| 8K | 5.764 | 33.973 | 4.465 | 30.961 |
-| 16K | 6.970 | 64.385 | 8.888 | 59.042 |
-
-与 Megatron mean latency 的对比如下：
-
-| tokens/rank | Megatron mean | Triton mean | Megatron / Triton |
-|---:|---:|---:|---:|
-| 4096 | 45.136 ms | 43.130 ms | **1.047x** |
-| 8192 | 68.541 ms | 74.582 ms | 0.919x |
-| 16384 | 127.801 ms | 137.767 ms | 0.928x |
-
-- 4K：Triton 快约 4.4%。
-- 8K：Megatron 快约 8.8%。
-- 16K：Megatron 快约 7.8%。
 
 ### Backward
 
