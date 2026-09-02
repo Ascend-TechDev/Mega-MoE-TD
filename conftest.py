@@ -99,6 +99,22 @@ def run_dist_test(fn, world_size=2, backend="hccl", args=()):
                 )
     finally:
         drain()
+        # Abandoned live workers poison every later node in the session: they
+        # keep their NPU contexts and the MASTER_PORT TCPStore, so the next
+        # test's ranks fail to open the device (SetDevice 507033 / TsdOpen)
+        # or bind the store (EADDRINUSE) and one flaky node cascades into a
+        # whole failed batch.  This fires only when workers are still alive
+        # (deadline raise, or peers spinning in a collective after a failed
+        # rank reported through the error queue); on normal exits every
+        # process is gone and the loop is a no-op.
+        for process in spawn_context.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in spawn_context.processes:
+            process.join(15)
+            if process.is_alive():
+                process.kill()
+            process.join()
     if errors:
         messages = "\n".join(f"[rank {rank}] {error}" for rank, error in errors)
         pytest.fail(f"distributed worker failure:\n{messages}")
