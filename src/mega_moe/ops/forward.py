@@ -1311,14 +1311,10 @@ class FusedMoEForward(torch.nn.Module):
         ``saved`` dict for the fused backward as ``(output, saved)`` — the
         full home-layout contract (metadata / permutation / scalar /
         activation / weight-reference sections, see
-        :mod:`mega_moe.ops._native_saved`).  ``return_saved=False`` (default)
-        keeps the previous behavior exactly.
+        :mod:`mega_moe.ops._native_saved`), extended with the MoonEP
+        physical ``[home | replica]`` sections when ``enable_moonep``.
+        ``return_saved=False`` (default) keeps the previous behavior exactly.
         """
-        if return_saved and self.enable_moonep:
-            raise NotImplementedError(
-                "native saved capture for the MoonEP layout arrives with "
-                "Stage N1; only the home layout is captured today"
-            )
         # Preserve the public validation order before routing launches any work.
         self._validate_dispatch_inputs(hidden_states, selected_experts)
         self._validate_gate_up_weight(gate_up_weight, hidden_states.device)
