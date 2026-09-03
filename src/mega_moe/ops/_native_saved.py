@@ -286,7 +286,7 @@ def snapshot_plan_metadata(op, plan: MoERoutingPlan) -> dict:
     return snapshot
 
 
-def capture_activations(op, dispatch_result):
+def capture_activations(op, dispatch_result, workspace=None):
     """T2 — snapshot the forward activations the backward needs.
 
     Call site: inside ``FusedMoEForward.forward`` between the ``dispatch_fc1``
@@ -299,22 +299,37 @@ def capture_activations(op, dispatch_result):
 
     * ``recv_hidden_sorted``  — ``empty_like``+``copy_`` of
       ``dispatch_result.dispatched_tokens`` (the one required materialization;
-      the caching allocator reuses the block across steps);
+      with ``workspace`` the copy lands in a fixed-address persistent slice
+      instead of a fresh allocation);
     * ``recv_weights_sorted`` — ``dispatch_result.received_routing_weights``
       (FP32 workspace) cast to the operator's BF16 activation dtype;
-    * ``fc1_output``          — reference to the freshly allocated FC1 output.
+    * ``fc1_output``          — reference to the freshly allocated FC1 output
+      (already a workspace slice when the caller passed one in).
 
     ``swiglu_out_weighted`` is produced inside ``_fc2_combine_shadow_activation``
     and rides that helper's two-tuple return instead of this call.
     """
     dispatched_tokens = dispatch_result.dispatched_tokens
-    recv_hidden_sorted = torch.empty_like(dispatched_tokens)
+    if workspace is not None:
+        m = dispatched_tokens.shape[0]
+        recv_hidden_sorted = workspace["recv_hidden_sorted"][:m]
+        if tuple(recv_hidden_sorted.shape) != tuple(dispatched_tokens.shape):
+            raise ValueError(
+                "workspace recv_hidden_sorted slice "
+                f"{tuple(recv_hidden_sorted.shape)} does not cover "
+                f"dispatched_tokens {tuple(dispatched_tokens.shape)}"
+            )
+        recv_weights_sorted = workspace["recv_weights_sorted"][:m]
+        recv_weights_sorted.copy_(dispatch_result.received_routing_weights)
+    else:
+        recv_hidden_sorted = torch.empty_like(dispatched_tokens)
+        recv_weights_sorted = dispatch_result.received_routing_weights.to(
+            op.activation_dtype
+        )
     recv_hidden_sorted.copy_(dispatched_tokens)
     return {
         "recv_hidden_sorted": recv_hidden_sorted,
-        "recv_weights_sorted": dispatch_result.received_routing_weights.to(
-            op.activation_dtype
-        ),
+        "recv_weights_sorted": recv_weights_sorted,
         "fc1_output": dispatch_result.fc1_output,
     }
 
