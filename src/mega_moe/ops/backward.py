@@ -308,6 +308,12 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         dist.all_reduce(_tmax, op=dist.ReduceOp.MAX, group=saved["ep_group"])
         saved.setdefault("_bwd_stage_samples", []).append(
             [float(x) for x in _tmax.cpu().tolist()])
+        if saved["ep_rank"] == 0:
+            # per-backward stage wall (ms, MAX across ranks): dispatch /
+            # fc2_wgrad / swiglu / fc1_wgrad / combine — surfaces directly in
+            # the integrated training log, not only via the bench aggregate.
+            print("[bwd-stage] " + " ".join(
+                f"{v:8.1f}" for v in _tmax.cpu().tolist()), flush=True)
     _t("step4-combine_fc1 done")
     # ensure side-stream wgrads finished before chunk/return
     if wgrad_stream is not None:
