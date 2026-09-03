@@ -8,6 +8,8 @@ router matmul, softmax, and top-k selection are intentionally excluded.
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import os
+
 import torch
 import torch.distributed
 
@@ -184,12 +186,91 @@ class FusedMoEForward(torch.nn.Module):
         self._replica_weight_epoch = 1
         self._active_replica_weight_epoch = 1
         self._forward_stream = None
+        # Persistent buffers for the large native-saved activations (see
+        # _get_saved_workspace).  Allocated once on first saved-forward and
+        # reused every step at a fixed address; MOE_SAVED_WORKSPACE=0 restores
+        # the per-step allocation (leaks ~3.8 GiB/iter on the integrated
+        # training path — the autograd ctx pins the saved dict).
+        self._saved_ws = None
+        # Fixed-address staging for a strided down (fc2) weight view (see
+        # _materialize_down_weight) — same persistent-buffer rationale.
+        self._fc2_ws = None
 
         # All ranks must observe zeroed symmetric buffers before first use.
         torch.npu.synchronize()
         torch.distributed.barrier(group=self.ep_group)
 
     # ===================== buffer-management =====================
+    def _get_saved_workspace(self, hidden_states, gate_up_weight):
+        """Fixed-address buffers for the large native-saved activations.
+
+        Sized once to the receive capacity (peer_mem bound) and handed out
+        every step as ``[:M]`` slices for ``fc1_output`` /
+        ``recv_hidden_sorted`` / ``recv_weights_sorted`` /
+        ``swiglu_out_weighted``.  The blocks never return to the caching
+        allocator, which matters twice on the integrated training path:
+
+        * the autograd ctx of ``MegaMoEFunction`` outlives the graph and pins
+          the saved dict — with per-step allocations that pinned dict grows
+          the live set by ~3.8 GiB/iteration (OOM at iter 5 on kimi-k3 w8);
+          views of these persistent buffers pin nothing new;
+        * recycled blocks get picked up by the next allocation while the
+          operator's own-stream / free-flight (ffts) work may still be using
+          them — the free-flight tasks outlive torch stream semantics, so any
+          cross-step reuse races the dispatch signal chain (ffts spin →
+          vector core timeout).  A fixed address cannot be raced.
+        """
+        if self._saved_ws is None:
+            max_recv = self.context.peer_mem.numel() // self.hidden_size
+            ffn = gate_up_weight.shape[2] // 2
+            dev = hidden_states.device
+            self._saved_ws = {
+                "fc1_output": torch.empty(
+                    max_recv, 2 * ffn,
+                    dtype=self.activation_dtype, device=dev),
+                "recv_hidden_sorted": torch.empty(
+                    max_recv, self.hidden_size,
+                    dtype=self.activation_dtype, device=dev),
+                "recv_weights_sorted": torch.empty(
+                    max_recv, dtype=self.activation_dtype, device=dev),
+                "swiglu_out_weighted": torch.empty(
+                    max_recv, ffn,
+                    dtype=self.activation_dtype, device=dev),
+            }
+        return self._saved_ws
+
+    def _materialize_down_weight(self, down_weight):
+        """Fixed-address contiguous staging for a strided down (fc2) view.
+
+        The integrated host stores down_proj as ``[E, F, H]`` and used to hand
+        over a fresh ``transpose(1, 2).contiguous()`` copy every step (~84 MB
+        per layer at the kimi-k3 shape) because the GEMM contract asked for a
+        contiguous table.  That per-step copy is retained by the autograd
+        ctx's pinned ``saved`` dict on the training path — +336 MB/iter of
+        live-set growth.  A stride view is acceptable to both fc2 GEMMs (they
+        address the table through explicit strides), but staging it here is
+        strictly better: the copy lands in a persistent buffer (address never
+        changes, so no block is ever recycled under a free-flight task) and
+        ``copy_`` refreshes it every step, so optimizer updates flow through.
+        ``MOE_SAVED_WORKSPACE=0`` restores the historical per-step
+        ``.contiguous()``.
+        """
+        if down_weight.is_contiguous():
+            return down_weight
+        if os.environ.get("MOE_SAVED_WORKSPACE", "1") == "0":
+            return down_weight.contiguous()
+        if (
+            self._fc2_ws is None
+            or tuple(self._fc2_ws.shape) != tuple(down_weight.shape)
+        ):
+            self._fc2_ws = torch.empty(
+                down_weight.shape,
+                dtype=down_weight.dtype,
+                device=down_weight.device,
+            )
+        self._fc2_ws.copy_(down_weight)
+        return self._fc2_ws
+
     def sync(self):
         torch.npu.synchronize()
 
@@ -1057,6 +1138,7 @@ class FusedMoEForward(torch.nn.Module):
         prefetch_done_event=None,
         *,
         return_weighted_activation: bool = False,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Produce grouped activation while FC2 consumes earlier groups.
 
@@ -1064,15 +1146,27 @@ class FusedMoEForward(torch.nn.Module):
         ``weighted_activation`` buffer (native-saved ``swiglu_out_weighted``);
         the default keeps the historical single return value for the existing
         stage-level callers (the layer benchmark drives this helper directly).
+        ``workspace`` (from _get_saved_workspace) supplies a fixed-address
+        slice for that buffer; None keeps the per-step allocation.
         """
         packed_dim = dispatch_result.fc1_output.shape[1]
         if packed_dim <= 0 or packed_dim % 2:
             raise ValueError("FC1 output dimension must be a positive even value")
-        weighted_activation = torch.empty(
-            (dispatch_result.routing_plan.num_received_routes, packed_dim // 2),
-            dtype=self.activation_dtype,
-            device=dispatch_result.fc1_output.device,
-        )
+        num_recv = dispatch_result.routing_plan.num_received_routes
+        if workspace is not None:
+            weighted_activation = workspace["swiglu_out_weighted"][:num_recv]
+            if weighted_activation.shape[1] != packed_dim // 2:
+                raise ValueError(
+                    "workspace swiglu buffer width "
+                    f"{weighted_activation.shape[1]} != fc1 output half "
+                    f"{packed_dim // 2}"
+                )
+        else:
+            weighted_activation = torch.empty(
+                (num_recv, packed_dim // 2),
+                dtype=self.activation_dtype,
+                device=dispatch_result.fc1_output.device,
+            )
         num_received_routes, ffn_size = weighted_activation.shape
         plan = dispatch_result.routing_plan
         if replica_down_weight is None:
@@ -1256,12 +1350,13 @@ class FusedMoEForward(torch.nn.Module):
             or tuple(down_weight.shape) != expected_down_shape
             or down_weight.dtype != self.activation_dtype
             or down_weight.device != hidden_states.device
-            or not down_weight.is_contiguous()
         ):
             raise ValueError(
-                "down_weight must be contiguous BF16 with shape "
-                f"{expected_down_shape}"
+                "down_weight must be BF16 with shape "
+                f"{expected_down_shape} on the input device (a strided view "
+                "is staged into the operator's persistent fc2 buffer)"
             )
+        down_weight = self._materialize_down_weight(down_weight)
         ffn_size = gate_up_weight.shape[2] // 2
         if (
             gate_up_weight.shape[2] % self.config.fc1_gemm_block_size_n
@@ -1304,11 +1399,24 @@ class FusedMoEForward(torch.nn.Module):
             )
         else:
             replica_gate_up_weight, replica_down_weight = gate_up_weight, down_weight
+        # Native-saved path: hand out fixed-address workspace slices for the
+        # large activations (see _get_saved_workspace) instead of per-step
+        # allocations.  MOE_SAVED_WORKSPACE=0 restores the historical
+        # per-step torch.empty behavior.
+        ws = (
+            self._get_saved_workspace(hidden_states, gate_up_weight)
+            if return_saved and os.environ.get("MOE_SAVED_WORKSPACE", "1") != "0"
+            else None
+        )
         dispatch_result = self.dispatch_fc1(
             hidden_states,
             selected_experts,
             routing_plan,
             gate_up_weight,
+            fc1_output=(
+                ws["fc1_output"][: routing_plan.num_received_routes]
+                if ws is not None else None
+            ),
             routing_weights=routing_weights,
             replica_fc1_weight=replica_gate_up_weight,
             replica_weight_ready=(
@@ -1341,7 +1449,8 @@ class FusedMoEForward(torch.nn.Module):
         # launch — FC2's device-put staging overwrites the peer-memory receive
         # view, so this is the only window for the recv_hidden_sorted clone.
         activations = (
-            capture_activations(self, dispatch_result) if return_saved else None
+            capture_activations(self, dispatch_result, workspace=ws)
+            if return_saved else None
         )
         # Produce expert-major activation groups on FC2's otherwise-idle
         # Vector stream while the Cube stream consumes earlier groups.
@@ -1351,6 +1460,7 @@ class FusedMoEForward(torch.nn.Module):
             replica_down_weight=replica_down_weight,
             prefetch_done_event=prefetch_done_event,
             return_weighted_activation=return_saved,
+            workspace=ws,
         )
         if not return_saved:
             return combine_result

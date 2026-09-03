@@ -93,6 +93,7 @@ except ImportError:  # pragma: no cover - distributed Ascend jobs require torch-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from mega_moe import FusedMoEForward, MoEForwardConfig
+from mega_moe.kernels.combine_fc1_bwd import GATE_PAD
 from mega_moe.kernels.fc2_combine import _fc2_device_put_worker_layout
 from config import CaseSpec, select_cases
 from benchmark.layer._grouped_forward_baseline import GroupedForwardBaseline
@@ -109,6 +110,17 @@ ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-device-put-v3"
 MOONEP_RESULT_CONTRACT = "bf16-activations-fp32-routing-moonep-hostwall-v7"
+MOONEP_BACKWARD_RESULT_CONTRACT = "bf16-activations-fp32-routing-moonep-backward-v1"
+# Serial MoonEP backward with grad transport records 7 events -> 6 intervals;
+# the last interval is the replica-grad transport (sink+reduce) stage.
+_MOONEP_BWD_STAGE_NAMES = (
+    "dispatch",
+    "fc2_wgrad",
+    "swiglu",
+    "fc1_wgrad",
+    "combine",
+    "grad_reduce",
+)
 _WEIGHT_INIT_CHUNK_BYTES = 128 * 1024 * 1024
 MOONEP_MIN_ASH_SIZE_GB = 16
 MOONEP_CLEAR_GAIN_RATIO = 1.05
@@ -2339,6 +2351,402 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+def _moonep_backward_transport_samples(
+    device,
+    ep_group,
+    op,
+    saved_phys,
+    dy,
+    peer_mem,
+    hidden_states,
+    selected_experts,
+    packed_w1,
+    down_weight,
+    routing_weights,
+    *,
+    warmup: int,
+    iterations: int,
+):
+    """Time the physical backward WITH the replica grad transport per sample.
+
+    The transport is single-use and lending permanently invalidates the
+    replica weight cache, so every sample pays an untimed production forward
+    (which re-publishes the replica weights) and a fresh lend before the
+    timed backward.  Ranks synchronize around the timed region; each sample
+    is MAX-reduced across ranks, matching the published host-wall semantics.
+    """
+    samples_ms = []
+    setup_ms = []
+    for i in range(warmup + iterations):
+        torch.npu.synchronize(device)
+        dist.barrier(group=ep_group)
+        setup_start = time.perf_counter()
+        ascend_full_post_routing(
+            op,
+            hidden_states,
+            selected_experts,
+            packed_w1,
+            down_weight,
+            routing_weights,
+        )
+        transport = op.lend_replica_weight_tables_for_grad()
+        torch.npu.synchronize(device)
+        dist.barrier(group=ep_group)
+        if i >= warmup:
+            setup_ms.append((time.perf_counter() - setup_start) * 1000.0)
+        start = time.perf_counter()
+        with torch.no_grad():
+            moe_backward_triton(saved_phys, dy, peer_mem, grad_transport=transport)
+        torch.npu.synchronize(device)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        value = torch.tensor([elapsed_ms], dtype=torch.float32, device=device)
+        dist.all_reduce(value, op=dist.ReduceOp.MAX, group=ep_group)
+        if i >= warmup:
+            samples_ms.append(float(value.item()))
+    return samples_ms, setup_ms
+
+
+def run_moonep_backward_benchmark(
+    rank: int,
+    world_size: int,
+    case: CaseSpec,
+    route_profile: str,
+):
+    """Run the MoonEP native-saved physical backward performance case (N5).
+
+    Timed regions, all rank-MAX: (a) the logical Torch backward baseline on a
+    synthetic saved (identical to the standard backward suite protocol),
+    (b) the physical MoonEP backward WITHOUT transport (nothing consumes the
+    replica tables, so the plain host_wall loop applies), and (c) the same
+    backward WITH the one-shot replica grad transport, per sample host_wall
+    with an untimed forward+lend setup, plus the 6-stage serial breakdown
+    that isolates the grad_reduce stage.
+    """
+    from mega_moe import moe_backward_triton
+    from mega_moe.ops._moonep_torch_forward import build_physical_saved_from_plan
+
+    case = case.validate()
+    _validate_moonep_route_profile(route_profile)
+    if (
+        case.direction != "backward"
+        or "performance" not in case.tags
+        or case.model.upper() != "KIMI-K3"
+        or world_size != 8
+        or case.world_size != world_size
+    ):
+        raise ValueError(
+            "MoonEP backward benchmark only accepts performance-bwd-kimi-k3 W8 cases"
+        )
+    case = replace(
+        case,
+        capacity_factor=max(
+            case.capacity_factor,
+            _moonep_receive_capacity_factor(world_size, route_profile),
+        ),
+    ).validate()
+    if torch_npu is None or kit.ash is None:
+        raise RuntimeError("MoonEP benchmark requires torch_npu and ACLSHMEM")
+    if G_ASH_SIZE_GB < MOONEP_MIN_ASH_SIZE_GB:
+        raise RuntimeError(
+            "MoonEP Kimi benchmark requires "
+            f"MOE_FUSED_ASH_SIZE_GB>={MOONEP_MIN_ASH_SIZE_GB}; got "
+            f"{G_ASH_SIZE_GB}"
+        )
+    peer_rows = case.tokens * case.topk
+    peer_mem_bytes = peer_rows * (case.hidden + GATE_PAD) * ACTIVATION_DTYPE.itemsize
+    required_ash_bytes = _required_moonep_ash_bytes(case, world_size) + peer_mem_bytes
+    if required_ash_bytes >= G_ASH_SIZE:
+        raise RuntimeError(
+            f"{case.case_id} MoonEP backward estimate is "
+            f"{required_ash_bytes / (1024**3):.3f} GiB (incl. peer_mem "
+            f"{peer_mem_bytes / (1024**3):.3f} GiB), but "
+            f"MOE_FUSED_ASH_SIZE_GB={G_ASH_SIZE_GB}"
+        )
+
+    _log_moonep_phase(rank, case, "checking HBM capacity")
+    required_free_hbm = _required_moonep_free_hbm_bytes(case, world_size)
+    local_free_hbm, local_total_hbm = torch.npu.mem_get_info()
+    hbm_info = torch.tensor(
+        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=f"npu:{rank}"
+    )
+    dist.all_reduce(hbm_info, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
+    min_free_hbm, min_total_hbm = (int(value) for value in hbm_info.cpu().tolist())
+    if min_free_hbm < required_free_hbm:
+        raise RuntimeError(
+            f"{case.case_id} requires an estimated "
+            f"{required_free_hbm / (1024**3):.3f} GiB free HBM per rank, "
+            f"but the least-free rank has {min_free_hbm / (1024**3):.3f} GiB"
+        )
+    hbm_preflight = {
+        "minimum_free_hbm_bytes_before_allocation": min_free_hbm,
+        "minimum_total_hbm_bytes": min_total_hbm,
+        "required_free_hbm_bytes": required_free_hbm,
+        "status": "passed",
+    }
+
+    ep_group = dist.group.WORLD
+    device = f"npu:{rank}"
+    experts_per_rank = case.num_experts // world_size
+
+    # Logical Torch baseline first, outside the symmetric session: the
+    # synthetic saved never touches ACLSHMEM, and releasing it before the
+    # 16+ GiB heap keeps the HBM peak close to the standard suite's.
+    _log_moonep_phase(rank, case, "timing logical Torch backward baseline")
+    saved_logical, dy_logical, _, _ = build_backward_saved(
+        case.tokens, case.hidden, case.ffn, case.num_experts, case.topk, ep_group
+    )
+    torch_gate_result = backward_torch_baseline(saved_logical, dy_logical)
+    for key, value in torch_gate_result.items():
+        if not bool(torch.isfinite(value.float()).all()):
+            raise AssertionError(f"logical Torch baseline has non-finite {key}")
+
+    def _torch():
+        backward_torch_baseline(saved_logical, dy_logical)
+
+    _, torch_timing = kit.PerformanceRunner(
+        _torch, _torch, BACKWARD_TIMING, device=device, ep_group=ep_group
+    ).run()
+    torch_ms = torch_timing.stats["median_ms"]
+    del saved_logical, dy_logical, torch_gate_result
+    torch.npu.empty_cache()
+    dist.barrier(group=ep_group)
+
+    with kit.aclshmem_session(rank, world_size, G_ASH_SIZE):
+        # The backward peer_mem must sit at heap offset 0 (dl.symm_at); the
+        # forward operator below allocates its own symmetric objects after it.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            peer_rows, peer_rows, case.hidden, ACTIVATION_DTYPE, rank, ep_group
+        )
+        try:
+            _log_moonep_phase(
+                rank, case, "allocating weights and deterministic hot routes"
+            )
+            packed_w1, down_weight, _ = _make_local_weights(
+                case, experts_per_rank, rank, device
+            )
+            (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+            ) = _prepare_moonep_inputs(
+                case, rank, world_size, device, route_profile=route_profile
+            )
+            torch.manual_seed(44 + rank * 1000)
+            dy = torch.randn(
+                (case.tokens, case.hidden), dtype=ACTIVATION_DTYPE, device=device
+            )
+
+            _log_moonep_phase(
+                rank, case, "publishing replica weights via one production forward"
+            )
+            op = _make_forward_op(case, ep_group, enable_moonep=True)
+            try:
+                produced = ascend_full_post_routing(
+                    op,
+                    hidden_states,
+                    selected_experts,
+                    packed_w1,
+                    down_weight,
+                    routing_weights,
+                )
+                if not bool(torch.isfinite(produced.float()).all()):
+                    raise AssertionError(
+                        "MoonEP production forward output is non-finite"
+                    )
+                del produced
+
+                # The plan must be rebuilt AFTER the forward: the forward
+                # reuses the planning workspace in place, so an earlier view
+                # is stale.
+                plan = op.build_routing_plan(selected_experts)
+                _, saved_phys = build_physical_saved_from_plan(
+                    plan,
+                    hidden_states,
+                    routing_weights,
+                    packed_w1,
+                    down_weight,
+                    op._replica_weight_buffers.gate_up,
+                    op._replica_weight_buffers.down,
+                    ep_group=ep_group,
+                )
+                if (
+                    int(saved_phys["total_recv"]) != peer_rows
+                    or int(saved_phys["total_send"]) != peer_rows
+                ):
+                    raise AssertionError(
+                        "the dropless MoonEP plan must keep total_recv == "
+                        f"total_send == tokens*topk ({peer_rows}), got "
+                        f"{int(saved_phys['total_recv'])}/"
+                        f"{int(saved_phys['total_send'])}"
+                    )
+
+                _log_moonep_phase(rank, case, "running untimed structure gate")
+                with torch.no_grad():
+                    gate_result = moe_backward_triton(saved_phys, dy, peer_mem)
+                gate_keys = sorted(gate_result)
+                for key, value in gate_result.items():
+                    if not bool(torch.isfinite(value.float()).all()):
+                        raise AssertionError(
+                            f"MoonEP backward gate has non-finite {key}"
+                        )
+                del gate_result
+
+                _log_moonep_phase(
+                    rank, case, "timing physical backward without transport"
+                )
+
+                def _local():
+                    with torch.no_grad():
+                        moe_backward_triton(saved_phys, dy, peer_mem)
+
+                local_timing, _ = kit.PerformanceRunner(
+                    _local, _local, BACKWARD_TIMING, device=device, ep_group=ep_group
+                ).run()
+                local_ms = local_timing.stats["median_ms"]
+
+                _log_moonep_phase(
+                    rank, case, "timing physical backward with grad transport"
+                )
+                transport_samples, setup_samples = (
+                    _moonep_backward_transport_samples(
+                        device,
+                        ep_group,
+                        op,
+                        saved_phys,
+                        dy,
+                        peer_mem,
+                        hidden_states,
+                        selected_experts,
+                        packed_w1,
+                        down_weight,
+                        routing_weights,
+                        warmup=BACKWARD_TIMING.warmup,
+                        iterations=BACKWARD_TIMING.iterations,
+                    )
+                )
+                transport_ms = statistics.median(transport_samples)
+                setup_stats = _stats(setup_samples, device)
+
+                _log_moonep_phase(rank, case, "collecting backward stage breakdown")
+                _bd_warmup = max(1, BACKWARD_TIMING.warmup)
+                saved_phys["_bwd_stage_samples"] = []
+                os.environ["MOE_BWD_STAGE_TIMING"] = "1"
+                os.environ["MOE_BWD_DUAL_STREAM"] = "0"
+                try:
+                    _moonep_backward_transport_samples(
+                        device,
+                        ep_group,
+                        op,
+                        saved_phys,
+                        dy,
+                        peer_mem,
+                        hidden_states,
+                        selected_experts,
+                        packed_w1,
+                        down_weight,
+                        routing_weights,
+                        warmup=_bd_warmup,
+                        iterations=BACKWARD_TIMING.iterations,
+                    )
+                finally:
+                    os.environ.pop("MOE_BWD_STAGE_TIMING", None)
+                    os.environ.pop("MOE_BWD_DUAL_STREAM", None)
+                bd_samples = saved_phys["_bwd_stage_samples"][_bd_warmup:]
+                stage_widths = {len(sample) for sample in bd_samples}
+                if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
+                    raise AssertionError(
+                        "the MoonEP transport backward must record "
+                        f"{len(_MOONEP_BWD_STAGE_NAMES)} stage intervals, got "
+                        f"{sorted(stage_widths)}"
+                    )
+                backward_breakdown = OrderedDict(
+                    (
+                        f"{name}_event_ms",
+                        _stats([sample[i] for sample in bd_samples], device),
+                    )
+                    for i, name in enumerate(_MOONEP_BWD_STAGE_NAMES)
+                )
+
+                entry = {
+                    "schema_version": 1,
+                    "direction": "backward",
+                    "case_id": case.case_id,
+                    "model": case.model,
+                    "world_size": world_size,
+                    "tokens_per_rank": case.tokens,
+                    "route_profile": route_profile,
+                    "effective_capacity_factor": case.capacity_factor,
+                    "shape": {
+                        "hidden": case.hidden,
+                        "ffn": case.ffn,
+                        "topk": case.topk,
+                        "num_experts": case.num_experts,
+                    },
+                    "protocol": {
+                        "torch_baseline": BACKWARD_TIMING.as_dict(),
+                        "local_only": BACKWARD_TIMING.as_dict(),
+                        "with_transport": {
+                            "warmup": BACKWARD_TIMING.warmup,
+                            "iterations": BACKWARD_TIMING.iterations,
+                            "clock": "host_wall_per_sample",
+                            "reduction": "rank_max",
+                            "untimed_per_sample_setup": (
+                                "production forward (replica refill) + fresh lend"
+                            ),
+                        },
+                        "result_contract": MOONEP_BACKWARD_RESULT_CONTRACT,
+                    },
+                    "correctness_gate": {
+                        "status": "passed_before_timing",
+                        "kind": "structure/shape/dtype/finite/no-exception",
+                        "keys": gate_keys,
+                    },
+                    "metrics": {
+                        "torch_ms": torch_ms,
+                        "local_only_ms": local_ms,
+                        "with_transport_ms": transport_ms,
+                        "grad_reduce_stage_ms": backward_breakdown[
+                            "grad_reduce_event_ms"
+                        ]["median_ms"],
+                        "with_transport_over_torch": (
+                            torch_ms / transport_ms if transport_ms > 0 else float("inf")
+                        ),
+                        "local_over_torch": (
+                            torch_ms / local_ms if local_ms > 0 else float("inf")
+                        ),
+                    },
+                    "diagnostics": {
+                        "backward_stage_slices": backward_breakdown,
+                        "untimed_setup_ms": setup_stats,
+                        "ash_required_bytes": required_ash_bytes,
+                        "ash_peer_mem_bytes": peer_mem_bytes,
+                        "hbm_preflight": hbm_preflight,
+                    },
+                }
+                if rank == 0:
+                    _log_moonep_phase(
+                        rank, case, "writing MoonEP backward result"
+                    )
+                    _upsert_result(
+                        Path(
+                            os.environ.get(
+                                "MOE_BACKWARD_BENCH_RESULTS_DIR",
+                                str(PROJECT_ROOT / "results" / "backward"),
+                            )
+                        )
+                        / f"bench_backward_moonep_suite_w{world_size}.json",
+                        "backward",
+                        world_size,
+                        entry,
+                        entry["protocol"],
+                    )
+            finally:
+                _finalize_forward_op(op, device, ep_group)
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+    dist.barrier(group=ep_group)
+
+
 _FORWARD_CASES = kit.make_pytest_params(
     select_cases(direction="forward", tags={"performance"})
 )
@@ -2352,6 +2760,14 @@ _MOONEP_FORWARD_CASES = kit.make_pytest_params(
 )
 _BACKWARD_CASES = kit.make_pytest_params(
     select_cases(direction="backward", tags={"performance"})
+)
+_MOONEP_BACKWARD_CASES = kit.make_pytest_params(
+    MoonEPBenchmarkSpec(case, route_profile)
+    for case in select_cases(
+        direction="backward", tags={"performance", "kimi"}
+    )
+    if case.world_size == 8
+    for route_profile in MOONEP_ROUTE_PROFILES
 )
 
 
@@ -2385,6 +2801,17 @@ def test_bench_backward_case(dist_test, spec: CaseSpec):
         run_backward_benchmark,
         world_size=spec.world_size,
         args=(spec,),
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.performance
+@pytest.mark.parametrize("spec", _MOONEP_BACKWARD_CASES)
+def test_bench_moonep_backward_case(dist_test, spec: MoonEPBenchmarkSpec):
+    dist_test(
+        run_moonep_backward_benchmark,
+        world_size=spec.case.world_size,
+        args=(spec.case, spec.route_profile),
     )
 
 
