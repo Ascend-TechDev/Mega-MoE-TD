@@ -153,6 +153,10 @@ class MoEForwardConfig:
     # benchmarks may disable the collective hit check without deleting the
     # useful production cache path.
     moonep_enable_replica_cache: bool = True
+    # Experimental home-expert path that executes routing through combine in
+    # one physical all-core kernel launch.  MoonEP and saved-forward support
+    # intentionally remain on the established multi-kernel path for now.
+    enable_single_kernel_forward: bool = False
 
     def __post_init__(self):
         object.__setattr__(
@@ -248,6 +252,12 @@ class MoEForwardConfig:
                 raise ValueError("situ_linear_beta must be positive when set")
         if type(self.enable_moonep) is not bool:
             raise TypeError("enable_moonep must be a bool")
+        if type(self.enable_single_kernel_forward) is not bool:
+            raise TypeError("enable_single_kernel_forward must be a bool")
+        if self.enable_single_kernel_forward and self.enable_moonep:
+            raise ValueError(
+                "enable_single_kernel_forward does not support MoonEP yet"
+            )
         if type(self.moonep_fused_balanced_count) is not bool:
             raise TypeError("moonep_fused_balanced_count must be a bool")
         if type(self.moonep_fused_route_mapping) is not bool:

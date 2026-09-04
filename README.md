@@ -37,7 +37,8 @@ src/mega_moe/
 ├── runtime/
 │   ├── workspace.py          # ACLSHMEM 对称内存及 workspace 生命周期
 │   └── routing.py            # 路由过滤、排序、计数交换和 offset
-├── kernels/                  # Triton JIT kernels 及 launcher
+└── kernels/                  # Triton JIT kernels 及 launcher
+    └── fused_forward.py      # 路由到 combine 的单次 all-core launch
 
 conftest.py                   # @pytest.mark.dist 多进程 HCCL 启动夹具
 
@@ -67,6 +68,19 @@ python -m pytest \
 python -m pytest \
   tests/layer/test_moe_suite.py -k 'backward and smoke' \
   -m dist -v -s
+```
+
+无 MoonEP 的单 kernel 前向通过
+`MoEForwardConfig(enable_single_kernel_forward=True)` 显式启用。当前范围是
+`return_saved=False` 且 `down_weight` 连续；路由、dispatch/FC1、加权激活、
+FC2、反向传输和 top-k combine 均在一次物理 all-core kernel launch 内完成。
+MoonEP 与 saved-forward 暂时继续使用原多 kernel 路径。
+
+8 卡 Kimi-K3 T4K 正确性用例：
+
+```bash
+MOE_FUSED_ASH_SIZE_GB=6 PYTHONPATH=src:. python -m pytest \
+  tests/layer/test_moe_suite.py::test_single_kernel_kimi_k3_t4k_w8 -v -s
 ```
 
 ### 性能测试（benchmark）

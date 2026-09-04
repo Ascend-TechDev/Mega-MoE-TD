@@ -24,5 +24,6 @@ markers = [
     "smoke: small/quick representative case",
     "slow: large or otherwise expensive case",
     "kimi: Kimi model case",
+    "trimmed: reduced expert-topology projection case",
     "dsv4: DSV4 model case",
 ]

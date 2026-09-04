@@ -219,6 +219,22 @@ _CASE_GROUPS = (
         tags=frozenset({"performance", "forward", "kimi", "slow"}),
         capacity_factor=1.25,
     ),
+    # Small expert-parallel projection used before scaling Kimi to multiple
+    # machines.  Keep the model dimensions and T16K load while reducing the
+    # routed expert topology to four local experts on each of eight ranks.
+    CaseGroup(
+        prefix="performance-fwd-kimi-k3-trimmed",
+        direction="forward",
+        model="KIMI-K3-TRIMMED",
+        tokens=(16384,),
+        worlds=(8,),
+        hidden=3584,
+        ffn=3072,
+        topk=8,
+        num_experts=32,
+        tags=frozenset({"performance", "forward", "kimi", "trimmed", "slow"}),
+        capacity_factor=1.25,
+    ),
 
     # Backward performance has only validated profiles.  There is no DSV4
     # backward profile yet, so it is intentionally not synthesized here.
