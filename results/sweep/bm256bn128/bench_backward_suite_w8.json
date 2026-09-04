@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "direction": "backward",
+  "world_size": 8,
+  "protocol": {
+    "warmup": 5,
+    "iterations": 50,
+    "clock": "host_wall",
+    "rank_reduction": "MAX"
+  },
+  "cases": [
+    {
+      "schema_version": 1,
+      "direction": "backward",
+      "case_id": "performance-bwd-kimi-k3-w8-t8k",
+      "model": "Kimi-K3",
+      "world_size": 8,
+      "tokens_per_rank": 8192,
+      "shape": {
+        "hidden": 3584,
+        "ffn": 3072,
+        "topk": 16,
+        "num_experts": 896
+      },
+      "protocol": {
+        "warmup": 5,
+        "iterations": 50,
+        "clock": "host_wall",
+        "rank_reduction": "MAX"
+      },
+      "correctness_gate": {
+        "status": "passed_before_timing",
+        "kind": "structure/shape/dtype/finite/no-exception"
+      },
+      "metrics": {
+        "torch_ms": 166.69,
+        "triton_ms": 89.942,
+        "triton_over_torch": 1.8533054635209358
+      },
+      "gradient_gate": {
+        "keys": [
+          "grad_fc1",
+          "grad_fc1_1",
+          "grad_fc1_2",
+          "grad_fc1_output",
+          "grad_fc2",
+          "grad_fc2_out_sorted",
+          "grad_gate",
+          "grad_hidden",
+          "grad_recv_hidden_sorted",
+          "grad_routing_weights",
+          "grad_swiglu"
+        ],
+        "comparison": "untimed structure gate"
+      },
+      "diagnostics": {
+        "backward_stage_slices": null,
+        "combine_phase_slices": {
+          "combine_gemm_ms": {
+            "min_ms": 33.154,
+            "max_ms": 35.49,
+            "mean_ms": 34.21,
+            "median_ms": 34.139
+          },
+          "combine_push_barrier_ms": {
+            "min_ms": 32.372,
+            "max_ms": 35.279,
+            "mean_ms": 33.68,
+            "median_ms": 33.482
+          },
+          "combine_reduce_ms": {
+            "min_ms": 2.028,
+            "max_ms": 2.045,
+            "mean_ms": 2.032,
+            "median_ms": 2.03
+          }
+        }
+      }
+    }
+  ]
+}

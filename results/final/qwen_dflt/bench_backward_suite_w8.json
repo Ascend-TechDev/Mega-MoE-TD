@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "direction": "backward",
+  "world_size": 8,
+  "protocol": {
+    "warmup": 5,
+    "iterations": 50,
+    "clock": "host_wall",
+    "rank_reduction": "MAX"
+  },
+  "cases": [
+    {
+      "schema_version": 1,
+      "direction": "backward",
+      "case_id": "performance-bwd-qwen3-30b-a3b-w8-t8k",
+      "model": "Qwen3-30B-A3B",
+      "world_size": 8,
+      "tokens_per_rank": 8192,
+      "shape": {
+        "hidden": 2048,
+        "ffn": 768,
+        "topk": 8,
+        "num_experts": 128
+      },
+      "protocol": {
+        "warmup": 5,
+        "iterations": 50,
+        "clock": "host_wall",
+        "rank_reduction": "MAX"
+      },
+      "correctness_gate": {
+        "status": "passed_before_timing",
+        "kind": "structure/shape/dtype/finite/no-exception"
+      },
+      "metrics": {
+        "torch_ms": 16.624,
+        "triton_ms": 8.803,
+        "triton_over_torch": 1.8884471202998974
+      },
+      "gradient_gate": {
+        "keys": [
+          "grad_fc1",
+          "grad_fc1_1",
+          "grad_fc1_2",
+          "grad_fc1_output",
+          "grad_fc2",
+          "grad_fc2_out_sorted",
+          "grad_gate",
+          "grad_hidden",
+          "grad_recv_hidden_sorted",
+          "grad_routing_weights",
+          "grad_swiglu"
+        ],
+        "comparison": "untimed structure gate"
+      },
+      "diagnostics": {
+        "backward_stage_slices": {
+          "dispatch_event_ms": {
+            "min_ms": 1.742,
+            "max_ms": 1.806,
+            "mean_ms": 1.755,
+            "median_ms": 1.754
+          },
+          "fc2_wgrad_event_ms": {
+            "min_ms": 0.559,
+            "max_ms": 0.563,
+            "mean_ms": 0.562,
+            "median_ms": 0.562
+          },
+          "swiglu_event_ms": {
+            "min_ms": 1.121,
+            "max_ms": 1.128,
+            "mean_ms": 1.123,
+            "median_ms": 1.123
+          },
+          "fc1_wgrad_event_ms": {
+            "min_ms": 1.094,
+            "max_ms": 1.099,
+            "mean_ms": 1.097,
+            "median_ms": 1.097
+          },
+          "combine_event_ms": {
+            "min_ms": 4.925,
+            "max_ms": 5.182,
+            "mean_ms": 5.041,
+            "median_ms": 5.029
+          }
+        },
+        "combine_phase_slices": {
+          "combine_gemm_ms": {
+            "min_ms": 1.524,
+            "max_ms": 1.53,
+            "mean_ms": 1.527,
+            "median_ms": 1.527
+          },
+          "combine_push_barrier_ms": {
+            "min_ms": 4.826,
+            "max_ms": 5.02,
+            "mean_ms": 4.93,
+            "median_ms": 4.933
+          },
+          "combine_reduce_ms": {
+            "min_ms": 0.951,
+            "max_ms": 0.955,
+            "mean_ms": 0.953,
+            "median_ms": 0.953
+          }
+        }
+      }
+    }
+  ]
+}

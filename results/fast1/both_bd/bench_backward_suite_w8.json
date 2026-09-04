@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "direction": "backward",
+  "world_size": 8,
+  "protocol": {
+    "warmup": 5,
+    "iterations": 50,
+    "clock": "host_wall",
+    "rank_reduction": "MAX"
+  },
+  "cases": [
+    {
+      "schema_version": 1,
+      "direction": "backward",
+      "case_id": "performance-bwd-kimi-k3-w8-t8k",
+      "model": "Kimi-K3",
+      "world_size": 8,
+      "tokens_per_rank": 8192,
+      "shape": {
+        "hidden": 3584,
+        "ffn": 3072,
+        "topk": 16,
+        "num_experts": 896
+      },
+      "protocol": {
+        "warmup": 5,
+        "iterations": 50,
+        "clock": "host_wall",
+        "rank_reduction": "MAX"
+      },
+      "correctness_gate": {
+        "status": "passed_before_timing",
+        "kind": "structure/shape/dtype/finite/no-exception"
+      },
+      "metrics": {
+        "torch_ms": 174.186,
+        "triton_ms": 572.587,
+        "triton_over_torch": 0.3042087927249484
+      },
+      "gradient_gate": {
+        "keys": [
+          "grad_fc1",
+          "grad_fc1_1",
+          "grad_fc1_2",
+          "grad_fc1_output",
+          "grad_fc2",
+          "grad_fc2_out_sorted",
+          "grad_gate",
+          "grad_hidden",
+          "grad_recv_hidden_sorted",
+          "grad_routing_weights",
+          "grad_swiglu"
+        ],
+        "comparison": "untimed structure gate"
+      },
+      "diagnostics": {
+        "backward_stage_slices": {
+          "dispatch_event_ms": {
+            "min_ms": 15.544,
+            "max_ms": 16.683,
+            "mean_ms": 15.676,
+            "median_ms": 15.635
+          },
+          "fc2_wgrad_event_ms": {
+            "min_ms": 10.228,
+            "max_ms": 10.253,
+            "mean_ms": 10.24,
+            "median_ms": 10.24
+          },
+          "swiglu_event_ms": {
+            "min_ms": 5.317,
+            "max_ms": 5.35,
+            "mean_ms": 5.329,
+            "median_ms": 5.328
+          },
+          "fc1_wgrad_event_ms": {
+            "min_ms": 20.366,
+            "max_ms": 20.38,
+            "mean_ms": 20.373,
+            "median_ms": 20.373
+          },
+          "combine_event_ms": {
+            "min_ms": 42.912,
+            "max_ms": 43.529,
+            "mean_ms": 43.342,
+            "median_ms": 43.351
+          }
+        },
+        "combine_phase_slices": {
+          "combine_gemm_ms": {
+            "min_ms": 20.858,
+            "max_ms": 21.508,
+            "mean_ms": 21.218,
+            "median_ms": 21.259
+          },
+          "combine_push_barrier_ms": {
+            "min_ms": 41.236,
+            "max_ms": 42.642,
+            "mean_ms": 41.93,
+            "median_ms": 41.808
+          },
+          "combine_reduce_ms": {
+            "min_ms": 2.028,
+            "max_ms": 2.039,
+            "mean_ms": 2.033,
+            "median_ms": 2.032
+          }
+        }
+      }
+    }
+  ]
+}
