@@ -110,7 +110,7 @@ ROUTING_INPUT_DTYPE = torch.float32
 ROUTING_TRANSPORT_DTYPE = torch.float32
 RESULT_CONTRACT = "bf16-activations-fp32-routing-device-put-v3"
 MOONEP_RESULT_CONTRACT = "bf16-activations-fp32-routing-moonep-hostwall-v7"
-MOONEP_BACKWARD_RESULT_CONTRACT = "bf16-activations-fp32-routing-moonep-backward-v1"
+MOONEP_BACKWARD_RESULT_CONTRACT = "bf16-activations-fp32-routing-moonep-backward-native-saved-v2"
 # Serial MoonEP backward with grad transport records 7 events -> 6 intervals;
 # the last interval is the replica-grad transport (sink+reduce) stage.
 _MOONEP_BWD_STAGE_NAMES = (
@@ -591,9 +591,9 @@ def _summarize_moonep_owner_routes(case, selected_experts, world_size):
 # ``_grouped_forward_baseline.GroupedForwardBaseline`` so it cannot be
 # confused with the independent correctness references in ``tests``.
 
-def ascend_full_post_routing(op, hidden_states, selected_experts, packed_w1, down_weight, routing_weights):
+def ascend_full_post_routing(op, hidden_states, selected_experts, packed_w1, down_weight, routing_weights, *, return_saved=False):
     """One direct production full-forward call; this is the primary candidate boundary."""
-    return op.forward(hidden_states, selected_experts, packed_w1, down_weight, routing_weights)
+    return op.forward(hidden_states, selected_experts, packed_w1, down_weight, routing_weights, return_saved=return_saved)
 
 
 def _sync_ranks_before_event(device, ep_group):
@@ -1012,6 +1012,22 @@ def _finalize_forward_op(op, device, ep_group):
 def _log_moonep_phase(rank, case, phase):
     if rank == 0:
         print(f"[MoonEP][{case.case_id}] {phase}", flush=True)
+
+
+def _all_finite_memory_lean(value, chunk_rows=16):
+    """isfinite gate that never materializes a full fp32 copy of big grads.
+
+    The MoonEP w8 kimi weight grads are multi-GiB bf16 tensors; a plain
+    ``value.float()`` transiently doubles them and overflows the HBM budget
+    once the symmetric heap and the replica mirrors are resident.
+    """
+    if value.dim() == 0 or value.numel() * value.element_size() <= (1 << 28):
+        return bool(torch.isfinite(value.float()).all())
+    for start in range(0, value.shape[0], chunk_rows):
+        chunk = value[start : start + chunk_rows]
+        if not bool(torch.isfinite(chunk.float()).all()):
+            return False
+    return True
 
 
 @torch.no_grad()
@@ -2355,7 +2371,6 @@ def _moonep_backward_transport_samples(
     device,
     ep_group,
     op,
-    saved_phys,
     dy,
     peer_mem,
     hidden_states,
@@ -2366,14 +2381,19 @@ def _moonep_backward_transport_samples(
     *,
     warmup: int,
     iterations: int,
+    stage_samples=None,
 ):
     """Time the physical backward WITH the replica grad transport per sample.
 
     The transport is single-use and lending permanently invalidates the
     replica weight cache, so every sample pays an untimed production forward
-    (which re-publishes the replica weights) and a fresh lend before the
-    timed backward.  Ranks synchronize around the timed region; each sample
-    is MAX-reduced across ranks, matching the published host-wall semantics.
+    with native-saved capture (which re-publishes the replica weights and
+    produces the fresh ``saved`` the timed backward consumes) and a fresh
+    lend.  Ranks synchronize around the timed region; each sample is
+    MAX-reduced across ranks, matching the published host-wall semantics.
+    ``stage_samples`` (optional shared list) pre-seeds every per-sample saved
+    dict's ``_bwd_stage_samples`` so the backward's stage intervals from all
+    samples land in one list for the caller's breakdown.
     """
     samples_ms = []
     setup_ms = []
@@ -2381,22 +2401,25 @@ def _moonep_backward_transport_samples(
         torch.npu.synchronize(device)
         dist.barrier(group=ep_group)
         setup_start = time.perf_counter()
-        ascend_full_post_routing(
+        _, sample_saved = ascend_full_post_routing(
             op,
             hidden_states,
             selected_experts,
             packed_w1,
             down_weight,
             routing_weights,
+            return_saved=True,
         )
         transport = op.lend_replica_weight_tables_for_grad()
+        if stage_samples is not None:
+            sample_saved["_bwd_stage_samples"] = stage_samples
         torch.npu.synchronize(device)
         dist.barrier(group=ep_group)
         if i >= warmup:
             setup_ms.append((time.perf_counter() - setup_start) * 1000.0)
         start = time.perf_counter()
         with torch.no_grad():
-            moe_backward_triton(saved_phys, dy, peer_mem, grad_transport=transport)
+            moe_backward_triton(sample_saved, dy, peer_mem, grad_transport=transport)
         torch.npu.synchronize(device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         value = torch.tensor([elapsed_ms], dtype=torch.float32, device=device)
@@ -2414,16 +2437,19 @@ def run_moonep_backward_benchmark(
 ):
     """Run the MoonEP native-saved physical backward performance case (N5).
 
+    The backward consumes the NATIVE saved captured by the production forward
+    (``return_saved=True``) — the fused dispatch/FC1/FC2 path with RMA replica
+    prefetch — with no torch replay anywhere in the measured loop.
+
     Timed regions, all rank-MAX: (a) the logical Torch backward baseline on a
     synthetic saved (identical to the standard backward suite protocol),
     (b) the physical MoonEP backward WITHOUT transport (nothing consumes the
     replica tables, so the plain host_wall loop applies), and (c) the same
     backward WITH the one-shot replica grad transport, per sample host_wall
-    with an untimed forward+lend setup, plus the 6-stage serial breakdown
-    that isolates the grad_reduce stage.
+    with an untimed forward-with-capture + lend setup, plus the 6-stage
+    serial breakdown that isolates the grad_reduce stage.
     """
     from mega_moe import moe_backward_triton
-    from mega_moe.ops._moonep_torch_forward import build_physical_saved_from_plan
 
     case = case.validate()
     _validate_moonep_route_profile(route_profile)
@@ -2537,55 +2563,46 @@ def run_moonep_backward_benchmark(
             )
 
             _log_moonep_phase(
-                rank, case, "publishing replica weights via one production forward"
+                rank, case,
+                "capturing native saved via one production forward",
             )
             op = _make_forward_op(case, ep_group, enable_moonep=True)
             try:
-                produced = ascend_full_post_routing(
+                produced, native_saved = ascend_full_post_routing(
                     op,
                     hidden_states,
                     selected_experts,
                     packed_w1,
                     down_weight,
                     routing_weights,
+                    return_saved=True,
                 )
                 if not bool(torch.isfinite(produced.float()).all()):
                     raise AssertionError(
                         "MoonEP production forward output is non-finite"
                     )
                 del produced
-
-                # The plan must be rebuilt AFTER the forward: the forward
-                # reuses the planning workspace in place, so an earlier view
-                # is stale.
-                plan = op.build_routing_plan(selected_experts)
-                _, saved_phys = build_physical_saved_from_plan(
-                    plan,
-                    hidden_states,
-                    routing_weights,
-                    packed_w1,
-                    down_weight,
-                    op._replica_weight_buffers.gate_up,
-                    op._replica_weight_buffers.down,
-                    ep_group=ep_group,
-                )
+                if native_saved.get("use_moonep") is not True:
+                    raise AssertionError(
+                        "the native saved capture is not flagged use_moonep"
+                    )
                 if (
-                    int(saved_phys["total_recv"]) != peer_rows
-                    or int(saved_phys["total_send"]) != peer_rows
+                    int(native_saved["total_recv"]) != peer_rows
+                    or int(native_saved["total_send"]) != peer_rows
                 ):
                     raise AssertionError(
                         "the dropless MoonEP plan must keep total_recv == "
                         f"total_send == tokens*topk ({peer_rows}), got "
-                        f"{int(saved_phys['total_recv'])}/"
-                        f"{int(saved_phys['total_send'])}"
+                        f"{int(native_saved['total_recv'])}/"
+                        f"{int(native_saved['total_send'])}"
                     )
 
                 _log_moonep_phase(rank, case, "running untimed structure gate")
                 with torch.no_grad():
-                    gate_result = moe_backward_triton(saved_phys, dy, peer_mem)
+                    gate_result = moe_backward_triton(native_saved, dy, peer_mem)
                 gate_keys = sorted(gate_result)
                 for key, value in gate_result.items():
-                    if not bool(torch.isfinite(value.float()).all()):
+                    if not _all_finite_memory_lean(value):
                         raise AssertionError(
                             f"MoonEP backward gate has non-finite {key}"
                         )
@@ -2597,7 +2614,7 @@ def run_moonep_backward_benchmark(
 
                 def _local():
                     with torch.no_grad():
-                        moe_backward_triton(saved_phys, dy, peer_mem)
+                        moe_backward_triton(native_saved, dy, peer_mem)
 
                 local_timing, _ = kit.PerformanceRunner(
                     _local, _local, BACKWARD_TIMING, device=device, ep_group=ep_group
@@ -2612,7 +2629,6 @@ def run_moonep_backward_benchmark(
                         device,
                         ep_group,
                         op,
-                        saved_phys,
                         dy,
                         peer_mem,
                         hidden_states,
@@ -2629,7 +2645,7 @@ def run_moonep_backward_benchmark(
 
                 _log_moonep_phase(rank, case, "collecting backward stage breakdown")
                 _bd_warmup = max(1, BACKWARD_TIMING.warmup)
-                saved_phys["_bwd_stage_samples"] = []
+                stage_sink = []
                 os.environ["MOE_BWD_STAGE_TIMING"] = "1"
                 os.environ["MOE_BWD_DUAL_STREAM"] = "0"
                 try:
@@ -2637,7 +2653,6 @@ def run_moonep_backward_benchmark(
                         device,
                         ep_group,
                         op,
-                        saved_phys,
                         dy,
                         peer_mem,
                         hidden_states,
@@ -2647,11 +2662,12 @@ def run_moonep_backward_benchmark(
                         routing_weights,
                         warmup=_bd_warmup,
                         iterations=BACKWARD_TIMING.iterations,
+                        stage_samples=stage_sink,
                     )
                 finally:
                     os.environ.pop("MOE_BWD_STAGE_TIMING", None)
                     os.environ.pop("MOE_BWD_DUAL_STREAM", None)
-                bd_samples = saved_phys["_bwd_stage_samples"][_bd_warmup:]
+                bd_samples = stage_sink[_bd_warmup:]
                 stage_widths = {len(sample) for sample in bd_samples}
                 if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
                     raise AssertionError(
@@ -2691,7 +2707,8 @@ def run_moonep_backward_benchmark(
                             "clock": "host_wall_per_sample",
                             "reduction": "rank_max",
                             "untimed_per_sample_setup": (
-                                "production forward (replica refill) + fresh lend"
+                                "production forward with native-saved capture "
+                                "(replica refill) + fresh lend"
                             ),
                         },
                         "result_contract": MOONEP_BACKWARD_RESULT_CONTRACT,

@@ -1364,7 +1364,11 @@ def run_moonep_backward_hot_expert_case(rank: int, world_size: int) -> None:
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -1498,7 +1502,11 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -1838,7 +1846,11 @@ def run_moonep_backward_symmetric_hot_expert_case(
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -2060,7 +2072,11 @@ def run_moonep_backward_symmetric_moderate_wide_case(
         # (dl.symm_at offset-0); the operator below allocates its own heap
         # objects to build the routing plan.
         peer_mem = kit.make_moonep_backward_peer_mem(
-            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+            # recv side budgets worst-case imbalance: per-rank recv is
+            # data-dependent, up to tokens*topk*world_size dropless; send is
+            # bounded by the local tokens*topk exactly.
+            tokens * topk * world_size, tokens * topk,
+            hidden, dtype, rank, ep_group,
         )
         try:
             op = FusedMoEForward(
@@ -3070,6 +3086,525 @@ def run_megamoe_native_saved_metadata_case(
             op.finalize()
 
 
+# ----------------------------------------------------------------------------
+# Stage N1/N2 (master plan §N): MoonEP-physical native-saved acceptance case.
+#
+# The fused forward with ``enable_moonep`` + ``return_saved=True`` must produce
+# the ``saved_phys`` contract of
+# ``_moonep_torch_forward.build_physical_saved_from_plan`` directly out of the
+# production path (fused dispatch + RMA replica prefetch + shadow FC2), with no
+# torch replay.  Unlike the home-layout replay (destination-rank-stable send
+# order) the MoonEP oracle replays *the plan's own* (destination, physical
+# slot) bucket-stable send order, so every permutation is bitwise comparable
+# with the native capture — no convention negotiation needed.
+# ----------------------------------------------------------------------------
+
+MOONEP_NATIVE_SAVED_BITWISE_KEYS = (
+    # plan metadata over the physical [home | replica] slot range
+    "expert_counts",
+    "split_size_cum_per_expert",
+    "meta_expert_ids",
+    "meta_split_cum",
+    "meta_tile_num",
+    "meta_tile_num_cum",
+    "num_tiles_total",
+    # raw plan snapshots
+    "plan_send_counts_by_rank_expert",
+    "plan_send_bucket_starts",
+    "plan_send_bucket_dst_starts",
+    "plan_recv_counts_by_source_expert",
+    "plan_received_expert_offsets",
+    # permutations (same plan send order on both sides)
+    "sort_idxs",
+    "inv_sort",
+    "local_sort_idxs",
+    "inv_local",
+    # MoonEP plan sections
+    "experts_to_copy",
+    "experts_to_copy_cpu",
+    # input routes
+    "selected_experts",
+)
+
+MOONEP_NATIVE_SAVED_SCALAR_KEYS = NATIVE_SAVED_SCALAR_KEYS + (
+    "num_experts",
+    "home_experts_per_rank",
+    "physical_experts_per_rank",
+    "active_physical_experts_per_rank",
+)
+
+# Computed activations: fused kernels vs torch grouped matmul -> plan's 2e-2.
+MOONEP_NATIVE_SAVED_FLOAT_KEYS = (
+    "fc1_output",
+    "swiglu_out_weighted",
+    "recv_weights_sorted",
+)
+
+# Weight tables: the oracle's copies (HCCL p2p gather / contiguous twins) must
+# be bit-identical to the native references — replica tables filled by the
+# production RMA prefetch, home views of the forward inputs.
+MOONEP_NATIVE_SAVED_WEIGHT_KEYS = (
+    "replica_gate_up",
+    "replica_down",
+    "fc1_1",
+    "fc1_2",
+    "fc1_combined",
+    "fc2",
+)
+
+
+def _check_moonep_native_saved_weight(
+    native_saved, oracle_saved, key, failures
+):
+    """One weight-table key: present, same dtype/shape, bit-identical values."""
+    native_value = native_saved.get(key)
+    oracle_value = oracle_saved.get(key)
+    if not isinstance(native_value, torch.Tensor):
+        failures.append(f"{key}: missing from the native saved")
+        return
+    if not isinstance(oracle_value, torch.Tensor):
+        failures.append(f"{key}: missing from the oracle saved_phys")
+        return
+    if native_value.dtype != oracle_value.dtype:
+        failures.append(
+            f"{key}: dtype {native_value.dtype} != oracle {oracle_value.dtype}"
+        )
+        return
+    if tuple(native_value.shape) != tuple(oracle_value.shape):
+        failures.append(
+            f"{key}: shape {tuple(native_value.shape)} != oracle "
+            f"{tuple(oracle_value.shape)}"
+        )
+        return
+    if not torch.equal(
+        native_value.contiguous(), oracle_value.contiguous()
+    ):
+        failures.append(
+            f"{key}: values differ from the oracle copy of the same weights"
+        )
+
+
+def _assert_moonep_native_saved(
+    native_saved,
+    native_output,
+    oracle_saved,
+    oracle_output,
+    op,
+    rank,
+    label,
+):
+    """N1+N2 verdict: native MoonEP saved against the saved_phys oracle."""
+    failures = []
+    for key in MOONEP_NATIVE_SAVED_BITWISE_KEYS:
+        if key == "recv_hidden_sorted":
+            continue
+        _check_native_saved_tensor(native_saved, oracle_saved, key, failures)
+
+    # Pure dispatch copy in the same physical (slot, source) row order — any
+    # deviation is a major signal (row-order mismatch between the fused
+    # dispatch and the oracle regroup), never relaxed.
+    h2_failures = []
+    _check_native_saved_tensor(
+        native_saved, oracle_saved, "recv_hidden_sorted", h2_failures
+    )
+    for message in h2_failures:
+        failures.append(
+            f"{message}  [MAJOR: recv_hidden_sorted is a pure dispatch copy in "
+            "the physical slot row order and must match the oracle "
+            "bit-for-bit — report to the orchestrator, do not relax]"
+        )
+
+    for key in MOONEP_NATIVE_SAVED_SCALAR_KEYS:
+        _check_native_saved_scalar(native_saved, oracle_saved, key, failures)
+    if native_saved.get("use_moonep") is not True:
+        failures.append("use_moonep: native saved is not flagged True")
+    for key in MOONEP_NATIVE_SAVED_FLOAT_KEYS:
+        _check_native_saved_float_tensor(
+            native_saved,
+            oracle_saved,
+            key,
+            NATIVE_SAVED_H2_RTOL,
+            NATIVE_SAVED_H2_ATOL,
+            failures,
+        )
+    for key in MOONEP_NATIVE_SAVED_WEIGHT_KEYS:
+        _check_moonep_native_saved_weight(
+            native_saved, oracle_saved, key, failures
+        )
+
+    # The replica tables must alias the operator's live symmetric buffers
+    # (zero-copy contract): a silently materialized copy would pin ~168 MiB per
+    # MoE layer per step on the kimi-k3 shapes.
+    if op._replica_weight_buffers is None:
+        failures.append("replica weight buffers are not allocated")
+    else:
+        for key, live_view in (
+            ("replica_gate_up", op._replica_weight_buffers.gate_up),
+            ("replica_down", op._replica_weight_buffers.down),
+        ):
+            native_value = native_saved.get(key)
+            if (
+                not isinstance(native_value, torch.Tensor)
+                or native_value.data_ptr() != live_view.data_ptr()
+            ):
+                failures.append(
+                    f"{key}: saved table does not alias the live symmetric "
+                    "replica buffer"
+                )
+
+    output_matches = True
+    try:
+        assert_close(
+            native_output,
+            oracle_output,
+            rtol=OUTPUT_RTOL,
+            atol=OUTPUT_ATOL,
+        )
+    except AssertionError:
+        output_matches = False
+        failures.append("output: return_saved output differs from the oracle")
+
+    ok = not failures
+    if not ok:
+        print(f"[rank {rank}] {label}: {'; '.join(failures)}", flush=True)
+    if rank == 0:
+        suffix = "" if ok else "  |  " + "; ".join(failures)
+        print(f"[{'PASS' if ok else 'FAIL'}] {label}{suffix}", flush=True)
+    return ok
+
+
+def run_moonep_native_saved_hot_expert_case(
+    rank: int,
+    world_size: int,
+) -> None:
+    """N1+N2: MoonEP native saved (return_saved=True) vs the saved_phys oracle.
+
+    One production ``op.forward(..., return_saved=True)`` on the all-hot
+    MoonEP plan, then the independent oracle: a metadata-only plan rebuild
+    (planning is deterministic for the same routes) plus the torch+HCCL
+    replay.  The native replica tables come from the production RMA prefetch,
+    the oracle's from ``gather_replica_weights_via_hccl`` — both must carry
+    the owners' weights bit-for-bit.
+    """
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the MoonEP native saved case requires two or four ranks"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError(
+            "the MoonEP native saved case requires NPU and ACLSHMEM"
+        )
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = f"moonep-native-saved-hot-expert-w{world_size}"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=1)
+    ):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=1.0,
+                enable_moonep=True,
+            ),
+        )
+        try:
+            w_gate, w_up = make_gate_up_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            packed_w1 = pack_gate_up_weights(w_gate, w_up)
+            w2 = make_down_weights(
+                num_experts, hidden, ffn, world_size, rank, dtype, device
+            )
+            hs, _ = prepare_inputs(
+                tokens,
+                hidden,
+                num_experts,
+                topk,
+                dtype,
+                device,
+                seed=2103 + rank,
+            )
+            expert_indices = torch.zeros(
+                (tokens, topk), dtype=torch.int32, device=device
+            )
+            routing_weights = torch.empty(
+                (tokens, topk), dtype=torch.float32, device=device
+            )
+            routing_weights[:, 0] = 0.25
+            routing_weights[:, 1] = 0.75
+
+            with torch.no_grad():
+                native_output, native_saved = op.forward(
+                    hs,
+                    expert_indices,
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                    return_saved=True,
+                )
+            _assert_physical_saved_layout(native_saved, tokens, topk)
+
+            # Independent oracle from a fresh (deterministic) plan build.
+            plan = op.build_routing_plan(expert_indices)
+            replica_routes = plan.received_routes_per_expert[
+                num_experts // world_size:
+            ].sum().clone()
+            dist.all_reduce(
+                replica_routes, op=dist.ReduceOp.SUM, group=ep_group
+            )
+            if int(replica_routes.item()) <= 0:
+                raise AssertionError(
+                    "the all-hot plan routed no traffic through replicas"
+                )
+            replica_gate_up, replica_down = gather_replica_weights_via_hccl(
+                plan.experts_to_copy_cpu, packed_w1, w2, ep_group
+            )
+            oracle_output, oracle_saved = build_physical_saved_from_plan(
+                plan,
+                hs,
+                routing_weights,
+                packed_w1,
+                w2,
+                replica_gate_up,
+                replica_down,
+                ep_group=ep_group,
+            )
+            _assert_physical_saved_layout(oracle_saved, tokens, topk)
+
+            all_passed = _assert_moonep_native_saved(
+                native_saved,
+                native_output,
+                oracle_saved,
+                oracle_output,
+                op,
+                rank,
+                label,
+            )
+            flag = torch.tensor(
+                [1 if all_passed else 0], dtype=torch.int32, device=device
+            )
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+            if not bool(flag.item()):
+                raise AssertionError(
+                    f"MoonEP native saved mismatched the oracle: {label}"
+                )
+        finally:
+            op.finalize()
+
+
+def run_moonep_native_backward_symmetric_hot_expert_case(
+    rank: int,
+    world_size: int,
+) -> None:
+    """N3+N4: fused forward -> native saved -> 5-op backward + grad transport.
+
+    The full production closure with no torch replay in the hot path: one
+    ``op.forward(..., return_saved=True)`` (which also fills the symmetric
+    replica tables via the owner-push), the 5-op triton backward consuming the
+    *native* saved, and the symmetric-slot grad transport sinking the replica
+    weight gradients onto their owners.  Gradients are checked against the
+    hand-written logical golden; the transport stages, the published sunk
+    slots, and a plain forward after the reduce are checked like the replay
+    symmetric case.
+    """
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the native symmetric backward case requires two or four ranks"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError(
+            "the native symmetric backward case requires NPU and ACLSHMEM"
+        )
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    experts_per_rank = num_experts // world_size
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "moonep-native-backward-symmetric-hot-expert"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # peer_mem must stay the session's FIRST symmetric allocation
+        # (dl.symm_at offset-0); the operator below claims its own heap
+        # objects for planning and dispatch.
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        try:
+            op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=1.0,
+                    enable_moonep=True,
+                ),
+            )
+            try:
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = make_down_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                hs, _ = prepare_inputs(
+                    tokens,
+                    hidden,
+                    num_experts,
+                    topk,
+                    dtype,
+                    device,
+                    seed=2153 + rank,
+                )
+                expert_indices = torch.zeros(
+                    (tokens, topk), dtype=torch.int32, device=device
+                )
+                routing_weights = torch.empty(
+                    (tokens, topk), dtype=torch.float32, device=device
+                )
+                routing_weights[:, 0] = 0.25
+                routing_weights[:, 1] = 0.75
+                torch.manual_seed(2154 + rank)
+                dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+                expected = torch_moe_fwd_golden(
+                    hs,
+                    routing_weights,
+                    expert_indices,
+                    w_gate,
+                    w_up,
+                    w2,
+                    num_experts,
+                    ep_group,
+                )
+
+                # One production forward doubles as the native-saved capture;
+                # its output is a free golden check on the fused path.
+                with torch.no_grad():
+                    produced, native_saved = op.forward(
+                        hs,
+                        expert_indices,
+                        packed_w1,
+                        w2,
+                        routing_weights,
+                        return_saved=True,
+                    )
+                assert_close(
+                    produced, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                )
+                _assert_physical_saved_layout(native_saved, tokens, topk)
+                if (
+                    op._replica_weight_buffers is None
+                    or not op._replica_weight_cache_valid
+                ):
+                    raise AssertionError(
+                        "the production forward did not publish replica weights"
+                    )
+                epoch_before_lend = op._replica_weight_epoch
+
+                # The plan has to be rebuilt AFTER the forward: forward reuses
+                # one planning workspace in place, so an earlier view is stale.
+                plan = op.build_routing_plan(expert_indices)
+                replica_routes = plan.received_routes_per_expert[
+                    experts_per_rank:
+                ].sum().clone()
+                dist.all_reduce(
+                    replica_routes, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(replica_routes.item()) <= 0:
+                    raise AssertionError(
+                        "the all-hot plan routed no traffic through replicas"
+                    )
+
+                transport = op.lend_replica_weight_tables_for_grad()
+                if op._replica_weight_cache_valid is not False:
+                    raise AssertionError(
+                        "lending the replica tables must invalidate the cache"
+                    )
+                captured_slots = {}
+
+                def capture_sunk_slots(transport):
+                    # Stream-ordered copies taken between the sink and the
+                    # reduce, i.e. exactly what barrier #1 publishes.
+                    consumed = transport.consumed_slots()
+                    captured_slots["gate_up"] = transport.buffers.gate_up[
+                        consumed
+                    ]
+                    captured_slots["down"] = transport.buffers.down[consumed]
+
+                transport.post_sink_hook = capture_sunk_slots
+
+                with torch.no_grad():
+                    _, home_saved = moe_forward(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        ep_group,
+                        topk,
+                        return_saved=True,
+                    )
+                    torch_result = backward_torch_baseline(home_saved, dy)
+                    # N3: the 5-op backward consumes the NATIVE saved dict.
+                    triton_result = moe_backward_triton(
+                        native_saved, dy, peer_mem, grad_transport=transport
+                    )
+                _assert_moonep_replica_grad_shapes(
+                    triton_result, native_saved, experts_per_rank, hidden, ffn
+                )
+                _assert_gradients_match_golden(
+                    rank, triton_result, torch_result, ep_group, label
+                )
+                accumulated = _assert_symmetric_transport_stages(
+                    rank,
+                    transport,
+                    captured_slots,
+                    triton_result,
+                    ep_group,
+                    label,
+                )
+                contributions = torch.tensor(
+                    [accumulated], dtype=torch.int64, device=device
+                )
+                dist.all_reduce(
+                    contributions, op=dist.ReduceOp.SUM, group=ep_group
+                )
+                if int(contributions.item()) <= 0:
+                    raise AssertionError(
+                        "no owner pulled a replica weight gradient back"
+                    )
+                _assert_forward_after_grad_transport(
+                    op,
+                    hs,
+                    expert_indices,
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                    expected,
+                    epoch_before_lend,
+                    rank,
+                    label,
+                )
+            finally:
+                op.finalize()
+        finally:
+            kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 def _megamoe_function_grads(leaves, ffn_dim):
     """Map the Function's autograd grads onto the five canonical check keys.
 
@@ -3557,6 +4092,26 @@ def test_backward_suite(dist_test, case: CaseSpec):
 def test_megamoe_native_saved_metadata(dist_test, world_size):
     dist_test(
         run_megamoe_native_saved_metadata_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_native_saved_hot_expert(dist_test, world_size):
+    dist_test(
+        run_moonep_native_saved_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_native_backward_symmetric_hot_expert(dist_test, world_size):
+    dist_test(
+        run_moonep_native_backward_symmetric_hot_expert_case,
         world_size=world_size,
     )
 
