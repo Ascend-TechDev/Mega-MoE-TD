@@ -247,18 +247,56 @@ def _snapshot_home_plan_sections(op, plan: MoERoutingPlan) -> dict:
 
 
 def _attach_moonep_plan_sections(op, plan: MoERoutingPlan, snapshot: dict):
-    """Stage N extension point: append the MoonEP plan snapshot sections.
+    """Append the MoonEP physical-slot sections to the home snapshot.
 
     The MoonEP layout reuses the home snapshot above verbatim — its plan
-    metadata already spans the physical ``[home | replica]`` slot range — and
-    adds the replica-specific sections (``experts_to_copy`` snapshots, the
-    physical/home expert strides, and the replica weight table references).
-    Implemented by Stage N1.
+    metadata already spans the physical ``[home | replica]`` slot range — so
+    this only adds the ``saved_phys``-contract replica sections
+    (``_moonep_torch_forward.build_physical_saved_from_plan``): the
+    ``use_moonep`` flag, the home/physical/active expert strides, the
+    ``experts_to_copy`` snapshots, and the replica weight table references.
+
+    ``replica_gate_up`` / ``replica_down`` reference the live symmetric
+    replica buffers (``op._replica_weight_buffers``, allocated before
+    ``build_routing_plan`` — the async prefetch that fills them is issued
+    inside planning, so by backward time they hold this step's weights).
+    They are *references*, not clones: the next forward on this operator
+    re-pushes fresh weights into the same slots, so the backward must run
+    first — the standard save-for-backward ordering, same rule as
+    ``lend_replica_weight_tables_for_grad``.
     """
     if not op.enable_moonep:
         return
-    raise NotImplementedError(
-        "MoonEP plan snapshot sections arrive with Stage N1"
+    if plan.experts_to_copy is None or plan.experts_to_copy_cpu is None:
+        raise RuntimeError(
+            "the MoonEP routing plan carries no experts_to_copy tables; "
+            "native saved capture requires a full MoonEP plan"
+        )
+    if op._replica_weight_buffers is None:
+        raise RuntimeError(
+            "replica weight buffers must be allocated before planning"
+        )
+    home_experts = int(op.experts_per_rank)
+    physical_experts = int(plan.physical_experts_per_rank)
+    if physical_experts != 2 * home_experts:
+        raise RuntimeError(
+            "the MoonEP physical slot stride must be 2 * experts_per_rank, "
+            f"got {physical_experts} for {home_experts} home experts"
+        )
+    snapshot.update(
+        use_moonep=True,
+        home_experts_per_rank=home_experts,
+        physical_experts_per_rank=physical_experts,
+        active_physical_experts_per_rank=int(
+            plan.active_physical_experts_per_rank
+        ),
+        num_experts=home_experts * int(op.world_size),
+        # planning-workspace tensors: clone like the oracle does
+        experts_to_copy=plan.experts_to_copy.clone(),
+        experts_to_copy_cpu=plan.experts_to_copy_cpu.clone(),
+        # live symmetric replica tables ([B, H, 2F] / [B, H, F] views)
+        replica_gate_up=op._replica_weight_buffers.gate_up,
+        replica_down=op._replica_weight_buffers.down,
     )
 
 
@@ -286,7 +324,7 @@ def snapshot_plan_metadata(op, plan: MoERoutingPlan) -> dict:
     return snapshot
 
 
-def capture_activations(op, dispatch_result):
+def capture_activations(op, dispatch_result, workspace=None):
     """T2 — snapshot the forward activations the backward needs.
 
     Call site: inside ``FusedMoEForward.forward`` between the ``dispatch_fc1``
@@ -299,22 +337,37 @@ def capture_activations(op, dispatch_result):
 
     * ``recv_hidden_sorted``  — ``empty_like``+``copy_`` of
       ``dispatch_result.dispatched_tokens`` (the one required materialization;
-      the caching allocator reuses the block across steps);
+      with ``workspace`` the copy lands in a fixed-address persistent slice
+      instead of a fresh allocation);
     * ``recv_weights_sorted`` — ``dispatch_result.received_routing_weights``
       (FP32 workspace) cast to the operator's BF16 activation dtype;
-    * ``fc1_output``          — reference to the freshly allocated FC1 output.
+    * ``fc1_output``          — reference to the freshly allocated FC1 output
+      (already a workspace slice when the caller passed one in).
 
     ``swiglu_out_weighted`` is produced inside ``_fc2_combine_shadow_activation``
     and rides that helper's two-tuple return instead of this call.
     """
     dispatched_tokens = dispatch_result.dispatched_tokens
-    recv_hidden_sorted = torch.empty_like(dispatched_tokens)
+    if workspace is not None:
+        m = dispatched_tokens.shape[0]
+        recv_hidden_sorted = workspace["recv_hidden_sorted"][:m]
+        if tuple(recv_hidden_sorted.shape) != tuple(dispatched_tokens.shape):
+            raise ValueError(
+                "workspace recv_hidden_sorted slice "
+                f"{tuple(recv_hidden_sorted.shape)} does not cover "
+                f"dispatched_tokens {tuple(dispatched_tokens.shape)}"
+            )
+        recv_weights_sorted = workspace["recv_weights_sorted"][:m]
+        recv_weights_sorted.copy_(dispatch_result.received_routing_weights)
+    else:
+        recv_hidden_sorted = torch.empty_like(dispatched_tokens)
+        recv_weights_sorted = dispatch_result.received_routing_weights.to(
+            op.activation_dtype
+        )
     recv_hidden_sorted.copy_(dispatched_tokens)
     return {
         "recv_hidden_sorted": recv_hidden_sorted,
-        "recv_weights_sorted": dispatch_result.received_routing_weights.to(
-            op.activation_dtype
-        ),
+        "recv_weights_sorted": recv_weights_sorted,
         "fc1_output": dispatch_result.fc1_output,
     }
 
