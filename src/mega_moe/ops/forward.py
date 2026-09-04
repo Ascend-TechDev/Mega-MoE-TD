@@ -1336,6 +1336,14 @@ class FusedMoEForward(torch.nn.Module):
                 "routing_weights must be contiguous FP32 with the same shape "
                 "and device as selected_experts"
             )
+        # Framework callers hand down_proj as a transposed stride view of
+        # their [E, F, H] table (MindSpeed-MM megamoe dispatcher); the FC2
+        # kernels address raw memory and need a row-major [E, H, F].  Copy
+        # once here so both callers work; the fresh allocation also keeps
+        # the replica weight cache honestly miss-per-step, which matches
+        # optimizer-updated weights.
+        if not down_weight.is_contiguous():
+            down_weight = down_weight.contiguous()
         expected_down_shape = (
             self.experts_per_rank,
             self.hidden_size,
