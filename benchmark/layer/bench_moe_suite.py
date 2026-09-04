@@ -2417,6 +2417,7 @@ def _moonep_backward_transport_samples(
         dist.barrier(group=ep_group)
         if i >= warmup:
             setup_ms.append((time.perf_counter() - setup_start) * 1000.0)
+        from mega_moe import moe_backward_triton
         start = time.perf_counter()
         with torch.no_grad():
             moe_backward_triton(sample_saved, dy, peer_mem, grad_transport=transport)
