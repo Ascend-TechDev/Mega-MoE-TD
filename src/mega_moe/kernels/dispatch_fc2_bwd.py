@@ -425,8 +425,28 @@ def _dispatch_gemm_tile():
     )
 
 
-def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
+def _ensure_bwd_signal_mem(saved, W, EPR, MAX_BWD_TILES):
+    """Lazy-alloc the shared backward tile-signal workspace on `saved`.
+
+    One SET slot per (source, expert, tile). Slot layout must match
+    producer/consumer: (rank*EPR+expert)*MAX_BWD_TILES+tile, with rank as the
+    source id. 16 int32 elements per slot (= 64 bytes) mirrors the forward
+    workspace's signal slot granularity. Shared by the standalone step-1
+    launcher and the one-kernel mega backward (mega_bwd.py); the SET epoch
+    lives alongside it in ``saved["_bwd_tile_signal_epoch"]``."""
     import shmem as ash
+    signal_mem = saved.get("_bwd_tile_signal_mem")
+    if signal_mem is None:
+        signal_mem = ash.aclshmem_create_tensor(
+            [W * EPR * MAX_BWD_TILES * 16],
+            dtype=torch.int32,
+            device_id=saved["ep_rank"])
+        signal_mem.zero_()
+        saved["_bwd_tile_signal_mem"] = signal_mem
+    return signal_mem
+
+
+def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
     W = saved["world_size"]
     EPR = prep["E"]
     MAX_BWD_TILES = prep["max_bwd_tiles"]
@@ -437,18 +457,7 @@ def _launch_dispatch_fc2_bwd_tile_signal(prep, peer_mem, out, saved):
     home_experts = prep.get("home_experts", EPR)
     active_experts = prep.get("active_experts", EPR)
     use_replica_weights = prep.get("use_moonep", False)
-    # Lazy-alloc one SET slot per (source, expert, tile). Slot layout must match
-    # producer/consumer: (rank*EPR+expert)*MAX_BWD_TILES+tile, with rank as the
-    # source id. 16 int32 elements per slot (= 64 bytes) mirrors the forward
-    # workspace's signal slot granularity.
-    signal_mem = saved.get("_bwd_tile_signal_mem")
-    if signal_mem is None:
-        signal_mem = ash.aclshmem_create_tensor(
-            [W * EPR * MAX_BWD_TILES * 16],
-            dtype=torch.int32,
-            device_id=saved["ep_rank"])
-        signal_mem.zero_()
-        saved["_bwd_tile_signal_mem"] = signal_mem
+    signal_mem = _ensure_bwd_signal_mem(saved, W, EPR, MAX_BWD_TILES)
     # SET-mode epoch: producer writes signal_epoch, consumer waits waitValue=
     # signal_epoch. Bump after launch so the next call sees a fresh value (no
     # need to zero the slots — SET overwrites unconditionally).

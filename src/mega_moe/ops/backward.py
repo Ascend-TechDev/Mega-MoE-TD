@@ -43,6 +43,7 @@ from ..kernels import (
     swiglu_bwd_triton,
     transposed_grouped_gemm_triton,
     combine_fc1_bwd_triton,
+    mega_backward_triton,
 )
 from ..kernels.fused_swiglu_bwd_fc2_wgrad import fused_swiglu_bwd_fc2_wgrad
 
@@ -132,6 +133,12 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
     use_moonep = bool(saved.get("use_moonep"))
     if grad_transport is not None and not use_moonep:
         raise ValueError("grad_transport requires a MoonEP saved_phys")
+    if (not use_moonep) and os.environ.get("MOE_BWD_MEGA") == "1":
+        # One-launch fused backward: steps 1-5 in a single triton kernel, the
+        # phases serialized by in-kernel libshmem_device.barrier_all() (see
+        # kernels/mega_bwd.py). Early return: every MOE_BWD_* / MOE_WGRAD_* /
+        # MOE_FUSED_SWIGLU_WGRAD orchestrator knob below is inert on this path.
+        return mega_backward_triton(saved, dy, peer_mem)
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
     use_fused = (not use_moonep) and os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)

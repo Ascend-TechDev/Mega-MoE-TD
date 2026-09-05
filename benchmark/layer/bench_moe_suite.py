@@ -2277,9 +2277,12 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             # Per-stage NPU-event breakdown of the default serial backward path
             # (dispatch / fc2_wgrad / swiglu / fc1_wgrad / combine). The library
             # records 6 events -> 5 intervals, MAX-reduced across ranks, appended
-            # to saved["_bwd_stage_samples"]. MOE_BWD_BREAKDOWN=0 disables.
+            # to saved["_bwd_stage_samples"]. MOE_BWD_BREAKDOWN=0 disables; the
+            # one-launch MOE_BWD_MEGA path has no per-stage events (and would
+            # leave the sample list empty, crashing _stats below).
             backward_breakdown = None
-            if os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0":
+            if (os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0"
+                    and os.environ.get("MOE_BWD_MEGA") != "1"):
                 os.environ["MOE_BWD_STAGE_TIMING"] = "1"
                 os.environ["MOE_BWD_DUAL_STREAM"] = "0"   # stage timing needs the serial step2/3 path
                 saved["_bwd_stage_samples"] = []
@@ -2301,8 +2304,11 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             # Combine 3-phase breakdown (serial combine: gemm / push+barrier /
             # reduce) — splits the combine stage into its components. The serial
             # path disables the two-stream group overlap so the phases are clean.
+            # Skipped under MOE_BWD_MEGA (the combine lives inside the one
+            # launch; no phase samples would be recorded -> _stats([]) crash).
             combine_phase_breakdown = None
-            if os.environ.get("MOE_BWD_COMBINE_PHASE", "1") != "0":
+            if (os.environ.get("MOE_BWD_COMBINE_PHASE", "1") != "0"
+                    and os.environ.get("MOE_BWD_MEGA") != "1"):
                 os.environ["MOE_BWD_COMBINE_SERIAL"] = "1"
                 os.environ["MOE_COMBINE_PHASE_TIMING"] = "1"
                 saved["_combine_phase_samples"] = []

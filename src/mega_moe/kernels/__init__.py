@@ -7,6 +7,8 @@ the 06 tutorial's ``barrier_all`` + ``dl.symm_at`` symmetric-memory idiom:
   * :mod:`mega_moe.kernels.transposed_grouped_gemm` step3/5: weight-grad
   * :mod:`mega_moe.kernels.dispatch_fc2_bwd` step1: dispatch-A2A + fc2 input-grad
   * :mod:`mega_moe.kernels.combine_fc1_bwd` step4: input-grad + reverse-A2A + gate-grad
+  * :mod:`mega_moe.kernels.mega_bwd` MOE_BWD_MEGA=1: steps 1-5 in ONE launch
+    (in-kernel barrier_all phase chain)
 """
 
 from .common import (  # noqa: F401
@@ -30,4 +32,8 @@ from .dispatch_fc2_bwd import (  # noqa: F401
 )
 from .combine_fc1_bwd import (  # noqa: F401
     combine_fc1_bwd_triton,
+)
+from .mega_bwd import (  # noqa: F401
+    mega_backward_triton,
+    kernel_moe_backward_mega,
 )
