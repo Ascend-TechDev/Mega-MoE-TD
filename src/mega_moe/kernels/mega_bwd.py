@@ -540,6 +540,7 @@ def mega_backward_triton(saved, dy, peer_mem):
     # P4 prep: cached combine maps + per-GEMM-tile expert/row tables.
     p4 = _combine_static_maps(saved)
     cbm, cbn, cbk, cns = _combine_gemm_tile()
+    cbm = int(os.environ.get("MOE_COMBINE_GEMM_BM", "256"))   # see dbm note above
     tiles = _gemm_tile_maps(saved, cbm)
     num_tn4 = (H + cbn - 1) // cbn
     grad_hidden = torch.empty(p4["B"], H, dtype=dy.dtype, device=device)
@@ -556,6 +557,14 @@ def mega_backward_triton(saved, dy, peer_mem):
     wbk = int(os.environ.get("MOE_MEGA_WGRAD_BK", str(FUSED_WBK)))
     wns = int(os.environ.get("MOE_MEGA_WGRAD_NS", "2"))
     dbm, dbn, dbk = _dispatch_gemm_tile()
+    # Mega-local GEMM BM defaults: 256 (the standalone kernels' getter
+    # defaults to 128). msprof on the optimized kernel showed the cube MTE2
+    # (GM->L1 feed) 90.6% busy on the busiest rank — BM 128->256 on BOTH
+    # GEMMs halves the per-tile weight re-reads (kimi t4k w8 sweep:
+    # 46.36 -> 43.42 ms/iter; w8 functional + f0b probe2/3 green).  CAVEAT:
+    # dbm=256 is only fast together with cbm=256 (which flips the no-l0c
+    # launch option below) — dbm=256 with cbm=128 measured 60.4 ms/iter.
+    dbm = int(os.environ.get("MOE_DISPATCH_GEMM_BM", "256"))
     num_tn3 = (H + wbn - 1) // wbn
     num_tk3 = (ffn + wbk - 1) // wbk
     num_tn5 = (2 * ffn + wbn - 1) // wbn

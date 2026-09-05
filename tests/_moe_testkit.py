@@ -101,7 +101,16 @@ def init_aclshmem(
     attr.n_ranks = world_size
     attr.local_mem_size = size_bytes
     attr.ip_port = ip_port if ip_port is not None else get_ash_ip_port()
-    attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    # Data-op engine for the symmetric heap: MTE (proven default for the
+    # signal/wait + symm_at kernels) or UDMA (tutorial
+    # 08-ascend-transpose-all2all putmem engine — its notes warn
+    # getmem/putmem_signal corrupt on this box, so signal_op paths need the
+    # correctness gates re-run under UDMA before trusting any number).
+    attr.option_attr.data_op_engine_type = (
+        ash.OpEngineType.UDMA
+        if os.environ.get("MOE_ASH_ENGINE") == "udma"
+        else ash.OpEngineType.MTE
+    )
     if ash.aclshmem_init(attr) != 0:
         raise RuntimeError("aclshmem_init failed")
 
