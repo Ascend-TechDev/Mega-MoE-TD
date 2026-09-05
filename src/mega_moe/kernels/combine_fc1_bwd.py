@@ -108,7 +108,7 @@ def _gemm_tile_maps(saved, block_m):
 
 @triton.jit
 def _kernel_combine_fc1_bwd_gemm_group(
-    # Phase 1 (Cube): fc1 input-grad GEMM for tile_m in [FIRST_TILE_M, LAST_TILE_M)
+    # Phase 1 (Cube): fc1 input-grad GEMM for tile_m in [first_tile_m, last_tile_m)
     inp_ptr,                  # grad_fc1_output [M, 2*ffn]  (sorted)
     weight_ptr,               # fc1_combined [E, 2*ffn, H]  (K=2*ffn, N=H)
     hidden_buf_ptr,           # grad_recv_hidden_sorted [M, H] out (LOCAL)
@@ -117,21 +117,27 @@ def _kernel_combine_fc1_bwd_gemm_group(
     tile_rows_ptr,            # int32 [T_m] valid row count of each GEMM tile
     N, K, num_tiles_n,
     stride_im, stride_ik, stride_we, stride_wk, stride_wn,
-    FIRST_TILE_M: tl.constexpr, LAST_TILE_M: tl.constexpr,
+    first_tile_m, last_tile_m,
     WEIGHT_EXPERT_BASE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """One fc1 input-grad GEMM sweep over the M-tile range
-    [FIRST_TILE_M, LAST_TILE_M) against ONE weight table re-based at
+    [first_tile_m, last_tile_m) against ONE weight table re-based at
     WEIGHT_EXPERT_BASE (0 for the home fc1_combined table, epn for the replica
-    gate/up table) — the dual-launch pattern of forward dispatch_fc1."""
+    gate/up table) — the dual-launch pattern of forward dispatch_fc1.
+
+    first_tile_m/last_tile_m are RUNTIME args on purpose (2026-09-05): the
+    bounds derive from per-batch expert counts, and a tl.constexpr here put
+    every new routing pattern into triton's specialization key — a ~3.1s JIT
+    recompile per distinct value, ~3x per iteration on the integrated kimi-k3
+    run (the whole 8.9x alltoall gap)."""
     pid = tl.program_id(axis=0)
     ncore = tl.num_programs(axis=0)
     with al.scope(core_mode="cube", disable_auto_sync=True):
         om = tl.arange(0, BLOCK_M)
         on_ = tl.arange(0, BLOCK_N)
         ok = tl.arange(0, BLOCK_K)
-        group_tiles = LAST_TILE_M - FIRST_TILE_M
+        group_tiles = last_tile_m - first_tile_m
         total_tasks = group_tiles * num_tiles_n
         # contiguous block partition (per triton_gen/zhoujinggan/output/report.md
         # iter_1): each pid owns [pid*blk, (pid+1)*blk) consecutive (tile_m,tile_n)
@@ -143,7 +149,7 @@ def _kernel_combine_fc1_bwd_gemm_group(
         for i in range(blk):
             task_id = base + i
             if task_id < total_tasks:
-                tile_m = FIRST_TILE_M + (task_id % group_tiles)
+                tile_m = first_tile_m + (task_id % group_tiles)
                 tile_n = task_id // group_tiles
                 expert_id = tl.load(tile_expert_ptr + tile_m)
                 row_start = tl.load(tile_row0_ptr + tile_m)
@@ -168,7 +174,9 @@ def _kernel_combine_fc1_bwd_gemm_group(
 @triton.jit
 def _kernel_combine_fc1_bwd_push_group(
     # Phase 2 (Vector): reverse-A2A push (expert->home) for src_pos in
-    # [FIRST_SRC_POS, LAST_SRC_POS). Iterates src_pos (expert-major hidden_buf
+    # [first_src_pos, last_src_pos) — RUNTIME bounds (count-derived, see the
+    # gemm kernel's note on the constexpr-recompile trap). Iterates src_pos
+    # (expert-major hidden_buf
     # row); write_rank_by_src/write_off_by_src give the per-row peer destination.
     # Each peer_mem row is [hidden (H) | gate (GATE_PAD)] so the per-row routing-
     # weight grad rides the same RMA as the hidden grad (no separate HCCL a2a).
@@ -177,7 +185,7 @@ def _kernel_combine_fc1_bwd_push_group(
     peer_mem_ptr,           # symmetric [total_send, H+GATE_PAD] at HEAP OFFSET 0
     grad_gate_ptr,          # [M] bf16 expert-sorted gate channel to pack
     H_push,
-    FIRST_SRC_POS: tl.constexpr, LAST_SRC_POS: tl.constexpr,
+    first_src_pos, last_src_pos,
     BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -189,7 +197,7 @@ def _kernel_combine_fc1_bwd_push_group(
         if sub_vec_id() == 0:
             ovp = tl.arange(0, BLOCK_N_PUSH)
             row_stride = H_push + GATE_PAD
-            for src_pos in range(FIRST_SRC_POS + pid, LAST_SRC_POS, num_progs):
+            for src_pos in range(first_src_pos + pid, last_src_pos, num_progs):
                 sp64 = src_pos.to(tl.int64)
                 dst_rank = tl.load(write_rank_by_src_ptr + sp64)
                 dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
@@ -427,7 +435,7 @@ def _launch_combine_fc1_bwd_gemm_range(prep, tiles, hidden_buf, first_tile_m,
             prep["N"], prep["K"], num_tiles_n,
             prep["inp_stride_im"], prep["inp_stride_ik"],
             prep["we"], prep["wk"], prep["wn"],
-            FIRST_TILE_M=first_tile_m, LAST_TILE_M=home_last,
+            first_tile_m=first_tile_m, last_tile_m=home_last,
             WEIGHT_EXPERT_BASE=0,
             **gemm_kwargs)
     replica_first = max(first_tile_m, home_bound)
@@ -438,7 +446,7 @@ def _launch_combine_fc1_bwd_gemm_range(prep, tiles, hidden_buf, first_tile_m,
             prep["N"], prep["K"], num_tiles_n,
             prep["inp_stride_im"], prep["inp_stride_ik"],
             prep["rwe"], prep["rwk"], prep["rwn"],
-            FIRST_TILE_M=replica_first, LAST_TILE_M=last_tile_m,
+            first_tile_m=replica_first, last_tile_m=last_tile_m,
             WEIGHT_EXPERT_BASE=prep["home_experts"],
             **gemm_kwargs)
 
@@ -510,7 +518,7 @@ def _launch_combine_fc1_bwd_pipeline(prep, peer_mem, hidden_buf, output, grad_ro
             _kernel_combine_fc1_bwd_push_group[(nvec(), 1, 1)](
                 hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
                 peer_mem, prep["grad_gate"], prep["H"],
-                FIRST_SRC_POS=fs[g], LAST_SRC_POS=ls[g],
+                first_src_pos=fs[g], last_src_pos=ls[g],
                 BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
                         num_warps=8)
 
@@ -568,7 +576,7 @@ def _launch_combine_fc1_bwd_serial(prep, peer_mem, hidden_buf, output, grad_rout
     _kernel_combine_fc1_bwd_push_group[(nvec(), 1, 1)](
         hidden_buf, prep["write_rank_by_src"], prep["write_off_by_src"],
         peer_mem, prep["grad_gate"], prep["H"],
-        FIRST_SRC_POS=0, LAST_SRC_POS=prep["M"],
+        first_src_pos=0, last_src_pos=prep["M"],
         BLOCK_N_PUSH=_push_block(), GATE_PAD=GATE_PAD,
         num_warps=8)
     # MOE_COMBINE_PHASE_SPLIT: fence push before the barrier (event 2).
