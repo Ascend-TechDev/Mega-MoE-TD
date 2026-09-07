@@ -44,6 +44,7 @@ from ._native_saved import (
 
 
 _FC2_PIPELINE_GROUP_EXPERTS = 16
+_SINGLE_KERNEL_GROUP_WINDOWS = 16
 
 
 @dataclass
@@ -136,6 +137,14 @@ class FusedMoEForward(torch.nn.Module):
                 "single-kernel forward requires world_size no larger than "
                 "the physical AICore count"
             )
+        if (
+            self.enable_single_kernel_forward
+            and self.experts_per_rank > self.num_aicore_programs
+        ):
+            raise ValueError(
+                "single-kernel forward requires experts_per_rank no larger "
+                "than the physical AICore count"
+            )
         self._fc2_pipeline_group_experts = min(
             _FC2_PIPELINE_GROUP_EXPERTS, self.physical_experts_per_rank
         )
@@ -181,8 +190,10 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
-        self._single_fc1_output = None
+        self._single_fc2_output = None
         self._single_weighted_activation = None
+        self._single_pipeline_signal_storage = None
+        self._single_pipeline_max_groups = 0
         self._single_core_bucket_cursors = None
         self._single_send_token_indices = None
         self._single_send_route_indices = None
@@ -302,6 +313,11 @@ class FusedMoEForward(torch.nn.Module):
             # table.  This is a teardown-only collective; normal forwards keep
             # the overlap path free of a host synchronization.
             torch.distributed.barrier(group=self.ep_group)
+        if self._single_pipeline_signal_storage is not None:
+            import shmem as ash
+
+            ash.aclshmem_free_tensor(self._single_pipeline_signal_storage)
+            self._single_pipeline_signal_storage = None
         if self._combine_fc2_storage is not None:
             import shmem as ash
 
@@ -339,8 +355,9 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
-        self._single_fc1_output = None
+        self._single_fc2_output = None
         self._single_weighted_activation = None
+        self._single_pipeline_max_groups = 0
         self._single_core_bucket_cursors = None
         self._single_send_token_indices = None
         self._single_send_route_indices = None
@@ -534,11 +551,10 @@ class FusedMoEForward(torch.nn.Module):
         ffn_size = gate_up_weight.shape[2] // 2
         device = self.context.peer_mem.device
 
-        expected_fc1 = (max_recv, 2 * ffn_size)
         expected_activation = (max_recv, ffn_size)
-        if self._single_fc1_output is None:
-            self._single_fc1_output = torch.empty(
-                expected_fc1,
+        if self._single_fc2_output is None:
+            self._single_fc2_output = torch.empty(
+                (max_recv, self.hidden_size),
                 dtype=self.activation_dtype,
                 device=device,
             )
@@ -562,11 +578,33 @@ class FusedMoEForward(torch.nn.Module):
                 dtype=torch.int32,
                 device=device,
             )
-        elif (
-            tuple(self._single_fc1_output.shape) != expected_fc1
-            or tuple(self._single_weighted_activation.shape)
-            != expected_activation
-        ):
+            pipeline_group_rows = _SINGLE_KERNEL_GROUP_WINDOWS * max(
+                self.config.fc1_gemm_block_size_m,
+                self.config.fc2_combine_block_size_m,
+            )
+            self._single_pipeline_max_groups = (
+                max_recv + pipeline_group_rows - 1
+            ) // pipeline_group_rows
+            import shmem as ash
+
+            pipeline_fc1_cores = (
+                self.num_aicore_programs // self.experts_per_rank
+            ) * self.experts_per_rank
+            reverse_workers_per_source = (
+                2 * self.num_aicore_programs // self.world_size
+            )
+            pipeline_slots = self._single_pipeline_max_groups * (
+                2 * pipeline_fc1_cores
+                + 2 * self.num_aicore_programs
+                + self.world_size * reverse_workers_per_source
+            )
+            self._single_pipeline_signal_storage = ash.aclshmem_create_tensor(
+                [pipeline_slots * 16],
+                dtype=torch.int32,
+                device_id=self.rank,
+            )
+            self._single_pipeline_signal_storage.zero_()
+        elif tuple(self._single_weighted_activation.shape) != expected_activation:
             raise ValueError(
                 "single-kernel workspaces were initialized for a different "
                 "FFN size; recreate the operator"
@@ -1395,6 +1433,7 @@ class FusedMoEForward(torch.nn.Module):
             > 128 * 256
             else {}
         )
+        launch_options["has_auto_blockify_blacklist_op"] = False
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
             selected_experts,
@@ -1404,8 +1443,9 @@ class FusedMoEForward(torch.nn.Module):
             self.context.peer_mem,
             self.context.routing_weight_mem,
             self.context.signal_mem,
+            self._single_pipeline_signal_storage,
             self._combine_fc2_buf,
-            self._single_fc1_output,
+            self._single_fc2_output,
             self._single_weighted_activation,
             output,
             self.context.metadata_counts_mem,
@@ -1419,10 +1459,7 @@ class FusedMoEForward(torch.nn.Module):
             self._single_send_token_indices,
             self._single_send_route_indices,
             self._route_to_send,
-            self._pull_tile_rank,
-            self._pull_tile_src_start,
             self._pull_tile_dst_start,
-            self._pull_tile_row_count,
             num_routes,
             signal_epoch,
             float(self.situ_beta),
@@ -1450,6 +1487,7 @@ class FusedMoEForward(torch.nn.Module):
             MAX_RECEIVED_ROUTES=max_received_routes,
             NUM_BINS_PAD=self.context.metadata_num_bins,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
+            MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
             DISPATCH_BLOCK_M=self.config.dispatch_fc1_block_size_m,
             FC1_BLOCK_M=self.config.fc1_gemm_block_size_m,
             FC1_BLOCK_N=self.config.fc1_gemm_block_size_n,
@@ -1459,6 +1497,7 @@ class FusedMoEForward(torch.nn.Module):
             FC2_BLOCK_K=self.config.fc2_gemm_block_size_k,
             ACTIVATION=0 if self.activation == "swiglu" else 1,
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
+            PIPELINE_GROUP_WINDOWS=_SINGLE_KERNEL_GROUP_WINDOWS,
             **launch_options,
         )
         self._tile_signal_epoch += 1

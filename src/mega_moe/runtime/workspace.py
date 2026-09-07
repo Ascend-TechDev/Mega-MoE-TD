@@ -256,7 +256,9 @@ def create_moe_forward_context(
     context.metadata_recv_per_expert = torch.empty(
         physical_experts_per_rank, dtype=torch.int32, device=device
     )
-    context.metadata_recv_expert_offs = torch.empty(
+    # The fused metadata kernel writes only offsets 1..EPR; offset zero is the
+    # invariant exclusive-prefix base and remains initialized here.
+    context.metadata_recv_expert_offs = torch.zeros(
         physical_experts_per_rank + 1, dtype=torch.int32, device=device
     )
     # [local receive routes, maximum receive routes required by any rank,
