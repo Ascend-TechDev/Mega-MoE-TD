@@ -35,6 +35,9 @@ from .replica_weight_prefetch import (
     _push_compact_replica_weight_descriptors,
 )
 
+_DIRECT_STORE_BLOCK_M: tl.constexpr = 64
+_DIRECT_STORE_BLOCK_N: tl.constexpr = 1024
+
 
 @triton.jit(
     do_not_specialize=[
@@ -141,7 +144,7 @@ def _kernel_dispatch_fc1(
                 signal_epoch, hidden, stride_input_m,
                 LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                 ACTIVE_EXPERTS_PER_RANK,
-                MAX_SOURCE_TILES, DISPATCH_BLOCK_SIZE_M)
+                MAX_SOURCE_TILES, DISPATCH_BLOCK_SIZE_M, False)
             if (
                 PREFETCH_REPLICA_DOWN
                 & (replica_down_descriptor_count > 0)
@@ -374,6 +377,9 @@ def _dispatch_one_source_tile_task(
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     DISPATCH_BLOCK_SIZE_M: tl.constexpr,
+    DIRECT_REMOTE_STORE: tl.constexpr,
+    source_tile_begin=0,
+    source_tile_end=None,
 ):
     """Dispatch the source-local tiles assigned to one lane of a nonempty bucket."""
     task_start = tl.load(send_bucket_starts_ptr + task_id)
@@ -382,42 +388,118 @@ def _dispatch_one_source_tile_task(
     dst_rank = task_id // EXPERTS_PER_RANK
     expert_id = task_id % EXPERTS_PER_RANK
     num_source_tiles = tl.cdiv(task_count, DISPATCH_BLOCK_SIZE_M)
+    if source_tile_end is not None:
+        num_source_tiles = tl.minimum(num_source_tiles, source_tile_end)
 
-    for source_tile in range(task_lane, num_source_tiles, task_cores):
+    for source_tile in range(source_tile_begin + task_lane, num_source_tiles, task_cores):
         tile_start = source_tile * DISPATCH_BLOCK_SIZE_M
         tile_count = tl.minimum(
             DISPATCH_BLOCK_SIZE_M,
             task_count - tile_start,
         )
-        for tile_token in range(tile_count):
-            send_idx = task_start + tile_start + tile_token
-            src_idx = tl.load(send_src_idx_ptr + send_idx)
-            dst_offs = (
-                task_dst_start + tile_start + tile_token
-            ).to(tl.int64)
-            src_idx64 = src_idx.to(tl.int64)
-            src_base = input_ptr + src_idx64 * stride_input_m
-            dst_base = peer_mem_ptr + dst_offs * stride_input_m
-            libshmem_device.putmem(dst_base, src_base, hidden * 2, dst_rank)
-            route_idx = tl.load(send_route_idx_ptr + send_idx)
-            libshmem_device.putmem(
-                routing_weight_recv_ptr + dst_offs,
-                routing_weight_ptr + route_idx,
-                4,
-                dst_rank,
-            )
-
-        libshmem_device.fence()
         signal_slot = (
             (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_SOURCE_TILES
             + source_tile
         )
-        libshmem_device.signal_op(
-            signal_mem_ptr + signal_slot * 16,
-            signal_epoch,
-            libshmem_device.ACLSHMEM_SIGNAL_SET,
-            dst_rank,
-        )
+        if DIRECT_REMOTE_STORE:
+            remote_input_ptr = dl.symm_at(peer_mem_ptr, dst_rank)
+            remote_weight_ptr = dl.symm_at(
+                routing_weight_recv_ptr, dst_rank
+            )
+            row_offsets = tl.arange(0, _DIRECT_STORE_BLOCK_M)
+            col_offsets = tl.arange(0, _DIRECT_STORE_BLOCK_N)
+            for row_start in range(
+                0,
+                DISPATCH_BLOCK_SIZE_M,
+                _DIRECT_STORE_BLOCK_M,
+            ):
+                tile_rows = row_start + row_offsets
+                row_mask = tile_rows < tile_count
+                send_indices = task_start + tile_start + tile_rows
+                source_rows = tl.load(
+                    send_src_idx_ptr + send_indices,
+                    mask=row_mask,
+                    other=0,
+                ).to(tl.int64)
+                destination_rows = (
+                    task_dst_start + tile_start + tile_rows
+                ).to(tl.int64)
+                for col_start in range(
+                    0,
+                    hidden,
+                    _DIRECT_STORE_BLOCK_N,
+                ):
+                    cols = col_start + col_offsets
+                    col_mask = cols < hidden
+                    values = tl.load(
+                        input_ptr
+                        + source_rows[:, None] * stride_input_m
+                        + cols[None, :],
+                        mask=row_mask[:, None] & col_mask[None, :],
+                        other=0.0,
+                    )
+                    tl.store(
+                        remote_input_ptr
+                        + destination_rows[:, None] * stride_input_m
+                        + cols[None, :],
+                        values,
+                        mask=row_mask[:, None] & col_mask[None, :],
+                    )
+
+                route_indices = tl.load(
+                    send_route_idx_ptr + send_indices,
+                    mask=row_mask,
+                    other=0,
+                )
+                route_weights = tl.load(
+                    routing_weight_ptr + route_indices,
+                    mask=row_mask,
+                    other=0.0,
+                )
+                tl.store(
+                    remote_weight_ptr + destination_rows,
+                    route_weights,
+                    mask=row_mask,
+                )
+
+            libshmem_device.fence()
+            libshmem_device.signal_op(
+                signal_mem_ptr + signal_slot * 16,
+                signal_epoch,
+                libshmem_device.ACLSHMEM_SIGNAL_SET,
+                dst_rank,
+            )
+        else:
+            for tile_token in range(tile_count):
+                send_idx = task_start + tile_start + tile_token
+                src_idx = tl.load(send_src_idx_ptr + send_idx)
+                dst_offs = (
+                    task_dst_start + tile_start + tile_token
+                ).to(tl.int64)
+                src_idx64 = src_idx.to(tl.int64)
+                src_base = input_ptr + src_idx64 * stride_input_m
+                dst_base = peer_mem_ptr + dst_offs * stride_input_m
+                libshmem_device.putmem(
+                    dst_base,
+                    src_base,
+                    hidden * 2,
+                    dst_rank,
+                )
+                route_idx = tl.load(send_route_idx_ptr + send_idx)
+                libshmem_device.putmem(
+                    routing_weight_recv_ptr + dst_offs,
+                    routing_weight_ptr + route_idx,
+                    4,
+                    dst_rank,
+                )
+
+            libshmem_device.quiet()
+            libshmem_device.signal_op(
+                signal_mem_ptr + signal_slot * 16,
+                signal_epoch,
+                libshmem_device.ACLSHMEM_SIGNAL_SET,
+                dst_rank,
+            )
 
 
 @triton.jit
@@ -437,6 +519,7 @@ def _dispatch_count_derived_source_tiles(
     ACTIVE_EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    DIRECT_REMOTE_STORE: tl.constexpr,
 ):
     """Assign cores only to nonempty buckets, then stripe each bucket's tiles."""
     num_tasks: tl.constexpr = WORLD_SIZE * ACTIVE_EXPERTS_PER_RANK
@@ -468,7 +551,7 @@ def _dispatch_count_derived_source_tiles(
                 send_bucket_starts_ptr, send_counts_re_ptr,
                 signal_epoch, hidden, stride_input_m,
                 LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
-                BLOCK_SIZE_M)
+                BLOCK_SIZE_M, DIRECT_REMOTE_STORE)
         else:
             for active_task_id in range(pid, num_active_tasks, num_cores):
                 task_id = _find_nth_nonempty_task(
@@ -484,7 +567,8 @@ def _dispatch_count_derived_source_tiles(
                     send_bucket_starts_ptr, send_counts_re_ptr,
                     signal_epoch, hidden, stride_input_m,
                     LOCAL_RANK, EXPERTS_PER_RANK,
-                    MAX_SOURCE_TILES, BLOCK_SIZE_M)
+                    MAX_SOURCE_TILES, BLOCK_SIZE_M,
+                    DIRECT_REMOTE_STORE)
 
 
 @triton.jit
@@ -571,23 +655,19 @@ def _triton_grouped_gemm_expert_n_merged_tiles_wait(
                         last_source_tile = (
                             overlap_end - source_start - 1
                         ) // DISPATCH_BLOCK_SIZE_M
-                        for source_tile in range(
-                            first_source_tile,
-                            last_source_tile + 1,
-                        ):
-                            signal_slot = (
-                                (source_id * EXPERTS_PER_RANK + expert_id)
-                                * MAX_SOURCE_TILES
-                                + source_tile
-                            )
-                            token = dl.wait(
-                                signal_mem_ptr + signal_slot * 16,
-                                1,
-                                "gpu",
-                                "acquire",
-                                waitValue=signal_epoch,
-                            )
-                            ready_token += token
+                        signal_slot = (
+                            (source_id * EXPERTS_PER_RANK + expert_id)
+                            * MAX_SOURCE_TILES
+                            + first_source_tile
+                        )
+                        token = dl.wait(
+                            signal_mem_ptr + signal_slot * 16,
+                            last_source_tile - first_source_tile + 1,
+                            "gpu",
+                            "acquire",
+                            waitValue=signal_epoch,
+                        )
+                        ready_token += token
                     source_start = source_end
 
                 ready_input_ptr = dl.consume_token(input_ptr, ready_token)

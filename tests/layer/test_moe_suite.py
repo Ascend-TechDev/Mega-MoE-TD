@@ -355,12 +355,15 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
             )
 
 
-def run_single_kernel_forward_case(rank: int, world_size: int) -> None:
+def run_single_kernel_forward_case(
+    rank: int, world_size: int, fc1_block_m: int = 256, tokens: int = 64,
+    num_experts: int = 8,
+) -> None:
     """Exercise the one-launch home-expert path against the Torch oracle."""
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("single-kernel forward requires NPU and ACLSHMEM")
 
-    tokens, hidden, ffn, topk, num_experts = 64, 256, 512, 2, 8
+    hidden, ffn, topk = 256, 512, 2
     device = f"npu:{rank}"
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
@@ -380,6 +383,8 @@ def run_single_kernel_forward_case(rank: int, world_size: int) -> None:
             config=MoEForwardConfig(
                 receive_capacity_factor=float(world_size),
                 enable_single_kernel_forward=True,
+                fc1_gemm_block_size_m=fc1_block_m,
+                fc2_combine_block_size_m=fc1_block_m,
             ),
         )
         try:
@@ -480,6 +485,8 @@ def run_single_kernel_forward_case(rank: int, world_size: int) -> None:
             config=MoEForwardConfig(
                 receive_capacity_factor=1.0,
                 enable_single_kernel_forward=True,
+                fc1_gemm_block_size_m=fc1_block_m,
+                fc2_combine_block_size_m=fc1_block_m,
             ),
         )
         try:
@@ -509,7 +516,7 @@ def run_single_kernel_forward_case(rank: int, world_size: int) -> None:
 
 
 def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
-    """Validate the fused launch at the real Kimi-K3 W8/T4K shape."""
+    """Validate the fused launch at the trimmed Kimi-K3 W8/T4K shape."""
     if world_size != 8:
         raise ValueError("the Kimi-K3 single-kernel case requires eight ranks")
     if kit.ash is None or kit.torch_npu is None:
@@ -519,7 +526,7 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
         case
         for case in select_cases(
             direction="forward",
-            tags={"performance", "kimi"},
+            tags={"performance", "kimi", "trimmed"},
         )
         if case.world_size == world_size and case.tokens == 4096
     )
@@ -543,6 +550,8 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
             config=MoEForwardConfig(
                 receive_capacity_factor=base_case.capacity_factor,
                 enable_single_kernel_forward=True,
+                fc1_gemm_block_size_k=256,
+                fc2_gemm_block_size_k=256,
             ),
         )
         try:
@@ -559,7 +568,7 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
                     if token_count == base_case.tokens
                     else replace(
                         base_case,
-                        case_id="performance-fwd-kimi-k3-w8-t64",
+                        case_id="performance-fwd-kimi-k3-trimmed-w8-t64",
                         tokens=token_count,
                     ).validate()
                 )
@@ -4256,6 +4265,19 @@ def test_single_kernel_forward_w2(dist_test):
 @pytest.mark.functional
 def test_single_kernel_forward_w8(dist_test):
     dist_test(run_single_kernel_forward_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize(
+    "tokens,block_m", [(3, 256), (4097, 256), (4097, 128)],
+    ids=("tiny-tail", "m256-multi-wave", "m128-multi-wave"),
+)
+def test_single_kernel_dynamic_waves_w8(dist_test, tokens, block_m):
+    dist_test(
+        run_single_kernel_forward_case, world_size=8,
+        args=(block_m, tokens, 32),
+    )
 
 
 @pytest.mark.dist

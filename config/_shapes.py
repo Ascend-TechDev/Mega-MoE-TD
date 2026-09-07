@@ -220,13 +220,13 @@ _CASE_GROUPS = (
         capacity_factor=1.25,
     ),
     # Small expert-parallel projection used before scaling Kimi to multiple
-    # machines.  Keep the model dimensions and T16K load while reducing the
+    # machines.  Keep the model dimensions and T4K/T16K loads while reducing the
     # routed expert topology to four local experts on each of eight ranks.
     CaseGroup(
         prefix="performance-fwd-kimi-k3-trimmed",
         direction="forward",
         model="KIMI-K3-TRIMMED",
-        tokens=(16384,),
+        tokens=(4096, 16384),
         worlds=(8,),
         hidden=3584,
         ffn=3072,

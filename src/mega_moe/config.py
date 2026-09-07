@@ -106,6 +106,9 @@ class MoEForwardConfig:
 
     The launch grid queries CANN's ``NPUUtils().get_aicore_num()`` and uses
     every physical AICore; it is device state rather than a user setting.
+
+    The single-kernel path fixes the schedule to 16-block dynamic waves with
+    dual Vector activation. Its FC1 and FC2 M tiles must match.
     """
 
     num_aicore_programs: int = field(init=False)
@@ -153,9 +156,9 @@ class MoEForwardConfig:
     # benchmarks may disable the collective hit check without deleting the
     # useful production cache path.
     moonep_enable_replica_cache: bool = True
-    # Experimental home-expert path that executes routing through combine in
-    # one physical all-core kernel launch.  MoonEP and saved-forward support
-    # intentionally remain on the established multi-kernel path for now.
+    # Home-expert routing through combine in one physical all-core launch.
+    # Uses dynamic waves, dual Vector activation, and explicit CV events.
+    # MoonEP and saved-forward continue to use the multi-kernel path.
     enable_single_kernel_forward: bool = False
 
     def __post_init__(self):
@@ -254,6 +257,9 @@ class MoEForwardConfig:
             raise TypeError("enable_moonep must be a bool")
         if type(self.enable_single_kernel_forward) is not bool:
             raise TypeError("enable_single_kernel_forward must be a bool")
+        if (self.enable_single_kernel_forward
+                and self.fc1_gemm_block_size_m != self.fc2_combine_block_size_m):
+            raise ValueError("single-kernel forward requires matching FC1 and FC2 M tiles")
         if self.enable_single_kernel_forward and self.enable_moonep:
             raise ValueError(
                 "enable_single_kernel_forward does not support MoonEP yet"
