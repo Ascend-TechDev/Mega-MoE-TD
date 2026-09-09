@@ -49,12 +49,16 @@
 #    B6   barrier_all  — = transport barrier #1 (sunk slots published)
 #    P6b  owner-pull (vec): by-home getmem + fp32 accumulate, (peer,slot)
 #          order preserved -> bit-identical to the fused transport kernel
-#    B7   barrier_all  — = transport barrier #2 (readers retired)
-#    P6c  zero consumed slots (vec) — barrier #3 is the kernel exit itself
 #
 #  (the seed/sink are IN-kernel because the host copies would read tensors
 #  this same launch only produces at B5; post_sink_hook cannot fire and is
-#  bypassed — sunk/reduced are still set).
+#  bypassed — sunk/reduced are still set.  The transport's THIRD stage —
+#  zeroing the consumed slots — runs HOST-side, stream-ordered behind the
+#  launch: it is purely local (all remote getmem readers retire at the
+#  kernel exit), so an in-kernel P6c tail phase bought nothing and its
+#  zero stores proved unreliable on this backend — w8 moderate-wide,
+#  910B1 2026-09-09: residual 256..57k elements per slot, run-varying,
+#  not the sunk values — while the same zeroing as a host op never missed.)
 #
 #  MOE_MEGA_FUSE_P4=1 replaces the whole P4a/B3/P4b run above with ONE
 #  fused tile loop: per program, per strided m-tile — [cube: all n-tiles of
@@ -118,7 +122,10 @@ from .combine_fc1_bwd import (
     GATE_PAD,
 )
 from .fused_swiglu_bwd_fc2_wgrad import FUSED_WBM, FUSED_WBN, FUSED_WBK
-from .replica_grad_reduce import build_owner_pull_descriptors_by_home
+from .replica_grad_reduce import (
+    build_owner_pull_descriptors_by_home,
+    zero_consumed_replica_slots,
+)
 
 
 # ============================================================================
@@ -264,7 +271,7 @@ def _mega_wgrad_sweep(
     orig_in_ptr, stride_om, stride_ok,        # [M, K]
     grad_w_ptr, stride_we, stride_wn, stride_wk,   # [E, N, K] out
     split_size_cum_per_expert_ptr, expert_counts_ptr,
-    N, K, num_tiles_n, num_tiles_k, task_begin, task_end,
+    N, K, num_tiles_n, num_tiles_k, task_begin, task_end, max_rows,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     WAIT_DISP: tl.constexpr,
@@ -330,7 +337,15 @@ def _mega_wgrad_sweep(
         nmask = (n_start + offs_n) < N
         kmask = (k_start + offs_k) < K
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
-        for m in tl.range(0, split_size, BLOCK_M, num_stages=NUM_STAGES):
+        # m bounded by the HOST-passed max_rows (>=1), never by the loaded
+        # split_size: a load-derived trip count inside this kernel's task
+        # loop miscompiles on this backend (w2, 910B1 2026-09-09 — zero-count
+        # experts accumulated garbage rows and the count loads themselves
+        # returned 0 where the table held 128, shifting with unrelated
+        # constexpr changes).  Runtime-arg trip counts (this bound, same
+        # shape as _mega_combine_gemm's K-loop) and loaded values as MASKS
+        # only (mmask below) are both proven-safe idioms here.
+        for m in tl.range(0, max_rows, BLOCK_M, num_stages=NUM_STAGES):
             mm = m + offs_m
             mmask = mm < split_size
             row64 = (split_begin + mm).to(tl.int64)
@@ -770,34 +785,6 @@ def _mega_grad_owner_pull(
                         acc_down_ptr, dn_row, home, cs, cnt, dn_elems, ACC_BLK)
 
 
-@triton.jit
-def _mega_grad_zero(
-    pid, ncores,
-    gate_up_slot_ptr, down_slot_ptr,
-    consumed_ptr, consumed_count,
-    gu_elems, dn_elems,
-    ACC_BLK: tl.constexpr,
-):
-    """P6c: zero this rank's sunk slots in both symmetric tables, strided.
-    Nothing after this phase touches the slots, and the next forward's
-    owner-push is stream-ordered behind kernel completion — so the transport's
-    barrier #3 is the kernel exit itself (the same argument as the missing
-    tail barrier after P4c).  Must run inside a vector scope."""
-    offs = tl.arange(0, ACC_BLK)
-    zeros_gu = tl.zeros((ACC_BLK,), dtype=gate_up_slot_ptr.dtype.element_ty)
-    zeros_dn = tl.zeros((ACC_BLK,), dtype=down_slot_ptr.dtype.element_ty)
-    for i in range(pid, consumed_count, ncores):
-        base = tl.load(consumed_ptr + i).to(tl.int64)
-        for start in range(0, gu_elems, ACC_BLK):
-            m = (start + offs) < gu_elems
-            tl.store(gate_up_slot_ptr + base * gu_elems + start + offs,
-                     zeros_gu, mask=m)
-        for start in range(0, dn_elems, ACC_BLK):
-            m = (start + offs) < dn_elems
-            tl.store(down_slot_ptr + base * dn_elems + start + offs,
-                     zeros_dn, mask=m)
-
-
 # ============================================================================
 # the mega kernel
 # ============================================================================
@@ -823,7 +810,7 @@ def kernel_moe_backward_mega(
     orig_in3_ptr, stride_om3, stride_ok3,      # swiglu_out_weighted [M, ffn]
     grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
     split_cum_ptr, expert_counts_ptr,          # shared by P3/P5
-    N3, K3, num_tn3, num_tk3, w3_total,
+    N3, K3, num_tn3, num_tk3, w3_total, max_rows_w,
     # ---- P4a: fc1 dgrad GEMM (inp == dAB_ptr, strides im/ik) ----
     fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
     hidden_buf_ptr,
@@ -980,7 +967,7 @@ def kernel_moe_backward_mega(
                 orig_in3_ptr, stride_om3, stride_ok3,
                 grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
                 split_cum_ptr, expert_counts_ptr,
-                N3, K3, num_tn3, num_tk3, 0, w3_total,
+                N3, K3, num_tn3, num_tk3, 0, w3_total, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=TILE_B1,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -1145,7 +1132,7 @@ def kernel_moe_backward_mega(
                 orig_in5_ptr, stride_om5, stride_ok5,
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
-                N5, K5, num_tn5, num_tk5, 0, w5_split,
+                N5, K5, num_tn5, num_tk5, 0, w5_split, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -1177,7 +1164,7 @@ def kernel_moe_backward_mega(
                 orig_in5_ptr, stride_om5, stride_ok5,
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
-                N5, K5, num_tn5, num_tk5, w5_split, w5_total,
+                N5, K5, num_tn5, num_tk5, w5_split, w5_total, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -1187,14 +1174,15 @@ def kernel_moe_backward_mega(
 
     # ---------------- P6: MoonEP grad_reduce (GRAD_REDUCE) ----------------
     # The ReplicaGradTransport chain inlined as tail phases: seed+sink -> B6
-    # (= its barrier #1) -> owner-pull -> B7 (= its barrier #2) -> zero.  B5
-    # ahead of the seed publishes the physical grad_fc1 (P5) / grad_fc2 (P3)
-    # stores — unlike the P4c tail this one IS cross-rank (P6b pulls every
-    # peer's sunk slots), so it cannot ride kernel exit.  The transport's
-    # trailing barrier #3 is the kernel exit itself (the _mega_grad_zero
-    # docstring).  GRAD_REDUCE is a uniform constexpr: non-MoonEP launches
-    # compile the whole tail — barriers included — out, leaving the chain
-    # exactly as probes proved it.
+    # (= its barrier #1) -> owner-pull.  B5 ahead of the seed publishes the
+    # physical grad_fc1 (P5) / grad_fc2 (P3) stores — unlike the P4c tail
+    # this one IS cross-rank (P6b pulls every peer's sunk slots), so it
+    # cannot ride kernel exit.  The transport's third stage (zeroing the
+    # consumed slots) and its barrier #2 are the kernel exit + a
+    # stream-ordered HOST zero after the launch — purely local work, see
+    # the module docstring.  GRAD_REDUCE is a uniform constexpr: non-MoonEP
+    # launches compile the whole tail — barriers included — out, leaving
+    # the chain exactly as probes proved it.
     if GRAD_REDUCE:
         libshmem_device.barrier_all()
         with al.scope(core_mode="vector", disable_auto_sync=True):
@@ -1210,7 +1198,7 @@ def kernel_moe_backward_mega(
         with al.scope(core_mode="vector", disable_auto_sync=True):
             # sub_vec0 gate (the P4b push pattern): an ungated vector body
             # runs on BOTH vector subcores with the same pid (probe 1) —
-            # fine for P6a/P6c's idempotent plain stores, fatal here, where
+            # fine for P6a's idempotent plain stores, fatal here, where
             # _mega_grad_accum's fp32 RMW would double-add every chunk.
             if sub_vec_id() == 0:
                 _mega_grad_owner_pull(
@@ -1222,13 +1210,6 @@ def kernel_moe_backward_mega(
                     gu6_elems, dn6_elems,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK)
-        libshmem_device.barrier_all()
-        with al.scope(core_mode="vector", disable_auto_sync=True):
-            _mega_grad_zero(
-                pid, num_cores,
-                gate_up_slot_ptr, down_slot_ptr,
-                consumed6_ptr, consumed_count6,
-                gu6_elems, dn6_elems, ACC_BLK)
 
 
 # ============================================================================
@@ -1363,6 +1344,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     w3_total = EPR * num_tn3 * num_tk3
     w5_total = EPR * num_tn5 * num_tk5
     w5_split = w5_total // 2   # P5a/P5b half-and-half over the P4b/P4c windows
+    # wgrad m-loop bound: the largest expert's row count, floored at 1 so the
+    # inner loop never degenerates to a zero-trip shape (all-experts-empty
+    # routings; see the miscompile note in _mega_wgrad_sweep).  Rows past
+    # each expert's split_size are masked out in-kernel.
+    max_rows_w = max(1, int(p4["expert_counts"].max().item()))
 
     # step-2 activation derivative selection (ops/backward.py semantics)
     activation = saved.get("activation", "swiglu")
@@ -1516,7 +1502,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         orig_in3, orig_in3.stride(0), orig_in3.stride(1),
         grad_fc2, grad_fc2.stride(0), grad_fc2.stride(1), grad_fc2.stride(2),
         p4["split_size_cum_per_expert"], p4["expert_counts"],
-        H, ffn, num_tn3, num_tk3, w3_total,
+        H, ffn, num_tn3, num_tk3, w3_total, max_rows_w,
         # P4a
         p4["weight"], p4["we"], p4["wk"], p4["wn"],
         hidden_buf,
@@ -1592,6 +1578,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
             # same copies after its own launch).
             grad_transport.sunk = True
             grad_transport.reduced = True
+            # the transport's third stage (zero the consumed slots) runs
+            # HOST-side here, stream-ordered behind the launch — purely
+            # local work (every remote getmem reader retired inside the
+            # launch); the in-kernel P6c tail's zero stores proved
+            # unreliable on this backend (see the module docstring).
+            zero_consumed_replica_slots(grad_transport.buffers, consumed)
             grad_fc1_reduced = torch.empty(
                 (epn6, 2 * ffn, H), dtype=dy.dtype, device=device
             ).copy_(acc_gate_up.transpose(1, 2))
