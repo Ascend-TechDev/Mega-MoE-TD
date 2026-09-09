@@ -86,6 +86,23 @@
 #  fence/signal/dl.wait chain it rests on is proven by probes 3/4,
 #  w8 910B1) and MOE_MEGA_FUSE_P4=1 (the P4a+P4b self-produce-self-push
 #  fusion — takes precedence over MOE_MEGA_TILE_B3).
+#
+#  KNOWN CODEGEN LIMITATION of the two variant knobs (910B1, pre-existing
+#  @91ed770): on CONCENTRATED routings (the symmetric hot-expert gate, w2/w4
+#  — one expert owns every received row) the FULL kernel miscompiles P1's
+#  fc2-dgrad row addressing: grad_swiglu comes out as bit-exact copies of
+#  correct rows placed at wrong rows (pure data-placement, zero arithmetic
+#  error; deterministic; TILE_B3 hits the home sweep on the owner rank,
+#  FUSE_P4 the replica sweep on the replica rank), and everything reading
+#  row-indexed companions (P2's AB, P3's orig_in3) corrupts downstream.
+#  Evidence that this is codegen, not source logic: with P2-P6 compiled out
+#  (MOE_MEGA_P23=0 MOE_MEGA_P4=0 MOE_MEGA_P5=0 MOE_MEGA_P6=0) P1 alone is
+#  bit-identical AND correct in all three configs (peer_mem and grad_swiglu,
+#  both ranks); MOE_MEGA_P6=0 alone already makes all configs bit-identical;
+#  symmetric-heap divergence was ruled out (routing-independent slab sizing
+#  changed nothing).  Same bishengir whole-kernel instability family as the
+#  _mega_wgrad_sweep DO-NOT-TOUCH note.  Near-uniform routings are green on
+#  both variants (w8/nm gates); both knobs stay default-off.
 #  MoonEP: use_moonep saved dicts are supported with the dual weight tables
 #  always on; the P6 grad_reduce tail turns on iff the caller lends a
 #  grad_transport (ops.backward passes it whenever the forward lent the
@@ -1407,11 +1424,29 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     # all); TILE_B3 uses one slot per (m,n) task.  Allocate the larger TILE_B3
     # footprint in both cases — the slab is grow-on-demand and the epoch key
     # is shared, so switching modes between calls stays monotonic and safe.
+    #
+    # ROUTING-INDEPENDENT sizing (w2 hot-expert, 910B1 2026-09-09): the slot
+    # count must NOT come from tiles["num_tiles_m"]/M — those are per-rank
+    # RECEIVED rows (hot routing: 1 tile on the owner, 0 on idle ranks), and
+    # aclshmem_create_tensor bumps each rank's symmetric heap independently:
+    # a divergent size skews every later heap offset on that rank (and a
+    # 0-slot call allocates a degenerate [0] tensor).  Every other symmetric
+    # slab here is sized from cross-rank collective values for this reason —
+    # max_bwd_tiles is an all_reduce MAX (dispatch_fc2_bwd.py), peer_mem an
+    # all_reduce MAX (make_moonep_backward_peer_mem).  Bound the row count
+    # the same way: no rank receives more than every (source, expert) bucket
+    # at the global max, W*EPR buckets of <= max_bwd_tiles*64 rows each.
+    # NOTE: this discipline is hardening only — the symmetric hot-expert gate
+    # (w2/w4) still FAILS under the variants with uniform sizing, byte-for-
+    # byte identically, so heap divergence is NOT that failure's cause (root
+    # cause: the codegen limitation documented in the module docstring).
+    m_bound = W * EPR * p1["max_bwd_tiles"] * 64
     tile_b3 = os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
     fuse_p4 = os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
     if fuse_p4 or tile_b3:
+        tiles_bound = (m_bound + cbm - 1) // cbm + EPR
         b3_signal = _ensure_mega_signal_local(
-            saved, "_mega_b3_signal_mem", tiles["num_tiles_m"] * num_tn4)
+            saved, "_mega_b3_signal_mem", tiles_bound * num_tn4)
         b3_epoch = saved.get("_mega_b3_signal_epoch", 1)
         saved["_mega_b3_signal_epoch"] = b3_epoch + 1
     else:
@@ -1424,15 +1459,17 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     # B1 signalization: one slot per (expert, n_tile, m_window) grad_swiglu
     # tile.  Slot stride max_win is derived IN-KERNEL (producer and consumer
     # run the same recv_per_expert walk); the slab only needs the hard upper
-    # bound sum_e cdiv(size_e, dbm) <= cdiv(M, dbm) + 1.  Requires P1 and P23
-    # (the producer/consumer phases) — otherwise the env knob is inert.
+    # bound sum_e cdiv(size_e, dbm) <= cdiv(M, dbm) + 1 — sized from the
+    # routing-independent m_bound above (same symmetric-heap alignment rule).
+    # Requires P1 and P23 (the producer/consumer phases) — otherwise the env
+    # knob is inert.
     tile_b1 = (os.environ.get("MOE_MEGA_TILE_B1", "0") == "1"
                and _flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23"))
     if tile_b1:
         num_n_tiles1 = (N1 + dbn - 1) // dbn
         b1_signal = _ensure_mega_signal_local(
             saved, "_mega_b1_signal_mem",
-            EPR * num_n_tiles1 * ((M + dbm - 1) // dbm + 1))
+            EPR * num_n_tiles1 * ((m_bound + dbm - 1) // dbm + 1))
         b1_epoch = saved.get("_mega_b1_signal_epoch", 1)
         saved["_mega_b1_signal_epoch"] = b1_epoch + 1
     else:
