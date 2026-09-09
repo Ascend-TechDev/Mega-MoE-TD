@@ -27,13 +27,19 @@ def main():
     parser.add_argument("--arch", default="Ascend950DT_9582")
     parser.add_argument("--cores", type=int, default=32)
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--moonep", action="store_true")
+    parser.add_argument("--wave-windows", type=int,
+                        help="M tiles per compute wave (default: 32 with MoonEP, otherwise 16)")
     parser.add_argument("--dump-sync-ir", action="store_true")
-    parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 256),
+    parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
-    parser.add_argument("--fc2-block", type=int, nargs=3, default=(256, 256, 256),
+    parser.add_argument("--fc2-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    windows = args.wave_windows if args.wave_windows is not None else (32 if args.moonep else 16)
+    if not 1 <= windows <= 64 or windows & (windows - 1):
+        parser.error("wave-windows must be a power of two in [1, 64]")
     case = resolve_case(args.case).validate()
     if not 0 <= args.rank < case.world_size:
         parser.error("rank must be in the selected case's world")
@@ -62,18 +68,21 @@ def main():
         WORLD_SIZE=case.world_size, NUM_EXPERTS=case.num_experts,
         EXPERTS_PER_RANK=case.experts_per_rank, TOPK=case.topk,
         HIDDEN=h, FFN=f, MAX_RECEIVED_ROUTES=max_recv,
-        NUM_BINS_PAD=triton.next_power_of_2(case.num_experts),
+        NUM_BINS_PAD=triton.next_power_of_2(case.num_experts * (2 if args.moonep else 1)),
         MAX_SOURCE_TILES=triton.cdiv(case.tokens * case.topk, 128),
         MAX_PIPELINE_GROUPS=triton.cdiv(
-            max_recv + case.experts_per_rank * (fc1_m - 1), 16 * fc1_m),
+            max_recv + case.experts_per_rank * (2 if args.moonep else 1) * (fc1_m - 1), windows * fc1_m),
         DISPATCH_BLOCK_M=128, FC1_BLOCK_M=fc1_m, FC1_BLOCK_N=fc1_n,
         FC1_BLOCK_K=fc1_k, FC2_BLOCK_N=fc2_n, FC2_BLOCK_K=fc2_k,
-        ACTIVATION=0, HAS_LINEAR_BETA=False, PIPELINE_GROUP_WINDOWS=16,
+        ACTIVATION=0, HAS_LINEAR_BETA=False, PIPELINE_GROUP_WINDOWS=windows,
+        MOONEP=args.moonep, RAW_NUM_BINS=triton.next_power_of_2(case.num_experts + 1),
+        UDMA_CHUNK_ELEMENTS=32 * 1024 * 1024,
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",
         "peer_mem_ptr", "combine_buf_ptr", "fc2_output_ptr",
         "weighted_activation_ptr", "output_ptr",
+        "replica_gate_ptr", "replica_down_ptr",
     }
     fp32_inputs = {"routing_weights_ptr", "routing_weight_recv_ptr"}
     signature = {}
@@ -84,6 +93,10 @@ def main():
             signature[name] = "*bf16"
         elif name in fp32_inputs:
             signature[name] = "*fp32"
+        elif name in ("gate_notify_ptr", "down_notify_ptr"):
+            signature[name] = "*u64"
+        elif name in ("expert_count_ptr", "transfers_ptr", "allocation_ptr"):
+            signature[name] = "*i64"
         elif name.endswith("_ptr"):
             signature[name] = "*i32"
         elif name in ("situ_beta", "situ_linear_beta"):

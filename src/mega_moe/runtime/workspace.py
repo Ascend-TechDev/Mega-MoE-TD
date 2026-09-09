@@ -166,7 +166,10 @@ def create_moe_forward_context(
     dispatch_signal_slots = (
         world_size * physical_experts_per_rank * max_source_tiles
     )
-    replica_signal_slots = 2 * replica_budget
+    # UDMA writes a 64-bit notify into the first two words of each aligned
+    # slot; Cube dl.wait acquires its low int32 word. Down has two N panels.
+    # The MTE multi-kernel path continues to use its first B down slots.
+    replica_signal_slots = 3 * replica_budget
     signal_slots = dispatch_signal_slots + replica_signal_slots
     context.signal_mem = ash.aclshmem_create_tensor(
         [signal_slots * 16],
@@ -181,7 +184,7 @@ def create_moe_forward_context(
             gate_start:down_start
         ]
         context.replica_down_ready = context.signal_mem[
-            down_start:down_start + replica_budget * 16
+            down_start:down_start + 2 * replica_budget * 16
         ]
 
     num_dispatch_buckets = world_size * physical_experts_per_rank

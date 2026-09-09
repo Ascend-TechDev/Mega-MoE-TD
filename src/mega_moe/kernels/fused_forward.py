@@ -1,8 +1,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Single-launch home-expert Mega-MoE forward for Ascend.
+"""Single-launch Mega-MoE forward with optional UDMA MoonEP for Ascend.
 
-Routing, dispatch/FC1, weighted activation, FC2, reverse transport, and local
-top-k reduction execute in one physical all-core launch.
+Routing, optional MoonEP planning/prefetch, dispatch/FC1, weighted activation,
+FC2, reverse transport, and top-k reduction execute in one all-core launch.
 """
 
 import triton
@@ -15,10 +15,17 @@ from triton_dist.language.extra import libshmem_device
 
 from .dispatch_fc1 import _dispatch_one_source_tile_task
 from .fc2_combine import _fc2_gemm_one_mn_tile
+from .moonep_planning import (
+    _kernel_moonep_b2, _kernel_moonep_alloc_cumsum, _kernel_moonep_b3,
+)
+from .balanced_routing import _kernel_build_balanced_count_cube
+from .fused_moonep import (
+    _single_moonep_b0, _single_moonep_scatter, _single_moonep_push, _udma_quiet,
+)
 
-_ROUTE_BLOCK: tl.constexpr = 256
-_SCATTER_BLOCK: tl.constexpr = 128
-_REDUCE_BLOCK_N: tl.constexpr = 4096
+_ROUTE_BLOCK = tl.constexpr(256)
+_SCATTER_BLOCK = tl.constexpr(128)
+_REDUCE_BLOCK_N = tl.constexpr(4096)
 
 
 @triton.jit
@@ -109,7 +116,11 @@ def _publish_count_row(
     NUM_PROGRAM_CORES: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
+    num_routes=0,
+    MOONEP: tl.constexpr = False,
+    CURSOR_STRIDE: tl.constexpr = 0,
 ):
+    cursor_stride: tl.constexpr = CURSOR_STRIDE if CURSOR_STRIDE else NUM_BINS_PAD
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
     for bucket in range(0, NUM_BINS_PAD):
         count = 0
@@ -117,21 +128,26 @@ def _publish_count_row(
             for core_id in range(0, NUM_PROGRAM_CORES):
                 count += tl.load(
                     core_bucket_cursor_ptr
-                    + core_id * NUM_BINS_PAD
+                    + core_id * cursor_stride
                     + bucket
                 )
+        if MOONEP:
+            count = tl.where(bucket == NUM_EXPERTS, num_routes, count)
         tl.store(local_row_ptr + bucket, count)
 
     # Scalar stores must reach GM before MTE reads the published count row.
     libshmem_device.fence()
     for peer_rank in range(0, WORLD_SIZE):
         if peer_rank != LOCAL_RANK:
-            libshmem_device.putmem(
-                local_row_ptr,
-                local_row_ptr,
-                NUM_BINS_PAD * 4,
-                peer_rank,
-            )
+            if MOONEP:
+                # Keep fine-grained metadata off the UDMA weight QPs.
+                remote = dl.symm_at(counts_mem_ptr, peer_rank)
+                bins = tl.arange(0, NUM_BINS_PAD)
+                values = tl.load(local_row_ptr + bins)
+                tl.store(remote + LOCAL_RANK * NUM_BINS_PAD + bins, values)
+            else:
+                libshmem_device.putmem(
+                    local_row_ptr, local_row_ptr, NUM_BINS_PAD * 4, peer_rank)
     libshmem_device.fence()
 
 
@@ -187,9 +203,12 @@ def _convert_counts_to_stable_cursors(
     NUM_PROGRAM_CORES: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
+    MOONEP: tl.constexpr = False,
 ):
     for bucket in range(pid, NUM_EXPERTS, NUM_PROGRAM_CORES):
-        cursor = tl.load(send_bucket_starts_ptr + bucket)
+        cursor = 0
+        if not MOONEP:
+            cursor = tl.load(send_bucket_starts_ptr + bucket)
         for core_id in range(0, NUM_PROGRAM_CORES):
             count_ptr = (
                 core_bucket_cursor_ptr
@@ -311,14 +330,15 @@ def _partition_pipeline_fc1_activation_group_ub(
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_WINDOWS: tl.constexpr,
         FC1_CORES: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        FULL_GROUP: tl.constexpr, wave_expert, wave_row_start, wave_rows):
+        FULL_GROUP: tl.constexpr, wave_expert, wave_row_start, wave_rows,
+        replica_ready_ptr, WEIGHT_EXPERT_BASE: tl.constexpr,
+        WAIT_REPLICA: tl.constexpr):
     """Pipeline FC1 gate/up tiles through UB directly into activation output."""
     pair_block_m: tl.constexpr = BLOCK_M
     pair_block_n: tl.constexpr = BLOCK_N // 2
     vector_block_m: tl.constexpr = pair_block_m // 2
     activation_block_m: tl.constexpr = 32 if vector_block_m >= 32 else vector_block_m
     num_n_tiles: tl.constexpr = (FFN + pair_block_n - 1) // pair_block_n
-    # The supported M*N <= 65536 bound leaves room for both UB slots.
     gate_buffer_0 = bl.alloc(tl.bfloat16, [vector_block_m, pair_block_n],
                              al.ascend_address_space.UB)
     up_buffer_0 = bl.alloc(tl.bfloat16, [vector_block_m, pair_block_n],
@@ -367,7 +387,12 @@ def _partition_pipeline_fc1_activation_group_ub(
                         if GROUP_WINDOWS > core_power_two else 1)
                     first_sweep = pipeline_step < first_sweep_steps
                 else:
-                    first_sweep = pipeline_step < cube_group_row_parts
+                    # Striding by FC1_CORES revisits rows after r/gcd(r, cores)
+                    # steps. Its power-of-two factor gives a safe bound even
+                    # for core counts with odd factors, and is exact on 32 cores.
+                    row_power_two = cube_group_row_parts & -cube_group_row_parts
+                    shared_factor = tl.minimum(row_power_two, FC1_CORES & -FC1_CORES)
+                    first_sweep = pipeline_step < cube_group_row_parts // shared_factor
                 if first_sweep:
                     group_ready_token += _wait_dispatch_row_range(
                         signal_mem_ptr, recv_counts_re_ptr, cube_expert_id,
@@ -387,8 +412,15 @@ def _partition_pipeline_fc1_activation_group_ub(
                 up_cols = FFN + gate_cols
                 mask_m = offs_m < row_count
                 mask_n = gate_cols < FFN
-                weight_base = weight_ptr + cube_expert_id.to(
-                    tl.int64) * stride_weight_e
+                if WAIT_REPLICA:
+                    replica = cube_expert_id - WEIGHT_EXPERT_BASE
+                    ready = dl.wait(replica_ready_ptr + replica * 16, 1,
+                                    'gpu', 'acquire', waitValue=signal_epoch)
+                    weight_base = dl.consume_token(weight_ptr, ready)
+                    weight_base += replica.to(tl.int64) * stride_weight_e
+                else:
+                    weight_base = weight_ptr + cube_expert_id.to(
+                        tl.int64) * stride_weight_e
                 gate_acc = tl.zeros((pair_block_m, pair_block_n),
                                     dtype=tl.float32)
                 up_acc = tl.zeros((pair_block_m, pair_block_n),
@@ -671,7 +703,9 @@ def _fc2_dynamic_wave(
         signal_epoch, stride_weight_e, stride_weight_n, stride_weight_k, NUM_CORES: tl.constexpr,
         LOCAL_RANK: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
         HIDDEN: tl.constexpr, FFN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr):
+        BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
+        replica_weight_ptr, replica_ready_ptr,
+        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
     completion_base: tl.constexpr = MAX_WAVES * NUM_CORES
     n_tiles: tl.constexpr = (HIDDEN + BLOCK_N - 1) // BLOCK_N
     activation_ready = dl.wait(
@@ -688,12 +722,28 @@ def _fc2_dynamic_wave(
             first_tile = (pid + NUM_CORES - tile_base % NUM_CORES) % NUM_CORES
             for tile in range(first_tile, row_tiles * n_tiles, NUM_CORES):
                 row_start = begin + tile // n_tiles * BLOCK_M
-                _fc2_gemm_one_mn_tile(
-                    wave_input, weight_ptr, output_ptr, expert,
-                    expert_offset + row_start, tl.minimum(BLOCK_M, end - row_start),
-                    tile % n_tiles, HIDDEN, FFN, FFN, 1, stride_weight_e,
-                    stride_weight_n, stride_weight_k, HIDDEN, 1,
-                    BLOCK_M, BLOCK_N, BLOCK_K, 0)
+                if MOONEP and expert >= HOME_EXPERTS:
+                    weight_expert = expert - HOME_EXPERTS
+                    n_start = tile % n_tiles * BLOCK_N
+                    first_panel = n_start // (HIDDEN // 2)
+                    last_panel = tl.minimum(n_start + BLOCK_N - 1, HIDDEN - 1) // (HIDDEN // 2)
+                    ready = dl.wait(replica_ready_ptr + (2 * weight_expert + first_panel) * 16,
+                                    last_panel - first_panel + 1, 'gpu', 'acquire',
+                                    waitValue=signal_epoch)
+                    ready_weight = dl.consume_token(replica_weight_ptr, ready)
+                    _fc2_gemm_one_mn_tile(
+                        wave_input, ready_weight, output_ptr, weight_expert,
+                        expert_offset + row_start, tl.minimum(BLOCK_M, end - row_start),
+                        tile % n_tiles, HIDDEN, FFN, FFN, 1, stride_weight_e,
+                        stride_weight_n, stride_weight_k, HIDDEN, 1,
+                        BLOCK_M, BLOCK_N, BLOCK_K, 0, True)
+                else:
+                    _fc2_gemm_one_mn_tile(
+                        wave_input, weight_ptr, output_ptr, expert,
+                        expert_offset + row_start, tl.minimum(BLOCK_M, end - row_start),
+                        tile % n_tiles, HIDDEN, FFN, FFN, 1, stride_weight_e,
+                        stride_weight_n, stride_weight_k, HIDDEN, 1,
+                        BLOCK_M, BLOCK_N, BLOCK_K, 0)
     libshmem_device.fence()
     libshmem_device.signal_op(
         pipeline_signal_ptr + (completion_base + wave * NUM_CORES + pid) * 16,
@@ -808,7 +858,9 @@ def _run_dynamic_wave_pipeline(
         MAX_SOURCE_TILES: tl.constexpr, MAX_WAVES: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr,
         BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr, FC1_BLOCK_K: tl.constexpr,
         FC2_BLOCK_N: tl.constexpr, FC2_BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
-        ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr):
+        ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+        replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
+        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
     global_waves = 0
     for rank in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
@@ -854,27 +906,35 @@ def _run_dynamic_wave_pipeline(
                 if begin < end:
                     tile_base = (first_block + begin // BLOCK_M) * fc1_n_tiles
                     lane = (pid + NUM_CORES - tile_base % NUM_CORES) % NUM_CORES
-                    full_rows = end - begin == WAVE_WINDOWS * BLOCK_M
-                    if full_rows:
-                        _partition_pipeline_fc1_activation_group_ub(
-                            lane, peer_mem_ptr, signal_mem_ptr, gate_up_weight_ptr,
-                            routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
-                            recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
-                            stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
-                            stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
-                            HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                            WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, expert,
-                            begin, end - begin)
-                    else:
-                        _partition_pipeline_fc1_activation_group_ub(
-                            lane, peer_mem_ptr, signal_mem_ptr, gate_up_weight_ptr,
-                            routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
-                            recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
-                            stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
-                            stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
-                            HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                            WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, expert,
-                            begin, end - begin)
+                    full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)
+                    # Separate allocation bases at compile time: the Ascend
+                    # block-pointer pass cannot merge home/replica pointers.
+                    for replica_kind in tl.static_range(2 if MOONEP else 1):
+                        if (not MOONEP) or ((expert >= HOME_EXPERTS) == (replica_kind == 1)):
+                            if full_rows:
+                                _partition_pipeline_fc1_activation_group_ub(
+                                    lane, peer_mem_ptr, signal_mem_ptr,
+                                    replica_gate_ptr if replica_kind else gate_up_weight_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
+                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
+                                    stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
+                                    HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, expert,
+                                    begin, end - begin, gate_ready_ptr,
+                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
+                            else:
+                                _partition_pipeline_fc1_activation_group_ub(
+                                    lane, peer_mem_ptr, signal_mem_ptr,
+                                    replica_gate_ptr if replica_kind else gate_up_weight_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
+                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
+                                    stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
+                                    HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, expert,
+                                    begin, end - begin, gate_ready_ptr,
+                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
             with al.scope(core_mode='vector', disable_auto_sync=True):
                 libshmem_device.fence()
                 libshmem_device.signal_op(
@@ -886,7 +946,8 @@ def _run_dynamic_wave_pipeline(
                     pid, step - 1, weighted_activation_ptr, down_weight_ptr, fc2_output_ptr,
                     pipeline_signal_ptr, wave_expert_offsets_ptr, signal_epoch, stride_down_e,
                     stride_down_n, stride_down_k, NUM_CORES, LOCAL_RANK, EXPERTS_PER_RANK, MAX_WAVES,
-                    HIDDEN, FFN, BLOCK_M, FC2_BLOCK_N, FC2_BLOCK_K, WAVE_WINDOWS)
+                    HIDDEN, FFN, BLOCK_M, FC2_BLOCK_N, FC2_BLOCK_K, WAVE_WINDOWS,
+                    replica_down_ptr, down_ready_ptr, HOME_EXPERTS, MOONEP)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (step >= 2) & (step - 2 < local_waves):
                 _return_dynamic_wave(
@@ -915,6 +976,10 @@ def _kernel_fused_forward(
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, recv_counts_re_ptr, recv_per_expert_ptr,
         recv_expert_offs_ptr, stats_ptr, core_bucket_cursor_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, pull_tile_dst_start_ptr, wave_expert_offsets_ptr,
+        raw_counts_ptr, expert_count_ptr, transfers_ptr, allocation_ptr, alloc_cumsum_ptr,
+        experts_to_copy_ptr, inverse_ptr, replica_counts_ptr,
+        replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
+        gate_notify_ptr, down_notify_ptr,
         num_routes, signal_epoch, situ_beta, situ_linear_beta, stride_hidden_m: tl.constexpr,
         stride_hidden_k: tl.constexpr, stride_gate_up_e: tl.constexpr,
         stride_gate_up_n: tl.constexpr, stride_gate_up_k: tl.constexpr, stride_down_e: tl.constexpr,
@@ -926,9 +991,11 @@ def _kernel_fused_forward(
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
         FC2_BLOCK_K: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        PIPELINE_GROUP_WINDOWS: tl.constexpr):
+        PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
+        RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
+    physical_experts: tl.constexpr = EXPERTS_PER_RANK * (2 if MOONEP else 1)
     pipeline_counter_count: tl.constexpr = MAX_PIPELINE_GROUPS * (
         2 * NUM_PROGRAM_CORES + WORLD_SIZE)
     with al.scope(core_mode='vector', disable_auto_sync=True):
@@ -949,31 +1016,81 @@ def _kernel_fused_forward(
     _mixed_forward_barrier()
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if (sub_vec_id() == 0) & (pid == 0):
-            _publish_count_row(core_bucket_cursor_ptr, counts_mem_ptr,
-                               LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
-                               NUM_EXPERTS, NUM_BINS_PAD)
+            if MOONEP:
+                _publish_count_row(core_bucket_cursor_ptr, raw_counts_ptr,
+                                   LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
+                                   NUM_EXPERTS, RAW_NUM_BINS, num_routes, True, NUM_BINS_PAD)
+            else:
+                _publish_count_row(core_bucket_cursor_ptr, counts_mem_ptr,
+                                   LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
+                                   NUM_EXPERTS, NUM_BINS_PAD)
     _mixed_forward_barrier()
+    if MOONEP:
+        with al.scope(core_mode='vector', disable_auto_sync=True):
+            if (sub_vec_id() == 0) & (pid == 0):
+                _single_moonep_b0(raw_counts_ptr, expert_count_ptr, transfers_ptr,
+                                  WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK,
+                                  RAW_NUM_BINS, min(32, NUM_EXPERTS & -NUM_EXPERTS))
+            libshmem_device.fence()
+        al.sync_block_all('all', 15)
+        with al.scope(core_mode='vector', disable_auto_sync=True):
+            if (sub_vec_id() == 0) & (pid < WORLD_SIZE):
+                _kernel_moonep_b2(expert_count_ptr, transfers_ptr, allocation_ptr,
+                                  WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK,
+                                  triton.next_power_of_2(EXPERTS_PER_RANK))
+            libshmem_device.fence()
+        al.sync_block_all('all', 15)
+        with al.scope(core_mode='vector', disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                if pid < WORLD_SIZE:
+                    _kernel_moonep_b3(allocation_ptr, experts_to_copy_ptr, inverse_ptr,
+                                      replica_counts_ptr, WORLD_SIZE, NUM_EXPERTS,
+                                      triton.next_power_of_2(NUM_EXPERTS),
+                                      EXPERTS_PER_RANK, EXPERTS_PER_RANK)
+                alloc_block: tl.constexpr = max(32, triton.next_power_of_2(
+                    triton.cdiv(NUM_EXPERTS, NUM_PROGRAM_CORES)))
+                if pid < triton.cdiv(NUM_EXPERTS, alloc_block):
+                    _kernel_moonep_alloc_cumsum(allocation_ptr, alloc_cumsum_ptr,
+                                               WORLD_SIZE, NUM_EXPERTS, alloc_block)
+            libshmem_device.fence()
+        al.sync_block_all('all', 15)
+        with al.scope(core_mode='vector', disable_auto_sync=True):
+            if pid < WORLD_SIZE:
+                if sub_vec_id() == 0:
+                    _kernel_build_balanced_count_cube(
+                        raw_counts_ptr, alloc_cumsum_ptr, experts_to_copy_ptr,
+                        counts_mem_ptr, expert_count_ptr, WORLD_SIZE, NUM_EXPERTS,
+                        EXPERTS_PER_RANK, LOCAL_RANK, RAW_NUM_BINS, NUM_BINS_PAD,
+                        32, triton.next_power_of_2(physical_experts), False)
+                elif pid != LOCAL_RANK:
+                    _single_moonep_push(
+                        pid, gate_up_weight_ptr, down_weight_ptr, replica_gate_ptr,
+                        replica_down_ptr, gate_notify_ptr, down_notify_ptr,
+                        experts_to_copy_ptr, signal_epoch, LOCAL_RANK,
+                        EXPERTS_PER_RANK, HIDDEN, FFN, UDMA_CHUNK_ELEMENTS)
+            libshmem_device.fence()
+        al.sync_block_all('all', 15)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if (sub_vec_id() == 0) & (pid < WORLD_SIZE):
             _build_destination_metadata(
                 pid, counts_mem_ptr, send_bucket_starts_ptr,
                 send_bucket_dst_starts_ptr, recv_counts_re_ptr,
                 recv_per_expert_ptr, recv_expert_offs_ptr, stats_ptr,
-                LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK, NUM_BINS_PAD)
+                LOCAL_RANK, WORLD_SIZE, physical_experts, NUM_BINS_PAD)
             _build_dynamic_wave_offsets(
                 pid, counts_mem_ptr, wave_expert_offsets_ptr, WORLD_SIZE,
-                EXPERTS_PER_RANK, NUM_BINS_PAD, FC1_BLOCK_M)
+                physical_experts, NUM_BINS_PAD, FC1_BLOCK_M)
     _mixed_forward_barrier()
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
             _convert_counts_to_stable_cursors(pid, core_bucket_cursor_ptr,
                                               send_bucket_starts_ptr,
                                               NUM_PROGRAM_CORES, NUM_EXPERTS,
-                                              NUM_BINS_PAD)
+                                              NUM_BINS_PAD, MOONEP)
             if pid < WORLD_SIZE:
                 _build_pull_destination_starts(
                     pid, counts_mem_ptr, pull_tile_dst_start_ptr, LOCAL_RANK,
-                    WORLD_SIZE, EXPERTS_PER_RANK, NUM_EXPERTS, NUM_BINS_PAD)
+                    WORLD_SIZE, physical_experts, WORLD_SIZE * physical_experts, NUM_BINS_PAD)
             if pid == 0:
                 max_received = 0
                 for dst_rank in range(0, WORLD_SIZE):
@@ -983,12 +1100,20 @@ def _kernel_fused_forward(
     _mixed_forward_barrier()
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
-            _scatter_stable_routes(pid, selected_experts_ptr,
-                                   core_bucket_cursor_ptr,
-                                   send_token_indices_ptr,
-                                   send_route_indices_ptr, route_to_send_ptr,
-                                   num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS,
-                                   NUM_BINS_PAD, TOPK, _SCATTER_BLOCK)
+            if MOONEP:
+                _single_moonep_scatter(
+                    pid, selected_experts_ptr, core_bucket_cursor_ptr, raw_counts_ptr,
+                    alloc_cumsum_ptr, inverse_ptr, send_bucket_starts_ptr,
+                    send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
+                    num_routes, NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, NUM_EXPERTS,
+                    EXPERTS_PER_RANK, NUM_BINS_PAD, RAW_NUM_BINS, TOPK, _SCATTER_BLOCK)
+            else:
+                _scatter_stable_routes(pid, selected_experts_ptr,
+                                       core_bucket_cursor_ptr,
+                                       send_token_indices_ptr,
+                                       send_route_indices_ptr, route_to_send_ptr,
+                                       num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS,
+                                       NUM_BINS_PAD, TOPK, _SCATTER_BLOCK)
     _mixed_forward_barrier()
     capacity_ok = tl.load(stats_ptr + 1) <= MAX_RECEIVED_ROUTES
     local_counts_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
@@ -1001,6 +1126,15 @@ def _kernel_fused_forward(
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
         situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
-        NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK, HIDDEN, FFN, TOPK,
+        NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
         MAX_SOURCE_TILES, MAX_PIPELINE_GROUPS, DISPATCH_BLOCK_M, FC1_BLOCK_M, FC1_BLOCK_N,
-        FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA)
+        FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA,
+        replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
+        EXPERTS_PER_RANK, MOONEP)
+    if MOONEP:
+        # Drain outstanding WQEs before releasing source aliases. The next
+        # call's initial rank barrier protects consumer slots from overwrite.
+        al.sync_block_all('all', 15)
+        with al.scope(core_mode='vector', disable_auto_sync=True):
+            if (sub_vec_id() == 1) & (pid < WORLD_SIZE) & (pid != LOCAL_RANK):
+                _udma_quiet(pid)

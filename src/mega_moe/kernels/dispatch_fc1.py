@@ -35,8 +35,8 @@ from .replica_weight_prefetch import (
     _push_compact_replica_weight_descriptors,
 )
 
-_DIRECT_STORE_BLOCK_M: tl.constexpr = 64
-_DIRECT_STORE_BLOCK_N: tl.constexpr = 1024
+_DIRECT_STORE_BLOCK_M = tl.constexpr(64)
+_DIRECT_STORE_BLOCK_N = tl.constexpr(1024)
 
 
 @triton.jit(

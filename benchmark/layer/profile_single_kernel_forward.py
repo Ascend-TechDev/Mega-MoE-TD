@@ -99,9 +99,13 @@ def _parse_args():
         action="store_true",
         help="run correctness gates and timing without collecting profiles",
     )
-    parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 256),
+    parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
-    parser.add_argument("--fc2-block", type=int, nargs=3, default=(256, 256, 256),
+    parser.add_argument("--moonep", action="store_true",
+                        help="enable device planning and UDMA replica prefetch in the same launch")
+    parser.add_argument("--wave-windows", type=int,
+                        help="M tiles per compute wave (default: 32 with MoonEP, otherwise 16)")
+    parser.add_argument("--fc2-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
@@ -109,7 +113,9 @@ def _parse_args():
 
 
 def _config_overrides(args):
-    overrides = {"enable_single_kernel_forward": True}
+    overrides = {"enable_single_kernel_forward": True, "enable_moonep": args.moonep,
+                 "moonep_enable_replica_cache": False,
+                 "single_kernel_group_windows": args.wave_windows}
     overrides.update(zip(
         ("fc1_gemm_block_size_m", "fc1_gemm_block_size_n", "fc1_gemm_block_size_k"),
         args.fc1_block,
@@ -322,7 +328,8 @@ def _worker(
 
         if rank == 0:
             print("[setup] initializing ACLSHMEM", flush=True)
-        with kit.aclshmem_session(rank, world_size, bench.G_ASH_SIZE):
+        with kit.aclshmem_session(rank, world_size, bench.G_ASH_SIZE,
+                                 enable_udma=config_overrides.get("enable_moonep", False)):
             if rank == 0:
                 print("[setup] ACLSHMEM initialized; constructing operator", flush=True)
             experts_per_rank = case.num_experts // world_size
@@ -389,6 +396,30 @@ def _worker(
                     down_weight,
                     torch_w2_kn,
                 )
+                if op.enable_moonep:
+                    from mega_moe.runtime.moonep_planning import plan_moonep_b0_b3
+
+                    raw_counts = op.context.planning_counts_mem.view(
+                        world_size, op.context.planning_num_bins)[:, :case.num_experts].cpu()
+                    oracle = plan_moonep_b0_b3(raw_counts)
+                    actual_etc = op.context.planning_experts_to_copy.cpu()
+                    if not torch.equal(actual_etc, oracle.experts_to_copy):
+                        raise AssertionError("single-kernel ETC differs from the MoonEP oracle")
+                    if not torch.equal(op.context.planning_alloc_cumsum.cpu(), oracle.alloc_cumsum):
+                        raise AssertionError("single-kernel allocation differs from the MoonEP oracle")
+                    copies = (actual_etc >= 0).sum(dim=1).tolist()
+                    if "moonep-skewed" in case.tags and case.num_experts == 32:
+                        if copies != [0, 0, 1, 1, 1, 1, 1, 1]:
+                            raise AssertionError(f"trimmed skewed case did not exercise six replicas: {copies}")
+                    route_distribution["moonep"] = {
+                        "experts_to_copy": actual_etc.tolist(),
+                        "copies_per_rank": copies,
+                        "total_weight_bytes_per_forward": sum(copies) * case.hidden * case.ffn * 6,
+                        "transport": "upstream PIPE_S UDMA",
+                        "replica_refresh": "every_forward",
+                    }
+                    if rank == 0:
+                        print(f"[moonep] copies_per_rank={copies}; GPU planner matches oracle", flush=True)
                 if rank == 0:
                     print("[correctness] zero-receive and all-drop routes", flush=True)
                 bench._validate_edge_cases(
@@ -533,6 +564,8 @@ def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
         Path(__file__).resolve(),
         _REPO_ROOT / "src/mega_moe/ops/forward.py",
         _REPO_ROOT / "src/mega_moe/kernels/fused_forward.py",
+        _REPO_ROOT / "src/mega_moe/kernels/fused_moonep.py",
+        _REPO_ROOT / "benchmark/layer/_kimi_routes.py",
         _REPO_ROOT / "src/mega_moe/kernels/dispatch_fc1.py",
         _REPO_ROOT / "src/mega_moe/kernels/fc2_combine.py",
         _REPO_ROOT / "src/mega_moe/config.py",

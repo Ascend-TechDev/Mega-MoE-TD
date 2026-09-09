@@ -152,14 +152,19 @@ class MoEForwardConfig:
     # all route metadata directly into the reusable context workspaces.
     moonep_fused_balanced_count: bool = True
     moonep_fused_route_mapping: bool = True
-    # Repeated stable routes can reuse replica tables.  One-shot/cache-miss
+    # The multi-kernel path can reuse replica tables for stable routes. One-shot/cache-miss
     # benchmarks may disable the collective hit check without deleting the
     # useful production cache path.
     moonep_enable_replica_cache: bool = True
-    # Home-expert routing through combine in one physical all-core launch.
+    # Routing through combine in one physical all-core launch.
     # Uses dynamic waves, dual Vector activation, and explicit CV events.
-    # MoonEP and saved-forward continue to use the multi-kernel path.
+    # MoonEP uses upstream PIPE_S UDMA; saved-forward uses the multi-kernel path.
     enable_single_kernel_forward: bool = False
+    # A Kimi gate/up payload (42 MiB) fits one asynchronous UDMA request.
+    moonep_udma_chunk_bytes: int = 64 * 1024 * 1024
+    # M tiles per compute wave. None selects 32 for MoonEP, 16 for home routing.
+    # Larger waves amortize synchronization but increase dispatch/startup latency.
+    single_kernel_group_windows: Optional[int] = None
 
     def __post_init__(self):
         object.__setattr__(
@@ -257,13 +262,19 @@ class MoEForwardConfig:
             raise TypeError("enable_moonep must be a bool")
         if type(self.enable_single_kernel_forward) is not bool:
             raise TypeError("enable_single_kernel_forward must be a bool")
+        windows = self.single_kernel_group_windows
+        if windows is not None and (type(windows) is not int or not 1 <= windows <= 64
+                                    or windows & (windows - 1)):
+            raise ValueError("single_kernel_group_windows must be None or a power of two in [1, 64]")
+        if windows is None:
+            object.__setattr__(self, "single_kernel_group_windows", 32 if self.enable_moonep else 16)
         if (self.enable_single_kernel_forward
                 and self.fc1_gemm_block_size_m != self.fc2_combine_block_size_m):
             raise ValueError("single-kernel forward requires matching FC1 and FC2 M tiles")
-        if self.enable_single_kernel_forward and self.enable_moonep:
-            raise ValueError(
-                "enable_single_kernel_forward does not support MoonEP yet"
-            )
+        if (type(self.moonep_udma_chunk_bytes) is not int
+                or not 0 < self.moonep_udma_chunk_bytes <= 256 * 1024 * 1024
+                or self.moonep_udma_chunk_bytes % 2):
+            raise ValueError("moonep_udma_chunk_bytes must be even and in (0, 256 MiB]")
         if type(self.moonep_fused_balanced_count) is not bool:
             raise TypeError("moonep_fused_balanced_count must be a bool")
         if type(self.moonep_fused_route_mapping) is not bool:

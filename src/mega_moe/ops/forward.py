@@ -44,7 +44,6 @@ from ._native_saved import (
 
 
 _FC2_PIPELINE_GROUP_EXPERTS = 16
-_SINGLE_KERNEL_GROUP_WINDOWS = 16
 
 
 @dataclass
@@ -335,6 +334,7 @@ class FusedMoEForward(torch.nn.Module):
         self._active_replica_weight_epoch = 1
         self._forward_stream = None
         self._routing_weights_keepalive = None
+        self._single_weight_sources = None
         self._combine_fc2_buf = None
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
@@ -575,15 +575,15 @@ class FusedMoEForward(torch.nn.Module):
             # For EPR1, each rank's two prefix bases remain zero. Dynamic
             # expert totals and the sentinel are rebuilt inside every call.
             self._single_wave_expert_offsets = torch.zeros(
-                (self.world_size, self.experts_per_rank + 1, 2),
+                (self.world_size, self.physical_experts_per_rank + 1, 2),
                 dtype=torch.int32, device=device,
             )
             pipeline_group_rows = (
-                _SINGLE_KERNEL_GROUP_WINDOWS * self.config.fc1_gemm_block_size_m
+                self.config.single_kernel_group_windows * self.config.fc1_gemm_block_size_m
             )
             self._single_pipeline_max_groups = (
                 max_recv + pipeline_group_rows - 1
-                + self.experts_per_rank * (self.config.fc1_gemm_block_size_m - 1)
+                + self.physical_experts_per_rank * (self.config.fc1_gemm_block_size_m - 1)
             ) // pipeline_group_rows
             import shmem as ash
 
@@ -1396,7 +1396,19 @@ class FusedMoEForward(torch.nn.Module):
         down_weight: torch.Tensor,
         routing_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Launch the home-expert routing-to-combine implementation once."""
+        """Launch routing, optional UDMA MoonEP, and compute exactly once."""
+        if self.enable_moonep:
+            if self._replica_weight_buffers is None:
+                from triton_dist.language.extra import libshmem_device
+
+                if not all(callable(getattr(libshmem_device, name, None)) for name in
+                           ("udma_put_nbi", "udma_put_signal_nbi", "udma_quiet")):
+                    raise RuntimeError(
+                        "single-kernel MoonEP requires upstream UDMA Triton/SHMEM wheels "
+                        "and ACLSHMEM initialized with MTE | UDMA")
+            if self.hidden_size % 2:
+                raise ValueError("single-kernel UDMA MoonEP requires even hidden_size")
+            self._ensure_replica_weight_buffers(gate_up_weight, down_weight)
         self._ensure_single_kernel_buffers(gate_up_weight)
         num_tokens = hidden_states.shape[0]
         num_routes = selected_experts.numel()
@@ -1412,7 +1424,15 @@ class FusedMoEForward(torch.nn.Module):
             dtype=self.activation_dtype,
             device=hidden_states.device,
         )
+        if self.enable_moonep:
+            # Saved-forward shares these destinations but has its own cache
+            # and epoch counter. Switching paths must not reuse an old signal.
+            self._tile_signal_epoch = max(self._tile_signal_epoch, self._replica_weight_epoch)
+            self._replica_weight_cache_valid = False
+            self._replica_weight_epoch = self._tile_signal_epoch + 1
         signal_epoch = self._tile_signal_epoch
+        if signal_epoch >= torch.iinfo(torch.int32).max:
+            raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
         # FC1 holds two (M, N/2) accumulators with the same total L0C footprint.
         launch_options = (
             {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
@@ -1459,6 +1479,20 @@ class FusedMoEForward(torch.nn.Module):
             self._route_to_send,
             self._pull_tile_dst_start,
             self._single_wave_expert_offsets,
+            self.context.planning_counts_mem if self.enable_moonep else self.context.metadata_counts_mem,
+            self.context.planning_expert_count,
+            self.context.planning_transfers,
+            self.context.planning_allocation,
+            self.context.planning_alloc_cumsum,
+            self.context.planning_experts_to_copy,
+            self.context.planning_inverse_experts_to_copy,
+            self.context.planning_replica_counts,
+            self._replica_weight_buffers.gate_up if self.enable_moonep else gate_up_for_gemm,
+            self._replica_weight_buffers.down if self.enable_moonep else down_weight,
+            self.context.replica_gate_ready if self.enable_moonep else self.context.signal_mem,
+            self.context.replica_down_ready if self.enable_moonep else self.context.signal_mem,
+            self.context.replica_gate_ready.view(torch.uint64) if self.enable_moonep else None,
+            self.context.replica_down_ready.view(torch.uint64) if self.enable_moonep else None,
             num_routes,
             signal_epoch,
             float(self.situ_beta),
@@ -1495,11 +1529,18 @@ class FusedMoEForward(torch.nn.Module):
             FC2_BLOCK_K=self.config.fc2_gemm_block_size_k,
             ACTIVATION=0 if self.activation == "swiglu" else 1,
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
-            PIPELINE_GROUP_WINDOWS=_SINGLE_KERNEL_GROUP_WINDOWS,
+            PIPELINE_GROUP_WINDOWS=self.config.single_kernel_group_windows,
+            MOONEP=self.enable_moonep,
+            RAW_NUM_BINS=self.context.planning_num_bins,
+            UDMA_CHUNK_ELEMENTS=self.config.moonep_udma_chunk_bytes // 2,
             **launch_options,
         )
         self._tile_signal_epoch += 1
         self._routing_weights_keepalive = routing_weights
+        if self.enable_moonep:
+            # Always refresh in this path: the device planner may change slot
+            # ownership every call, without host ETC copies or cache collectives.
+            self._single_weight_sources = (gate_up_weight, down_weight)
         if self.receive_capacity_factor < self.world_size:
             required_received_routes = int(
                 self.context.metadata_stats[1].item()
