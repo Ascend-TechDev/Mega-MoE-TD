@@ -62,6 +62,28 @@ consume inside a task loop with multiple consumes per program — but always
 within ONE scope; nothing alternates scopes per loop iteration.  A wedge or
 mismatch means the fusion must stay two-phase (P4a; barrier/TILE_B3; P4b).
 
+Probe 5 gates MOE_MEGA_UB_P4 (the forwardOne borrow): the tile crosses from
+the cube scope to the SAME program's vector scope through an ON-CHIP UB
+double buffer — ``al.fixpipe(acc, ub[p])`` + ``al.sync_block_set`` on the
+cube side, ``al.sync_block_wait`` + ``bl.to_tensor(subview)`` + release on
+the vector side, with 2-deep ping-pong backpressure (the producer waits the
+consumer's release from two iterations back).  The tile never touches GM
+and no signal slot exists — this is the FC1->activation handoff of the
+single-kernel forward (origin/forwardOne ``fused_forward.py``) transplanted
+into the mega backward's alternating-scope task loop.  A wedge or a stale
+read means P4a+P4b must keep the GM ``hidden_buf`` handoff (probe 4's
+regime) — the UB path would eliminate the tile's GM round-trip entirely.
+
+Probe 5 RESULT (2026-09-09, 910B1 x8): the toolchain HARD-GATES ``al.fixpipe``
+to Ascend910_95 — the extension's semantic layer raises "this feature is only
+supported on Ascend910_95" (Fixpipe docstring: "L0C to UB (for Ascend910_95
+series)"), and ``copy_from_ub_to_l1``/buffer ``copy`` carry the same gate — so
+the UB direct handoff is A5-ONLY and cannot compile on any other part.  The
+probe therefore asserts the gate on non-910_95 (the boundary is a TESTED
+fact, not a red X) and keeps the numeric leg ready for A5.  ``sync_block_*``
+and ``bl.alloc/subview/to_tensor`` are NOT gated; on A3 the realizable subset
+of forwardOne's pipeline is the FUSE_P4 GM-handoff wave (probe 4).
+
 Decision tree (plan R1)
 -----------------------
 | result                              | decision                                   |
@@ -102,10 +124,12 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl  # noqa: F401  (peer_mem symmetric mapping)
 from triton_dist.language.extra import libshmem_device
+import triton.extension.buffer.language as bl
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
 from mega_moe.kernels.common import ncore
+from triton.backends.ascend.driver import NPUUtils
 from tests import _moe_testkit as kit
 
 # Probe-1 GEMM shape: one BLOCK_M row-block per program (grid == ncore()), so
@@ -886,6 +910,187 @@ def test_mega_probe2b_barrier_chain_loop(dist_test):
                     "set MOE_PROBE_RUN_CHAIN_LOOP=1 to reproduce")
 
 
+@triton.jit
+def kernel_probe5_ub_pingpong(
+    a_ptr, b_ptr, golden_ptr, flags_ptr,
+    NITER,
+    NPROG: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    RTOL: tl.constexpr, ATOL: tl.constexpr,
+):
+    """Probe 5: per iteration a cube scope computes one 16x16 dot tile
+    (probe 4's math) and hands it to the SAME program's vector scope through
+    an on-chip UB double buffer -- al.fixpipe(acc, ub[p]) +
+    al.sync_block_set('cube','vector',8+p); the vector scope (sub_vec0)
+    sync_block_waits, bl.to_tensor's the buffer back, verifies it against the
+    golden, then releases the slot with sync_block_set('vector','cube',10+p);
+    the cube side waits that release before overwriting the same ping-pong
+    slot two iterations later (2-deep backpressure).  The tile NEVER touches
+    GM and NO signal slot exists -- this is the forwardOne single-kernel
+    forward's FC1->activation handoff mechanism (fused_forward.py,
+    origin/forwardOne) gated in the mega backward's task-loop shape.
+    flags[pid, 0] = mismatched elements, flags[pid, 1] = iterations done."""
+    pid = tl.program_id(axis=0)
+    om = tl.arange(0, 16)
+    ub0 = bl.alloc(tl.bfloat16, [16, 16], al.ascend_address_space.UB)
+    ub1 = bl.alloc(tl.bfloat16, [16, 16], al.ascend_address_space.UB)
+    bad = 0  # python-int init + tensor accumulate (probe-3 idiom)
+    for it in range(NITER):
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            base = (pid * NITER + it) * 256
+            if it >= 2:
+                # backpressure: buffer (it % 2) was last consumed by the
+                # vector scope of iteration it-2 -- wait its release.  The
+                # buffer SELECT must be a device branch with each arm
+                # hardcoding its buffer (a buffer is not an SSA value one
+                # can tl.select; the forwardOne form).
+                if it % 2 == 0:
+                    al.sync_block_wait("vector", "cube", 10)
+                else:
+                    al.sync_block_wait("vector", "cube", 11)
+            acc = tl.zeros((16, 16), dtype=tl.float32)
+            for ks in tl.range(0, 16, 8, num_stages=2):
+                ok8 = ks + tl.arange(0, 8)
+                x = tl.load(a_ptr + base + om[:, None] * 16 + ok8[None, :])
+                yv = tl.load(b_ptr + ok8[:, None] * 16 + om[None, :])
+                acc += tl.dot(x, yv)
+            if it % 2 == 0:
+                al.fixpipe(acc, ub0)
+                al.sync_block_set("cube", "vector", 8)
+            else:
+                al.fixpipe(acc, ub1)
+                al.sync_block_set("cube", "vector", 9)
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                # recompute from the loop index only (probe-4 idiom: no SSA
+                # value needs to cross a scope boundary when it is cheap)
+                base = (pid * NITER + it) * 256
+                # forwardOne reads UB in 8-row chunks (fused_forward.py's
+                # `for row_chunk in range(0, pair_block_m, 8)` loop), wait
+                # BEFORE the chunk loop and release AFTER it -- match the
+                # production form exactly.
+                if it % 2 == 0:
+                    al.sync_block_wait("cube", "vector", 8)
+                else:
+                    al.sync_block_wait("cube", "vector", 9)
+                for row_chunk in range(0, 16, 8):
+                    # both subviews built unconditionally; only the
+                    # to_tensor sits in the device branch (the forwardOne
+                    # form -- a view is cheap, a buffer is not an SSA value)
+                    view0 = ub0.subview([row_chunk, 0], [8, 16], [1, 1])
+                    view1 = ub1.subview([row_chunk, 0], [8, 16], [1, 1])
+                    if it % 2 == 0:
+                        got = bl.to_tensor(view0,
+                                           writable=False).to(tl.float32)
+                    else:
+                        got = bl.to_tensor(view1,
+                                           writable=False).to(tl.float32)
+                    rows8 = row_chunk + tl.arange(0, 8)
+                    gold = tl.load(
+                        golden_ptr + base + rows8[:, None] * 16
+                        + om[None, :])
+                    diff = tl.abs(got - gold)
+                    bad += tl.sum((diff > (ATOL + RTOL * tl.abs(gold)))
+                                  .to(tl.int32))
+                if it % 2 == 0:
+                    al.sync_block_set("vector", "cube", 10)
+                else:
+                    al.sync_block_set("vector", "cube", 11)
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            tl.store(flags_ptr + pid * 2, bad)
+            tl.store(flags_ptr + pid * 2 + 1, NITER)
+
+
+def run_mega_probe5_ub_pingpong(rank: int, world_size: int) -> None:
+    """Probe 5 driver: the forwardOne UB ping-pong handoff (fixpipe +
+    sync_block, zero GM round-trip and zero signal slots) inside the mega
+    backward's alternating-scope task loop (the MOE_MEGA_UB_P4 gate).
+
+    ARCH BOUNDARY (found 2026-09-09, 910B1 x8): the toolchain HARD-GATES
+    al.fixpipe to Ascend910_95 — semantic.py raises "this feature is only
+    supported on Ascend910_95" (triton/language/extra/cann/extension/
+    core.py, Fixpipe docstring: "L0C to UB (for Ascend910_95 series)");
+    copy_from_ub_to_l1 / buffer copy carry the same gate.  forwardOne's UB
+    direct handoff is therefore A5-ONLY — on every other part this probe
+    ASSERTS the gate fires (a tested boundary, not a failure) and the
+    numeric validation below runs only on 910_95.  sync_block_set/wait and
+    bl.alloc/subview/to_tensor themselves are NOT gated — the A3 subset of
+    forwardOne's pipeline is the FUSE_P4 GM-handoff wave (probe 4).
+
+    MOE_PROBE5_ITERS overrides the iteration count (default 16 -- enough for
+    seven full ping-pong cycles of backpressure)."""
+    _require_runtime("mega probe5")
+    device = f"npu:{rank}"
+    ep_group = dist.group.WORLD
+    nprog = ncore()
+    niter = int(os.environ.get("MOE_PROBE5_ITERS", "16"))
+    label = f"mega-probe5-ub-pingpong-w{world_size}"
+    arch = str(NPUUtils().get_arch())
+    is_910_95 = "910_95" in arch
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
+        # no symmetric allocation: the whole handoff is on-chip (the session
+        # wrapper only keeps the probe environment uniform with 1-4).
+        torch.manual_seed(2416 + rank)
+        a = torch.randn(
+            nprog * niter, 16, 16, dtype=torch.bfloat16, device=device)
+        b = torch.randn(16, 16, dtype=torch.bfloat16, device=device)
+        golden = a.float() @ b.float()   # (N,16,16)@(16,16) broadcasts
+        flags = torch.full((nprog, 2), -1, dtype=torch.int32, device=device)
+        dist.barrier()
+
+        if not is_910_95:
+            # boundary leg: the fixpipe semantic gate must fire, identically,
+            # on every rank — anything else (a wedge, a DIFFERENT error, or a
+            # surprise success) is a real failure.
+            try:
+                kernel_probe5_ub_pingpong[(nprog, 1, 1)](
+                    a, b, golden, flags,
+                    niter,
+                    NPROG=nprog, LOCAL_RANK=rank,
+                    RTOL=GEMM_RTOL, ATOL=GEMM_ATOL,
+                    num_warps=8)
+                torch.npu.synchronize()
+            except Exception as e:  # noqa: BLE001 — verdict on the message
+                if "only supported on Ascend910_95" in str(e):
+                    print(f"[{label}] rank {rank}: fixpipe 910_95 gate "
+                          f"fires as documented on {arch} — UB handoff is "
+                          f"A5-only, boundary OK")
+                    return
+                raise
+            raise RuntimeError(
+                f"[{label}] rank {rank}: fixpipe COMPILED on {arch} — the "
+                f"910_95 gate is gone; run the numeric leg on this part "
+                f"(set is_910_95) and re-baseline this probe")
+
+        kernel_probe5_ub_pingpong[(nprog, 1, 1)](
+            a, b, golden, flags,
+            niter,
+            NPROG=nprog, LOCAL_RANK=rank,
+            RTOL=GEMM_RTOL, ATOL=GEMM_ATOL,
+            num_warps=8)
+        torch.npu.synchronize()
+
+        failures = []
+        bad = int(flags[:, 0].sum().item())
+        done = int(flags[:, 1].max().item())
+        unverified = int((flags[:, 1] < 0).sum().item())
+        if bad:
+            worst = int(flags[:, 0].max().item())
+            failures.append(
+                f"UB ping-pong handoff failed: {bad} mismatched elements "
+                f"(worst program {worst}) -- fixpipe did not publish the "
+                f"cube tile to UB, or bl.to_tensor read a stale buffer "
+                f"(sync_block ordering)")
+        if unverified or done != niter:
+            failures.append(
+                f"{unverified} programs never stored a verdict or the "
+                f"loop short-ran (max iterations seen {done}, want "
+                f"{niter}) -- the sync_block backpressure chain wedged or "
+                f"miscompiled")
+        _fold_and_raise(failures, label, rank, device, ep_group)
+
+
 @pytest.mark.dist
 @pytest.mark.functional
 def test_mega_probe3_local_signal(dist_test):
@@ -902,3 +1107,17 @@ def test_mega_probe4_fused_loop(dist_test):
     per-iteration local self-signal (MOE_MEGA_FUSE_P4 gate).  A wedge (scope
     machinery per iteration) is caught by DIST_TEST_TIMEOUT_S."""
     dist_test(run_mega_probe4_fused_loop, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_mega_probe5_ub_pingpong(dist_test):
+    """Probe 5: UB fixpipe ping-pong cube->vector handoff in a device-side
+    loop — no GM round-trip, no signal slots (the MOE_MEGA_UB_P4 gate;
+    forwardOne's mechanism).  On non-910_95 parts the fixpipe semantic gate
+    is EXPECTED to fire at compile ("only supported on Ascend910_95",
+    found 910B1 2026-09-09) — the boundary leg asserts exactly that and
+    passes; the numeric leg runs only on A5.  A wedge (sync_block / bl
+    machinery under per-iteration scope alternation) is caught by
+    DIST_TEST_TIMEOUT_S."""
+    dist_test(run_mega_probe5_ub_pingpong, world_size=8)
