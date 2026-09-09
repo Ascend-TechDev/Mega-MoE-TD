@@ -2417,6 +2417,8 @@ def _moonep_backward_transport_samples(
     dict's ``_bwd_stage_samples`` so the backward's stage intervals from all
     samples land in one list for the caller's breakdown.
     """
+    from mega_moe import moe_backward_triton
+
     samples_ms = []
     setup_ms = []
     for i in range(warmup + iterations):

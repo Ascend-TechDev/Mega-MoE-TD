@@ -348,6 +348,19 @@ def _mega_wgrad_sweep(
         for m in tl.range(0, max_rows, BLOCK_M, num_stages=NUM_STAGES):
             mm = m + offs_m
             mmask = mm < split_size
+            # DO NOT touch this address chain: for late/small experts
+            # split_begin + max_rows runs past the buffers and this backend's
+            # masked loads trap aicore on an illegal base address (507015, w2
+            # hot-expert probe, 910B1 2026-09-09) — but BOTH clamp forms tried
+            # on row64 (tl.where on the load-derived mmask, and an arg-derived
+            # tl.minimum row bound) DETERMINISTICALLY faulted the whole
+            # mixed-scope kernel (fftsplus aicore + aivector, identical pc
+            # across runs, w8 moderate-wide 2026-09-09).  This loop's codegen
+            # is bistable and the bare add is its only proven-good shape; the
+            # OOB is fixed HOST-side instead — the wrapper pads the read
+            # buffers (grad_out/orig_in/hidden_buf) with max_rows extra rows
+            # so masked-lane addresses stay mapped (peer_mem relies on its
+            # recv-budget slack, total_recv + max_rows <= budget rows).
             row64 = (split_begin + mm).to(tl.int64)
             a_off = row64[None, :] * stride_outm + (n_start + offs_n[:, None]) * stride_outn
             a = tl.load(grad_out_base + a_off, mask=nmask[:, None] & mmask[None, :], other=0.0)
@@ -1281,16 +1294,44 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     signal_epoch = saved.get("_bwd_tile_signal_epoch", 1)
     saved["_bwd_tile_signal_epoch"] = signal_epoch + 1
 
-    # outputs (fresh, contiguous — strides passed to the kernel)
+    # wgrad m-loop bound + the READ-buffer pad row count, needed before the
+    # output allocations below: rows past each expert's split_size are masked
+    # in-kernel, but the masked lanes still VALIDATE their base addresses —
+    # for late/small experts split_begin + max_rows runs past the buffers and
+    # traps aicore 507015 (w2 hot-expert, 910B1 2026-09-09).  Both in-kernel
+    # clamp forms faulted the kernel deterministically (see the
+    # DO-NOT-TOUCH note in _mega_wgrad_sweep), so the buffers are PADDED
+    # host-side instead: max_rows_w extra rows keep every masked-lane address
+    # mapped.  peer_mem — the one buffer this wrapper cannot re-alloc —
+    # relies on its recv-budget slack: total_recv + max_rows_w <= budget rows
+    # holds for every non-adversarial routing (total_recv ~= tokens*topk <<
+    # budget = tokens*topk*world).
+    p4 = _combine_static_maps(saved)
+    # floored at 1 so the in-kernel m-loop never degenerates to a zero-trip
+    # shape (all-experts-empty routings; see the miscompile note in
+    # _mega_wgrad_sweep)
+    max_rows_w = max(1, int(p4["expert_counts"].max().item()))
+    pad_rows_w = max_rows_w
+
+    # outputs (fresh, contiguous — strides passed to the kernel; the four
+    # wgrad-sweep read targets carry the pad rows, returned keys are [:M]
+    # views)
     fc1_output = saved["fc1_output"].contiguous()      # [M, 2*ffn]
-    grad_swiglu = torch.empty(M, ffn, dtype=dy.dtype, device=device)
-    grad_fc1_output = torch.empty_like(fc1_output)     # [M, 2*ffn]
+    grad_swiglu = torch.empty(
+        M + pad_rows_w, ffn, dtype=dy.dtype, device=device)[:M]
+    grad_fc1_output = torch.empty(
+        M + pad_rows_w, 2 * ffn, dtype=fc1_output.dtype, device=device)[:M]
     grad_gate = torch.empty(M, dtype=fc1_output.dtype, device=device)
-    orig_in3 = saved["swiglu_out_weighted"].contiguous()   # [M, ffn]
+    orig_in3 = torch.empty(
+        M + pad_rows_w, ffn, dtype=dy.dtype, device=device)
+    orig_in3[:M].copy_(saved["swiglu_out_weighted"])
     grad_fc2 = torch.empty(EPR, H, ffn, dtype=dy.dtype, device=device)
-    orig_in5 = saved["recv_hidden_sorted"].contiguous()    # [M, H]
+    orig_in5 = torch.empty(
+        M + pad_rows_w, H, dtype=dy.dtype, device=device)
+    orig_in5[:M].copy_(saved["recv_hidden_sorted"])
     grad_fc1 = torch.empty(EPR, 2 * ffn, H, dtype=dy.dtype, device=device)
-    hidden_buf = torch.empty(M, H, dtype=dy.dtype, device=device)
+    hidden_buf = torch.empty(
+        M + pad_rows_w, H, dtype=dy.dtype, device=device)
 
     # P4 prep: cached combine maps + per-GEMM-tile expert/row tables.
     # A3 (910B-class) L0C halves 256KB -> 128KB: a 256x256 accumulator (the
@@ -1306,7 +1347,6 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         _l0c_128k = str(NPUUtils().get_arch()).startswith("Ascend910")
     except Exception:
         _l0c_128k = False
-    p4 = _combine_static_maps(saved)
     cbm, cbn, cbk, cns = _combine_gemm_tile()
     cbm = int(os.environ.get(
         "MOE_COMBINE_GEMM_BM", "128" if _l0c_128k else "256"))   # see dbm note above
@@ -1344,11 +1384,6 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     w3_total = EPR * num_tn3 * num_tk3
     w5_total = EPR * num_tn5 * num_tk5
     w5_split = w5_total // 2   # P5a/P5b half-and-half over the P4b/P4c windows
-    # wgrad m-loop bound: the largest expert's row count, floored at 1 so the
-    # inner loop never degenerates to a zero-trip shape (all-experts-empty
-    # routings; see the miscompile note in _mega_wgrad_sweep).  Rows past
-    # each expert's split_size are masked out in-kernel.
-    max_rows_w = max(1, int(p4["expert_counts"].max().item()))
 
     # step-2 activation derivative selection (ops/backward.py semantics)
     activation = saved.get("activation", "swiglu")
