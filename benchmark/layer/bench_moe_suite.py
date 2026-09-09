@@ -2218,20 +2218,36 @@ def run_moonep_forward_benchmark(
 def _backward_gate(saved, dy, peer_mem):
     from mega_moe import moe_backward_triton
 
+    keys = ("grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2")
+    # The gate is finiteness/shape only, so the two full grad dicts (each
+    # ~12 GiB at kimi-k3 w8) never need to coexist: free the baseline before
+    # the candidate runs. The A3 bench cards co-host ~35 GiB of external
+    # tenants, and the previous hold-both-then-check form OOM'd inside the
+    # gate before any timed phase ran.
     with torch.no_grad():
         torch_result = backward_torch_baseline(saved, dy)
+        for key in keys:
+            if key not in torch_result:
+                raise AssertionError(f"backward baseline is missing {key}")
+            if not bool(torch.isfinite(torch_result[key].float()).all()):
+                raise AssertionError(f"backward baseline has non-finite {key}")
+        torch_keys = sorted(torch_result)
+        torch_shapes = {key: tuple(torch_result[key].shape) for key in keys}
+        del torch_result
+        torch.npu.empty_cache()
+
         triton_result = moe_backward_triton(saved, dy, peer_mem)
-    keys = ("grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2")
-    for key in keys:
-        if key not in torch_result or key not in triton_result:
-            raise AssertionError(f"backward result is missing {key}")
-        if torch_result[key].shape != triton_result[key].shape:
-            raise AssertionError(f"backward gate shape mismatch for {key}")
-        if not bool(torch.isfinite(torch_result[key].float()).all()):
-            raise AssertionError(f"backward baseline has non-finite {key}")
-        if not bool(torch.isfinite(triton_result[key].float()).all()):
-            raise AssertionError(f"backward candidate has non-finite {key}")
-    return torch_result, triton_result
+        for key in keys:
+            if key not in triton_result:
+                raise AssertionError(f"backward candidate is missing {key}")
+            if tuple(triton_result[key].shape) != torch_shapes[key]:
+                raise AssertionError(f"backward gate shape mismatch for {key}")
+            if not bool(torch.isfinite(triton_result[key].float()).all()):
+                raise AssertionError(f"backward candidate has non-finite {key}")
+        triton_keys = sorted(triton_result)
+        del triton_result
+        torch.npu.empty_cache()
+    return torch_keys, triton_keys
 
 
 def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
