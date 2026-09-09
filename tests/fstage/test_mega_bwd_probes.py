@@ -39,6 +39,29 @@ accumulator carried across barriers, WEDGED all 8 ranks at w8 on 2026-09-04;
 it is kept as the wedge record and skipped by default — collectives must not
 sit inside a device-side loop.  Probe 2c is a vector-only bisect aid.)
 
+Probe 3 gates the B1/B3 *signalization* plan (replacing those barriers with
+per-tile signals, the "pipeline end-to-end" borrow): a cube-scope GEMM stores
+its row-block, ``fence()`` (or ``quiet()`` via ``MOE_PROBE3_QUIET=1``), then
+``signal_op SET`` to THIS rank's slot; a vector scope — where ``dl.wait`` has
+never been exercised, P1 only waits in cube scopes — consumes each producer's
+slot with ``dl.wait/consume_token`` and verifies that producer's rows.  NO
+barrier anywhere; producer-first source order avoids the circular wait.
+Pass = B1/B3 signalization is mechanically sound; wedge/fail = fall back to
+the barrier chain (the shipped mega kernel is the fallback state).
+
+Probe 4 gates the P4a+P4b FUSION (``MOE_MEGA_FUSE_P4``, the "self-produce-
+self-push" tile loop): alternating cube/vector scopes INSIDE a device-side
+``for`` loop — every iteration computes a dot tile in a cube scope (K-loop
+with num_stages, mirroring the fused GEMM body), stores it, ``fence()`` (or
+``quiet()`` via ``MOE_PROBE4_QUIET=1``), ``signal_op SET`` to THIS rank's
+per-(pid, it) slot; the adjacent vector scope then ``dl.wait``s that slot,
+``consume_token``s, and verifies the tile.  No barrier anywhere.  The pieces
+are individually proven — probe 3: the local cube->vector fence/signal/wait
+chain (single-shot); P1 production (dispatch_fc2_bwd.py:327-333): wait +
+consume inside a task loop with multiple consumes per program — but always
+within ONE scope; nothing alternates scopes per loop iteration.  A wedge or
+mismatch means the fusion must stay two-phase (P4a; barrier/TILE_B3; P4b).
+
 Decision tree (plan R1)
 -----------------------
 | result                              | decision                                   |
@@ -534,6 +557,252 @@ def run_mega_probe2c_barrier_vec_only(rank: int, world_size: int) -> None:
         _fold_and_raise(failures, label, rank, device, ep_group)
 
 
+# ---------------------------------------------------------------------------
+# Probe 3: LOCAL cube->vector per-tile signal (no barrier at all)
+# ---------------------------------------------------------------------------
+# The remote direction of this pipeline is production-proven (P1: vector
+# putmem+fence+signal_op SET -> cube dl.wait/consume_token, dispatch_fc2_bwd).
+# The B1/B3 signalization plan needs the LOCAL direction, which nothing in the
+# repo exercises yet: a CUBE scope's plain GM stores (FixPipe path) -> fence()
+# -> signal_op SET to THIS rank's slot -> a VECTOR scope's dl.wait (also
+# unproven in a vector scope; P1 only waits in cube scopes) -> GM loads of the
+# producer's rows.  Producer-first source order avoids the circular wait (every
+# program's first phase requires nothing), mirroring how a signalized P4a->P4b
+# would sit in the mega kernel.
+@triton.jit(do_not_specialize=["signal_epoch"])
+def kernel_probe_local_signal(
+    a_ptr, b_ptr, gemm_out_ptr, golden_ptr, signal_mem_ptr, flags_ptr,
+    T, N, K, signal_epoch,
+    stride_am, stride_bk, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_N_TILES: tl.constexpr, NPROG: tl.constexpr,
+    LOCAL_RANK: tl.constexpr,
+    RTOL: tl.constexpr, ATOL: tl.constexpr, QUIET_FENCE: tl.constexpr,
+):
+    """Probe 3: cube GEMM row-block + local signal, then vector verify gated
+    per producer signal — NO barrier_all anywhere.  flags[pid, 0] = mismatched
+    element count across ALL producers' rows, [pid, 1] = waits completed."""
+    pid = tl.program_id(axis=0)
+
+    # producer first: nothing it does can block on another program
+    with al.scope(core_mode="cube", disable_auto_sync=True):
+        _probe_gemm_body(pid, a_ptr, b_ptr, gemm_out_ptr, N, K,
+                         stride_am, stride_bk, stride_om,
+                         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                         NUM_N_TILES=NUM_N_TILES)
+        # QUIET_FENCE is the fallback rung if fence() does not order the
+        # FixPipe store before the signal (quiet drains all engines).
+        if QUIET_FENCE:
+            libshmem_device.quiet()
+        else:
+            libshmem_device.fence()
+        libshmem_device.signal_op(
+            signal_mem_ptr + pid * 16, signal_epoch,
+            libshmem_device.ACLSHMEM_SIGNAL_SET, LOCAL_RANK)
+
+    # consumer: wait each producer's slot in order, then verify THAT
+    # producer's row-block immediately (pipelined consumption, the shape a
+    # signalized B1/B3 would use).  sub_vec0-gated: dl.wait/consume_token must
+    # not run twice per program (token accounting).
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            offs_n = tl.arange(0, BLOCK_N)
+            bad = 0  # python-int init + tensor accumulate (ready_token idiom)
+            token = 0
+            for src in range(NPROG):
+                token += dl.wait(signal_mem_ptr + src * 16, 1, "gpu",
+                                 "acquire", waitValue=signal_epoch)
+                ready_ptr = dl.consume_token(gemm_out_ptr, token)
+                row0 = src * BLOCK_M
+                for r in range(BLOCK_M):
+                    out = tl.load(ready_ptr + (row0 + r) * stride_om
+                                  + offs_n).to(tl.float32)
+                    gold = tl.load(golden_ptr + (row0 + r) * N + offs_n)
+                    diff = tl.abs(out - gold)
+                    bad += tl.sum((diff > (ATOL + RTOL * tl.abs(gold)))
+                                  .to(tl.int32))
+            tl.store(flags_ptr + pid * 2, bad)
+            tl.store(flags_ptr + pid * 2 + 1, NPROG)
+
+
+def run_mega_probe3_local_signal(rank: int, world_size: int) -> None:
+    """Probe 3 driver: local cube->vector signal visibility, no barrier.
+    MOE_PROBE3_QUIET=1 swaps fence() for quiet() (fallback rung)."""
+    _require_runtime("mega probe3")
+    device = f"npu:{rank}"
+    ep_group = dist.group.WORLD
+    nprog = ncore()
+    quiet = os.environ.get("MOE_PROBE3_QUIET") == "1"
+    label = f"mega-probe3-local-signal-w{world_size}"
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
+        signal_mem = kit.ash.aclshmem_create_tensor(
+            [nprog * 16], dtype=torch.int32, device_id=rank)
+        try:
+            signal_mem.zero_()
+            torch.manual_seed(2315 + rank)
+            T = nprog * PROBE_BLOCK_M
+            a = torch.randn(T, PROBE_K, dtype=torch.bfloat16, device=device)
+            b = torch.randn(PROBE_K, PROBE_N, dtype=torch.bfloat16, device=device)
+            gemm_out = torch.empty(T, PROBE_N, dtype=torch.bfloat16, device=device)
+            golden = a.float() @ b.float()
+            flags = torch.full((nprog, 2), -1, dtype=torch.int32, device=device)
+            dist.barrier()
+
+            kernel_probe_local_signal[(nprog, 1, 1)](
+                a, b, gemm_out, golden, signal_mem, flags,
+                T, PROBE_N, PROBE_K, 1,
+                a.stride(0), b.stride(0), gemm_out.stride(0),
+                BLOCK_M=PROBE_BLOCK_M, BLOCK_N=PROBE_BLOCK_N,
+                BLOCK_K=PROBE_BLOCK_K, NUM_N_TILES=PROBE_N // PROBE_BLOCK_N,
+                NPROG=nprog, LOCAL_RANK=rank,
+                RTOL=GEMM_RTOL, ATOL=GEMM_ATOL, QUIET_FENCE=quiet,
+                num_warps=8)
+            torch.npu.synchronize()
+
+            failures = []
+            bad_gemm = int(flags[:, 0].sum().item())
+            unverified = int((flags[:, 1] < 0).sum().item())
+            if bad_gemm:
+                worst = int(flags[:, 0].max().item())
+                failures.append(
+                    f"local cube->vector signal visibility failed: {bad_gemm} "
+                    f"mismatched elements (worst program {worst}); "
+                    f"fence({'quiet' if quiet else 'fence'} did not order "
+                    f"the cube store before the signal)")
+            if unverified:
+                failures.append(
+                    f"{unverified} programs never stored a verdict "
+                    f"(kernel did not run to completion?)")
+            _fold_and_raise(failures, label, rank, device, ep_group)
+        finally:
+            kit.ash.aclshmem_free_tensor(signal_mem)
+
+
+# ---------------------------------------------------------------------------
+# Probe 4: fused tile loop — alternating cube/vector scopes INSIDE a device
+# side for-loop, with the per-iteration LOCAL self-signal chain (cube store
+# -> fence -> signal_op own slot; vector wait/consume/load).  Gates
+# MOE_MEGA_FUSE_P4: probe 3 proved the chain single-shot, P1 proves
+# wait+consume inside a task loop, but both keep ONE scope for the whole
+# loop — per-iteration scope ALTERNATION is the only unproven piece.
+# ---------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["signal_epoch"])
+def kernel_probe_fused_loop(
+    a_ptr, b_ptr, out_ptr, golden_ptr, signal_mem_ptr, flags_ptr,
+    NITER, signal_epoch,
+    NPROG: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    RTOL: tl.constexpr, ATOL: tl.constexpr, QUIET_FENCE: tl.constexpr,
+):
+    """Probe 4: per iteration a cube scope computes one 16x16 dot tile
+    (K-loop with num_stages, the fused GEMM body's shape), stores, fence/
+    quiet, signal_op SET to THIS rank's slot (pid*NITER+it); the adjacent
+    vector scope (sub_vec0) dl.waits that slot, consume_token, verifies the
+    tile vs the fp32 golden.  NO barrier anywhere.  flags[pid, 0] = mismatched
+    elements over all iterations, flags[pid, 1] = iterations completed."""
+    pid = tl.program_id(axis=0)
+    om = tl.arange(0, 16)
+    bad = 0  # python-int init + tensor accumulate (probe-3 idiom)
+    token = 0
+    for it in range(NITER):
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            base = (pid * NITER + it) * 256
+            acc = tl.zeros((16, 16), dtype=tl.float32)
+            for ks in tl.range(0, 16, 8, num_stages=2):
+                ok8 = ks + tl.arange(0, 8)
+                x = tl.load(a_ptr + base + om[:, None] * 16 + ok8[None, :])
+                yv = tl.load(b_ptr + ok8[:, None] * 16 + om[None, :])
+                acc += tl.dot(x, yv)
+            tl.store(out_ptr + base + om[:, None] * 16 + om[None, :],
+                     acc.to(out_ptr.dtype.element_ty))
+            # QUIET_FENCE is the fallback rung if fence() does not order the
+            # FixPipe store before the per-iteration signal (probe 3 rung).
+            if QUIET_FENCE:
+                libshmem_device.quiet()
+            else:
+                libshmem_device.fence()
+            libshmem_device.signal_op(
+                signal_mem_ptr + (pid * NITER + it) * 16, signal_epoch,
+                libshmem_device.ACLSHMEM_SIGNAL_SET, LOCAL_RANK)
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                # recompute `base` here: no SSA value needs to cross a scope
+                # boundary when it is this cheap (loop index only).
+                base = (pid * NITER + it) * 256
+                token += dl.wait(
+                    signal_mem_ptr + (pid * NITER + it) * 16,
+                    1, "gpu", "acquire", waitValue=signal_epoch)
+                ready_ptr = dl.consume_token(out_ptr, token)
+                got = tl.load(
+                    ready_ptr + base + om[:, None] * 16 + om[None, :]
+                ).to(tl.float32)
+                gold = tl.load(
+                    golden_ptr + base + om[:, None] * 16 + om[None, :])
+                diff = tl.abs(got - gold)
+                bad += tl.sum((diff > (ATOL + RTOL * tl.abs(gold)))
+                              .to(tl.int32))
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            tl.store(flags_ptr + pid * 2, bad)
+            tl.store(flags_ptr + pid * 2 + 1, NITER)
+
+
+def run_mega_probe4_fused_loop(rank: int, world_size: int) -> None:
+    """Probe 4 driver: fused scope-alternation loop + per-iteration local
+    self-signal (the MOE_MEGA_FUSE_P4 gate).  MOE_PROBE4_QUIET=1 swaps
+    fence() for quiet(); MOE_PROBE4_ITERS overrides the iteration count."""
+    _require_runtime("mega probe4")
+    device = f"npu:{rank}"
+    ep_group = dist.group.WORLD
+    nprog = ncore()
+    niter = int(os.environ.get("MOE_PROBE4_ITERS", "8"))
+    quiet = os.environ.get("MOE_PROBE4_QUIET") == "1"
+    label = f"mega-probe4-fused-loop-w{world_size}"
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
+        signal_mem = kit.ash.aclshmem_create_tensor(
+            [nprog * niter * 16], dtype=torch.int32, device_id=rank)
+        try:
+            signal_mem.zero_()
+            torch.manual_seed(2415 + rank)
+            a = torch.randn(
+                nprog * niter, 16, 16, dtype=torch.bfloat16, device=device)
+            b = torch.randn(16, 16, dtype=torch.bfloat16, device=device)
+            out = torch.empty_like(a)
+            golden = a.float() @ b.float()   # (N,16,16)@(16,16) broadcasts
+            flags = torch.full((nprog, 2), -1, dtype=torch.int32, device=device)
+            dist.barrier()
+
+            kernel_probe_fused_loop[(nprog, 1, 1)](
+                a, b, out, golden, signal_mem, flags,
+                niter, 1,
+                NPROG=nprog, LOCAL_RANK=rank,
+                RTOL=GEMM_RTOL, ATOL=GEMM_ATOL, QUIET_FENCE=quiet,
+                num_warps=8)
+            torch.npu.synchronize()
+
+            failures = []
+            bad = int(flags[:, 0].sum().item())
+            done = int(flags[:, 1].max().item())
+            unverified = int((flags[:, 1] < 0).sum().item())
+            if bad:
+                worst = int(flags[:, 0].max().item())
+                failures.append(
+                    f"fused-loop self-signal visibility failed: {bad} "
+                    f"mismatched elements (worst program {worst}); "
+                    f"fence({'quiet' if quiet else 'fence'}) did not order "
+                    f"the cube store before the per-iteration signal")
+            if unverified or done != niter:
+                failures.append(
+                    f"{unverified} programs never stored a verdict or the "
+                    f"loop short-ran (max iterations seen {done}, want "
+                    f"{niter}) — scope alternation inside a device loop "
+                    f"wedged or miscompiled")
+            _fold_and_raise(failures, label, rank, device, ep_group)
+        finally:
+            kit.ash.aclshmem_free_tensor(signal_mem)
+
+
 def run_mega_probe2b_barrier_chain_loop(rank: int, world_size: int) -> None:
     """Probe 2b (wedge record, off by default): the device-loop form that
     wedged all ranks at w8 — kept to document the constraint, re-enabled with
@@ -615,3 +884,21 @@ def test_mega_probe2b_barrier_chain_loop(dist_test):
     if os.environ.get("MOE_PROBE_RUN_CHAIN_LOOP") != "1":
         pytest.skip("loop-form chain wedged all ranks at w8; "
                     "set MOE_PROBE_RUN_CHAIN_LOOP=1 to reproduce")
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_mega_probe3_local_signal(dist_test):
+    """Probe 3: local cube->vector per-tile signal, no barrier (B1/B3
+    signalization gate).  A wedge (signal_op-to-self or dl.wait in a vector
+    scope unsupported) is caught by DIST_TEST_TIMEOUT_S."""
+    dist_test(run_mega_probe3_local_signal, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_mega_probe4_fused_loop(dist_test):
+    """Probe 4: alternating cube/vector scopes in a device-side loop +
+    per-iteration local self-signal (MOE_MEGA_FUSE_P4 gate).  A wedge (scope
+    machinery per iteration) is caught by DIST_TEST_TIMEOUT_S."""
+    dist_test(run_mega_probe4_fused_loop, world_size=8)

@@ -37,6 +37,16 @@
 #             no rank writes another rank's memory, so programs exit when
 #             their own reduce + wgrad remainder finish
 #
+#  MOE_MEGA_FUSE_P4=1 replaces the whole P4a/B3/P4b run above with ONE
+#  fused tile loop: per program, per strided m-tile — [cube: all n-tiles of
+#  tile_m + fence + signal own slot] [vec: wait own slot + push tile_m's
+#  rows].  Self-produce-self-push makes B3 vanish (the handoff is
+#  intra-program) and iteration i+1's GEMM overlaps iteration i's push —
+#  the structural borrow of MoonEP's AIC/AIV wave pipeline; on A5's
+#  independent engine arrays this is true concurrent cube-GEMM/transport
+#  overlap.  Probe 4 (test_mega_bwd_probes.py) gates the scope-alternation-
+#  in-loop + self-signal chain; the barriered form above is the fallback.
+#
 #  Every program reaches every barrier unconditionally (phase work is behind
 #  constexpr PHASE flags / strided task-range bounds, never an early
 #  return) — the replica_grad_reduce contract.
@@ -48,8 +58,12 @@
 #  them). MOE_DISPATCH_GEMM_* / MOE_COMBINE_GEMM_* / MOE_COMBINE_PUSH_BN /
 #  MOE_FUSED_WGRAD_BLOCK_M tiles still apply (the kernel reuses those
 #  getters), plus the mega-local MOE_MEGA_WGRAD_BN / MOE_MEGA_WGRAD_BK /
-#  MOE_MEGA_WGRAD_NS wgrad tile knobs. Only the non-MoonEP layout is
-#  supported.
+#  MOE_MEGA_WGRAD_NS wgrad tile knobs, MOE_MEGA_TILE_B3=1 (replace the
+#  B3 barrier with per-(tile,n) readiness signals; the local cube->vector
+#  fence/signal/dl.wait chain it rests on is proven by probes 3/4,
+#  w8 910B1) and MOE_MEGA_FUSE_P4=1 (the P4a+P4b self-produce-self-push
+#  fusion — takes precedence over MOE_MEGA_TILE_B3).
+#  Only the non-MoonEP layout is supported.
 # ============================================================================
 
 import os
@@ -63,7 +77,7 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
-from .common import ncore
+from .common import ncore, NPUUtils
 from .dispatch_fc2_bwd import (
     _prepare_dispatch_fc2_bwd,
     _dispatch_grad_source_tiles,
@@ -208,8 +222,10 @@ def _mega_combine_gemm(
     hidden_buf_ptr,                         # [M, H] out (row stride = N)
     tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
     N, K, num_tiles_n, num_tiles_m,
+    signal_mem_ptr, signal_epoch,           # B3 readiness slots (SIGNAL_ON)
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
 ):
     """fc1 input-grad GEMM ``hidden_buf[m, :] = grad_fc1_output[m, :] @
     fc1_combined[e]`` over ALL M-tiles (FIRST=0/LAST=num_tiles_m as RUNTIME
@@ -217,7 +233,13 @@ def _mega_combine_gemm(
     routing moves a tile). Persistent STRIDED task partition (same imbalance
     fix as _mega_wgrad_sweep), from _kernel_combine_fc1_bwd_gemm_group
     (combine_fc1_bwd.py:114-171); WEIGHT_EXPERT_BASE=0 (non-MoonEP single
-    home table). Must run inside a cube scope."""
+    home table). Must run inside a cube scope.
+
+    SIGNAL_ON=1 (MOE_MEGA_TILE_B3=1) fires a local readiness signal after
+    each (tile_m, tile_n) task's store lands: fence() orders the FixPipe
+    store before signal_op SET (probe 3, w8 910B1 2026-09-08), so the P4b
+    push can dl.wait per M-tile instead of crossing the B3 barrier. Slot
+    layout tile_m*num_tiles_n + tile_n matches the push-side merged wait."""
     om = tl.arange(0, BLOCK_M)
     on_ = tl.arange(0, BLOCK_N)
     ok = tl.arange(0, BLOCK_K)
@@ -245,6 +267,102 @@ def _mega_combine_gemm(
         co = row_base[:, None] * N + (n_start + on_[None, :])
         tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
                  mask=mm[:, None] & mn[None, :])
+        if SIGNAL_ON:
+            libshmem_device.fence()
+            libshmem_device.signal_op(
+                signal_mem_ptr + (tile_m * num_tiles_n + tile_n) * 16,
+                signal_epoch, libshmem_device.ACLSHMEM_SIGNAL_SET, LOCAL_RANK)
+
+
+@triton.jit
+def _mega_gemm_mtile(
+    tile_m,
+    inp_ptr, stride_im, stride_ik,          # grad_fc1_output [M, 2*ffn]
+    weight_ptr, stride_we, stride_wk, stride_wn,   # fc1_combined [E, 2*ffn, H] (K, N)
+    hidden_buf_ptr,                         # [M, H] out (row stride = N)
+    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+    N, K, num_tiles_n,
+    signal_mem_ptr, signal_epoch,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr, LOCAL_RANK: tl.constexpr,
+):
+    """FUSE_P4 cube body: ALL n-tiles of ONE m-tile (the same math as
+    _mega_combine_gemm restricted to a single tile_m, so every n-tile of the
+    row-block lands from THIS program), then one fence + ONE readiness signal
+    on the tile's own slot ``tile_m``.  Self-produce-self-push: the adjacent
+    vector scope (_mega_push_mtile) waits exactly this slot, so no cross-
+    program B3 handoff exists.  Slot layout: one slot per m-tile (each slot
+    written once per launch — SET epoch semantics hold).  Must run inside a
+    cube scope; probe 4 gates the scope-alternation-in-loop form."""
+    om = tl.arange(0, BLOCK_M)
+    on_ = tl.arange(0, BLOCK_N)
+    ok = tl.arange(0, BLOCK_K)
+    expert_id = tl.load(tile_expert_ptr + tile_m)
+    row_start = tl.load(tile_row0_ptr + tile_m)
+    rem = tl.load(tile_rows_ptr + tile_m)
+    mm = om < rem
+    wb = expert_id.to(tl.int64) * stride_we
+    row_base = row_start.to(tl.int64) + om.to(tl.int64)
+    for tile_n in range(num_tiles_n):
+        n_start = tile_n * BLOCK_N
+        mn = on_ < (N - n_start)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for ks in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+            mk = ok < (K - ks)
+            ao = row_base[:, None] * stride_im + (ks + ok[None, :]) * stride_ik
+            a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
+            bo = (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
+            b = tl.load(weight_ptr + wb + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+            acc += tl.dot(a, b)
+        co = row_base[:, None] * N + (n_start + on_[None, :])
+        tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
+                 mask=mm[:, None] & mn[None, :])
+    libshmem_device.fence()
+    libshmem_device.signal_op(
+        signal_mem_ptr + tile_m * 16, signal_epoch,
+        libshmem_device.ACLSHMEM_SIGNAL_SET, LOCAL_RANK)
+
+
+@triton.jit
+def _mega_push_mtile(
+    tile_m,
+    hidden_buf_ptr,
+    write_rank_by_src_ptr, write_off_by_src_ptr,
+    peer_mem_ptr,
+    grad_gate_ptr,
+    tile_row0_ptr, tile_rows_ptr,
+    signal_mem_ptr, signal_epoch,
+    H_push,
+    BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
+):
+    """FUSE_P4 vector body (behind sub_vec_id()==0): wait THIS program's own
+    signal for tile_m (already satisfied when the adjacent cube scope
+    finished — the wait is the visibility fence, not a stall), consume_token,
+    push the tile's rows.  Row work is _mega_push_rows restricted to one
+    tile; dl.wait/consume_token per loop iteration is the P1 production
+    idiom (dispatch_fc2_bwd.py:327-333, one consume per window, many per
+    program).  Must run inside a vector scope behind the sub_vec_id()==0
+    gate."""
+    ovp = tl.arange(0, BLOCK_N_PUSH)
+    row_stride = H_push + GATE_PAD
+    row_start = tl.load(tile_row0_ptr + tile_m)
+    rows = tl.load(tile_rows_ptr + tile_m)
+    token = dl.wait(signal_mem_ptr + tile_m * 16, 1, "gpu", "acquire",
+                    waitValue=signal_epoch)
+    ready_ptr = dl.consume_token(hidden_buf_ptr, token)
+    for r in range(rows):
+        sp = row_start + r
+        sp64 = sp.to(tl.int64)
+        dst_rank = tl.load(write_rank_by_src_ptr + sp64)
+        dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
+        dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
+        for ns in range(0, H_push, BLOCK_N_PUSH):
+            mask = ovp < (H_push - ns)
+            val = tl.load(ready_ptr + sp64 * H_push + (ns + ovp),
+                          mask=mask, other=0.0)
+            tl.store(dst_base + ns + ovp, val, mask=mask)
+        # pack the gate grad as the trailing channel of this row
+        tl.store(dst_base + H_push, tl.load(grad_gate_ptr + sp))
 
 
 @triton.jit
@@ -276,6 +394,53 @@ def _mega_push_rows(
             tl.store(dst_base + ns + ovp, val, mask=mask)
         # pack the gate grad as the trailing channel of this row
         tl.store(dst_base + H_push, tl.load(grad_gate_ptr + sp64))
+
+
+@triton.jit
+def _mega_push_rows_tiled(
+    pid, num_progs,
+    hidden_buf_ptr,
+    write_rank_by_src_ptr, write_off_by_src_ptr,
+    peer_mem_ptr,
+    grad_gate_ptr,
+    tile_row0_ptr, tile_rows_ptr,
+    signal_mem_ptr, signal_epoch,
+    num_tiles_m, num_tiles_n,
+    H_push, M,
+    BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
+):
+    """MOE_MEGA_TILE_B3=1 variant of _mega_push_rows: iterate M-tiles in
+    strided order, dl.wait EVERY (tile_m, tile_n) readiness slot of the tile
+    (the P1 merged-window idiom — no atomic last-finisher counting), then push
+    that tile's rows. Producer-first shape: the cube scope signals each task
+    as its store lands and never waits, so there is no circular wait (probe 3
+    proved the local cube->vector fence/signal/dl.wait chain in a vector
+    scope, w8 910B1 2026-09-08). Must run inside a vector scope behind the
+    sub_vec_id()==0 gate (dl.wait/consume_token must not run twice)."""
+    ovp = tl.arange(0, BLOCK_N_PUSH)
+    row_stride = H_push + GATE_PAD
+    for tile_m in range(pid, num_tiles_m, num_progs):
+        row_start = tl.load(tile_row0_ptr + tile_m)
+        rows = tl.load(tile_rows_ptr + tile_m)
+        token = 0
+        for nt in range(num_tiles_n):
+            token += dl.wait(
+                signal_mem_ptr + (tile_m * num_tiles_n + nt) * 16,
+                1, "gpu", "acquire", waitValue=signal_epoch)
+        ready_ptr = dl.consume_token(hidden_buf_ptr, token)
+        for r in range(rows):
+            sp = row_start + r
+            sp64 = sp.to(tl.int64)
+            dst_rank = tl.load(write_rank_by_src_ptr + sp64)
+            dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
+            dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
+            for ns in range(0, H_push, BLOCK_N_PUSH):
+                mask = ovp < (H_push - ns)
+                val = tl.load(ready_ptr + sp64 * H_push + (ns + ovp),
+                              mask=mask, other=0.0)
+                tl.store(dst_base + ns + ovp, val, mask=mask)
+            # pack the gate grad as the trailing channel of this row
+            tl.store(dst_base + H_push, tl.load(grad_gate_ptr + sp))
 
 
 @triton.jit
@@ -372,6 +537,11 @@ def kernel_moe_backward_mega(
     BLOCK_N_PUSH: tl.constexpr, GATE_PAD_C: tl.constexpr,
     P1_ON: tl.constexpr, P23_ON: tl.constexpr,
     P4_ON: tl.constexpr, P5_ON: tl.constexpr,
+    # ---- B3 signalization (MOE_MEGA_TILE_B3=1): per-tile readiness ----
+    b3_signal_ptr, b3_epoch,
+    TILE_B3: tl.constexpr,
+    # ---- P4a+P4b fusion (MOE_MEGA_FUSE_P4=1): self-produce-self-push ----
+    FUSE_P4: tl.constexpr,
 ):
     """One launch for the whole non-MoonEP MoE backward — see the module
     docstring for the phase/barrier map and the M0 probe evidence.  Grid MUST
@@ -431,35 +601,93 @@ def kernel_moe_backward_mega(
     # overwrite it; P2 outputs (dAB/dscale) published for P4a/P4b.
     libshmem_device.barrier_all()
 
-    # ---------------- P4a: fc1 input-grad GEMM ----------------
-    if P4_ON:
-        with al.scope(core_mode="cube", disable_auto_sync=True):
-            _mega_combine_gemm(
-                pid, num_cores,
-                dAB_ptr, stride_im4, stride_ik4,
-                fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
-                hidden_buf_ptr,
-                tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
-                N4, K4, num_tiles_n4, num_tiles_m4,
-                C_BM, C_BN, C_BK, C_NS)
-    # B3: local cube->vector handoff of hidden_buf.
-    libshmem_device.barrier_all()
-
-    # ------- P4b (vec push) ∥ P5a (cube wgrad, first half of tasks) -------
-    # The P2∥P3 concurrency recipe: adjacent vector/cube scopes overlap on
-    # their engines. P5 needs only P2's dAB (published at B2), so its first
-    # task half rides the push window — msprof showed the vector engine
-    # ~97% idle across the kernel, so this window was pure loss before.
-    if P4_ON:
-        with al.scope(core_mode="vector", disable_auto_sync=True):
-            if sub_vec_id() == 0:
-                _mega_push_rows(
-                    pid, num_cores,
+    # ---------------- P4a+P4b: fc1 input-grad GEMM + reverse-A2A push ------
+    if FUSE_P4:
+        # MOE_MEGA_FUSE_P4=1: each program owns a strided set of m-tiles and
+        # SELF-PRODUCES then SELF-PUSHES each one — cube scope computes all
+        # n-tiles of tile_m and signals its slot, the adjacent vector scope
+        # waits that SAME slot and pushes the tile's rows.  B3 disappears
+        # entirely (the handoff is intra-program, never cross-program), and
+        # iteration i+1's cube GEMM overlaps iteration i's vector push — the
+        # P2∥P3 adjacent-scope recipe applied per tile, the structural
+        # equivalent of MoonEP's AIC/AIV wave pipeline (on A5's independent
+        # engine arrays this is true concurrent transport).  No barrier sits
+        # inside the loop and B1/B2/B4 remain unconditional; probe 4 gates
+        # the scope-alternation-in-loop + self-signal chain.
+        for tile_m in range(pid, num_tiles_m4, num_cores):
+            with al.scope(core_mode="cube", disable_auto_sync=True):
+                _mega_gemm_mtile(
+                    tile_m,
+                    dAB_ptr, stride_im4, stride_ik4,
+                    fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
                     hidden_buf_ptr,
-                    write_rank_by_src_ptr, write_off_by_src_ptr,
-                    peer_mem_ptr, dscale_ptr,
-                    H, M4,
-                    BLOCK_N_PUSH, GATE_PAD_C)
+                    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                    N4, K4, num_tiles_n4,
+                    b3_signal_ptr, b3_epoch,
+                    C_BM, C_BN, C_BK, C_NS, LOCAL_RANK=LOCAL_RANK)
+            with al.scope(core_mode="vector", disable_auto_sync=True):
+                if sub_vec_id() == 0:
+                    _mega_push_mtile(
+                        tile_m,
+                        hidden_buf_ptr,
+                        write_rank_by_src_ptr, write_off_by_src_ptr,
+                        peer_mem_ptr, dscale_ptr,
+                        tile_row0_ptr, tile_rows_ptr,
+                        b3_signal_ptr, b3_epoch,
+                        H,
+                        BLOCK_N_PUSH, GATE_PAD_C)
+    else:
+        # ---------------- P4a: fc1 input-grad GEMM ----------------
+        if P4_ON:
+            with al.scope(core_mode="cube", disable_auto_sync=True):
+                _mega_combine_gemm(
+                    pid, num_cores,
+                    dAB_ptr, stride_im4, stride_ik4,
+                    fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
+                    hidden_buf_ptr,
+                    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                    N4, K4, num_tiles_n4, num_tiles_m4,
+                    b3_signal_ptr, b3_epoch,
+                    C_BM, C_BN, C_BK, C_NS,
+                    SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+        # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
+        # barrier with per-(tile,n) readiness signals (uniform constexpr —
+        # every program takes the same branch, so the barrier contract is
+        # intact and B1/B2/B4 remain unconditional).
+        if not TILE_B3:
+            libshmem_device.barrier_all()
+
+        # ------- P4b (vec push) ∥ P5a (cube wgrad, first half of tasks) -------
+        # The P2∥P3 concurrency recipe: adjacent vector/cube scopes overlap on
+        # their engines. P5 needs only P2's dAB (published at B2), so its first
+        # task half rides the push window — msprof showed the vector engine
+        # ~97% idle across the kernel, so this window was pure loss before.
+        if P4_ON:
+            with al.scope(core_mode="vector", disable_auto_sync=True):
+                if sub_vec_id() == 0:
+                    if TILE_B3:
+                        _mega_push_rows_tiled(
+                            pid, num_cores,
+                            hidden_buf_ptr,
+                            write_rank_by_src_ptr, write_off_by_src_ptr,
+                            peer_mem_ptr, dscale_ptr,
+                            tile_row0_ptr, tile_rows_ptr,
+                            b3_signal_ptr, b3_epoch,
+                            num_tiles_m4, num_tiles_n4,
+                            H, M4,
+                            BLOCK_N_PUSH, GATE_PAD_C)
+                    else:
+                        _mega_push_rows(
+                            pid, num_cores,
+                            hidden_buf_ptr,
+                            write_rank_by_src_ptr, write_off_by_src_ptr,
+                            peer_mem_ptr, dscale_ptr,
+                            H, M4,
+                            BLOCK_N_PUSH, GATE_PAD_C)
+
+    # P5a (cube wgrad, first half of tasks): with FUSE_P4 it follows the
+    # fused loop, overlapping only the per-program tail pushes (adjacent
+    # vec->cube scopes); otherwise it rides the P4b window as before.
     if P5_ON:
         with al.scope(core_mode="cube", disable_auto_sync=True):
             _mega_wgrad_sweep(
@@ -502,6 +730,26 @@ def kernel_moe_backward_mega(
 # ============================================================================
 # wrapper
 # ============================================================================
+def _ensure_mega_b3_signal_mem(saved, slots):
+    """Lazy/grow-alloc the B3 local-readiness signal slab on `saved`: one SET
+    slot per combine (tile_m, tile_n) task, 16 int32 elements (64B) per slot,
+    mirroring _ensure_bwd_signal_mem's discipline. num_tiles_m moves with
+    routing, so an existing slab is reused while it fits and regrown (free +
+    re-alloc + re-zero) when a routing needs more slots. Local-only target
+    (dst == LOCAL_RANK) — the slab never leaves this rank."""
+    import shmem as ash
+    mem = saved.get("_mega_b3_signal_mem")
+    if mem is not None and mem.numel() >= slots * 16:
+        return mem
+    if mem is not None:
+        ash.aclshmem_free_tensor(mem)
+    mem = ash.aclshmem_create_tensor(
+        [slots * 16], dtype=torch.int32, device_id=saved["ep_rank"])
+    mem.zero_()
+    saved["_mega_b3_signal_mem"] = mem
+    return mem
+
+
 def mega_backward_triton(saved, dy, peer_mem):
     """MOE_BWD_MEGA=1 backward: the whole non-MoonEP 5-step backward in ONE
     kernel launch. Returns the SAME 10-key dict as the orchestrator's
@@ -538,9 +786,23 @@ def mega_backward_triton(saved, dy, peer_mem):
     hidden_buf = torch.empty(M, H, dtype=dy.dtype, device=device)
 
     # P4 prep: cached combine maps + per-GEMM-tile expert/row tables.
+    # A3 (910B-class) L0C halves 256KB -> 128KB: a 256x256 accumulator (the
+    # A5 default BM/BN pair) trips bishengir `cc overflow ... 2097152 bits
+    # while 1048576 bits available` at COMPILE time. 128KB accs are all fine
+    # (A3 sweep, functional w8 2026-09-08: D 128x256 / C 128x256 / D,C
+    # 256x128 / W 128x256 pass; only 256x256 fails), so on 910B parts just
+    # the BM default steps down (both GEMMs, see the dbm note below) — BN
+    # stays 256 to keep the MTE2 weight-reuse amortization the A5 tuning was
+    # after. The no-l0c launch option below stays keyed to cbm*cbn > 128*256
+    # (A3 defaults never reach it).
+    try:
+        _l0c_128k = str(NPUUtils().get_arch()).startswith("Ascend910")
+    except Exception:
+        _l0c_128k = False
     p4 = _combine_static_maps(saved)
     cbm, cbn, cbk, cns = _combine_gemm_tile()
-    cbm = int(os.environ.get("MOE_COMBINE_GEMM_BM", "256"))   # see dbm note above
+    cbm = int(os.environ.get(
+        "MOE_COMBINE_GEMM_BM", "128" if _l0c_128k else "256"))   # see dbm note above
     tiles = _gemm_tile_maps(saved, cbm)
     num_tn4 = (H + cbn - 1) // cbn
     grad_hidden = torch.empty(p4["B"], H, dtype=dy.dtype, device=device)
@@ -564,7 +826,10 @@ def mega_backward_triton(saved, dy, peer_mem):
     # 46.36 -> 43.42 ms/iter; w8 functional + f0b probe2/3 green).  CAVEAT:
     # dbm=256 is only fast together with cbm=256 (which flips the no-l0c
     # launch option below) — dbm=256 with cbm=128 measured 60.4 ms/iter.
-    dbm = int(os.environ.get("MOE_DISPATCH_GEMM_BM", "256"))
+    # On A3 (_l0c_128k above) the same 256x256 acc will not even compile,
+    # so both defaults step down to 128x256 together.
+    dbm = int(os.environ.get(
+        "MOE_DISPATCH_GEMM_BM", "128" if _l0c_128k else "256"))
     num_tn3 = (H + wbn - 1) // wbn
     num_tk3 = (ffn + wbk - 1) // wbk
     num_tn5 = (2 * ffn + wbn - 1) // wbn
@@ -588,6 +853,26 @@ def mega_backward_triton(saved, dy, peer_mem):
 
     def _flag(key):
         return os.environ.get(key, "1") != "0"
+
+    # B3 signalization / P4 fusion: per-tile readiness slots + SET-mode epoch
+    # (bumped per call — SET overwrites, so no slot re-zero between calls).
+    # FUSE_P4 uses one slot per m-tile (self-produce-self-push, no B3 at
+    # all); TILE_B3 uses one slot per (m,n) task.  Allocate the larger TILE_B3
+    # footprint in both cases — the slab is grow-on-demand and the epoch key
+    # is shared, so switching modes between calls stays monotonic and safe.
+    tile_b3 = os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
+    fuse_p4 = os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
+    if fuse_p4 or tile_b3:
+        b3_signal = _ensure_mega_b3_signal_mem(
+            saved, tiles["num_tiles_m"] * num_tn4)
+        b3_epoch = saved.get("_mega_b3_signal_epoch", 1)
+        saved["_mega_b3_signal_epoch"] = b3_epoch + 1
+    else:
+        # dead args under TILE_B3=0/FUSE_P4=0 (constexpr-guarded uses), but
+        # the launch signature is fixed — hand it the (valid symmetric) P1
+        # slab.
+        b3_signal = signal_mem
+        b3_epoch = 0
 
     launch_options = (
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
@@ -642,6 +927,8 @@ def mega_backward_triton(saved, dy, peer_mem):
         BLOCK_N_PUSH=_push_block(), GATE_PAD_C=GATE_PAD,
         P1_ON=_flag("MOE_MEGA_P1"), P23_ON=_flag("MOE_MEGA_P23"),
         P4_ON=_flag("MOE_MEGA_P4"), P5_ON=_flag("MOE_MEGA_P5"),
+        b3_signal_ptr=b3_signal, b3_epoch=b3_epoch, TILE_B3=tile_b3,
+        FUSE_P4=fuse_p4 and _flag("MOE_MEGA_P4"),
         num_warps=8, **launch_options)
 
     # expert-major peer_mem IS the sorted layout -> identity view (no gather),
