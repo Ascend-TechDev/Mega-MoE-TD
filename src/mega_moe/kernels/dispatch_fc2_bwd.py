@@ -262,6 +262,8 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     FIRST_EXPERT: tl.constexpr, LAST_EXPERT: tl.constexpr,
     WEIGHT_EXPERT_BASE: tl.constexpr,
     MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
+    b1_signal_ptr, b1_epoch,
+    SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
 ):
     """Consume merged expert M windows as their source tiles become ready. Adapted
     from forward _triton_grouped_gemm_expert_n_merged_tiles_wait
@@ -282,8 +284,23 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     A BLOCK_M=128 window simply waits every 64-row source tile overlapping it
     before running one double-height GEMM — the readiness protocol itself is
     unchanged, which decouples the GEMM L0A fill (a-tile [64,BK] bf16 = half of
-    64KB L0A) from the transport tile granularity."""
+    64KB L0A) from the transport tile granularity.
+
+    SIGNAL_ON=1 (MOE_MEGA_TILE_B1=1, mega backward only) additionally fires a
+    LOCAL readiness SET after each (expert, n_tile, m_window) tile of the
+    output lands: fence() + signal_op to this rank's b1 slot, the probe-3
+    producer side.  Slot layout (expert*num_n_tiles + n_tile)*max_win +
+    m_window, where max_win — the max window count any expert occupies — is
+    derived from recv_per_expert INSIDE the kernel, so producer and consumer
+    share one slot formula with no host-side table.  The downstream swiglu
+    phase then merged-waits a window's num_n_tiles slots instead of crossing
+    the B1 barrier."""
     num_n_tiles = tl.cdiv(N, BLOCK_N)
+    max_win = 1
+    if SIGNAL_ON:
+        for e0 in range(EXPERTS_PER_RANK):
+            sz0 = tl.load(recv_per_expert_ptr + e0)
+            max_win = tl.maximum(max_win, tl.cdiv(sz0, BLOCK_M))
     first_task = FIRST_EXPERT * num_n_tiles
     last_task = LAST_EXPERT * num_n_tiles
     for task_id in range(pid + first_task, last_task, ncore):
@@ -336,6 +353,18 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                     expert_id, expert_off + window_start, window_size, n_tile, N, K,
                     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
                     BLOCK_M, BLOCK_N, BLOCK_K, WEIGHT_EXPERT_BASE, dtype)
+                if SIGNAL_ON:
+                    # B1 readiness: this (expert, n_tile, m_window) output tile
+                    # has landed — probe 3's local cube->vector fence/signal
+                    # chain, producer side (fence() orders the FixPipe store
+                    # before the SET).
+                    libshmem_device.fence()
+                    libshmem_device.signal_op(
+                        b1_signal_ptr
+                        + ((expert_id * num_n_tiles + n_tile) * max_win
+                           + m_window) * 16,
+                        b1_epoch, libshmem_device.ACLSHMEM_SIGNAL_SET,
+                        LOCAL_RANK)
 
 
 @triton.jit(do_not_specialize=["signal_epoch"])
@@ -395,7 +424,8 @@ def kernel_dispatch_fc2_bwd_tile_signal(
             BLOCK_M, BLOCK_N, BLOCK_K, PUSH_BLOCK_M,
             WORLD_SIZE, EXPERTS_PER_RANK,
             0, HOME_EXPERTS_PER_RANK, 0,
-            MAX_BWD_TILES, dtype)
+            MAX_BWD_TILES, dtype,
+            signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK)
         if USE_REPLICA_WEIGHTS:
             _fc2_bwd_gemm_merged_tiles_wait(
                 pid, num_cores,
@@ -408,7 +438,8 @@ def kernel_dispatch_fc2_bwd_tile_signal(
                 WORLD_SIZE, EXPERTS_PER_RANK,
                 HOME_EXPERTS_PER_RANK, ACTIVE_EXPERTS_PER_RANK,
                 HOME_EXPERTS_PER_RANK,
-                MAX_BWD_TILES, dtype)
+                MAX_BWD_TILES, dtype,
+                signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK)
 
 
 def _dispatch_gemm_tile():

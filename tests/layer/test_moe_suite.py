@@ -9,6 +9,7 @@ environment variables.
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -1723,19 +1724,24 @@ def _assert_symmetric_transport_stages(
     """
     consumed = transport.consumed_slots()
     failures = []
-    if captured_slots["gate_up"].shape[0] != len(consumed):
-        failures.append("the sink capture did not cover every consumed slot")
-    for index, slot in enumerate(consumed):
-        if not torch.equal(
-            captured_slots["gate_up"][index],
-            triton_result["_replica_grad_gate_up"][slot].t(),
-        ):
-            failures.append(f"gate/up slot {slot} did not hold its sunk gradient")
-        if not torch.equal(
-            captured_slots["down"][index],
-            triton_result["_replica_grad_down"][slot],
-        ):
-            failures.append(f"down slot {slot} did not hold its sunk gradient")
+    # MOE_BWD_MEGA=1 sinks INSIDE the launch (P6a), so no host hook can fire
+    # between sink and reduce — `captured_slots` arrives empty and the
+    # bit-exact slot compare is skipped; the HCCL-oracle reduction compare
+    # and the post-zero check below still cover the whole chain end-to-end.
+    if captured_slots:
+        if captured_slots["gate_up"].shape[0] != len(consumed):
+            failures.append("the sink capture did not cover every consumed slot")
+        for index, slot in enumerate(consumed):
+            if not torch.equal(
+                captured_slots["gate_up"][index],
+                triton_result["_replica_grad_gate_up"][slot].t(),
+            ):
+                failures.append(f"gate/up slot {slot} did not hold its sunk gradient")
+            if not torch.equal(
+                captured_slots["down"][index],
+                triton_result["_replica_grad_down"][slot],
+            ):
+                failures.append(f"down slot {slot} did not hold its sunk gradient")
 
     reduced_fc1 = torch.cat(
         (triton_result["grad_fc1_1"], triton_result["grad_fc1_2"]), dim=1
@@ -1975,17 +1981,19 @@ def run_moonep_backward_symmetric_hot_expert_case(
                         "lending the replica tables must invalidate the cache"
                     )
                 captured_slots = {}
+                if os.environ.get("MOE_BWD_MEGA") != "1":
+                    # host-sink capture; under MOE_BWD_MEGA=1 the sink rides
+                    # the launch (P6a) and no host hook can fire
+                    def capture_sunk_slots(transport):
+                        # Stream-ordered copies taken between the sink and
+                        # the reduce, i.e. exactly what barrier #1 publishes.
+                        consumed = transport.consumed_slots()
+                        captured_slots["gate_up"] = transport.buffers.gate_up[
+                            consumed
+                        ]
+                        captured_slots["down"] = transport.buffers.down[consumed]
 
-                def capture_sunk_slots(transport):
-                    # Stream-ordered copies taken between the sink and the
-                    # reduce, i.e. exactly what barrier #1 publishes.
-                    consumed = transport.consumed_slots()
-                    captured_slots["gate_up"] = transport.buffers.gate_up[
-                        consumed
-                    ]
-                    captured_slots["down"] = transport.buffers.down[consumed]
-
-                transport.post_sink_hook = capture_sunk_slots
+                    transport.post_sink_hook = capture_sunk_slots
 
                 with torch.no_grad():
                     _, home_saved = moe_forward(
@@ -2199,15 +2207,17 @@ def run_moonep_backward_symmetric_moderate_wide_case(
                         "lending the replica tables must invalidate the cache"
                     )
                 captured_slots = {}
+                if os.environ.get("MOE_BWD_MEGA") != "1":
+                    # host-sink capture; under MOE_BWD_MEGA=1 the sink rides
+                    # the launch (P6a) and no host hook can fire
+                    def capture_sunk_slots(transport):
+                        consumed = transport.consumed_slots()
+                        captured_slots["gate_up"] = transport.buffers.gate_up[
+                            consumed
+                        ]
+                        captured_slots["down"] = transport.buffers.down[consumed]
 
-                def capture_sunk_slots(transport):
-                    consumed = transport.consumed_slots()
-                    captured_slots["gate_up"] = transport.buffers.gate_up[
-                        consumed
-                    ]
-                    captured_slots["down"] = transport.buffers.down[consumed]
-
-                transport.post_sink_hook = capture_sunk_slots
+                    transport.post_sink_hook = capture_sunk_slots
 
                 with torch.no_grad():
                     _, home_saved = moe_forward(
@@ -3534,17 +3544,19 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
                         "lending the replica tables must invalidate the cache"
                     )
                 captured_slots = {}
+                if os.environ.get("MOE_BWD_MEGA") != "1":
+                    # host-sink capture; under MOE_BWD_MEGA=1 the sink rides
+                    # the launch (P6a) and no host hook can fire
+                    def capture_sunk_slots(transport):
+                        # Stream-ordered copies taken between the sink and
+                        # the reduce, i.e. exactly what barrier #1 publishes.
+                        consumed = transport.consumed_slots()
+                        captured_slots["gate_up"] = transport.buffers.gate_up[
+                            consumed
+                        ]
+                        captured_slots["down"] = transport.buffers.down[consumed]
 
-                def capture_sunk_slots(transport):
-                    # Stream-ordered copies taken between the sink and the
-                    # reduce, i.e. exactly what barrier #1 publishes.
-                    consumed = transport.consumed_slots()
-                    captured_slots["gate_up"] = transport.buffers.gate_up[
-                        consumed
-                    ]
-                    captured_slots["down"] = transport.buffers.down[consumed]
-
-                transport.post_sink_hook = capture_sunk_slots
+                    transport.post_sink_hook = capture_sunk_slots
 
                 with torch.no_grad():
                     _, home_saved = moe_forward(

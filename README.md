@@ -190,3 +190,14 @@ bigop grouped matmul/wgrad + `npu_swiglu_backward`，A2A 走 torch/HCCL）的
 梯度，无 grouped-op 中间转置/重排缓冲；短序列端优势最大（单 launch 省去的
 调度/启动开销占比高）。正确性门槛：w2/w8 functional suite + f0b probe2
 （kimi 真形 5-key 全比对）/ probe3（epoch 复用 bit 级）全绿。
+
+`MOE_BWD_MEGA=1` 同样覆盖 MoonEP 物理布局（`use_moonep` saved）：P1 增加
+replica down 表的第二趟 fc2-dgrad 扫，P4a 的 GEMM 过 `tile_home_bound` 切
+home/replica 双权重表（均为 standalone kernel 双表模式的内联）；当前向借出
+对称 replica 表（`grad_transport`）时，M3 grad_reduce 链（seed+sink →
+owner-pull → zero）作为 P6a/P6b/P6c 尾相位并入同一次 launch，transport 的
+三条 barrier 变为内核 B5/B6/B7，尾 barrier #3 由 kernel 退出本身承担。fp32
+累加按 home 专家分区、(peer, slot) 描述符序保持 —— 与 fused transport
+kernel 逐位一致；host 侧 sink/`post_sink_hook` 被内核链取代（`sunk`/
+`reduced` 仍置位，槽位级 bit 精确断言在该模式下跳过，HCCL oracle 归约比对
+与 post-zero 检查仍然全量生效）。
