@@ -20,14 +20,19 @@
 #  Phase map (mirrors ops.backward.moe_backward_triton's 5-op order):
 #
 #    P1   dispatch A2A (vec, putmem+signal) + fc2 dgrad (cube, dl.wait)   ]
-#    B1   barrier_all  — publish P1's remote puts + grad_swiglu           ] step 1
+#    B1   barrier_all  — publish P1's remote puts + grad_swiglu.          ] step 1
+#         (MOE_MEGA_TILE_B1=1 replaces it with per-window SET slots — 910B1
+#         only; 950DT lowering boundary, see the knob paragraph below):
 #    P2   swiglu/situ backward (vec, ungated)                             ]
 #    P3   fc2 wgrad (cube, BM=64 direct transposed read of peer_mem)      ] step2+3
-#    B2   barrier_all  — all ranks done READING peer_mem (P3) before any
-#                        rank's P4b may overwrite it; publishes P2 outputs
+#    B2   barrier_all  — publishes P2's outputs (dAB/dscale) for P4a/P4b;
+#                        step 2 removed its OTHER job (P4b overwriting
+#                        peer_mem's dispatch area while P3 still reads it)
+#                        by giving the return push its own slab
 #    P4a  fc1 dgrad GEMM (cube) -> hidden_buf                             ]
 #    B3   barrier_all  — local cube->vector hidden_buf handoff            ] step 4
-#    P4b  reverse A2A push (vec, sub_vec0-gated dl.symm_at remote stores) ]
+#    P4b  reverse A2A push (vec, sub_vec0-gated dl.symm_at remote stores
+#         into combine_buf, the dedicated symmetric return slab — step 2) ]
 #      ∥ P5a  fc1 wgrad first half (cube) — the P2∥P3 adjacent-scope      ] step 5
 #             concurrency recipe; P5 needs only B2's dAB, and msprof
 #             showed the vector engine ~97% idle across the kernel
@@ -41,14 +46,27 @@
 #  sweep against the replica down table and P4a's GEMM reads the replica
 #  gate/up table past tile_home_bound (both dual-table cuts are the standalone
 #  kernels' pattern, inlined).  When the caller lends a grad_transport, the
-#  M3 ReplicaGradTransport chain rides as tail phases:
+#  M3 ReplicaGradTransport chain rides as TRANSPORT WAVE phases (2026-09-10
+#  restructure; the chain is split by table and hidden in windows that
+#  already existed — the old form ran it serially after B5 as
+#  [seed+sink both -> B6 -> pull both]):
 #
-#    B5   barrier_all  — publish the physical grad_fc1 (P5) / grad_fc2 (P3)
-#    P6a  seed+sink (vec): fp32 seed from the home segments + this rank's
-#          replica segments sunk into its own symmetric slots (transposed)
-#    B6   barrier_all  — = transport barrier #1 (sunk slots published)
-#    P6b  owner-pull (vec): by-home getmem + fp32 accumulate, (peer,slot)
-#          order preserved -> bit-identical to the fused transport kernel
+#    w1   seed acc_down + sink down slots (vec) — grad_fc2 is final at B2,
+#         so this rides the B2->B3 window BESIDE the cube P4a (whose vector
+#         engine sat idle); published by B3/B4
+#    B5   barrier_all  — publish P5's physical grad_fc1 (the wave's last
+#         producer dependency)
+#    w2   ∥ (vec, one scope): sink gate/up slots (ungated, idempotent plain
+#         stores) + owner-pull + fp32-accumulate the DOWN slots (sub_vec0:
+#         getmem + RMW) — comm latency hides under the local transposes
+#    B6   barrier_all  — = transport barrier #1 (the w2 gate/up slots
+#         published)
+#    w3   owner-pull + accumulate GATE/UP (vec, sub_vec0) — no trailing
+#         barrier: after B6 no rank writes another rank's memory, programs
+#         exit when their own pulls finish
+#
+#    (per-table (peer,slot) descriptor order is untouched by the split, so
+#    the fp32 accumulators stay bit-identical to the fused transport kernel)
 #
 #  (the seed/sink are IN-kernel because the host copies would read tensors
 #  this same launch only produces at B5; post_sink_hook cannot fire and is
@@ -86,6 +104,32 @@
 #  fence/signal/dl.wait chain it rests on is proven by probes 3/4,
 #  w8 910B1) and MOE_MEGA_FUSE_P4=1 (the P4a+P4b self-produce-self-push
 #  fusion — takes precedence over MOE_MEGA_TILE_B3).
+#  MOE_MEGA_TILE_B1=1 (B1 -> per-(expert, n_tile, m_window) grad_swiglu
+#  SET slots; P2 merged-waits its windows, P3 re-waits the dispatch slots
+#  itself) stays DEFAULT-OFF — 950DT LOWERING BOUNDARY (2026-09-10): the
+#  WAIT_DISP=1 instantiation of _mega_wgrad_sweep does not lower on this
+#  toolchain at all — bishengir's "merged native A5 regbase pipeline"
+#  (buildFinalHIVMPipelines/PlanMemoryRegBase) emits pointer_cast ops with
+#  EMPTY address spaces at the P3 transposed m-loop load fed by
+#  dl.consume_token ("addrs of PointerCastOp should not be empty"); the
+#  whole gate suite is compile-red 7/7 (moonep w2h x3 / w4h / w8, non-moonep
+#  functional w2/w4).  Not the dual-def (single-def rebind tried), not the
+#  no-l0c A5 launch path (cbm=128 tried), not m-loop pipelining
+#  (MOE_MEGA_WGRAD_NS=1 tried) — the consume_token pointer x transposed
+#  dot-operand orientation x regbase staging is the poison triad; P1's
+#  row-major consume load lowers fine.  Validated GREEN on 910B1's older
+#  bishengir (the TILE_B1 functional gate), so the knob stays for 910B1.
+#  (One first-run-of-the-day anomaly compiled and numerically mismatched
+#  instead — unreproduced, suspected stale cache; every subsequent run
+#  fails at compile.)
+#  MOE_MEGA_COMBINE_BUF (DEFAULT-ON, 2026-09-10 wave-evolution step 2):
+#  the return push (P4b/P4c and the FUSE_P4 push) targets a DEDICATED
+#  symmetric combine_buf instead of overwriting peer_mem's dispatch area —
+#  the send/recv reuse hazard that forced B2's cross-rank edge, and the
+#  precondition for wave-overlapping the return push (step 3).  symm_at
+#  resolves non-first symmetric slabs on 950DT (probe 6b; the
+#  combine_fc1_bwd.py offset-0 note is 910B1-era) — MOE_MEGA_COMBINE_BUF=0
+#  restores the peer_mem target (the 910B1 form).
 #
 #  KNOWN CODEGEN LIMITATION of the two variant knobs (910B1, pre-existing
 #  @91ed770): on CONCENTRATED routings (the symmetric hot-expert gate, w2/w4
@@ -102,7 +146,9 @@
 #  symmetric-heap divergence was ruled out (routing-independent slab sizing
 #  changed nothing).  Same bishengir whole-kernel instability family as the
 #  _mega_wgrad_sweep DO-NOT-TOUCH note.  Near-uniform routings are green on
-#  both variants (w8/nm gates); both knobs stay default-off.
+#  both variants (w8/nm gates); both knobs stay default-off.  (The
+#  MOE_MEGA_P6=0 bisect cited above is 910B1-only; on 950DT the =0
+#  instantiation miscompiles P3/P5 itself — see the wrapper note.)
 #  MoonEP: use_moonep saved dicts are supported with the dual weight tables
 #  always on; the P6 grad_reduce tail turns on iff the caller lends a
 #  grad_transport (ops.backward passes it whenever the forward lent the
@@ -115,6 +161,7 @@
 import os
 
 import torch
+import torch.distributed as dist
 import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
@@ -515,7 +562,7 @@ def _mega_push_mtile(
     tile_m,
     hidden_buf_ptr,
     write_rank_by_src_ptr, write_off_by_src_ptr,
-    peer_mem_ptr,
+    combine_buf_ptr,
     grad_gate_ptr,
     tile_row0_ptr, tile_rows_ptr,
     signal_mem_ptr, signal_epoch,
@@ -542,7 +589,7 @@ def _mega_push_mtile(
         sp64 = sp.to(tl.int64)
         dst_rank = tl.load(write_rank_by_src_ptr + sp64)
         dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
-        dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
+        dst_base = dl.symm_at(combine_buf_ptr, dst_rank) + dst_off * row_stride
         for ns in range(0, H_push, BLOCK_N_PUSH):
             mask = ovp < (H_push - ns)
             val = tl.load(ready_ptr + sp64 * H_push + (ns + ovp),
@@ -557,7 +604,7 @@ def _mega_push_rows(
     pid, num_progs,
     hidden_buf_ptr,
     write_rank_by_src_ptr, write_off_by_src_ptr,
-    peer_mem_ptr,
+    combine_buf_ptr,
     grad_gate_ptr,
     H_push, M,
     BLOCK_N_PUSH: tl.constexpr, GATE_PAD: tl.constexpr,
@@ -573,7 +620,7 @@ def _mega_push_rows(
         sp64 = src_pos.to(tl.int64)
         dst_rank = tl.load(write_rank_by_src_ptr + sp64)
         dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
-        dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
+        dst_base = dl.symm_at(combine_buf_ptr, dst_rank) + dst_off * row_stride
         for ns in range(0, H_push, BLOCK_N_PUSH):
             mask = ovp < (H_push - ns)
             val = tl.load(hidden_buf_ptr + sp64 * H_push + (ns + ovp),
@@ -588,7 +635,7 @@ def _mega_push_rows_tiled(
     pid, num_progs,
     hidden_buf_ptr,
     write_rank_by_src_ptr, write_off_by_src_ptr,
-    peer_mem_ptr,
+    combine_buf_ptr,
     grad_gate_ptr,
     tile_row0_ptr, tile_rows_ptr,
     signal_mem_ptr, signal_epoch,
@@ -620,7 +667,7 @@ def _mega_push_rows_tiled(
             sp64 = sp.to(tl.int64)
             dst_rank = tl.load(write_rank_by_src_ptr + sp64)
             dst_off = tl.load(write_off_by_src_ptr + sp64).to(tl.int64)
-            dst_base = dl.symm_at(peer_mem_ptr, dst_rank) + dst_off * row_stride
+            dst_base = dl.symm_at(combine_buf_ptr, dst_rank) + dst_off * row_stride
             for ns in range(0, H_push, BLOCK_N_PUSH):
                 mask = ovp < (H_push - ns)
                 val = tl.load(ready_ptr + sp64 * H_push + (ns + ovp),
@@ -634,7 +681,7 @@ def _mega_push_rows_tiled(
 def _mega_reduce(
     pid, num_progs,
     inv_sort_idxs_ptr,
-    peer_mem_ptr,
+    combine_buf_ptr,
     output_ptr,
     grad_routing_ptr,
     B, topk, H_push,
@@ -654,14 +701,14 @@ def _mega_reduce(
             fi = (ti * topk + j).to(tl.int64)
             sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
             tl.store(grad_routing_ptr + fi,
-                     tl.load(peer_mem_ptr + sp * row_stride + H_push))
+                     tl.load(combine_buf_ptr + sp * row_stride + H_push))
         for ns in range(0, H_push, BLOCK_N_PUSH):
             mask = ovr < (H_push - ns)
             acc = tl.zeros((BLOCK_N_PUSH,), dtype=tl.float32)
             for j in range(topk):
                 fi = ti * topk + j
                 sp = tl.load(inv_sort_idxs_ptr + fi).to(tl.int64)
-                acc += tl.load(peer_mem_ptr + sp * row_stride + (ns + ovr),
+                acc += tl.load(combine_buf_ptr + sp * row_stride + (ns + ovr),
                                mask=mask, other=0.0)
             oo = ti64 * stride_om + (ns + ovr) * stride_on
             tl.store(output_ptr + oo, acc.to(output_ptr.dtype.element_ty), mask=mask)
@@ -728,41 +775,52 @@ def _mega_grad_seed_sink(
     consumed_ptr, consumed_count,
     EPN, H_dim, F_dim,
     TM: tl.constexpr, TN: tl.constexpr, BLK: tl.constexpr,
+    SINK_GU: tl.constexpr, SINK_DN: tl.constexpr,
 ):
-    """P6a: seed the fp32 accumulators with the HOME segments (gate/up
-    transposed into the table layout, down cast in place) and SINK this
-    rank's replica segments into its own symmetric slots (gate/up transposed,
-    down contiguous).  Experts and slots strided across programs — pure local
-    copies, no cross-rank dependency.  Must run inside a vector scope."""
+    """P6a seed+sink, SPLIT BY TABLE for the transport wave (2026-09-10):
+    SINK_DN=1 seeds acc_down from the HOME grad_fc2 rows and sinks the
+    replica down segments into this rank's own symmetric down slots
+    (contiguous bf16 casts) — needs only P3/B2, so it runs in the B2->B3
+    window beside the cube P4a (window 1).  SINK_GU=1 seeds acc_gate_up
+    (transposed into the table layout) and sinks the replica gate/up
+    segments (transposed) — needs P5/B5, and runs in the B5->B6 window
+    beside the DOWN owner-pull (window 2).  Experts and slots strided across
+    programs — pure local copies, no cross-rank dependency.  Must run inside
+    a vector scope."""
     n_down = H_dim * F_dim
     offs = tl.arange(0, BLK)
     # seed: home expert e is physical row e; acc rows are per-expert disjoint
     for e in range(pid, EPN, ncores):
         e64 = e.to(tl.int64)
-        _mega_grad_transpose(
-            acc_gate_up_ptr + e64 * H_dim * (2 * F_dim),
-            grad_fc1_ptr + e64 * (2 * F_dim) * H_dim,
-            H_dim, 2 * F_dim, TM, TN)
-        for start in range(0, n_down, BLK):
-            m = (start + offs) < n_down
-            v = tl.load(grad_fc2_ptr + e64 * n_down + start + offs,
-                        mask=m, other=0.0)
-            tl.store(acc_down_ptr + e64 * n_down + start + offs,
-                     v.to(tl.float32), mask=m)
+        if SINK_GU:
+            _mega_grad_transpose(
+                acc_gate_up_ptr + e64 * H_dim * (2 * F_dim),
+                grad_fc1_ptr + e64 * (2 * F_dim) * H_dim,
+                H_dim, 2 * F_dim, TM, TN)
+        if SINK_DN:
+            for start in range(0, n_down, BLK):
+                m = (start + offs) < n_down
+                v = tl.load(grad_fc2_ptr + e64 * n_down + start + offs,
+                            mask=m, other=0.0)
+                tl.store(acc_down_ptr + e64 * n_down + start + offs,
+                         v.to(tl.float32), mask=m)
     # sink: consumed slot s carries the gradient of physical expert EPN + s
     for i in range(pid, consumed_count, ncores):
         slot = tl.load(consumed_ptr + i)
         slot64 = slot.to(tl.int64)
         phys64 = (EPN + slot).to(tl.int64)   # int64: 2*epn*2F*H can top 2^31
-        _mega_grad_transpose(
-            gate_up_slot_ptr + slot64 * H_dim * (2 * F_dim),
-            grad_fc1_ptr + phys64 * (2 * F_dim) * H_dim,
-            H_dim, 2 * F_dim, TM, TN)
-        for start in range(0, n_down, BLK):
-            m = (start + offs) < n_down
-            v = tl.load(grad_fc2_ptr + phys64 * n_down + start + offs,
-                        mask=m, other=0.0)
-            tl.store(down_slot_ptr + slot64 * n_down + start + offs, v, mask=m)
+        if SINK_GU:
+            _mega_grad_transpose(
+                gate_up_slot_ptr + slot64 * H_dim * (2 * F_dim),
+                grad_fc1_ptr + phys64 * (2 * F_dim) * H_dim,
+                H_dim, 2 * F_dim, TM, TN)
+        if SINK_DN:
+            for start in range(0, n_down, BLK):
+                m = (start + offs) < n_down
+                v = tl.load(grad_fc2_ptr + phys64 * n_down + start + offs,
+                            mask=m, other=0.0)
+                tl.store(down_slot_ptr + slot64 * n_down + start + offs,
+                         v, mask=m)
 
 
 @triton.jit
@@ -776,13 +834,20 @@ def _mega_grad_owner_pull(
     EPN: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     LOCAL_RANK: tl.constexpr,
+    PULL_GU: tl.constexpr, PULL_DN: tl.constexpr,
 ):
-    """P6b: owner-pull — HOME experts strided across programs; each expert's
-    (peer, slot)-ordered descriptors are pulled chunk-wise (getmem, blocking)
-    and fp32-accumulated onto the seed.  Per-expert accumulator rows are
-    disjoint across programs, so the fp32 order is bit-identical to the fused
-    transport kernel's.  The self-owned slot branch is defensive only (the
-    planner forbids self-copies).  Must run inside a vector scope."""
+    """P6b owner-pull, SPLIT BY TABLE for the transport wave (2026-09-10):
+    PULL_DN=1 runs in the B5->B6 window (peers' down slots were sunk in the
+    B2->B3 window and published by B3/B4 — nothing left to wait for at B5),
+    PULL_GU=1 in the B6->exit window (gate/up slots are only published at
+    B6).  HOME experts strided across programs; each expert's (peer,
+    slot)-ordered descriptors are pulled chunk-wise (getmem, blocking) and
+    fp32-accumulated onto the seed — the per-table descriptor ORDER is
+    untouched by the split, so the fp32 result stays bit-identical to the
+    fused transport kernel's.  Per-expert accumulator rows are disjoint
+    across programs.  The self-owned slot branch is defensive only (the
+    planner forbids self-copies).  Must run inside a vector scope behind the
+    sub_vec0 gate (the fp32 RMW would double-add on the second subcore)."""
     gu_row = staging_gu_ptr + pid.to(tl.int64) * GU_CHUNK
     dn_row = staging_dn_ptr + pid.to(tl.int64) * DN_CHUNK
     for home in range(pid, EPN, ncores):
@@ -792,27 +857,32 @@ def _mega_grad_owner_pull(
             peer = tl.load(desc_peer_ptr + ordinal)
             slot = tl.load(desc_slot_ptr + ordinal)
             slot64 = slot.to(tl.int64)
-            for cs in range(0, gu_elems, GU_CHUNK):
-                cnt = tl.minimum(GU_CHUNK, gu_elems - cs)
-                src = gate_up_slot_ptr + slot64 * gu_elems + cs
-                if peer == LOCAL_RANK:
-                    _mega_grad_accum(
-                        acc_gate_up_ptr, src, home, cs, cnt, gu_elems, ACC_BLK)
-                else:
-                    libshmem_device.getmem(gu_row, src, cnt * 2, peer)
-                    _mega_grad_accum(
-                        acc_gate_up_ptr, gu_row, home, cs, cnt, gu_elems,
-                        ACC_BLK)
-            for cs in range(0, dn_elems, DN_CHUNK):
-                cnt = tl.minimum(DN_CHUNK, dn_elems - cs)
-                src = down_slot_ptr + slot64 * dn_elems + cs
-                if peer == LOCAL_RANK:
-                    _mega_grad_accum(
-                        acc_down_ptr, src, home, cs, cnt, dn_elems, ACC_BLK)
-                else:
-                    libshmem_device.getmem(dn_row, src, cnt * 2, peer)
-                    _mega_grad_accum(
-                        acc_down_ptr, dn_row, home, cs, cnt, dn_elems, ACC_BLK)
+            if PULL_GU:
+                for cs in range(0, gu_elems, GU_CHUNK):
+                    cnt = tl.minimum(GU_CHUNK, gu_elems - cs)
+                    src = gate_up_slot_ptr + slot64 * gu_elems + cs
+                    if peer == LOCAL_RANK:
+                        _mega_grad_accum(
+                            acc_gate_up_ptr, src, home, cs, cnt, gu_elems,
+                            ACC_BLK)
+                    else:
+                        libshmem_device.getmem(gu_row, src, cnt * 2, peer)
+                        _mega_grad_accum(
+                            acc_gate_up_ptr, gu_row, home, cs, cnt, gu_elems,
+                            ACC_BLK)
+            if PULL_DN:
+                for cs in range(0, dn_elems, DN_CHUNK):
+                    cnt = tl.minimum(DN_CHUNK, dn_elems - cs)
+                    src = down_slot_ptr + slot64 * dn_elems + cs
+                    if peer == LOCAL_RANK:
+                        _mega_grad_accum(
+                            acc_down_ptr, src, home, cs, cnt, dn_elems,
+                            ACC_BLK)
+                    else:
+                        libshmem_device.getmem(dn_row, src, cnt * 2, peer)
+                        _mega_grad_accum(
+                            acc_down_ptr, dn_row, home, cs, cnt, dn_elems,
+                            ACC_BLK)
 
 
 # ============================================================================
@@ -880,6 +950,10 @@ def kernel_moe_backward_mega(
     TILE_B1: tl.constexpr,
     # ---- P4a+P4b fusion (MOE_MEGA_FUSE_P4=1): self-produce-self-push ----
     FUSE_P4: tl.constexpr,
+    # ---- step-2 wave evolution: dedicated symmetric return slab ----
+    # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
+    #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
+    combine_buf_ptr,
     # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
     replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
     replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
@@ -1004,9 +1078,31 @@ def kernel_moe_backward_mega(
                 recv_counts_re_ptr=recv_counts_re_ptr,
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
-    # B2: all ranks finish READING peer_mem (P3) before ANY rank's P4b may
-    # overwrite it; P2 outputs (dAB/dscale) published for P4a/P4b.
+    # B2: publishes P2's outputs (dAB for P4a/P5, dscale for P4b) across
+    # programs.  Step 2 removed this barrier's cross-rank job — with the
+    # dedicated combine_buf the return push no longer overwrites peer_mem's
+    # dispatch area while remote P3s still read it (the =0 fallback keeps
+    # that hazard and this barrier remains its only protection).
     libshmem_device.barrier_all()
+
+    # ---- transport wave window 1 (GRAD_REDUCE): fc2-grad seed+sink ∥ P4a ----
+    # grad_fc2 is final at P3/B2, and this window's vector engine is idle
+    # (P4a — or the FUSE_P4 loop's first iteration — is cube-only), so the
+    # DOWN half of the old P6a rides here as the leading [vec] scope of a
+    # P2∥P3-style adjacent pair.  The sunk slots are cross-rank published by
+    # the very next hard barrier (B3, or B4 when B3 is signalized/unrolled)
+    # and the only consumer is the B5->B6 owner-pull — no new barrier needed.
+    if GRAD_REDUCE:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            _mega_grad_seed_sink(
+                pid, num_cores,
+                grad_fc1_ptr, grad_fc2_ptr,
+                acc_gate_up_ptr, acc_down_ptr,
+                gate_up_slot_ptr, down_slot_ptr,
+                consumed6_ptr, consumed_count6,
+                EPN6, H, ffn,
+                TM6, TN6, BLK6,
+                SINK_GU=0, SINK_DN=1)
 
     # ---------------- P4a+P4b: fc1 input-grad GEMM + reverse-A2A push ------
     if FUSE_P4:
@@ -1042,7 +1138,7 @@ def kernel_moe_backward_mega(
                         tile_m,
                         hidden_buf_ptr,
                         write_rank_by_src_ptr, write_off_by_src_ptr,
-                        peer_mem_ptr, dscale_ptr,
+                        combine_buf_ptr, dscale_ptr,
                         tile_row0_ptr, tile_rows_ptr,
                         b3_signal_ptr, b3_epoch,
                         H,
@@ -1070,7 +1166,7 @@ def kernel_moe_backward_mega(
                             tile_m,
                             hidden_buf_ptr,
                             write_rank_by_src_ptr, write_off_by_src_ptr,
-                            peer_mem_ptr, dscale_ptr,
+                            combine_buf_ptr, dscale_ptr,
                             tile_row0_ptr, tile_rows_ptr,
                             b3_signal_ptr, b3_epoch,
                             H,
@@ -1136,7 +1232,7 @@ def kernel_moe_backward_mega(
                             pid, num_cores,
                             hidden_buf_ptr,
                             write_rank_by_src_ptr, write_off_by_src_ptr,
-                            peer_mem_ptr, dscale_ptr,
+                            combine_buf_ptr, dscale_ptr,
                             tile_row0_ptr, tile_rows_ptr,
                             b3_signal_ptr, b3_epoch,
                             num_tiles_m4, num_tiles_n4,
@@ -1147,7 +1243,7 @@ def kernel_moe_backward_mega(
                             pid, num_cores,
                             hidden_buf_ptr,
                             write_rank_by_src_ptr, write_off_by_src_ptr,
-                            peer_mem_ptr, dscale_ptr,
+                            combine_buf_ptr, dscale_ptr,
                             H, M4,
                             BLOCK_N_PUSH, GATE_PAD_C)
 
@@ -1181,7 +1277,7 @@ def kernel_moe_backward_mega(
         with al.scope(core_mode="vector", disable_auto_sync=True):
             _mega_reduce(
                 pid, num_cores,
-                inv_sort_ptr, peer_mem_ptr,
+                inv_sort_ptr, combine_buf_ptr,
                 grad_hidden_ptr, grad_routing_ptr,
                 B4, topk4, H,
                 H, 1,
@@ -1203,33 +1299,31 @@ def kernel_moe_backward_mega(
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
 
     # ---------------- P6: MoonEP grad_reduce (GRAD_REDUCE) ----------------
-    # The ReplicaGradTransport chain inlined as tail phases: seed+sink -> B6
-    # (= its barrier #1) -> owner-pull.  B5 ahead of the seed publishes the
-    # physical grad_fc1 (P5) / grad_fc2 (P3) stores — unlike the P4c tail
-    # this one IS cross-rank (P6b pulls every peer's sunk slots), so it
-    # cannot ride kernel exit.  The transport's third stage (zeroing the
-    # consumed slots) and its barrier #2 are the kernel exit + a
-    # stream-ordered HOST zero after the launch — purely local work, see
-    # the module docstring.  GRAD_REDUCE is a uniform constexpr: non-MoonEP
-    # launches compile the whole tail — barriers included — out, leaving
-    # the chain exactly as probes proved it.
+    # The ReplicaGradTransport chain inlined as tail phases, restructured
+    # into the transport wave (2026-09-10): the old serial chain [seed+sink
+    # BOTH tables -> B6 -> pull BOTH tables] is split by table and hidden in
+    # windows that already existed —
+    #   window 1 (B2->B3, ∥ cube P4a, above): seed acc_down + sink down
+    #   window 2 (B5->B6, below): sink gate/up (ungated, idempotent) ∥
+    #     owner-pull + accumulate the DOWN slots (sub_vec0-gated RMW)
+    #   window 3 (B6->exit, below): owner-pull + accumulate GATE/UP
+    # B5 publishes the wave's last producer dependency (P5's grad_fc1 — the
+    # down slots were published by B3/B4 already); B6 publishes the window-2
+    # gate/up slots for window 3.  Barrier count is unchanged (B1..B6) and
+    # each table's (peer, slot) descriptor order is untouched, so the fp32
+    # accumulators stay bit-identical to the fused transport kernel's.  The
+    # transport's third stage (zeroing the consumed slots) and its barrier
+    # #2 remain the kernel exit + a stream-ordered HOST zero after the
+    # launch — purely local work, see the module docstring.  GRAD_REDUCE is
+    # a uniform constexpr: non-MoonEP launches compile the whole tail —
+    # barriers included — out, leaving the chain exactly as probes proved
+    # it.
     if GRAD_REDUCE:
         libshmem_device.barrier_all()
         with al.scope(core_mode="vector", disable_auto_sync=True):
-            _mega_grad_seed_sink(
-                pid, num_cores,
-                grad_fc1_ptr, grad_fc2_ptr,
-                acc_gate_up_ptr, acc_down_ptr,
-                gate_up_slot_ptr, down_slot_ptr,
-                consumed6_ptr, consumed_count6,
-                EPN6, H, ffn,
-                TM6, TN6, BLK6)
-        libshmem_device.barrier_all()
-        with al.scope(core_mode="vector", disable_auto_sync=True):
-            # sub_vec0 gate (the P4b push pattern): an ungated vector body
-            # runs on BOTH vector subcores with the same pid (probe 1) —
-            # fine for P6a's idempotent plain stores, fatal here, where
-            # _mega_grad_accum's fp32 RMW would double-add every chunk.
+            # pull FIRST: the getmem stream (blocking per chunk) starts
+            # while other programs are still in the ungated sink below —
+            # comm latency hides under the local transposes at engine level.
             if sub_vec_id() == 0:
                 _mega_grad_owner_pull(
                     pid, num_cores,
@@ -1239,12 +1333,57 @@ def kernel_moe_backward_mega(
                     staging_gu_ptr, staging_dn_ptr,
                     gu6_elems, dn6_elems,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
-                    ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK)
+                    ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
+                    PULL_GU=0, PULL_DN=1)
+            # ungated like the old P6a: idempotent plain stores, so running
+            # on BOTH vector subcores with the same pid is harmless.
+            _mega_grad_seed_sink(
+                pid, num_cores,
+                grad_fc1_ptr, grad_fc2_ptr,
+                acc_gate_up_ptr, acc_down_ptr,
+                gate_up_slot_ptr, down_slot_ptr,
+                consumed6_ptr, consumed_count6,
+                EPN6, H, ffn,
+                TM6, TN6, BLK6,
+                SINK_GU=1, SINK_DN=0)
+        libshmem_device.barrier_all()
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                _mega_grad_owner_pull(
+                    pid, num_cores,
+                    acc_gate_up_ptr, acc_down_ptr,
+                    gate_up_slot_ptr, down_slot_ptr,
+                    desc_peer6_ptr, desc_slot6_ptr, home_off6_ptr,
+                    staging_gu_ptr, staging_dn_ptr,
+                    gu6_elems, dn6_elems,
+                    EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
+                    ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
+                    PULL_GU=1, PULL_DN=0)
 
 
 # ============================================================================
 # wrapper
 # ============================================================================
+def _ensure_mega_combine_buf(saved, elems):
+    """Lazy/grow-alloc the DEDICATED symmetric return slab (wave-evolution
+    step 2): P4b's pushes land here instead of overwriting peer_mem's
+    dispatch area. bf16 like peer_mem, grow-on-demand with re-zero, mirroring
+    _ensure_mega_signal_local's discipline.  Rows are fully rewritten each
+    launch (write_off covers every (dst, slot) exactly once), so a reused
+    slab is never re-zeroed — stale tails are never read."""
+    import shmem as ash
+    mem = saved.get("_mega_combine_buf")
+    if mem is not None and mem.numel() >= elems:
+        return mem
+    if mem is not None:
+        ash.aclshmem_free_tensor(mem)
+    mem = ash.aclshmem_create_tensor(
+        [elems], dtype=torch.bfloat16, device_id=saved["ep_rank"])
+    mem.zero_()
+    saved["_mega_combine_buf"] = mem
+    return mem
+
+
 def _ensure_mega_signal_local(saved, key, slots):
     """Lazy/grow-alloc a LOCAL readiness signal slab on `saved` under `key`:
     one SET slot per task, 16 int32 elements (64B) per slot, mirroring
@@ -1274,7 +1413,9 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     and _home_grad_* seed views — see ops/backward.py:328-368).  In both
     layouts grad_fc2_out_sorted is the same zero-copy peer_mem alias step 1
     returns. peer_mem must be the session's FIRST symmetric allocation (heap
-    offset 0 — dl.symm_at in P4b).
+    offset 0 — the P1 putmem target and the P4b push under the
+    MOE_MEGA_COMBINE_BUF=0 fallback; the default combine_buf push sits at a
+    later offset, proven by probe 6b on 950DT).
 
     grad_transport (MoonEP only): lends the forward's symmetric replica
     tables so the M3 grad_reduce chain rides the SAME launch as P6a/b/c tail
@@ -1285,7 +1426,13 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     borrows them."""
     use_moonep = bool(saved.get("use_moonep"))
     # MOE_MEGA_P6=0 compiles the MoonEP dual tables without the grad_reduce
-    # tail (bisect/escape hatch; default on).
+    # tail (bisect/escape hatch; default on).  950DT CAVEAT (2026-09-10): the
+    # GRAD_REDUCE=0 instantiation is itself miscompiled on this toolchain —
+    # P3/P5 wgrad outputs corrupt (91k mismatches at w8, deterministic,
+    # grad_hidden/grad_routing bit-exact) while the GRAD_REDUCE=1 binary is
+    # green at w8 in the same device state.  The knob's 910B1 bisect evidence
+    # (below, KNOWN CODEGEN LIMITATION) does NOT transfer; on 950DT it is not
+    # a valid escape hatch or bisect control.
     grad_reduce = (use_moonep and grad_transport is not None
                    and os.environ.get("MOE_MEGA_P6", "1") != "0")
     device = dy.device
@@ -1462,7 +1609,9 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     # bound sum_e cdiv(size_e, dbm) <= cdiv(M, dbm) + 1 — sized from the
     # routing-independent m_bound above (same symmetric-heap alignment rule).
     # Requires P1 and P23 (the producer/consumer phases) — otherwise the env
-    # knob is inert.
+    # knob is inert.  DEFAULT-OFF: see the 950DT lowering boundary in the
+    # module docstring (the wave-evolution step-1 default-on attempt of
+    # 2026-09-10 was reverted the same day).
     tile_b1 = (os.environ.get("MOE_MEGA_TILE_B1", "0") == "1"
                and _flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23"))
     if tile_b1:
@@ -1476,6 +1625,24 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         b1_signal = signal_mem   # dead (constexpr-guarded uses)
         b1_epoch = 0
         num_n_tiles1 = 1
+
+    # step-2 wave evolution: the return push (P4b/P4c and FUSE_P4's push)
+    # targets a DEDICATED symmetric slab instead of overwriting peer_mem's
+    # dispatch area — the send/recv reuse hazard that forced B2's cross-rank
+    # edge, and the precondition for wave-overlapping the return push (step
+    # 3).  symm_at resolves non-first slabs on 950DT (probe 6b, 2026-09-10;
+    # the combine_fc1_bwd.py offset-0 note is 910B1-era); =0 restores the
+    # peer_mem form.  Sizing from the cross-rank MAX of B*topk return rows:
+    # every rank pushes onto its peers, so a rank-local count would skew the
+    # symmetric heap (the same discipline as every other slab here).
+    if os.environ.get("MOE_MEGA_COMBINE_BUF", "1") == "1":
+        _rows = torch.tensor(
+            [p4["B"] * p4["topk"]], dtype=torch.int64, device=device)
+        dist.all_reduce(_rows, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        combine_buf = _ensure_mega_combine_buf(
+            saved, int(_rows.item()) * (H + GATE_PAD))
+    else:
+        combine_buf = peer_mem
 
     # P4a dual weight tables (MoonEP): replica_weight is the plan's packed
     # replica gate/up table as a stride-only [B, 2F, H] view; tiles are
@@ -1624,6 +1791,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         b1_signal_ptr=b1_signal, b1_epoch=b1_epoch, num_n_tiles1=num_n_tiles1,
         TILE_B1=tile_b1,
         FUSE_P4=fuse_p4 and _flag("MOE_MEGA_P4"),
+        combine_buf_ptr=combine_buf,
         HOME_E=home_e, ACTIVE_E=active_e,
         GRAD_REDUCE=grad_reduce, EPN6=epn6,
         GU_CHUNK=gu_chunk6, DN_CHUNK=dn_chunk6,
