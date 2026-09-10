@@ -84,6 +84,23 @@ fact, not a red X) and keeps the numeric leg ready for A5.  ``sync_block_*``
 and ``bl.alloc/subview/to_tensor`` are NOT gated; on A3 the realizable subset
 of forwardOne's pipeline is the FUSE_P4 GM-handoff wave (probe 4).
 
+Probe 6 gates the combine_buf step of the wave evolution (2026-09-10): the
+backward's P4b return push writes the DESTINATION rank's buffer through
+``dl.symm_at`` + ``tl.store``, and production only ever does that against
+peer_mem, which the wrapper guarantees is the session's FIRST symmetric
+allocation (heap offset 0 — the ``dl.symm_at only resolves at heap offset 0``
+note in combine_fc1_bwd.py).  A separate return buffer (forwardOne's
+combine_buf arrangement, the precondition for wave-overlapping the return
+push with later dispatch) sits at a NON-zero heap offset, and BOTH remote
+write forms are unproven there: symm_at never ran against a non-first slab,
+and putmem (the P1 form) only ever wrote offset-0 peer_mem (P6b getmem only
+READS offset-N).  With a dummy slab occupying offset 0 (misresolution lands
+in it and is detected), the two forms run as SEPARATE kernels so a faulting
+form wedges only its own test: 6a = putmem, 6b = symm_at + store.  A 6b
+wedge/mismatch/corruption is the boundary record — combine_buf's push then
+takes 6a's putmem form; 6a failing too means no remote-write form works at
+offset N and the step is blocked at the transport level.
+
 Decision tree (plan R1)
 -----------------------
 | result                              | decision                                   |
@@ -1121,3 +1138,190 @@ def test_mega_probe5_ub_pingpong(dist_test):
     machinery under per-iteration scope alternation) is caught by
     DIST_TEST_TIMEOUT_S."""
     dist_test(run_mega_probe5_ub_pingpong, world_size=8)
+
+
+# ---------------------------------------------------------------------------
+# Probe 6: remote writes to a symmetric slab at a NON-zero heap offset (the
+# combine_buf gate of the 2026-09-10 wave evolution).  A dummy symmetric
+# tensor occupies offset 0; buf sits behind it, exactly like a combine_buf
+# would sit behind peer_mem.  The FIRST draft coupled both write forms in
+# ONE kernel before a shared barrier — a faulting store wedged both legs
+# and the probe wedged/failed/greened nondeterministically at w2 (2026-09-
+# 10); the forms are therefore SEPARATE kernels so each verdict stands
+# alone (a wedge in 6b is then the boundary itself, recorded by the
+# DIST_TEST_TIMEOUT_S deadline):
+#   6a putmem -> remote offset-N rows (the P1-dispatch write form; P1 only
+#      ever putmems offset-0 peer_mem, P6b getmem-READS offset-N — the
+#      write direction is unproven),
+#   6b dl.symm_at(buf) + tl.store (the P4b return-push form; production
+#      symm_at only ever targets the FIRST symmetric allocation).
+# ---------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["dst_rank", "src_rank"])
+def kernel_probe6a_putmem_offset(
+        dummy_ptr, buf_ptr, pat_ptr, flags_ptr,
+        dst_rank, src_rank,
+        PATN: tl.constexpr, NPROG: tl.constexpr, PUT_ON: tl.constexpr):
+    """putmem leg: rows [NPROG, 2*NPROG) of the peer's offset-N buf carry
+    this rank's pattern; flags[pid, 0] = mismatches, [pid, 1] = nonzero
+    elements that appeared in OUR offset-0 dummy (cross-slab corruption
+    signature).  PUT_ON=0 is the CONTROL shape (MOE_PROBE6_CONTROL=1): the
+    identical session/scopes/barrier with the putmem compiled out — if the
+    control wedges too the probe's structure is at fault, not the write
+    form (that bisect ran 2026-09-10 after the first 6a wedged)."""
+    pid = tl.program_id(axis=0)
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            if PUT_ON:
+                libshmem_device.putmem(
+                    buf_ptr + (NPROG + pid) * PATN, pat_ptr + pid * PATN,
+                    PATN * 4, dst_rank)
+                libshmem_device.fence()
+    libshmem_device.barrier_all()
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        # offs/want derived INSIDE the scope: no tensor SSA value may cross
+        # the barrier (probe 2b's wedge lesson).
+        offs = tl.arange(0, PATN)
+        want = _probe_pattern_value(src_rank, pid, offs)
+        got_put = tl.load(buf_ptr + (NPROG + pid) * PATN + offs)
+        tl.store(flags_ptr + pid * 2,
+                 tl.sum((got_put != want).to(tl.int32)))
+        dummy_vals = tl.load(dummy_ptr + pid * PATN + offs)
+        tl.store(flags_ptr + pid * 2 + 1,
+                 tl.sum((dummy_vals != 0).to(tl.int32)))
+
+
+@triton.jit(do_not_specialize=["dst_rank", "src_rank"])
+def kernel_probe6b_symm_at_offset(
+        dummy_ptr, buf_ptr, pat_ptr, flags_ptr,
+        dst_rank, src_rank,
+        PATN: tl.constexpr, NPROG: tl.constexpr):
+    """symm_at leg: rows [0, NPROG) of the peer's offset-N buf carry pid+1
+    through dl.symm_at + tl.store (the P4b form); flags[pid, 0] = mismatches,
+    [pid, 1] = nonzero elements in OUR offset-0 dummy (the misresolution
+    signature — symm_at silently resolving the heap base instead of the
+    slab would land the peer's stores in our dummy)."""
+    pid = tl.program_id(axis=0)
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            offs = tl.arange(0, PATN)
+            remote = dl.symm_at(buf_ptr, dst_rank)
+            tl.store(remote + pid * PATN + offs, pid + 1)
+            libshmem_device.fence()
+    libshmem_device.barrier_all()
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        offs = tl.arange(0, PATN)
+        got_symm = tl.load(buf_ptr + pid * PATN + offs)
+        tl.store(flags_ptr + pid * 2,
+                 tl.sum((got_symm != pid + 1).to(tl.int32)))
+        dummy_vals = tl.load(dummy_ptr + pid * PATN + offs)
+        tl.store(flags_ptr + pid * 2 + 1,
+                 tl.sum((dummy_vals != 0).to(tl.int32)))
+
+
+def _run_probe6(rank: int, world_size: int, *, symm: bool, label: str) -> None:
+    """Shared 6a/6b driver: identical geometry, only the write form differs."""
+    _require_runtime("mega probe6")
+    device = f"npu:{rank}"
+    ep_group = dist.group.WORLD
+    nprog = ncore()
+    dst_rank = (rank + 1) % world_size
+    src_rank = (rank - 1 + world_size) % world_size
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
+        # allocation ORDER is the point: dummy owns heap offset 0, buf sits
+        # at a nonzero offset exactly like a combine_buf behind peer_mem
+        dummy = kit.ash.aclshmem_create_tensor(
+            [nprog * PROBE_PATN], dtype=torch.int32, device_id=rank)
+        buf = kit.ash.aclshmem_create_tensor(
+            [2 * nprog * PROBE_PATN], dtype=torch.int32, device_id=rank)
+        try:
+            dummy.zero_()
+            buf.zero_()
+            # host mirror of _probe_pattern_value (rank, pid, e)
+            pat = torch.tensor(
+                [[rank * 1000003 + p * 131 + e * 7 + 12345
+                  for e in range(PROBE_PATN)]
+                 for p in range(nprog)],
+                dtype=torch.int32, device=device)
+            flags = torch.full((nprog, 2), -1, dtype=torch.int32, device=device)
+            dist.barrier()
+
+            if symm:
+                kernel_probe6b_symm_at_offset[(nprog, 1, 1)](
+                    dummy, buf, pat, flags, dst_rank, src_rank,
+                    PATN=PROBE_PATN, NPROG=nprog, num_warps=8)
+            else:
+                # control mode: PUT_ON=0 keeps the session/allocation/
+                # scope/barrier shape and compiles out only the putmem
+                kernel_probe6a_putmem_offset[(nprog, 1, 1)](
+                    dummy, buf, pat, flags, dst_rank, src_rank,
+                    PATN=PROBE_PATN, NPROG=nprog,
+                    PUT_ON=(os.environ.get("MOE_PROBE6_CONTROL") != "1"),
+                    num_warps=8)
+            torch.npu.synchronize()
+
+            bad = int(flags[:, 0].sum().item())
+            bad_dummy = int(flags[:, 1].sum().item())
+            unverified = int((flags[:, 0] < 0).sum().item())
+            control = (not symm
+                       and os.environ.get("MOE_PROBE6_CONTROL") == "1")
+            failures = []
+            if unverified:
+                failures.append(
+                    f"{unverified} programs never stored a verdict "
+                    f"(kernel wedged or short-ran)")
+            form = "dl.symm_at+store" if symm else "putmem"
+            if control:
+                # PUT_ON=0: the only verdict is completion — the numeric
+                # mismatch (buf stays zero) is expected
+                print(f"[{label}] rank {rank}: CONTROL completed (putmem "
+                      f"compiled out; dummy corruption {bad_dummy} would "
+                      f"still be a finding)", flush=True)
+            elif bad or bad_dummy:
+                print(f"[{label}] rank {rank}: BOUNDARY — the {form} form "
+                      f"does not cleanly write the offset-N slab "
+                      f"({bad} mismatched, offset-0 dummy corruption "
+                      f"{bad_dummy})", flush=True)
+                if not symm:
+                    # the putmem leg is the FALLBACK form — if it is broken
+                    # too the environment cannot build combine_buf at all
+                    failures.append(
+                        f"putmem control leg failed ({bad} mismatched, "
+                        f"{bad_dummy} dummy corruptions) — both remote-write "
+                        f"forms are broken at offset N")
+            else:
+                print(f"[{label}] rank {rank}: the {form} form cleanly "
+                      f"writes the offset-N slab", flush=True)
+            _fold_and_raise(failures, label, rank, device, ep_group)
+        finally:
+            kit.ash.aclshmem_free_tensor(buf)
+            kit.ash.aclshmem_free_tensor(dummy)
+
+
+def run_mega_probe6a_putmem_offset(rank: int, world_size: int) -> None:
+    _run_probe6(rank, world_size, symm=False,
+                label=f"mega-probe6a-putmem-offset-w{world_size}")
+
+
+def run_mega_probe6b_symm_at_offset(rank: int, world_size: int) -> None:
+    _run_probe6(rank, world_size, symm=True,
+                label=f"mega-probe6b-symm-at-offset-w{world_size}")
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_mega_probe6a_putmem_offset(dist_test):
+    """Probe 6a: putmem into a remote offset-N symmetric slab (the P1 write
+    form at a heap offset it has never run against).  Wedges are caught by
+    DIST_TEST_TIMEOUT_S."""
+    dist_test(run_mega_probe6a_putmem_offset, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_mega_probe6b_symm_at_offset(dist_test):
+    """Probe 6b: dl.symm_at + tl.store against a remote offset-N symmetric
+    slab (the P4b return-push form; production symm_at only targets the
+    FIRST symmetric allocation).  A wedge here IS the boundary record —
+    combine_buf's push must then take 6a's putmem form."""
+    dist_test(run_mega_probe6b_symm_at_offset, world_size=2)
