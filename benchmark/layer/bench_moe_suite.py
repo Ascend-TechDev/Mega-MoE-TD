@@ -2667,45 +2667,51 @@ def run_moonep_backward_benchmark(
                 transport_ms = statistics.median(transport_samples)
                 setup_stats = _stats(setup_samples, device)
 
-                _log_moonep_phase(rank, case, "collecting backward stage breakdown")
-                _bd_warmup = max(1, BACKWARD_TIMING.warmup)
-                stage_sink = []
-                os.environ["MOE_BWD_STAGE_TIMING"] = "1"
-                os.environ["MOE_BWD_DUAL_STREAM"] = "0"
-                try:
-                    _moonep_backward_transport_samples(
-                        device,
-                        ep_group,
-                        op,
-                        dy,
-                        peer_mem,
-                        hidden_states,
-                        selected_experts,
-                        packed_w1,
-                        down_weight,
-                        routing_weights,
-                        warmup=_bd_warmup,
-                        iterations=BACKWARD_TIMING.iterations,
-                        stage_samples=stage_sink,
+                # Per-stage breakdown of the SERIAL transport backward —
+                # skipped under MOE_BWD_MEGA: the one-launch path records no
+                # per-stage events (the generic runner's note), and the width
+                # assertion below would fail on the empty sample list.
+                backward_breakdown = None
+                if os.environ.get("MOE_BWD_MEGA") != "1":
+                    _log_moonep_phase(rank, case, "collecting backward stage breakdown")
+                    _bd_warmup = max(1, BACKWARD_TIMING.warmup)
+                    stage_sink = []
+                    os.environ["MOE_BWD_STAGE_TIMING"] = "1"
+                    os.environ["MOE_BWD_DUAL_STREAM"] = "0"
+                    try:
+                        _moonep_backward_transport_samples(
+                            device,
+                            ep_group,
+                            op,
+                            dy,
+                            peer_mem,
+                            hidden_states,
+                            selected_experts,
+                            packed_w1,
+                            down_weight,
+                            routing_weights,
+                            warmup=_bd_warmup,
+                            iterations=BACKWARD_TIMING.iterations,
+                            stage_samples=stage_sink,
+                        )
+                    finally:
+                        os.environ.pop("MOE_BWD_STAGE_TIMING", None)
+                        os.environ.pop("MOE_BWD_DUAL_STREAM", None)
+                    bd_samples = stage_sink[_bd_warmup:]
+                    stage_widths = {len(sample) for sample in bd_samples}
+                    if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
+                        raise AssertionError(
+                            "the MoonEP transport backward must record "
+                            f"{len(_MOONEP_BWD_STAGE_NAMES)} stage intervals, got "
+                            f"{sorted(stage_widths)}"
+                        )
+                    backward_breakdown = OrderedDict(
+                        (
+                            f"{name}_event_ms",
+                            _stats([sample[i] for sample in bd_samples], device),
+                        )
+                        for i, name in enumerate(_MOONEP_BWD_STAGE_NAMES)
                     )
-                finally:
-                    os.environ.pop("MOE_BWD_STAGE_TIMING", None)
-                    os.environ.pop("MOE_BWD_DUAL_STREAM", None)
-                bd_samples = stage_sink[_bd_warmup:]
-                stage_widths = {len(sample) for sample in bd_samples}
-                if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
-                    raise AssertionError(
-                        "the MoonEP transport backward must record "
-                        f"{len(_MOONEP_BWD_STAGE_NAMES)} stage intervals, got "
-                        f"{sorted(stage_widths)}"
-                    )
-                backward_breakdown = OrderedDict(
-                    (
-                        f"{name}_event_ms",
-                        _stats([sample[i] for sample in bd_samples], device),
-                    )
-                    for i, name in enumerate(_MOONEP_BWD_STAGE_NAMES)
-                )
 
                 entry = {
                     "schema_version": 1,
@@ -2746,9 +2752,11 @@ def run_moonep_backward_benchmark(
                         "torch_ms": torch_ms,
                         "local_only_ms": local_ms,
                         "with_transport_ms": transport_ms,
-                        "grad_reduce_stage_ms": backward_breakdown[
-                            "grad_reduce_event_ms"
-                        ]["median_ms"],
+                        "grad_reduce_stage_ms": (
+                            backward_breakdown["grad_reduce_event_ms"]["median_ms"]
+                            if backward_breakdown is not None
+                            else None
+                        ),
                         "with_transport_over_torch": (
                             torch_ms / transport_ms if transport_ms > 0 else float("inf")
                         ),
