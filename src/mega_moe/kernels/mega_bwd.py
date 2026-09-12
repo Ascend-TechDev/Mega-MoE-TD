@@ -448,24 +448,39 @@ def _mega_combine_gemm(
     hidden_buf_ptr,                         # [M, H] out (row stride = N)
     tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
     N, K, num_tiles_n, num_tiles_m,
-    task_begin, task_end,
+    tile_m_begin, tile_m_end,
     signal_mem_ptr, signal_epoch,           # B3 readiness slots (SIGNAL_ON)
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
 ):
     """fc1 input-grad GEMM ``hidden_buf[m, :] = grad_fc1_output[m, :] @
-    weight[e]`` over the global task range [task_begin, task_end) against ONE
+    weight[e]`` over the M-TILE range [tile_m_begin, tile_m_end) against ONE
     weight table re-based at expert_base (bounds RUNTIME — the constexpr-bound
     production variant would recompile whenever routing moves a tile).
     Persistent STRIDED task partition (same imbalance fix as
     _mega_wgrad_sweep), from _kernel_combine_fc1_bwd_gemm_group
     (combine_fc1_bwd.py:114-171).  The MoonEP dual weight table is TWO calls
-    of this helper (home tasks then replica tasks — tiles are expert-major,
-    so the split is a contiguous task-range cut), NOT a runtime select on the
-    weight pointer: an arith.select on pointers/strides inside the GEMM loop
-    does not lower (CANN TritonToUnstructure fails, w2 910B1). Must run
-    inside a cube scope.
+    of this helper (home m-tiles then replica m-tiles — the RANGE is in
+    m-tile units exactly like the standalone's FIRST/LAST_TILE_M), NOT a
+    runtime select on the weight pointer: an arith.select on pointers/strides
+    inside the GEMM loop does not lower (CANN TritonToUnstructure fails, w2
+    910B1). Must run inside a cube scope.
+
+    2026-09-12 BUGFIX (kimi t4k 507015): this helper originally took a GLOBAL
+    task range and decoded ``tile_m = task % num_tiles_m`` (n-major over ALL
+    m-tiles), while the MoonEP call site cut the range at
+    ``tile_home_bound * num_tiles_n`` — a bound that is only the home tile
+    set under M-MAJOR enumeration.  Under the n-major decode the home sweep
+    picked up replica m-tiles (weight row ``expert_id`` read up to epn rows
+    PAST the epn-row home table) and the replica sweep picked up home tiles
+    (NEGATIVE weight rows), i.e. both sweeps read the wrong table for ~half
+    the tiles with offsets of up to ±epn expert rows (±176 MB at kimi t4k) —
+    silent wrong values where the VA happened to be mapped (tokens=512) and
+    MTE invalid-GM 507015 where it was not (tokens=4096).  The m-tile range
+    restores the standalone's exact split semantics; for the non-MoonEP full
+    range [0, num_tiles_m) the (task -> tile, program) mapping is bit-for-bit
+    the old one.
 
     SIGNAL_ON=1 (MOE_MEGA_TILE_B3=1) fires a local readiness signal after
     each (tile_m, tile_n) task's store lands: fence() orders the FixPipe
@@ -475,9 +490,10 @@ def _mega_combine_gemm(
     om = tl.arange(0, BLOCK_M)
     on_ = tl.arange(0, BLOCK_N)
     ok = tl.arange(0, BLOCK_K)
-    group_tiles = num_tiles_m
-    for task_id in range(task_begin + pid, task_end, ncores):
-        tile_m = task_id % group_tiles
+    group_tiles = tile_m_end - tile_m_begin
+    total_tasks = group_tiles * num_tiles_n
+    for task_id in range(pid, total_tasks, ncores):
+        tile_m = tile_m_begin + task_id % group_tiles
         tile_n = task_id // group_tiles
         expert_id = tl.load(tile_expert_ptr + tile_m)
         row_start = tl.load(tile_row0_ptr + tile_m)
@@ -1213,12 +1229,11 @@ def kernel_moe_backward_mega(
         # ---------------- P4a: fc1 input-grad GEMM ----------------
         if P4_ON:
             with al.scope(core_mode="cube", disable_auto_sync=True):
-                # MoonEP dual weight table as TWO single-table task-range
-                # sweeps (tiles are expert-major, so home tasks are exactly
-                # [0, tile_home_bound4*num_tiles_n)); the alternative — a
-                # runtime weight-pointer/stride select inside the loop — does
-                # not lower (TritonToUnstructure, w2 910B1).
-                home_tasks4 = tile_home_bound4 * num_tiles_n4
+                # MoonEP dual weight table as TWO single-table M-TILE-range
+                # sweeps (home m-tiles [0, tile_home_bound4) then replica);
+                # the alternative — a runtime weight-pointer/stride select
+                # inside the loop — does not lower (TritonToUnstructure, w2
+                # 910B1).
                 _mega_combine_gemm(
                     pid, num_cores,
                     dAB_ptr, stride_im4, stride_ik4,
@@ -1227,17 +1242,16 @@ def kernel_moe_backward_mega(
                     hidden_buf_ptr,
                     tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
                     N4, K4, num_tiles_n4, num_tiles_m4,
-                    0, home_tasks4,
+                    0, tile_home_bound4,
                     b3_signal_ptr, b3_epoch,
                     C_BM, C_BN, C_BK, C_NS,
                     SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
                 if ACTIVE_E > HOME_E:
-                    # first replica task id on this program's stride class
-                    # (ids stay ≡ pid mod num_cores across the cut; pid <
-                    # num_cores keeps tl.cdiv's truncating divide exact for
-                    # the negative remainder)
-                    rep_begin = pid + tl.cdiv(home_tasks4 - pid,
-                                              num_cores) * num_cores
+                    # replica m-tiles [tile_home_bound4, num_tiles_m4) against
+                    # the replica gate/up table — the m-tile range IS the split
+                    # (the old global-task-range cut mixed home and replica
+                    # tiles across the two sweeps; see the helper's 2026-09-12
+                    # bugfix note)
                     _mega_combine_gemm(
                         pid, num_cores,
                         dAB_ptr, stride_im4, stride_ik4,
@@ -1246,7 +1260,7 @@ def kernel_moe_backward_mega(
                         hidden_buf_ptr,
                         tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
                         N4, K4, num_tiles_n4, num_tiles_m4,
-                        rep_begin - pid, num_tiles_m4 * num_tiles_n4,
+                        tile_home_bound4, num_tiles_m4,
                         b3_signal_ptr, b3_epoch,
                         C_BM, C_BN, C_BK, C_NS,
                         SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
