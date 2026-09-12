@@ -23,6 +23,22 @@ from triton.language.extra.cann.extension import sub_vec_id
 from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
 
 
+@triton.jit
+def _sys_cnt_tick(dummy):
+    """Read the NPU system clock (SYS_CNT, ~20 MHz on this part — calibrate
+    host-side against a known-duration launch).  The inline-asm form is the
+    sb_rw_benchmark.py pattern, proven to lower on this toolchain; ``is_pure``
+    must be False or the compiler hoists/CSEs the reads away."""
+    return tl.inline_asm_elementwise(
+        asm="MOV $0, SYS_CNT;",
+        constraints="=l,l",
+        args=[dummy],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
 def _dispatch_static_maps(saved):
     """Build the dy-independent expert-major dispatch maps once, cached on `saved`.
 
@@ -264,6 +280,11 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
     b1_signal_ptr, b1_epoch,
     SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    # MOE_MEGA_TIMING=1 only (mega backward): accumulate the SYS_CNT ticks
+    # this program spends inside the arrival-wait region into wait_acc_ptr[pid],
+    # splitting P1 into "stalled on dispatch" vs "GEMM".  Default-off keeps the
+    # standalone step-1 kernel's binary untouched (dead-arg pattern).
+    wait_acc_ptr=None, WAIT_ACC: tl.constexpr = 0,
 ):
     """Consume merged expert M windows as their source tiles become ready. Adapted
     from forward _triton_grouped_gemm_expert_n_merged_tiles_wait
@@ -303,6 +324,8 @@ def _fc2_bwd_gemm_merged_tiles_wait(
             max_win = tl.maximum(max_win, tl.cdiv(sz0, BLOCK_M))
     first_task = FIRST_EXPERT * num_n_tiles
     last_task = LAST_EXPERT * num_n_tiles
+    wait_ticks = tl.zeros((1,), dtype=tl.int64)
+    dummy_w = tl.arange(0, 1)
     for task_id in range(pid + first_task, last_task, ncore):
         expert_id = task_id // num_n_tiles
         n_tile = task_id % num_n_tiles
@@ -318,6 +341,8 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                 ready_token = 0
                 # peer_mem is expert-major then source-major. Acquire every
                 # dispatch tile whose rows overlap this merged expert window.
+                if WAIT_ACC:
+                    _w0 = _sys_cnt_tick(dummy_w)
                 for source_id in range(WORLD_SIZE):
                     source_size = tl.load(
                         recv_counts_re_ptr
@@ -347,6 +372,9 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                                 waitValue=signal_epoch)
                             ready_token += token
                     source_start = source_end
+                if WAIT_ACC:
+                    _w1 = _sys_cnt_tick(dummy_w)
+                    wait_ticks += _w1 - _w0
                 ready_input_ptr = dl.consume_token(peer_mem_ptr, ready_token)
                 _fc2_bwd_gemm_one_mn_tile(
                     ready_input_ptr, fc2_ptr, output_ptr,
@@ -365,6 +393,8 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                            + m_window) * 16,
                         b1_epoch, libshmem_device.ACLSHMEM_SIGNAL_SET,
                         LOCAL_RANK)
+    if WAIT_ACC:
+        tl.store(wait_acc_ptr + pid + dummy_w, wait_ticks)
 
 
 @triton.jit(do_not_specialize=["signal_epoch"])
@@ -425,7 +455,8 @@ def kernel_dispatch_fc2_bwd_tile_signal(
             WORLD_SIZE, EXPERTS_PER_RANK,
             0, HOME_EXPERTS_PER_RANK, 0,
             MAX_BWD_TILES, dtype,
-            signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK)
+            signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK,
+            wait_acc_ptr=signal_mem_ptr, WAIT_ACC=0)
         if USE_REPLICA_WEIGHTS:
             _fc2_bwd_gemm_merged_tiles_wait(
                 pid, num_cores,
@@ -439,7 +470,8 @@ def kernel_dispatch_fc2_bwd_tile_signal(
                 HOME_EXPERTS_PER_RANK, ACTIVE_EXPERTS_PER_RANK,
                 HOME_EXPERTS_PER_RANK,
                 MAX_BWD_TILES, dtype,
-                signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK)
+                signal_mem_ptr, 0, SIGNAL_ON=0, LOCAL_RANK=LOCAL_RANK,
+                wait_acc_ptr=signal_mem_ptr, WAIT_ACC=0)
 
 
 def _dispatch_gemm_tile():
