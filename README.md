@@ -182,40 +182,11 @@ Mega-MoE-TD 的主要阶段 median 耗时 如下：
 | 其他 | ~3.5 | ~1.9 |
 | **E2E** | **52.90**（=串行相加 52.8） | **40.68**（名义和 49.3，重叠收益 ~8.6） |
 
-#### Kimi-K3 mega-kernel 单 launch（`MOE_BWD_MEGA=1`）
+#### Kimi-K3 mega-kernel A5 单 launch（`MOE_BWD_MEGA=1`）
 
-`MOE_BWD_MEGA=1` 把非 MoonEP 五步反向合并为**一个 Triton kernel launch**，
-相位间用 `libshmem_device.barrier_all()` 串行（GEMM `BM=256` 默认 tile）。下表为
-*950DT 八卡* 与 bigop 基线（`mega_moe._goldens.bigop_ref.moe_backward_bigop`：
-bigop grouped matmul/wgrad + `npu_swiglu_backward`，A2A 走 torch/HCCL）的
-性能与峰值内存对比。协议：WARM=3 / ITERS=10 / rank-MAX，`torch.manual_seed`
-随机路由；内存为 torch 峰值 `reserved`，mega 侧已计入池外 2 GiB aclshmem
-对称堆（t8k 峰值需求 ~0.94 GiB，固定 2 GiB 配额）。
 
 | tokens/rank | mega ms/iter | bigop ms/iter | 加速比 | mega 峰值 reserved | bigop 峰值 reserved | 内存差 |
 |---:|---:|---:|---:|---:|---:|---:|
 | 2K | **24.94** | 38.89 | **1.56x** | **25.3 GiB**¹ | 29.9 GiB | −4.6 GiB |
 | 4K | **43.43** | 56.34 | **1.30x** | **29.9 GiB**¹ | 34.3 GiB | −4.4 GiB |
 | 8K | **79.31** | 94.55 | **1.19x** | **39.6 GiB**¹ | 43.4 GiB | −3.7 GiB |
-
-¹ = torch reserved + 2 GiB 池外 aclshmem 对称堆。
-
-全序列档位性能领先 1.19–1.56x 且峰值内存省 3.7–4.6 GiB：单 kernel 直出
-梯度，无 grouped-op 中间转置/重排缓冲；短序列端优势最大（单 launch 省去的
-调度/启动开销占比高）。正确性门槛：w2/w8 functional suite + f0b probe2
-（kimi 真形 5-key 全比对）/ probe3（epoch 复用 bit 级）全绿。
-
-`MOE_BWD_MEGA=1` 同样覆盖 MoonEP 物理布局（`use_moonep` saved）：P1 增加
-replica down 表的第二趟 fc2-dgrad 扫，P4a 的 GEMM 过 `tile_home_bound` 切
-home/replica 双权重表（均为 standalone kernel 双表模式的内联）；当前向借出
-对称 replica 表（`grad_transport`）时，M3 grad_reduce 链并入同一次 launch，
-并按表拆分藏进已有窗口（2026-09-10 wave 重构）：w1 = seed acc_down + sink
-down 槽（B2→B3，骑 cube P4a 窗口）、w2 = sink gate/up ∥ down owner-pull
-（B5→B6）、w3 = gate/up owner-pull（B6→exit）；第三阶段（清零 consumed 槽）
-为 kernel 退出后的 host 侧流序操作。fp32 累加按 (home, chunk) 单写者分区、
-(peer, slot) 描述符序保持 —— 与 fused transport kernel 逐位一致；host 侧
-sink/`post_sink_hook` 被内核链取代（`sunk`/`reduced` 仍置位，槽位级 bit
-精确断言在该模式下跳过，HCCL oracle 归约比对与 post-zero 检查仍然全量
-生效）。2026-09-13 P6 任务进一步摊平到全部 program（(row, tile)/(home,
-chunk) 平铺任务空间，kimi t4k 尾 ~58ms → ~14ms、host wall 76.8 → 31.4ms，
-主线 stamps 不变）。
