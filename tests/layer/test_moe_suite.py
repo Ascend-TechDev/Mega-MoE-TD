@@ -9,6 +9,7 @@ environment variables.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -352,6 +353,260 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
             raise AssertionError(
                 f"functional forward case failed: {case.case_id}"
             )
+
+
+def run_single_kernel_forward_case(
+    rank: int, world_size: int, fc1_block_m: int = 256, tokens: int = 64,
+    num_experts: int = 8,
+) -> None:
+    """Exercise the one-launch home-expert path against the Torch oracle."""
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("single-kernel forward requires NPU and ACLSHMEM")
+
+    hidden, ffn, topk = 256, 512, 2
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    all_passed = True
+
+    with kit.aclshmem_session(
+        rank,
+        world_size,
+        kit.get_ash_size_bytes(default_gb=1),
+    ):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=float(world_size),
+                enable_single_kernel_forward=True,
+                fc1_gemm_block_size_m=fc1_block_m,
+                fc2_combine_block_size_m=fc1_block_m,
+            ),
+        )
+        try:
+            w_gate, w_up = make_gate_up_weights(
+                num_experts,
+                hidden,
+                ffn,
+                world_size,
+                rank,
+                dtype,
+                device,
+            )
+            packed_w1 = pack_gate_up_weights(w_gate, w_up)
+            w2 = make_down_weights(
+                num_experts,
+                hidden,
+                ffn,
+                world_size,
+                rank,
+                dtype,
+                device,
+            )
+            hs, expert_indices = prepare_inputs(
+                tokens,
+                hidden,
+                num_experts,
+                topk,
+                dtype,
+                device,
+                seed=9100 + rank,
+                drop_frac=0.25,
+            )
+            expert_indices[0, 0] = -1
+            routing_weights = make_routing_weights(
+                tokens,
+                topk,
+                device,
+                seed=9200 + rank,
+            )
+            dist.barrier(group=ep_group)
+
+            for iteration in range(2):
+                all_passed &= run_full_one(
+                    op,
+                    hs,
+                    expert_indices,
+                    routing_weights,
+                    w_gate,
+                    w_up,
+                    packed_w1,
+                    w2,
+                    num_experts,
+                    f"single-kernel-forward-w{world_size}-iter{iteration}",
+                    rank,
+                    device,
+                )
+
+            all_to_rank_zero = torch.zeros_like(expert_indices)
+            all_passed &= run_full_one(
+                op,
+                hs,
+                all_to_rank_zero,
+                routing_weights,
+                w_gate,
+                w_up,
+                packed_w1,
+                w2,
+                num_experts,
+                f"single-kernel-forward-w{world_size}-zero-receive",
+                rank,
+                device,
+            )
+
+            all_dropped = torch.full_like(expert_indices, num_experts)
+            all_passed &= run_full_one(
+                op,
+                hs,
+                all_dropped,
+                routing_weights,
+                w_gate,
+                w_up,
+                packed_w1,
+                w2,
+                num_experts,
+                f"single-kernel-forward-w{world_size}-all-dropped",
+                rank,
+                device,
+            )
+        finally:
+            op.finalize()
+
+        overflow_op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=tokens,
+            hidden_size=hidden,
+            top_k=topk,
+            num_experts=num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=1.0,
+                enable_single_kernel_forward=True,
+                fc1_gemm_block_size_m=fc1_block_m,
+                fc2_combine_block_size_m=fc1_block_m,
+            ),
+        )
+        try:
+            rejected_overflow = False
+            try:
+                overflow_op.forward(
+                    hs,
+                    torch.zeros_like(expert_indices),
+                    packed_w1,
+                    w2,
+                    routing_weights,
+                )
+            except ValueError as exc:
+                rejected_overflow = "required receive size" in str(exc)
+            all_passed &= rejected_overflow
+        finally:
+            overflow_op.finalize()
+
+        flag = torch.tensor(
+            [1 if all_passed else 0],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
+        if not bool(flag.item()):
+            raise AssertionError("single-kernel forward mismatched the oracle")
+
+
+def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
+    """Validate the fused launch at the trimmed Kimi-K3 W8/T4K shape."""
+    if world_size != 8:
+        raise ValueError("the Kimi-K3 single-kernel case requires eight ranks")
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("Kimi-K3 single-kernel forward requires NPU and ACLSHMEM")
+
+    base_case = next(
+        case
+        for case in select_cases(
+            direction="forward",
+            tags={"performance", "kimi", "trimmed"},
+        )
+        if case.world_size == world_size and case.tokens == 4096
+    )
+    heap_size = kit.get_ash_size_bytes(default_gb=2)
+    required_heap = bench_module._required_ash_bytes(base_case, world_size)
+    if required_heap >= heap_size:
+        raise RuntimeError(
+            "Kimi-K3 single-kernel test needs more ACLSHMEM heap: "
+            f"required={required_heap}, configured={heap_size}"
+        )
+
+    device = f"npu:{rank}"
+    ep_group = dist.group.WORLD
+    with kit.aclshmem_session(rank, world_size, heap_size):
+        op = FusedMoEForward(
+            ep_group,
+            max_tokens_per_rank=base_case.tokens,
+            hidden_size=base_case.hidden,
+            top_k=base_case.topk,
+            num_experts=base_case.num_experts,
+            config=MoEForwardConfig(
+                receive_capacity_factor=base_case.capacity_factor,
+                enable_single_kernel_forward=True,
+                fc1_gemm_block_size_k=256,
+                fc2_gemm_block_size_k=256,
+            ),
+        )
+        try:
+            experts_per_rank = base_case.num_experts // world_size
+            packed_w1, down_weight, _ = bench_module._make_local_weights(
+                base_case,
+                experts_per_rank,
+                rank,
+                device,
+            )
+            for token_count in (64, base_case.tokens):
+                case = (
+                    base_case
+                    if token_count == base_case.tokens
+                    else replace(
+                        base_case,
+                        case_id="performance-fwd-kimi-k3-trimmed-w8-t64",
+                        tokens=token_count,
+                    ).validate()
+                )
+                hidden_states, selected_experts, routing_weights = (
+                    bench_module._prepare_inputs(case, rank, device)
+                )
+                dist.barrier(group=ep_group)
+                actual = op.forward(
+                    hidden_states,
+                    selected_experts,
+                    packed_w1,
+                    down_weight,
+                    routing_weights,
+                )
+                expected = bench_module._logical_torch_golden(
+                    case,
+                    ep_group,
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    packed_w1,
+                    down_weight,
+                )
+                bench_module._assert_close_collective(
+                    actual,
+                    expected,
+                    device,
+                    f"single-kernel-{case.case_id}",
+                    ep_group,
+                )
+                if rank == 0:
+                    print(f"[PASS] single-kernel-{case.case_id}", flush=True)
+                del actual, expected
+                del hidden_states, selected_experts, routing_weights
+                torch.npu.empty_cache()
+                dist.barrier(group=ep_group)
+        finally:
+            op.finalize()
 
 
 def run_moonep_hot_expert_case(
@@ -3998,6 +4253,39 @@ FUNCTIONAL_BACKWARD_CASES = kit.make_pytest_params(
 @pytest.mark.parametrize("case", FUNCTIONAL_FORWARD_CASES)
 def test_forward_suite(dist_test, case: CaseSpec):
     dist_test(run_forward_case, world_size=case.world_size, args=(case,))
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_forward_w2(dist_test):
+    dist_test(run_single_kernel_forward_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_forward_w8(dist_test):
+    dist_test(run_single_kernel_forward_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize(
+    "tokens,block_m", [(3, 256), (4097, 256), (4097, 128)],
+    ids=("tiny-tail", "m256-multi-wave", "m128-multi-wave"),
+)
+def test_single_kernel_dynamic_waves_w8(dist_test, tokens, block_m):
+    dist_test(
+        run_single_kernel_forward_case, world_size=8,
+        args=(block_m, tokens, 32),
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.slow
+@pytest.mark.kimi
+def test_single_kernel_kimi_k3_t4k_w8(dist_test):
+    dist_test(run_single_kernel_kimi_k3_case, world_size=8)
 
 
 @pytest.mark.dist

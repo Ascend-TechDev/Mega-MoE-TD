@@ -24,5 +24,7 @@ markers = [
     "smoke: small/quick representative case",
     "slow: large or otherwise expensive case",
     "kimi: Kimi model case",
+    "moonep-skewed: matched Kimi owner imbalance for MoonEP",
+    "trimmed: reduced expert-topology projection case",
     "dsv4: DSV4 model case",
 ]

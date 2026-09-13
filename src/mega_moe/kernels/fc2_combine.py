@@ -154,6 +154,7 @@ def _fc2_gemm_one_mn_tile(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     WEIGHT_EXPERT_BASE: tl.constexpr,
+    WEIGHT_NK_LOAD: tl.constexpr = False,
 ):
     """Compute one FC2 M/N tile for the coarse expert-group schedule."""
     offs_m = tl.arange(0, BLOCK_M)
@@ -175,21 +176,25 @@ def _fc2_gemm_one_mn_tile(
             + rows[:, None] * stride_input_m
             + red[None, :] * stride_input_k
         )
-        b_ptrs = (
-            weight_base
-            + cols[None, :] * stride_weight_n
-            + red[:, None] * stride_weight_k
-        )
         a = tl.load(
             a_ptrs,
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0,
         )
-        b = tl.load(
-            b_ptrs,
-            mask=mask_k[:, None] & mask_n[None, :],
-            other=0.0,
-        )
+        if WEIGHT_NK_LOAD:
+            # Preserve the contiguous K dimension after consume_token. The
+            # acquired pointer otherwise takes an implicit-transpose lowering
+            # that miscompiles the replica weight load on this Ascend backend.
+            b_nk = tl.load(
+                weight_base + cols[:, None] * stride_weight_n
+                + red[None, :] * stride_weight_k,
+                mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+            b = tl.trans(b_nk)
+        else:
+            b = tl.load(
+                weight_base + cols[None, :] * stride_weight_n
+                + red[:, None] * stride_weight_k,
+                mask=mask_k[:, None] & mask_n[None, :], other=0.0)
         acc += tl.dot(a, b)
     out_ptrs = (
         fc2_buf_ptr

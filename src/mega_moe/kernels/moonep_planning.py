@@ -33,6 +33,7 @@ def _kernel_moonep_b0_b1(
     EPN: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    FINAL_BARRIER: tl.constexpr = True,
 ):
     """Build MoonEP global counts and the B.1 transfer matrix."""
     offs_r = tl.arange(0, R)
@@ -95,7 +96,8 @@ def _kernel_moonep_b0_b1(
     )
     # This is the last planner access to the symmetric input.  Do not let a
     # faster rank publish its next tpe row while a peer still reads this one.
-    libshmem_device.barrier_all_vec()
+    if FINAL_BARRIER:
+        libshmem_device.barrier_all_vec()
 
 
 @triton.jit

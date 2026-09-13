@@ -88,6 +88,7 @@ def init_aclshmem(
     world_size,
     size_bytes,
     ip_port=None,
+    enable_udma=False,
 ):
     """Initialize the ACLSHMEM symmetric heap for this rank.
 
@@ -102,6 +103,9 @@ def init_aclshmem(
     attr.local_mem_size = size_bytes
     attr.ip_port = ip_port if ip_port is not None else get_ash_ip_port()
     attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    if enable_udma:
+        attr.option_attr.data_op_engine_type = ash.OpEngineType(
+            ash.OpEngineType.MTE.value | ash.OpEngineType.UDMA.value)
     if ash.aclshmem_init(attr) != 0:
         raise RuntimeError("aclshmem_init failed")
 
@@ -304,6 +308,7 @@ def aclshmem_session(
     world_size,
     size_bytes,
     ip_port=None,
+    enable_udma=False,
 ) -> Iterator[None]:
     """Initialize and finalize one isolated ACLSHMEM session."""
     init_aclshmem(
@@ -311,6 +316,7 @@ def aclshmem_session(
         world_size,
         size_bytes,
         ip_port=ip_port,
+        enable_udma=enable_udma,
     )
     try:
         yield

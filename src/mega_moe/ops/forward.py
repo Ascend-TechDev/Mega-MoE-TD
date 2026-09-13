@@ -15,6 +15,7 @@ import torch.distributed
 
 from ..config import MoEForwardConfig
 from ..kernels.dispatch_fc1 import _kernel_dispatch_fc1
+from ..kernels.fused_forward import _kernel_fused_forward
 from ..kernels.replica_weight_prefetch import (
     _kernel_compact_local_replica_descriptors,
 )
@@ -111,6 +112,9 @@ class FusedMoEForward(torch.nn.Module):
         self.activation_dtype = torch.bfloat16
         self.config = config if config is not None else MoEForwardConfig()
         self.enable_moonep = self.config.enable_moonep
+        self.enable_single_kernel_forward = (
+            self.config.enable_single_kernel_forward
+        )
         if self.enable_moonep and self.world_size & (self.world_size - 1):
             raise ValueError(
                 "MoonEP Triton planning requires a power-of-two EP world size"
@@ -124,6 +128,14 @@ class FusedMoEForward(torch.nn.Module):
         )
         self.num_aicore_programs = self.config.num_aicore_programs
         self.num_aivector_programs = self.config.num_aivector_programs
+        if (
+            self.enable_single_kernel_forward
+            and self.world_size > self.num_aicore_programs
+        ):
+            raise ValueError(
+                "single-kernel forward requires world_size no larger than "
+                "the physical AICore count"
+            )
         self._fc2_pipeline_group_experts = min(
             _FC2_PIPELINE_GROUP_EXPERTS, self.physical_experts_per_rank
         )
@@ -169,6 +181,14 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
+        self._single_fc2_output = None
+        self._single_weighted_activation = None
+        self._single_pipeline_signal_storage = None
+        self._single_pipeline_max_groups = 0
+        self._single_core_bucket_cursors = None
+        self._single_send_token_indices = None
+        self._single_send_route_indices = None
+        self._single_wave_expert_offsets = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
         self._replica_weight_cache_key = None
@@ -285,6 +305,11 @@ class FusedMoEForward(torch.nn.Module):
             # table.  This is a teardown-only collective; normal forwards keep
             # the overlap path free of a host synchronization.
             torch.distributed.barrier(group=self.ep_group)
+        if self._single_pipeline_signal_storage is not None:
+            import shmem as ash
+
+            ash.aclshmem_free_tensor(self._single_pipeline_signal_storage)
+            self._single_pipeline_signal_storage = None
         if self._combine_fc2_storage is not None:
             import shmem as ash
 
@@ -309,6 +334,7 @@ class FusedMoEForward(torch.nn.Module):
         self._active_replica_weight_epoch = 1
         self._forward_stream = None
         self._routing_weights_keepalive = None
+        self._single_weight_sources = None
         self._combine_fc2_buf = None
         self._combine_pipeline_cube_stream = None
         self._combine_pipeline_vector_stream = None
@@ -322,6 +348,13 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = None
         self._pull_tile_dst_start = None
         self._pull_tile_row_count = None
+        self._single_fc2_output = None
+        self._single_weighted_activation = None
+        self._single_pipeline_max_groups = 0
+        self._single_core_bucket_cursors = None
+        self._single_send_token_indices = None
+        self._single_send_route_indices = None
+        self._single_wave_expert_offsets = None
         self.context.finalize()
 
     def _ensure_replica_weight_buffers(
@@ -503,6 +536,70 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_src_start = make_int_workspace(descriptor_slots)
         self._pull_tile_dst_start = make_int_workspace(descriptor_slots)
         self._pull_tile_row_count = make_int_workspace(descriptor_slots)
+
+    def _ensure_single_kernel_buffers(self, gate_up_weight: torch.Tensor):
+        """Allocate fixed-capacity ordinary buffers for the fused launch."""
+        self._ensure_combine_buffers()
+        max_recv = self.context.peer_mem.numel() // self.hidden_size
+        max_send = self.max_tokens_per_rank * self.top_k
+        ffn_size = gate_up_weight.shape[2] // 2
+        device = self.context.peer_mem.device
+
+        expected_activation = (max_recv, ffn_size)
+        if self._single_fc2_output is None:
+            self._single_fc2_output = torch.empty(
+                (max_recv, self.hidden_size),
+                dtype=self.activation_dtype,
+                device=device,
+            )
+            self._single_weighted_activation = torch.empty(
+                expected_activation,
+                dtype=self.activation_dtype,
+                device=device,
+            )
+            self._single_core_bucket_cursors = torch.empty(
+                (self.num_aicore_programs, self.context.metadata_num_bins),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._single_send_token_indices = torch.empty(
+                max_send,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._single_send_route_indices = torch.empty(
+                max_send,
+                dtype=torch.int32,
+                device=device,
+            )
+            # For EPR1, each rank's two prefix bases remain zero. Dynamic
+            # expert totals and the sentinel are rebuilt inside every call.
+            self._single_wave_expert_offsets = torch.zeros(
+                (self.world_size, self.physical_experts_per_rank + 1, 2),
+                dtype=torch.int32, device=device,
+            )
+            pipeline_group_rows = (
+                self.config.single_kernel_group_windows * self.config.fc1_gemm_block_size_m
+            )
+            self._single_pipeline_max_groups = (
+                max_recv + pipeline_group_rows - 1
+                + self.physical_experts_per_rank * (self.config.fc1_gemm_block_size_m - 1)
+            ) // pipeline_group_rows
+            import shmem as ash
+
+            pipeline_slots = self._single_pipeline_max_groups * (
+                2 * self.num_aicore_programs + self.world_size)
+            self._single_pipeline_signal_storage = ash.aclshmem_create_tensor(
+                [pipeline_slots * 16],
+                dtype=torch.int32,
+                device_id=self.rank,
+            )
+            self._single_pipeline_signal_storage.zero_()
+        elif tuple(self._single_weighted_activation.shape) != expected_activation:
+            raise ValueError(
+                "single-kernel workspaces were initialized for a different "
+                "FFN size; recreate the operator"
+            )
 
     def _ensure_group_pipeline_runtime(
         self,
@@ -1291,6 +1388,171 @@ class FusedMoEForward(torch.nn.Module):
             return output, weighted_activation
         return output
 
+    def _forward_single_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch routing, optional UDMA MoonEP, and compute exactly once."""
+        if self.enable_moonep:
+            if self._replica_weight_buffers is None:
+                from triton_dist.language.extra import libshmem_device
+
+                if not all(callable(getattr(libshmem_device, name, None)) for name in
+                           ("udma_put_nbi", "udma_put_signal_nbi", "udma_quiet")):
+                    raise RuntimeError(
+                        "single-kernel MoonEP requires upstream UDMA Triton/SHMEM wheels "
+                        "and ACLSHMEM initialized with MTE | UDMA")
+            if self.hidden_size % 2:
+                raise ValueError("single-kernel UDMA MoonEP requires even hidden_size")
+            self._ensure_replica_weight_buffers(gate_up_weight, down_weight)
+        self._ensure_single_kernel_buffers(gate_up_weight)
+        num_tokens = hidden_states.shape[0]
+        num_routes = selected_experts.numel()
+        ffn_size = gate_up_weight.shape[2] // 2
+        max_received_routes = (
+            self.context.peer_mem.numel() // self.hidden_size
+        )
+        if max_received_routes >= torch.iinfo(torch.int32).max:
+            raise ValueError("dispatch receive offsets exceed int32 range")
+        gate_up_for_gemm = gate_up_weight.transpose(-1, -2)
+        output = torch.empty(
+            (num_tokens, self.hidden_size),
+            dtype=self.activation_dtype,
+            device=hidden_states.device,
+        )
+        if self.enable_moonep:
+            # Saved-forward shares these destinations but has its own cache
+            # and epoch counter. Switching paths must not reuse an old signal.
+            self._tile_signal_epoch = max(self._tile_signal_epoch, self._replica_weight_epoch)
+            self._replica_weight_cache_valid = False
+            self._replica_weight_epoch = self._tile_signal_epoch + 1
+        signal_epoch = self._tile_signal_epoch
+        if signal_epoch >= torch.iinfo(torch.int32).max:
+            raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
+        # FC1 holds two (M, N/2) accumulators with the same total L0C footprint.
+        launch_options = (
+            {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
+            if max(
+                self.config.fc1_gemm_block_size_m
+                * self.config.fc1_gemm_block_size_n,
+                self.config.fc2_combine_block_size_m
+                * self.config.fc2_gemm_block_size_n,
+            )
+            > 128 * 256
+            else {}
+        )
+        launch_options["has_auto_blockify_blacklist_op"] = False
+        # UB slots already have explicit lifetimes. Auto-buffering Vector
+        # temporaries can exhaust UB and make the backend drop L1 buffering.
+        launch_options.update(
+            enable_dynamic_cv_pipeline=False, enable_mixed_cv=True,
+            disable_auto_inject_block_sync=True, set_workspace_multibuffer=0,
+            limit_auto_multi_buffer_buffer="only-cube")
+        _kernel_fused_forward[self.num_aicore_programs, 1, 1](
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            gate_up_for_gemm,
+            down_weight,
+            self.context.peer_mem,
+            self.context.routing_weight_mem,
+            self.context.signal_mem,
+            self._single_pipeline_signal_storage,
+            self._combine_fc2_buf,
+            self._single_fc2_output,
+            self._single_weighted_activation,
+            output,
+            self.context.metadata_counts_mem,
+            self.context.metadata_send_bucket_starts,
+            self.context.metadata_send_bucket_dst_starts,
+            self.context.metadata_recv_counts_re,
+            self.context.metadata_recv_per_expert,
+            self.context.metadata_recv_expert_offs,
+            self.context.metadata_stats,
+            self._single_core_bucket_cursors,
+            self._single_send_token_indices,
+            self._single_send_route_indices,
+            self._route_to_send,
+            self._pull_tile_dst_start,
+            self._single_wave_expert_offsets,
+            self.context.planning_counts_mem if self.enable_moonep else self.context.metadata_counts_mem,
+            self.context.planning_expert_count,
+            self.context.planning_transfers,
+            self.context.planning_allocation,
+            self.context.planning_alloc_cumsum,
+            self.context.planning_experts_to_copy,
+            self.context.planning_inverse_experts_to_copy,
+            self.context.planning_replica_counts,
+            self._replica_weight_buffers.gate_up if self.enable_moonep else gate_up_for_gemm,
+            self._replica_weight_buffers.down if self.enable_moonep else down_weight,
+            self.context.replica_gate_ready if self.enable_moonep else self.context.signal_mem,
+            self.context.replica_down_ready if self.enable_moonep else self.context.signal_mem,
+            self.context.replica_gate_ready.view(torch.uint64) if self.enable_moonep else None,
+            self.context.replica_down_ready.view(torch.uint64) if self.enable_moonep else None,
+            num_routes,
+            signal_epoch,
+            float(self.situ_beta),
+            (
+                float(self.situ_linear_beta)
+                if self.situ_linear_beta is not None
+                else 0.0
+            ),
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            gate_up_for_gemm.stride(0),
+            gate_up_for_gemm.stride(1),
+            gate_up_for_gemm.stride(2),
+            down_weight.stride(0),
+            down_weight.stride(1),
+            down_weight.stride(2),
+            NUM_PROGRAM_CORES=self.num_aicore_programs,
+            LOCAL_RANK=self.rank,
+            WORLD_SIZE=self.world_size,
+            NUM_EXPERTS=self.world_size * self.experts_per_rank,
+            EXPERTS_PER_RANK=self.experts_per_rank,
+            TOPK=self.top_k,
+            HIDDEN=self.hidden_size,
+            FFN=ffn_size,
+            MAX_RECEIVED_ROUTES=max_received_routes,
+            NUM_BINS_PAD=self.context.metadata_num_bins,
+            MAX_SOURCE_TILES=self.context.max_source_tiles,
+            MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
+            DISPATCH_BLOCK_M=self.config.dispatch_fc1_block_size_m,
+            FC1_BLOCK_M=self.config.fc1_gemm_block_size_m,
+            FC1_BLOCK_N=self.config.fc1_gemm_block_size_n,
+            FC1_BLOCK_K=self.config.fc1_gemm_block_size_k,
+            FC2_BLOCK_N=self.config.fc2_gemm_block_size_n,
+            FC2_BLOCK_K=self.config.fc2_gemm_block_size_k,
+            ACTIVATION=0 if self.activation == "swiglu" else 1,
+            HAS_LINEAR_BETA=self.situ_linear_beta is not None,
+            PIPELINE_GROUP_WINDOWS=self.config.single_kernel_group_windows,
+            MOONEP=self.enable_moonep,
+            RAW_NUM_BINS=self.context.planning_num_bins,
+            UDMA_CHUNK_ELEMENTS=self.config.moonep_udma_chunk_bytes // 2,
+            **launch_options,
+        )
+        self._tile_signal_epoch += 1
+        self._routing_weights_keepalive = routing_weights
+        if self.enable_moonep:
+            # Always refresh in this path: the device planner may change slot
+            # ownership every call, without host ETC copies or cache collectives.
+            self._single_weight_sources = (gate_up_weight, down_weight)
+        if self.receive_capacity_factor < self.world_size:
+            required_received_routes = int(
+                self.context.metadata_stats[1].item()
+            )
+            if required_received_routes > max_received_routes:
+                raise ValueError(
+                    f"peer buffer capacity {max_received_routes} routes is "
+                    "smaller than the required receive size "
+                    f"{required_received_routes}"
+                )
+        return output
+
     # ===================== full forward ================================
     def forward(
         self,
@@ -1342,6 +1604,14 @@ class FusedMoEForward(torch.nn.Module):
         # once here so both callers work; the fresh allocation also keeps
         # the replica weight cache honestly miss-per-step, which matches
         # optimizer-updated weights.
+        if (
+            self.enable_single_kernel_forward
+            and not return_saved
+            and not down_weight.is_contiguous()
+        ):
+            raise ValueError(
+                "single-kernel forward requires contiguous down_weight"
+            )
         if not down_weight.is_contiguous():
             down_weight = down_weight.contiguous()
         expected_down_shape = (
@@ -1370,6 +1640,14 @@ class FusedMoEForward(torch.nn.Module):
         ):
             raise ValueError(
                 "configured FC1/FC2 N and K tiles must divide the weight dimensions"
+            )
+        if self.enable_single_kernel_forward and not return_saved:
+            return self._forward_single_kernel(
+                hidden_states,
+                selected_experts,
+                gate_up_weight,
+                down_weight,
+                routing_weights,
             )
         # Symmetric replica allocations must be complete before any rank enters
         # the routing count exchange.  The planner then starts owner-push RMA
