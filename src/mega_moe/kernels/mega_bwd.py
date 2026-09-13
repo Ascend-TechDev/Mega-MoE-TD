@@ -738,28 +738,37 @@ def _mega_reduce(
 # way, because they read grad tensors the SAME launch only produces at B5.
 # ============================================================================
 @triton.jit
-def _mega_grad_transpose(
+def _mega_grad_transpose_tile(
     dst_ptr, src_ptr,
     H_dim, F2,
+    tile,
     TM: tl.constexpr, TN: tl.constexpr,
 ):
-    """dst[H, F2] = transpose(src[F2, H]), blocked; the store casts to dst's
-    element type, so one body serves the fp32 accumulator seed AND the bf16
-    slot sink.  NO tl.trans: this backend's TritonToUnstructure pass fails to
-    lower it here (w2 compile, 910B1) and no other kernel in the repo uses
-    it — the transposed read is expressed as index arithmetic instead (the
-    P4c reduce's strided gather/scatter pattern, masked blocked tiles)."""
-    om = tl.arange(0, TM)   # H axis of dst
-    on_ = tl.arange(0, TN)  # F2 axis of dst
-    for h0 in range(0, H_dim, TM):
-        hm = (h0 + om) < H_dim
-        for f0 in range(0, F2, TN):
-            fn = (f0 + on_) < F2
-            v = tl.load(
-                src_ptr + (f0 + on_)[None, :] * H_dim + (h0 + om)[:, None],
-                mask=hm[:, None] & fn[None, :], other=0.0)
-            tl.store(dst_ptr + (h0 + om)[:, None] * F2 + (f0 + on_)[None, :],
-                     v, mask=hm[:, None] & fn[None, :])
+    """ONE (h0, f0) tile of dst[H, F2] = transpose(src[F2, H]); the store casts
+    to dst's element type, so one body serves the fp32 accumulator seed AND
+    the bf16 slot sink.  NO tl.trans: this backend's TritonToUnstructure pass
+    fails to lower it here (w2 compile, 910B1) and no other kernel in the repo
+    uses it — the transposed read is expressed as index arithmetic instead
+    (the P4c reduce's strided gather/scatter pattern, masked blocked tiles).
+
+    2026-09-13 re-partition: the old double-loop body walked every tile of one
+    row inside a single call (row = expert/slot strided across programs); the
+    tile index decomposition here is h-major (tile // cdiv(F2,TN) = h0) so a
+    FLAT task space of (row, tile) can be strided across all ncore()
+    programs — at kimi t4k (epn=4, 32 programs) the row-strided form left 4
+    programs doing every transpose while 28 sat at the transport barriers."""
+    nt = tl.cdiv(F2, TN)
+    h0 = (tile // nt) * TM
+    f0 = (tile - (tile // nt) * nt) * TN
+    om = h0 + tl.arange(0, TM)     # H axis of dst
+    on_ = f0 + tl.arange(0, TN)    # F2 axis of dst
+    hm = om < H_dim
+    fn = on_ < F2
+    v = tl.load(
+        src_ptr + on_[None, :] * H_dim + om[:, None],
+        mask=hm[:, None] & fn[None, :], other=0.0)
+    tl.store(dst_ptr + om[:, None] * F2 + on_[None, :],
+             v, mask=hm[:, None] & fn[None, :])
 
 
 @triton.jit
@@ -801,39 +810,57 @@ def _mega_grad_seed_sink(
     window beside the cube P4a (window 1).  SINK_GU=1 seeds acc_gate_up
     (transposed into the table layout) and sinks the replica gate/up
     segments (transposed) — needs P5/B5, and runs in the B5->B6 window
-    beside the DOWN owner-pull (window 2).  Experts and slots strided across
-    programs — pure local copies, no cross-rank dependency.  Must run inside
-    a vector scope."""
+    beside the DOWN owner-pull (window 2).  Pure local copies, no cross-rank
+    dependency.  Must run inside a vector scope.
+
+    2026-09-13 re-partition: tasks are FLAT (row, tile/chunk) strided across
+    all programs — row 0..EPN-1 seeds home experts, rows EPN.. sink consumed
+    slots.  The old row-strided form left only min(rows, ncores) programs
+    eligible (epn=4 of 32 at kimi t4k, consumed ~1-2), serializing hundreds
+    of MB of transposes on a handful of programs while the rest sat at the
+    transport barriers.  Tile/chunk bodies, masks, and per-element value
+    order are unchanged."""
     n_down = H_dim * F_dim
     offs = tl.arange(0, BLK)
-    # seed: home expert e is physical row e; acc rows are per-expert disjoint
-    for e in range(pid, EPN, ncores):
-        e64 = e.to(tl.int64)
-        if SINK_GU:
-            _mega_grad_transpose(
-                acc_gate_up_ptr + e64 * H_dim * (2 * F_dim),
-                grad_fc1_ptr + e64 * (2 * F_dim) * H_dim,
-                H_dim, 2 * F_dim, TM, TN)
-        if SINK_DN:
-            for start in range(0, n_down, BLK):
-                m = (start + offs) < n_down
-                v = tl.load(grad_fc2_ptr + e64 * n_down + start + offs,
+    rows = EPN + consumed_count
+    if SINK_GU:
+        gu_tiles = tl.cdiv(H_dim, TM) * tl.cdiv(2 * F_dim, TN)
+        for task in range(pid, rows * gu_tiles, ncores):
+            row = task // gu_tiles
+            tile = task - row * gu_tiles
+            if row < EPN:
+                # seed: home expert e is physical row e; acc rows disjoint
+                row64 = row.to(tl.int64)
+                _mega_grad_transpose_tile(
+                    acc_gate_up_ptr + row64 * H_dim * (2 * F_dim),
+                    grad_fc1_ptr + row64 * (2 * F_dim) * H_dim,
+                    H_dim, 2 * F_dim, tile, TM, TN)
+            else:
+                # sink: consumed slot s carries the gradient of physical
+                # expert EPN + s (int64: 2*epn*2F*H can top 2^31)
+                slot = tl.load(consumed_ptr + (row - EPN))
+                slot64 = slot.to(tl.int64)
+                phys64 = (EPN + slot).to(tl.int64)
+                _mega_grad_transpose_tile(
+                    gate_up_slot_ptr + slot64 * H_dim * (2 * F_dim),
+                    grad_fc1_ptr + phys64 * (2 * F_dim) * H_dim,
+                    H_dim, 2 * F_dim, tile, TM, TN)
+    if SINK_DN:
+        dn_chunks = tl.cdiv(n_down, BLK)
+        for task in range(pid, rows * dn_chunks, ncores):
+            row = task // dn_chunks
+            start = (task - row * dn_chunks) * BLK
+            m = (start + offs) < n_down
+            if row < EPN:
+                row64 = row.to(tl.int64)
+                v = tl.load(grad_fc2_ptr + row64 * n_down + start + offs,
                             mask=m, other=0.0)
-                tl.store(acc_down_ptr + e64 * n_down + start + offs,
+                tl.store(acc_down_ptr + row64 * n_down + start + offs,
                          v.to(tl.float32), mask=m)
-    # sink: consumed slot s carries the gradient of physical expert EPN + s
-    for i in range(pid, consumed_count, ncores):
-        slot = tl.load(consumed_ptr + i)
-        slot64 = slot.to(tl.int64)
-        phys64 = (EPN + slot).to(tl.int64)   # int64: 2*epn*2F*H can top 2^31
-        if SINK_GU:
-            _mega_grad_transpose(
-                gate_up_slot_ptr + slot64 * H_dim * (2 * F_dim),
-                grad_fc1_ptr + phys64 * (2 * F_dim) * H_dim,
-                H_dim, 2 * F_dim, TM, TN)
-        if SINK_DN:
-            for start in range(0, n_down, BLK):
-                m = (start + offs) < n_down
+            else:
+                slot = tl.load(consumed_ptr + (row - EPN))
+                slot64 = slot.to(tl.int64)
+                phys64 = (EPN + slot).to(tl.int64)
                 v = tl.load(grad_fc2_ptr + phys64 * n_down + start + offs,
                             mask=m, other=0.0)
                 tl.store(down_slot_ptr + slot64 * n_down + start + offs,
@@ -857,49 +884,69 @@ def _mega_grad_owner_pull(
     PULL_DN=1 runs in the B5->B6 window (peers' down slots were sunk in the
     B2->B3 window and published by B3/B4 — nothing left to wait for at B5),
     PULL_GU=1 in the B6->exit window (gate/up slots are only published at
-    B6).  HOME experts strided across programs; each expert's (peer,
-    slot)-ordered descriptors are pulled chunk-wise (getmem, blocking) and
-    fp32-accumulated onto the seed — the per-table descriptor ORDER is
-    untouched by the split, so the fp32 result stays bit-identical to the
-    fused transport kernel's.  Per-expert accumulator rows are disjoint
-    across programs.  The self-owned slot branch is defensive only (the
-    planner forbids self-copies).  Must run inside a vector scope behind the
-    sub_vec0 gate (the fp32 RMW would double-add on the second subcore)."""
+    B6).  Each expert's (peer, slot)-ordered descriptors are pulled
+    chunk-wise (getmem, blocking) and fp32-accumulated onto the seed — the
+    per-table descriptor ORDER is untouched, so the fp32 result stays
+    bit-identical to the fused transport kernel's.  The self-owned slot
+    branch is defensive only (the planner forbids self-copies).  Must run
+    inside a vector scope behind the sub_vec0 gate (the fp32 RMW would
+    double-add on the second subcore).
+
+    2026-09-13 re-partition: tasks are FLAT (home, chunk) strided across all
+    programs — each task walks its home's FULL descriptor list in ordinal
+    order but moves only its own chunk.  Single writer per (home, chunk)
+    accumulator range (no cross-program RMW overlap, no atomics), and the
+    per-element fp32 addition order is exactly the old home-strided form's
+    (seed, then descriptor ordinals ascending).  The old home-strided form
+    gave EPN programs work max (4 of 32 at kimi t4k) and each serialized a
+    blocking getmem chain over every chunk — msprof showed the busiest
+    program at 28ms with GM_to_UB 4.8% utilized."""
     gu_row = staging_gu_ptr + pid.to(tl.int64) * GU_CHUNK
     dn_row = staging_dn_ptr + pid.to(tl.int64) * DN_CHUNK
-    for home in range(pid, EPN, ncores):
-        start = tl.load(home_offsets_ptr + home)
-        end = tl.load(home_offsets_ptr + home + 1)
-        for ordinal in range(start, end):
-            peer = tl.load(desc_peer_ptr + ordinal)
-            slot = tl.load(desc_slot_ptr + ordinal)
-            slot64 = slot.to(tl.int64)
-            if PULL_GU:
-                for cs in range(0, gu_elems, GU_CHUNK):
-                    cnt = tl.minimum(GU_CHUNK, gu_elems - cs)
-                    src = gate_up_slot_ptr + slot64 * gu_elems + cs
-                    if peer == LOCAL_RANK:
-                        _mega_grad_accum(
-                            acc_gate_up_ptr, src, home, cs, cnt, gu_elems,
-                            ACC_BLK)
-                    else:
-                        libshmem_device.getmem(gu_row, src, cnt * 2, peer)
-                        _mega_grad_accum(
-                            acc_gate_up_ptr, gu_row, home, cs, cnt, gu_elems,
-                            ACC_BLK)
-            if PULL_DN:
-                for cs in range(0, dn_elems, DN_CHUNK):
-                    cnt = tl.minimum(DN_CHUNK, dn_elems - cs)
-                    src = down_slot_ptr + slot64 * dn_elems + cs
-                    if peer == LOCAL_RANK:
-                        _mega_grad_accum(
-                            acc_down_ptr, src, home, cs, cnt, dn_elems,
-                            ACC_BLK)
-                    else:
-                        libshmem_device.getmem(dn_row, src, cnt * 2, peer)
-                        _mega_grad_accum(
-                            acc_down_ptr, dn_row, home, cs, cnt, dn_elems,
-                            ACC_BLK)
+    if PULL_GU:
+        gu_chunks = tl.cdiv(gu_elems, GU_CHUNK)
+        for task in range(pid, EPN * gu_chunks, ncores):
+            home = task // gu_chunks
+            cs = (task - home * gu_chunks) * GU_CHUNK
+            cnt = tl.minimum(GU_CHUNK, gu_elems - cs)
+            start = tl.load(home_offsets_ptr + home)
+            end = tl.load(home_offsets_ptr + home + 1)
+            for ordinal in range(start, end):
+                peer = tl.load(desc_peer_ptr + ordinal)
+                slot = tl.load(desc_slot_ptr + ordinal)
+                slot64 = slot.to(tl.int64)
+                src = gate_up_slot_ptr + slot64 * gu_elems + cs
+                if peer == LOCAL_RANK:
+                    _mega_grad_accum(
+                        acc_gate_up_ptr, src, home, cs, cnt, gu_elems,
+                        ACC_BLK)
+                else:
+                    libshmem_device.getmem(gu_row, src, cnt * 2, peer)
+                    _mega_grad_accum(
+                        acc_gate_up_ptr, gu_row, home, cs, cnt, gu_elems,
+                        ACC_BLK)
+    if PULL_DN:
+        dn_chunks = tl.cdiv(dn_elems, DN_CHUNK)
+        for task in range(pid, EPN * dn_chunks, ncores):
+            home = task // dn_chunks
+            cs = (task - home * dn_chunks) * DN_CHUNK
+            cnt = tl.minimum(DN_CHUNK, dn_elems - cs)
+            start = tl.load(home_offsets_ptr + home)
+            end = tl.load(home_offsets_ptr + home + 1)
+            for ordinal in range(start, end):
+                peer = tl.load(desc_peer_ptr + ordinal)
+                slot = tl.load(desc_slot_ptr + ordinal)
+                slot64 = slot.to(tl.int64)
+                src = down_slot_ptr + slot64 * dn_elems + cs
+                if peer == LOCAL_RANK:
+                    _mega_grad_accum(
+                        acc_down_ptr, src, home, cs, cnt, dn_elems,
+                        ACC_BLK)
+                else:
+                    libshmem_device.getmem(dn_row, src, cnt * 2, peer)
+                    _mega_grad_accum(
+                        acc_down_ptr, dn_row, home, cs, cnt, dn_elems,
+                        ACC_BLK)
 
 
 # ----------------------------------------------------------------------------
