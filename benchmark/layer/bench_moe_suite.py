@@ -2227,20 +2227,36 @@ def run_moonep_forward_benchmark(
 def _backward_gate(saved, dy, peer_mem):
     from mega_moe import moe_backward_triton
 
+    keys = ("grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2")
+    # The gate is finiteness/shape only, so the two full grad dicts (each
+    # ~12 GiB at kimi-k3 w8) never need to coexist: free the baseline before
+    # the candidate runs. The A3 bench cards co-host ~35 GiB of external
+    # tenants, and the previous hold-both-then-check form OOM'd inside the
+    # gate before any timed phase ran.
     with torch.no_grad():
         torch_result = backward_torch_baseline(saved, dy)
+        for key in keys:
+            if key not in torch_result:
+                raise AssertionError(f"backward baseline is missing {key}")
+            if not bool(torch.isfinite(torch_result[key].float()).all()):
+                raise AssertionError(f"backward baseline has non-finite {key}")
+        torch_keys = sorted(torch_result)
+        torch_shapes = {key: tuple(torch_result[key].shape) for key in keys}
+        del torch_result
+        torch.npu.empty_cache()
+
         triton_result = moe_backward_triton(saved, dy, peer_mem)
-    keys = ("grad_hidden", "grad_routing_weights", "grad_fc1_1", "grad_fc1_2", "grad_fc2")
-    for key in keys:
-        if key not in torch_result or key not in triton_result:
-            raise AssertionError(f"backward result is missing {key}")
-        if torch_result[key].shape != triton_result[key].shape:
-            raise AssertionError(f"backward gate shape mismatch for {key}")
-        if not bool(torch.isfinite(torch_result[key].float()).all()):
-            raise AssertionError(f"backward baseline has non-finite {key}")
-        if not bool(torch.isfinite(triton_result[key].float()).all()):
-            raise AssertionError(f"backward candidate has non-finite {key}")
-    return torch_result, triton_result
+        for key in keys:
+            if key not in triton_result:
+                raise AssertionError(f"backward candidate is missing {key}")
+            if tuple(triton_result[key].shape) != torch_shapes[key]:
+                raise AssertionError(f"backward gate shape mismatch for {key}")
+            if not bool(torch.isfinite(triton_result[key].float()).all()):
+                raise AssertionError(f"backward candidate has non-finite {key}")
+        triton_keys = sorted(triton_result)
+        del triton_result
+        torch.npu.empty_cache()
+    return torch_keys, triton_keys
 
 
 def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
@@ -2286,9 +2302,12 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             # Per-stage NPU-event breakdown of the default serial backward path
             # (dispatch / fc2_wgrad / swiglu / fc1_wgrad / combine). The library
             # records 6 events -> 5 intervals, MAX-reduced across ranks, appended
-            # to saved["_bwd_stage_samples"]. MOE_BWD_BREAKDOWN=0 disables.
+            # to saved["_bwd_stage_samples"]. MOE_BWD_BREAKDOWN=0 disables; the
+            # one-launch MOE_BWD_MEGA path has no per-stage events (and would
+            # leave the sample list empty, crashing _stats below).
             backward_breakdown = None
-            if os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0":
+            if (os.environ.get("MOE_BWD_BREAKDOWN", "1") != "0"
+                    and os.environ.get("MOE_BWD_MEGA") != "1"):
                 os.environ["MOE_BWD_STAGE_TIMING"] = "1"
                 os.environ["MOE_BWD_DUAL_STREAM"] = "0"   # stage timing needs the serial step2/3 path
                 saved["_bwd_stage_samples"] = []
@@ -2310,8 +2329,11 @@ def run_backward_benchmark(rank: int, world_size: int, case: CaseSpec):
             # Combine 3-phase breakdown (serial combine: gemm / push+barrier /
             # reduce) — splits the combine stage into its components. The serial
             # path disables the two-stream group overlap so the phases are clean.
+            # Skipped under MOE_BWD_MEGA (the combine lives inside the one
+            # launch; no phase samples would be recorded -> _stats([]) crash).
             combine_phase_breakdown = None
-            if os.environ.get("MOE_BWD_COMBINE_PHASE", "1") != "0":
+            if (os.environ.get("MOE_BWD_COMBINE_PHASE", "1") != "0"
+                    and os.environ.get("MOE_BWD_MEGA") != "1"):
                 os.environ["MOE_BWD_COMBINE_SERIAL"] = "1"
                 os.environ["MOE_COMBINE_PHASE_TIMING"] = "1"
                 saved["_combine_phase_samples"] = []
@@ -2404,6 +2426,8 @@ def _moonep_backward_transport_samples(
     dict's ``_bwd_stage_samples`` so the backward's stage intervals from all
     samples land in one list for the caller's breakdown.
     """
+    from mega_moe import moe_backward_triton
+
     samples_ms = []
     setup_ms = []
     for i in range(warmup + iterations):
@@ -2652,45 +2676,51 @@ def run_moonep_backward_benchmark(
                 transport_ms = statistics.median(transport_samples)
                 setup_stats = _stats(setup_samples, device)
 
-                _log_moonep_phase(rank, case, "collecting backward stage breakdown")
-                _bd_warmup = max(1, BACKWARD_TIMING.warmup)
-                stage_sink = []
-                os.environ["MOE_BWD_STAGE_TIMING"] = "1"
-                os.environ["MOE_BWD_DUAL_STREAM"] = "0"
-                try:
-                    _moonep_backward_transport_samples(
-                        device,
-                        ep_group,
-                        op,
-                        dy,
-                        peer_mem,
-                        hidden_states,
-                        selected_experts,
-                        packed_w1,
-                        down_weight,
-                        routing_weights,
-                        warmup=_bd_warmup,
-                        iterations=BACKWARD_TIMING.iterations,
-                        stage_samples=stage_sink,
+                # Per-stage breakdown of the SERIAL transport backward —
+                # skipped under MOE_BWD_MEGA: the one-launch path records no
+                # per-stage events (the generic runner's note), and the width
+                # assertion below would fail on the empty sample list.
+                backward_breakdown = None
+                if os.environ.get("MOE_BWD_MEGA") != "1":
+                    _log_moonep_phase(rank, case, "collecting backward stage breakdown")
+                    _bd_warmup = max(1, BACKWARD_TIMING.warmup)
+                    stage_sink = []
+                    os.environ["MOE_BWD_STAGE_TIMING"] = "1"
+                    os.environ["MOE_BWD_DUAL_STREAM"] = "0"
+                    try:
+                        _moonep_backward_transport_samples(
+                            device,
+                            ep_group,
+                            op,
+                            dy,
+                            peer_mem,
+                            hidden_states,
+                            selected_experts,
+                            packed_w1,
+                            down_weight,
+                            routing_weights,
+                            warmup=_bd_warmup,
+                            iterations=BACKWARD_TIMING.iterations,
+                            stage_samples=stage_sink,
+                        )
+                    finally:
+                        os.environ.pop("MOE_BWD_STAGE_TIMING", None)
+                        os.environ.pop("MOE_BWD_DUAL_STREAM", None)
+                    bd_samples = stage_sink[_bd_warmup:]
+                    stage_widths = {len(sample) for sample in bd_samples}
+                    if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
+                        raise AssertionError(
+                            "the MoonEP transport backward must record "
+                            f"{len(_MOONEP_BWD_STAGE_NAMES)} stage intervals, got "
+                            f"{sorted(stage_widths)}"
+                        )
+                    backward_breakdown = OrderedDict(
+                        (
+                            f"{name}_event_ms",
+                            _stats([sample[i] for sample in bd_samples], device),
+                        )
+                        for i, name in enumerate(_MOONEP_BWD_STAGE_NAMES)
                     )
-                finally:
-                    os.environ.pop("MOE_BWD_STAGE_TIMING", None)
-                    os.environ.pop("MOE_BWD_DUAL_STREAM", None)
-                bd_samples = stage_sink[_bd_warmup:]
-                stage_widths = {len(sample) for sample in bd_samples}
-                if stage_widths != {len(_MOONEP_BWD_STAGE_NAMES)}:
-                    raise AssertionError(
-                        "the MoonEP transport backward must record "
-                        f"{len(_MOONEP_BWD_STAGE_NAMES)} stage intervals, got "
-                        f"{sorted(stage_widths)}"
-                    )
-                backward_breakdown = OrderedDict(
-                    (
-                        f"{name}_event_ms",
-                        _stats([sample[i] for sample in bd_samples], device),
-                    )
-                    for i, name in enumerate(_MOONEP_BWD_STAGE_NAMES)
-                )
 
                 entry = {
                     "schema_version": 1,
@@ -2731,9 +2761,11 @@ def run_moonep_backward_benchmark(
                         "torch_ms": torch_ms,
                         "local_only_ms": local_ms,
                         "with_transport_ms": transport_ms,
-                        "grad_reduce_stage_ms": backward_breakdown[
-                            "grad_reduce_event_ms"
-                        ]["median_ms"],
+                        "grad_reduce_stage_ms": (
+                            backward_breakdown["grad_reduce_event_ms"]["median_ms"]
+                            if backward_breakdown is not None
+                            else None
+                        ),
                         "with_transport_over_torch": (
                             torch_ms / transport_ms if transport_ms > 0 else float("inf")
                         ),
