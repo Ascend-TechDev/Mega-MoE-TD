@@ -36,6 +36,8 @@ zero-receive/empty-expert, and negative/out-of-range all-drop comparison gates.
 Workload profiles:
     KIMI-K3: H=3584, F=3072, top-k=16, E=896,
              tokens/rank in {4096, 8192, 16384}; primary optimization target
+    KIMI-K3-TRIMMED: H=3584, F=3072, top-k=8, E=32, EP=8,
+                     tokens/rank=16384; multi-machine projection case
     QWEN: H=2048, F=768, top-k=8, E=128,
           tokens/rank in {4096, 8192, 16384}
     DSV4: H=7168, F=3072, top-k=6, E=384,
@@ -479,6 +481,13 @@ def _prepare_inputs(case: CaseSpec, rank, device, seed=43):
     hidden_states = torch.randn(
         (case.tokens, case.hidden), dtype=ACTIVATION_DTYPE, device=device
     ).mul_(0.5).contiguous()
+    if "moonep-skewed" in case.tags:
+        from benchmark.layer._kimi_routes import kimi_skewed_routes
+
+        selected_experts = kimi_skewed_routes(
+            case.tokens, case.num_experts, case.topk, rank).to(device)
+        logits = torch.randn((case.tokens, case.topk), dtype=ROUTING_INPUT_DTYPE, device=device)
+        return hidden_states, selected_experts, F.softmax(logits, dim=-1).contiguous()
     router_logits = torch.randn(
         (case.tokens, case.num_experts),
         dtype=ROUTING_INPUT_DTYPE,
@@ -2804,7 +2813,7 @@ _MOONEP_FORWARD_CASES = kit.make_pytest_params(
     for case in select_cases(
         direction="forward", tags={"performance", "kimi"}
     )
-    if case.world_size == 8
+    if case.world_size == 8 and case.model.upper() == "KIMI-K3"
     for route_profile in MOONEP_ROUTE_PROFILES
 )
 _BACKWARD_CASES = kit.make_pytest_params(

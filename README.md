@@ -37,7 +37,8 @@ src/mega_moe/
 ├── runtime/
 │   ├── workspace.py          # ACLSHMEM 对称内存及 workspace 生命周期
 │   └── routing.py            # 路由过滤、排序、计数交换和 offset
-├── kernels/                  # Triton JIT kernels 及 launcher
+└── kernels/                  # Triton JIT kernels 及 launcher
+    └── fused_forward.py      # 路由到 combine 的单次 all-core launch
 
 conftest.py                   # @pytest.mark.dist 多进程 HCCL 启动夹具
 
@@ -67,6 +68,19 @@ python -m pytest \
 python -m pytest \
   tests/layer/test_moe_suite.py -k 'backward and smoke' \
   -m dist -v -s
+```
+
+无 MoonEP 的单 kernel 前向通过
+`MoEForwardConfig(enable_single_kernel_forward=True)` 显式启用。当前范围是
+`return_saved=False` 且 `down_weight` 连续；路由、dispatch/FC1、加权激活、
+FC2、反向传输和 top-k combine 均在一次物理 all-core kernel launch 内完成。
+MoonEP 与 saved-forward 暂时继续使用原多 kernel 路径。
+
+8 卡 Kimi-K3 T4K 正确性用例：
+
+```bash
+MOE_FUSED_ASH_SIZE_GB=6 PYTHONPATH=src:. python -m pytest \
+  tests/layer/test_moe_suite.py::test_single_kernel_kimi_k3_t4k_w8 -v -s
 ```
 
 ### 性能测试（benchmark）
@@ -194,10 +208,14 @@ bigop grouped matmul/wgrad + `npu_swiglu_backward`，A2A 走 torch/HCCL）的
 `MOE_BWD_MEGA=1` 同样覆盖 MoonEP 物理布局（`use_moonep` saved）：P1 增加
 replica down 表的第二趟 fc2-dgrad 扫，P4a 的 GEMM 过 `tile_home_bound` 切
 home/replica 双权重表（均为 standalone kernel 双表模式的内联）；当前向借出
-对称 replica 表（`grad_transport`）时，M3 grad_reduce 链（seed+sink →
-owner-pull → zero）作为 P6a/P6b/P6c 尾相位并入同一次 launch，transport 的
-三条 barrier 变为内核 B5/B6/B7，尾 barrier #3 由 kernel 退出本身承担。fp32
-累加按 home 专家分区、(peer, slot) 描述符序保持 —— 与 fused transport
-kernel 逐位一致；host 侧 sink/`post_sink_hook` 被内核链取代（`sunk`/
-`reduced` 仍置位，槽位级 bit 精确断言在该模式下跳过，HCCL oracle 归约比对
-与 post-zero 检查仍然全量生效）。
+对称 replica 表（`grad_transport`）时，M3 grad_reduce 链并入同一次 launch，
+并按表拆分藏进已有窗口（2026-09-10 wave 重构）：w1 = seed acc_down + sink
+down 槽（B2→B3，骑 cube P4a 窗口）、w2 = sink gate/up ∥ down owner-pull
+（B5→B6）、w3 = gate/up owner-pull（B6→exit）；第三阶段（清零 consumed 槽）
+为 kernel 退出后的 host 侧流序操作。fp32 累加按 (home, chunk) 单写者分区、
+(peer, slot) 描述符序保持 —— 与 fused transport kernel 逐位一致；host 侧
+sink/`post_sink_hook` 被内核链取代（`sunk`/`reduced` 仍置位，槽位级 bit
+精确断言在该模式下跳过，HCCL oracle 归约比对与 post-zero 检查仍然全量
+生效）。2026-09-13 P6 任务进一步摊平到全部 program（(row, tile)/(home,
+chunk) 平铺任务空间，kimi t4k 尾 ~58ms → ~14ms、host wall 76.8 → 31.4ms，
+主线 stamps 不变）。
