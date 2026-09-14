@@ -96,7 +96,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from mega_moe import FusedMoEForward, MoEForwardConfig
 from mega_moe.kernels.combine_fc1_bwd import GATE_PAD
-from mega_moe.kernels.fc2_combine import _fc2_device_put_worker_layout
 from config import CaseSpec, select_cases
 from benchmark.layer._grouped_forward_baseline import GroupedForwardBaseline
 from tests import _moe_testkit as kit
@@ -1324,11 +1323,6 @@ def _make_entry(case, world_size, op, measured, route_distribution):
     """Build one schema-v1 forward result entry for one immutable case."""
     ascend_full = measured["ascend_full"]
     torch_grouped_full = measured["torch_grouped_full"]
-    _, device_put_workers = _fc2_device_put_worker_layout(
-        op.num_aivector_programs,
-        world_size,
-        op._fc2_pipeline_group_experts,
-    )
     device_properties = torch_npu.npu.get_device_properties(op.rank)
     entry = OrderedDict(
         {
@@ -1376,10 +1370,9 @@ def _make_entry(case, world_size, op, measured, route_distribution):
             "symmetric_heap_size_gb": G_ASH_SIZE_GB,
             "weighted_vector_programs": op.num_aivector_programs,
             "fc2_combine_transport": (
-                "aclshmem_device_putmem_striped_workers_stream_events"
+                "fused_cv_mixed_kernel_per_item_setwait_device_put"
             ),
             "fc2_pipeline_group_experts": op._fc2_pipeline_group_experts,
-            "fc2_reverse_vector_workers": device_put_workers,
             "fc2_reduce_programs": op.num_aivector_programs,
             "fc2_reduce_block_n_policy": (
                 "1024 if local received routes >= 1024 else 256"
