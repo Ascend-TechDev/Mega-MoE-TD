@@ -373,7 +373,7 @@ def _dispatch_one_source_tile_task(
     signal_epoch,
     hidden: tl.constexpr,
     stride_input_m,
-    LOCAL_RANK: tl.constexpr,
+    LOCAL_RANK,
     EXPERTS_PER_RANK: tl.constexpr,
     MAX_SOURCE_TILES: tl.constexpr,
     DISPATCH_BLOCK_SIZE_M: tl.constexpr,
@@ -381,7 +381,13 @@ def _dispatch_one_source_tile_task(
     source_tile_begin=0,
     source_tile_end=None,
 ):
-    """Dispatch the source-local tiles assigned to one lane of a nonempty bucket."""
+    """Dispatch the source-local tiles assigned to one lane of a nonempty bucket.
+
+    ``LOCAL_RANK`` is a runtime value: the single-kernel forward passes its
+    rank from a non-specialized launch argument so every rank shares one
+    compiled binary, while the multi-kernel caller keeps passing its
+    constexpr unchanged.
+    """
     task_start = tl.load(send_bucket_starts_ptr + task_id)
     task_count = tl.load(send_counts_re_ptr + task_id)
     task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)

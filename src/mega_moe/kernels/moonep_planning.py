@@ -28,6 +28,7 @@ def _kernel_moonep_b0_b1(
     tpe_all_ptr,
     expert_count_ptr,
     transfers_ptr,
+    allocation_ptr,
     R: tl.constexpr,
     E: tl.constexpr,
     EPN: tl.constexpr,
@@ -37,18 +38,27 @@ def _kernel_moonep_b0_b1(
 ):
     """Build MoonEP global counts and the B.1 transfer matrix."""
     offs_r = tl.arange(0, R)
+    source_lanes = tl.arange(0, triton.next_power_of_2(R))
+    # Masked lanes still form their physical address; clamp padded lanes
+    # into the table even though MoonEP worlds are powers of two.
+    safe_sources = tl.minimum(source_lanes, R - 1)
+    prior_mask = source_lanes[:, None] < R
 
     # B.0: global expert counts and home-group loads.  The caller validates
     # the published route totals once, before entering this collective kernel.
+    # One (R, BLOCK_E) gather per expert block replaces the per-source
+    # compile-time unroll, which explodes at wide worlds.
     group_tokens = tl.zeros((R,), dtype=tl.int64)
     for e0 in tl.static_range(0, E, BLOCK_E):
         offs_e = e0 + tl.arange(0, BLOCK_E)
-        expert_count = tl.zeros((BLOCK_E,), dtype=tl.int64)
-        for source in tl.static_range(0, R):
-            counts = tl.load(
-                tpe_all_ptr + source * ROW_STRIDE + offs_e
-            ).to(tl.int64)
-            expert_count += counts
+        counts = tl.load(
+            tpe_all_ptr
+            + safe_sources[:, None] * ROW_STRIDE
+            + offs_e[None, :],
+            mask=prior_mask,
+            other=0,
+        )
+        expert_count = tl.sum(counts, 0).to(tl.int64)
         tl.store(expert_count_ptr + offs_e, expert_count)
         home = offs_e // EPN
         group_tokens += tl.sum(
@@ -63,14 +73,30 @@ def _kernel_moonep_b0_b1(
 
     # B.1: greedily fill the most underloaded destination from the most
     # overloaded home group.  Both argmax and argmin ties choose low rank ids.
-    balance = group_tokens - capacity
-    transfers = tl.zeros((R, R), dtype=tl.int64)
+    # Balance and the transfer matrix live in global memory — this backend
+    # cannot lower vector selects carried through a dynamic scf.for (see
+    # _kernel_moonep_b2's note), and a register-resident (R, R) matrix would
+    # exceed vector UB at wide worlds.  A failed step leaves the state
+    # untouched, so recomputing the step predicate each iteration reproduces
+    # the old carried ``active`` flag exactly.
+    # The balance vector borrows allocation's first column as scratch: B.2
+    # fully rewrites allocation (zero stores then initial counts) before any
+    # reader consumes it, and the launches are barrier/stream ordered.
+    balance_ptr = allocation_ptr
+    tl.store(balance_ptr + offs_r, group_tokens - capacity)
+    row_tile: tl.constexpr = min(32, triton.next_power_of_2(R))
+    for r0 in range(0, R, row_tile):
+        rows = r0 + tl.arange(0, row_tile)
+        tl.store(
+            transfers_ptr + rows[:, None] * R + offs_r[None, :],
+            tl.zeros((row_tile, R), dtype=tl.int64),
+        )
     if R > 1:
-        active = True
-        for _ in tl.static_range(0, R - 1):
+        for _ in range(R - 1):
+            balance = tl.load(balance_ptr + offs_r)
             largest = tl.max(balance, axis=0)
             smallest = tl.min(balance, axis=0)
-            step = active & (largest > 0) & (smallest < 0)
+            step = (largest > 0) & (smallest < 0)
             source = tl.min(
                 tl.where(balance == largest, offs_r, R), axis=0
             )
@@ -78,22 +104,26 @@ def _kernel_moonep_b0_b1(
                 tl.where(balance == smallest, offs_r, R), axis=0
             )
             moved = -smallest
-            transfers = tl.where(
-                step
-                & (offs_r[:, None] == source)
-                & (offs_r[None, :] == destination),
+            safe_source = tl.where(step, source, 0)
+            safe_destination = tl.where(step, destination, 0)
+            # Each (source, destination) cell is written at most once (a
+            # chosen destination's balance becomes zero and can never be
+            # argmin again), so a plain masked store matches the old
+            # register-matrix semantics.
+            tl.store(
+                transfers_ptr + safe_source * R + safe_destination,
                 moved,
-                transfers,
+                mask=step,
             )
-            balance = tl.where(
-                step & (offs_r == source), balance - moved, balance
+            source_balance = tl.load(
+                balance_ptr + safe_source, mask=step, other=0
             )
-            balance = tl.where(step & (offs_r == destination), 0, balance)
-            active = step
-
-    tl.store(
-        transfers_ptr + offs_r[:, None] * R + offs_r[None, :], transfers
-    )
+            tl.store(
+                balance_ptr + safe_source,
+                source_balance - moved,
+                mask=step,
+            )
+            tl.store(balance_ptr + safe_destination, 0, mask=step)
     # This is the last planner access to the symmetric input.  Do not let a
     # faster rank publish its next tpe row while a peer still reads this one.
     if FINAL_BARRIER:
@@ -101,17 +131,22 @@ def _kernel_moonep_b0_b1(
 
 
 @triton.jit
-def _kernel_moonep_b2(
-    expert_count_ptr,
-    transfers_ptr,
-    allocation_ptr,
-    R: tl.constexpr,
-    E: tl.constexpr,
-    EPN: tl.constexpr,
-    BLE: tl.constexpr,
+def _moonep_b2_home(
+        home,
+        expert_count_ptr,
+        transfers_ptr,
+        allocation_ptr,
+        R: tl.constexpr,
+        E: tl.constexpr,
+        EPN: tl.constexpr,
+        BLE: tl.constexpr,
 ):
-    """Cut one home group per program according to MoonEP B.2."""
-    home = tl.program_id(axis=0)
+    """Cut one home group for ``home`` according to MoonEP B.2.
+
+    ``home`` is an explicit argument so single-kernel callers can stride one
+    program across several home groups when the EP world exceeds the
+    physical core count.
+    """
     offs_r = tl.arange(0, R)
     offs_le = tl.arange(0, BLE)
     valid_le = offs_le < EPN
@@ -186,6 +221,29 @@ def _kernel_moonep_b2(
 
 
 @triton.jit
+def _kernel_moonep_b2(
+        expert_count_ptr,
+        transfers_ptr,
+        allocation_ptr,
+        R: tl.constexpr,
+        E: tl.constexpr,
+        EPN: tl.constexpr,
+        BLE: tl.constexpr,
+):
+    """Grid entry: one home group per program (multi-kernel launch)."""
+    _moonep_b2_home(
+        tl.program_id(axis=0),
+        expert_count_ptr,
+        transfers_ptr,
+        allocation_ptr,
+        R,
+        E,
+        EPN,
+        BLE,
+    )
+
+
+@triton.jit
 def _kernel_moonep_alloc_cumsum(
     allocation_ptr,
     alloc_cumsum_ptr,
@@ -197,7 +255,9 @@ def _kernel_moonep_alloc_cumsum(
     offs_e = tl.program_id(axis=0) * BLOCK_E + tl.arange(0, BLOCK_E)
     valid_e = offs_e < E
     running = tl.zeros((BLOCK_E,), dtype=tl.int64)
-    for destination in tl.static_range(0, R):
+    # Dynamic loop: a compile-time unrolled version explodes at wide worlds.
+    # Pure accumulation carries fine through a dynamic scf.for.
+    for destination in range(0, R):
         allocation = tl.load(
             allocation_ptr + destination * E + offs_e,
             mask=valid_e,
@@ -212,19 +272,24 @@ def _kernel_moonep_alloc_cumsum(
 
 
 @triton.jit
-def _kernel_moonep_b3(
-    allocation_ptr,
-    experts_to_copy_ptr,
-    inverse_ptr,
-    replica_counts_ptr,
-    R: tl.constexpr,
-    E: tl.constexpr,
-    BE: tl.constexpr,
-    EPN: tl.constexpr,
-    B: tl.constexpr,
+def _moonep_b3_destination(
+        destination,
+        allocation_ptr,
+        experts_to_copy_ptr,
+        inverse_ptr,
+        replica_counts_ptr,
+        R: tl.constexpr,
+        E: tl.constexpr,
+        BE: tl.constexpr,
+        EPN: tl.constexpr,
+        B: tl.constexpr,
 ):
-    """Select remote experts and build ETC plus its inverse in one pass."""
-    destination = tl.program_id(axis=0)
+    """Select remote experts and build ETC plus its inverse in one pass.
+
+    ``destination`` is an explicit argument so single-kernel callers can
+    stride one program across several destinations when the EP world
+    exceeds the physical core count.
+    """
     offs_e = tl.arange(0, BE)
     valid_e = offs_e < E
     is_home = (offs_e >= destination * EPN) & (
@@ -267,6 +332,33 @@ def _kernel_moonep_b3(
         inverse_ptr + destination * E + offs_e,
         slot_of,
         mask=valid_e,
+    )
+
+
+@triton.jit
+def _kernel_moonep_b3(
+        allocation_ptr,
+        experts_to_copy_ptr,
+        inverse_ptr,
+        replica_counts_ptr,
+        R: tl.constexpr,
+        E: tl.constexpr,
+        BE: tl.constexpr,
+        EPN: tl.constexpr,
+        B: tl.constexpr,
+):
+    """Grid entry: one destination per program (multi-kernel launch)."""
+    _moonep_b3_destination(
+        tl.program_id(axis=0),
+        allocation_ptr,
+        experts_to_copy_ptr,
+        inverse_ptr,
+        replica_counts_ptr,
+        R,
+        E,
+        BE,
+        EPN,
+        B,
     )
 
 
@@ -330,6 +422,7 @@ def launch_moonep_b0_b3(
         tpe_all,
         expert_count,
         transfers,
+        allocation,
         R=world_size,
         E=num_experts,
         EPN=experts_per_rank,

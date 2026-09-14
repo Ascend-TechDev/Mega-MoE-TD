@@ -59,8 +59,6 @@ def main():
     case = resolve_case(args.case).validate()
     if not 0 <= args.rank < case.world_size:
         parser.error("rank must be in the selected case's world")
-    if args.cores < case.world_size:
-        parser.error("the pipeline requires at least one core per rank")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output directory must be new or empty")
     h, f = case.hidden, case.ffn
@@ -83,7 +81,10 @@ def main():
         stride_hidden_m=h, stride_hidden_k=1,
         stride_gate_up_e=h * 2 * f, stride_gate_up_n=1, stride_gate_up_k=2 * f,
         stride_down_e=h * f, stride_down_n=f, stride_down_k=1,
-        NUM_PROGRAM_CORES=args.cores, LOCAL_RANK=args.rank,
+        NUM_PROGRAM_CORES=args.cores,
+        # LOCAL_RANK is a non-specialized runtime argument, so every rank of
+        # the selected world compiles to the same binary; --rank only picks
+        # the representative for the report.
         WORLD_SIZE=case.world_size, NUM_EXPERTS=case.num_experts,
         EXPERTS_PER_RANK=case.experts_per_rank, TOPK=case.topk,
         HIDDEN=h, FFN=f, MAX_RECEIVED_ROUTES=max_recv,
@@ -101,6 +102,7 @@ def main():
         TS_SLOTS=FWD_TS_SLOTS, ACC_SLOTS=FWD_ACC_SLOTS,
         RING_SLOTS=fwd_ring_slots(max_pipeline_groups, physical_experts),
         TIMING=args.timing,
+        WORLD_SEARCH_STEPS=case.world_size.bit_length(),
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",

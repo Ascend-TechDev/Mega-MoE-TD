@@ -43,11 +43,13 @@ class MoEForwardContext:
     planning_experts_to_copy: Optional[torch.Tensor] = None
     planning_inverse_experts_to_copy: Optional[torch.Tensor] = None
     planning_replica_counts: Optional[torch.Tensor] = None
+    planning_source_prefix: Optional[torch.Tensor] = None
     metadata_counts_mem: Optional[torch.Tensor] = None
     metadata_num_bins: int = 0
     metadata_send_bucket_starts: Optional[torch.Tensor] = None
     metadata_send_bucket_dst_starts: Optional[torch.Tensor] = None
     metadata_recv_counts_re: Optional[torch.Tensor] = None
+    metadata_recv_seg_starts: Optional[torch.Tensor] = None
     metadata_recv_per_expert: Optional[torch.Tensor] = None
     metadata_recv_expert_offs: Optional[torch.Tensor] = None
     metadata_stats: Optional[torch.Tensor] = None
@@ -82,6 +84,7 @@ class MoEForwardContext:
         self.planning_experts_to_copy = None
         self.planning_inverse_experts_to_copy = None
         self.planning_replica_counts = None
+        self.planning_source_prefix = None
         if self.metadata_counts_mem is not None:
             ash.aclshmem_free_tensor(self.metadata_counts_mem)
             self.metadata_counts_mem = None
@@ -90,6 +93,7 @@ class MoEForwardContext:
         self.metadata_send_bucket_starts = None
         self.metadata_send_bucket_dst_starts = None
         self.metadata_recv_counts_re = None
+        self.metadata_recv_seg_starts = None
         self.metadata_recv_per_expert = None
         self.metadata_recv_expert_offs = None
         self.metadata_stats = None
@@ -235,6 +239,11 @@ def create_moe_forward_context(
         context.planning_replica_counts = torch.empty(
             world_size, dtype=torch.int32, device=device
         )
+        # Prior-source route-count prefix per expert; rebuilt on device every
+        # step so the scatter's destination lookup stays O(log R).
+        context.planning_source_prefix = torch.empty(
+            num_experts, dtype=torch.int32, device=device
+        )
         context.metadata_local_expert_starts = torch.empty(
             num_experts, dtype=torch.int32, device=device
         )
@@ -253,6 +262,14 @@ def create_moe_forward_context(
     )
     context.metadata_recv_counts_re = torch.empty(
         (world_size, physical_experts_per_rank),
+        dtype=torch.int32,
+        device=device,
+    )
+    # Per-expert source segment starts [EPR, W + 1] (sentinel = total rows);
+    # the single-kernel wave pipeline binary-searches it instead of scanning
+    # every source rank.
+    context.metadata_recv_seg_starts = torch.empty(
+        (physical_experts_per_rank, world_size + 1),
         dtype=torch.int32,
         device=device,
     )

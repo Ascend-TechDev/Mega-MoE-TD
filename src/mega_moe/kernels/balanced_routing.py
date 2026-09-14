@@ -7,7 +7,8 @@ import triton.language.extra.cann.extension as al
 
 
 @triton.jit
-def _kernel_build_balanced_count_cube(
+def _balanced_count_cube_destination(
+    destination,
     tpe_all_ptr,
     alloc_cumsum_ptr,
     experts_to_copy_ptr,
@@ -16,15 +17,20 @@ def _kernel_build_balanced_count_cube(
     R: tl.constexpr,
     E: tl.constexpr,
     EPN: tl.constexpr,
-    LOCAL_RANK: tl.constexpr,
+    LOCAL_RANK,
     TPE_ROW_STRIDE: tl.constexpr,
     COUNT_ROW_STRIDE: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_SLOTS: tl.constexpr,
     STORE_LOCAL_STARTS: tl.constexpr,
 ):
-    """Write one destination's disjoint count-cube slice per program."""
-    destination = tl.program_id(axis=0)
+    """Write one destination's disjoint count-cube slice.
+
+    ``destination`` is an explicit argument so single-kernel callers can
+    stride one program across several destinations when the EP world
+    exceeds the physical core count.  ``LOCAL_RANK`` is a runtime value so
+    the fused caller shares one binary across every rank.
+    """
     physical_slots: tl.constexpr = 2 * EPN
 
     with al.scope(core_mode="vector", disable_auto_sync=True):
@@ -38,7 +44,9 @@ def _kernel_build_balanced_count_cube(
         valid_slot = slot_offsets < physical_slots
         safe_slot_offsets = tl.minimum(slot_offsets, physical_slots - 1)
         destination_base = destination * physical_slots
-        for source in tl.static_range(0, R):
+        # Dynamic loop: the per-source clear is a pure store pattern, and a
+        # compile-time unroll would explode at wide worlds.
+        for source in range(0, R):
             tl.store(
                 counts_ptr
                 + source * COUNT_ROW_STRIDE
@@ -81,7 +89,7 @@ def _kernel_build_balanced_count_cube(
             other=0,
         )
         source_lo = tl.zeros((BLOCK_SLOTS,), dtype=tl.int32)
-        for source in tl.static_range(0, R):
+        for source in range(0, R):
             source_count = tl.load(
                 tpe_all_ptr + source * TPE_ROW_STRIDE + sel_expert
             )
@@ -125,6 +133,43 @@ def _kernel_build_balanced_count_cube(
                     mask=valid_expert & (destination == 0),
                 )
                 running += tl.sum(local_count, axis=0)
+
+
+@triton.jit
+def _kernel_build_balanced_count_cube(
+    tpe_all_ptr,
+    alloc_cumsum_ptr,
+    experts_to_copy_ptr,
+    counts_ptr,
+    local_expert_starts_ptr,
+    R: tl.constexpr,
+    E: tl.constexpr,
+    EPN: tl.constexpr,
+    LOCAL_RANK: tl.constexpr,
+    TPE_ROW_STRIDE: tl.constexpr,
+    COUNT_ROW_STRIDE: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    STORE_LOCAL_STARTS: tl.constexpr,
+):
+    """Grid entry: one destination per program (multi-kernel launch)."""
+    _balanced_count_cube_destination(
+        tl.program_id(axis=0),
+        tpe_all_ptr,
+        alloc_cumsum_ptr,
+        experts_to_copy_ptr,
+        counts_ptr,
+        local_expert_starts_ptr,
+        R,
+        E,
+        EPN,
+        LOCAL_RANK,
+        TPE_ROW_STRIDE,
+        COUNT_ROW_STRIDE,
+        BLOCK_E,
+        BLOCK_SLOTS,
+        STORE_LOCAL_STARTS,
+    )
 
 
 @triton.jit
