@@ -1,53 +1,54 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""BF16 Ascend Triton kernel for MoE FC2 and distributed combine.
+"""BF16 Ascend Triton kernel for MoE FC2 and distributed combine (v0).
 
-The input rows are already grouped as local-expert major, then source-rank
-major.  The production pipeline computes weighted SwiGLU on the Vector stream,
-feeds FC2 on the Cube stream, and then performs route-output transport and the
-final top-k reduction.  Vector programs resolve each source rank's symmetric
-combine workspace and put contiguous source/expert FC2 segments there before
-reducing locally.
+Step-1 fusion: the weighted SwiGLU activation, the FC2 GEMM, and the
+device-put transport from ``old_fc2_combine.py`` are folded into one mixed
+kernel (AIV0 -> AIC -> AIV1) while keeping the original numerical layout and
+computation byte-for-byte identical.
+
+The stage handoffs use coarse ``sync_block_all`` phase barriers plus a final
+rank-wide ``barrier_all`` that fences the remote puts before the caller's
+reduction kernel is released.  This preserves the old multi-kernel,
+three-stream event chain's end-to-end data contract:
+    weighted_activation -> peer_mem -> fc2_buf -> local top-k reduction.
 """
+
+import os
 
 import torch
 import triton
 import triton.language as tl
 from triton_dist.language.extra import libshmem_device
+from triton.language.extra.cann.extension import sub_vec_id
 import triton.language.extra.cann.extension as al
 
 from .weighted_swiglu import (
     _BLOCK_M as _WEIGHTED_BLOCK_M,
     _BLOCK_N as _WEIGHTED_BLOCK_N,
-    _weighted_activation_expert_group_kernel,
 )
 
 
 _ROUTE_BLOCK = 256
 _ACLSHMEM_PUTMEM_MAX_BYTES = (1 << 32) - 1
 
+# Event ids for the two cross-core handoffs.  Phase-level ``sync_block_all``
+# barriers proved too weak here: the counting barrier outside the cube scope
+# does not fence AIV0's GM stores against the Cube's phase-2 loads, so the
+# FC2 read stale activation rows and the failed ``-full`` cases were
+# nondeterministic across runs.  We use instead the semaphore
+# ``sync_block_set/wait`` pairs on a per-item basis -- all three stages walk
+# the same striped item sequence, so each program's handoffs pair 1:1:
+#   event 0: AIV0 -> AIC  "activation window ready in GM"
+#             (PIPE_MTE3 store -> PIPE_MTE2 load);
+#   event 2: AIC -> AIV1  "FC2 window ready in GM peer_mem"
+#             (PIPE_FIX store -> PIPE_MTE2 load).
+_ACT_TO_FC2_EVENT: tl.constexpr = 0
+_FC2_TO_PUT_EVENT: tl.constexpr = 2
+
 
 def _fc2_reduce_block_n(num_rows: int) -> int:
     """Return the validated reduction width for the current route count."""
     return 1024 if num_rows >= 1024 else 256
-
-
-def _fc2_device_put_worker_layout(
-    num_vector_programs: int,
-    world_size: int,
-    group_experts: int,
-) -> tuple[int, int]:
-    """Return ``(workers_per_source, worker_count)`` for device-put."""
-    if world_size <= 0 or group_experts <= 0:
-        raise ValueError("world_size and group_experts must be positive")
-    if num_vector_programs < world_size:
-        raise ValueError(
-            "device-put FC2 requires at least one Vector program per rank"
-        )
-    workers_per_source = min(
-        group_experts,
-        num_vector_programs // world_size,
-    )
-    return workers_per_source, world_size * workers_per_source
 
 
 def _validate_putmem_descriptor_capacity(max_rows: int, row_width: int) -> None:
@@ -209,131 +210,229 @@ def _fc2_gemm_one_mn_tile(
 
 
 @triton.jit
-def _kernel_fc2_expert_group(
-    input_ptr,
-    weight_ptr,
+def _kernel_fc2_combine_v0_mix(
+    fc1_output_ptr,
+    routing_weight_ptr,
+    down_weight_ptr,
+    replica_down_weight_ptr,
     peer_mem_ptr,
-    recv_per_expert_ptr,
-    recv_expert_offs_ptr,
-    stride_input_m,
-    stride_input_k,
-    stride_weight_e,
-    stride_weight_n,
-    stride_weight_k,
-    stride_peer_m,
-    stride_peer_n,
-    GROUP_FIRST_EXPERT: tl.constexpr,
-    GROUP_LAST_EXPERT: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    WEIGHT_EXPERT_BASE: tl.constexpr,
-):
-    """Cube-only FC2 for one contiguous expert group."""
-    pid = tl.program_id(0)
-    ncore = tl.num_programs(0)
-    with al.scope(core_mode="cube", disable_auto_sync=True):
-        num_n_tiles: tl.constexpr = N // BLOCK_N
-        first_task = GROUP_FIRST_EXPERT * num_n_tiles
-        last_task = GROUP_LAST_EXPERT * num_n_tiles
-        for task_id in range(pid + first_task, last_task, ncore):
-            expert_id = task_id // num_n_tiles
-            n_tile = task_id % num_n_tiles
-            expert_size = tl.load(recv_per_expert_ptr + expert_id)
-            expert_off = tl.load(recv_expert_offs_ptr + expert_id)
-            if expert_size > 0:
-                num_m_windows = tl.cdiv(expert_size, BLOCK_M)
-                for m_window in range(0, num_m_windows):
-                    row_start = expert_off + m_window * BLOCK_M
-                    row_count = tl.minimum(
-                        BLOCK_M,
-                        expert_size - m_window * BLOCK_M,
-                    )
-                    _fc2_gemm_one_mn_tile(
-                        input_ptr,
-                        weight_ptr,
-                        peer_mem_ptr,
-                        expert_id,
-                        row_start,
-                        row_count,
-                        n_tile,
-                        N,
-                        K,
-                        stride_input_m,
-                        stride_input_k,
-                        stride_weight_e,
-                        stride_weight_n,
-                        stride_weight_k,
-                        stride_peer_m,
-                        stride_peer_n,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_K,
-                        WEIGHT_EXPERT_BASE,
-                    )
-
-
-@triton.jit
-def _kernel_remote_put_transport_group(
-    reverse_buf_ptr,
-    peer_mem_ptr,
+    fc2_buf_ptr,
+    weighted_activation_ptr,
+    item_expert_ptr,
+    item_row_base_ptr,
+    item_row_count_ptr,
+    item_count_ptr,
     pull_tile_rank_ptr,
     pull_tile_src_start_ptr,
     pull_tile_dst_start_ptr,
     pull_tile_row_count_ptr,
+    stride_activation_m,
+    stride_activation_k,
+    stride_weight_e,
+    stride_weight_n,
+    stride_weight_k,
     stride_reverse_m,
-    GROUP_ID: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    EXPERTS_PER_RANK: tl.constexpr,
-    GROUP_EXPERTS: tl.constexpr,
-    WORKERS_PER_SOURCE: tl.constexpr,
     N: tl.constexpr,
+    K: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    ACTIVE_EXPERTS: tl.constexpr,
+    HOME_EXPERTS: tl.constexpr,
+    ACT_BLOCK_M: tl.constexpr,
+    ACT_BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    SITU_BETA: tl.constexpr,
+    SITU_LINEAR_BETA: tl.constexpr,
 ):
-    """Move one expert group's descriptors with striped workers per source."""
-    worker_id = tl.program_id(axis=0)
-    with al.scope(core_mode="vector", disable_auto_sync=True):
-        first_expert = GROUP_ID * GROUP_EXPERTS
-        source_rank = (worker_id // WORKERS_PER_SOURCE + GROUP_ID) % WORLD_SIZE
-        expert_lane = worker_id % WORKERS_PER_SOURCE
-        for expert_delta in tl.static_range(0, GROUP_EXPERTS):
-            if expert_delta % WORKERS_PER_SOURCE == expert_lane:
-                expert_id = first_expert + expert_delta
-                if expert_id < EXPERTS_PER_RANK:
-                    segment_id = expert_id * WORLD_SIZE + source_rank
-                    encoded_rank = tl.load(pull_tile_rank_ptr + segment_id)
-                    if encoded_rank >= 0:
-                        src_start = tl.load(
-                            pull_tile_src_start_ptr + segment_id
-                        ).to(tl.int64)
-                        dst_start = tl.load(
-                            pull_tile_dst_start_ptr + segment_id
-                        ).to(tl.int64)
-                        row_count = tl.load(
-                            pull_tile_row_count_ptr + segment_id
-                        ).to(tl.int64)
-                        # ACLSHMEM's ``*_putmem`` extern is byte-oriented,
-                        # despite selecting a dtype-specific symbol.
-                        libshmem_device.putmem(
-                            reverse_buf_ptr + dst_start * stride_reverse_m,
-                            peer_mem_ptr + src_start * N,
-                            row_count * N * 2,
-                            encoded_rank % WORLD_SIZE,
-                        )
+    """Single-launch per-item pipelined CV mix (AIV0 -> AIC -> AIV1).
 
+    ``peer_mem`` is the flat BF16 FC2 mailbox (expert-major received rows).
+    ``fc2_buf`` is the reverse buffer in stable send-row order on the
+    destination ranks.  Every stage walks the same striped item sequence
+    ``range(pid, num_items, ncore)`` over an item table of (expert,
+    row_base, row_count) M-windows (``row_count <= BLOCK_M``), so a given
+    program produces, computes, and ships the *same* items and the per-item
+    semaphore pairs are 1:1 on that program (no cross-program id stealing):
 
-@triton.jit
-def _kernel_remote_put_barrier():
-    """Fence grouped device-put RMA with the backend's barrier-sized grid.
+      event 0: AIV0 -> AIC  "activation window ready in GM"
+               (PIPE_MTE3 store -> PIPE_MTE2 load);
+      event 2: AIC -> AIV1  "FC2 window ready in peer_mem"
+               (PIPE_FIX store -> PIPE_MTE2 load).
 
-    On Ascend950DT, ``barrier_all_vec`` is tied to one participating Vector
-    block per AI Core.  The transport itself can use all physical Vector
-    programs, but putting the barrier inside a 64-block transport launch can
-    leave the collective waiting forever.  Keep the data movement launch and
-    the rank-wide barrier as separate, stream-ordered kernels; the latter is
-    launched with the Cube/AICore-sized grid by the helper below.
+    The tail ``barrier_all_vec`` fences every remote put before the caller's
+    final local-top-k reduction reads ``fc2_buf``.
     """
+    pid = tl.program_id(0)
+    ncore = tl.num_programs(0)
+    sub = sub_vec_id()
+    num_items = tl.load(item_count_ptr)
+
+    # AIV0 (sub-block 0): weighted gated activation for each owned item window.
+    # Each item holds up to ``BLOCK_M`` FC2 rows (item table granularity), so
+    # the rows are produced in ``ACT_BLOCK_M``-row sub-tiles; the whole item's
+    # activation is visible in GM before a single set releases the Cube.
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        for item in range(pid, num_items, ncore):
+            if sub == 0:
+                rb = tl.load(item_row_base_ptr + item).to(tl.int64)
+                rc = tl.load(item_row_count_ptr + item)
+                for m0 in range(0, rc, ACT_BLOCK_M):
+                    rcb = tl.minimum(ACT_BLOCK_M, rc - m0)
+                    offs_m = tl.arange(0, ACT_BLOCK_M)
+                    row64 = rb + m0 + offs_m.to(tl.int64)
+                    mask_m = offs_m < rcb
+                    weight = tl.load(
+                        routing_weight_ptr + row64, mask=mask_m, other=0.0
+                    ).to(tl.float32)
+                    for k_base in range(0, K, ACT_BLOCK_N):
+                        offs_n = k_base + tl.arange(0, ACT_BLOCK_N)
+                        k_mask = offs_n < K
+                        m = mask_m[:, None] & k_mask[None, :]
+                        gate = tl.load(
+                            fc1_output_ptr + row64[:, None] * (2 * K)
+                            + offs_n[None, :],
+                            mask=m, other=0.0,
+                        ).to(tl.float32)
+                        up = tl.load(
+                            fc1_output_ptr + row64[:, None] * (2 * K)
+                            + K + offs_n[None, :],
+                            mask=m, other=0.0,
+                        ).to(tl.float32)
+                        if ACTIVATION == 0:
+                            activated = gate * tl.sigmoid(gate) * up
+                        else:
+                            situ_a = (
+                                SITU_BETA * tl.math.tanh(gate / SITU_BETA)
+                                * tl.sigmoid(gate)
+                            )
+                            if HAS_LINEAR_BETA:
+                                up = SITU_LINEAR_BETA * tl.math.tanh(
+                                    up / SITU_LINEAR_BETA
+                                )
+                            activated = situ_a * up
+                        out = (activated * weight[:, None]).to(tl.bfloat16)
+                        tl.store(
+                            weighted_activation_ptr
+                            + row64[:, None] * stride_activation_m
+                            + offs_n[None, :] * stride_activation_k,
+                            out,
+                            mask=m,
+                        )
+            # Activation rows for this item are now visible in GM.
+            al.sync_block_set(
+                "vector", "cube", _ACT_TO_FC2_EVENT,
+                al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2,
+            )
+
+    # AIC (cube): FC2 for each owned item once its activation is ready.
+    with al.scope(core_mode="cube", disable_auto_sync=True):
+        for item in range(pid, num_items, ncore):
+            al.sync_block_wait(
+                "vector", "cube", _ACT_TO_FC2_EVENT,
+                al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2,
+            )
+            expert_id = tl.load(item_expert_ptr + item)
+            rb = tl.load(item_row_base_ptr + item).to(tl.int64)
+            rc = tl.load(item_row_count_ptr + item)
+            for n_tile in tl.static_range(0, N // BLOCK_N):
+                if expert_id < HOME_EXPERTS:
+                    _fc2_gemm_one_mn_tile(
+                        weighted_activation_ptr,
+                        down_weight_ptr,
+                        peer_mem_ptr,
+                        expert_id,
+                        rb,
+                        rc,
+                        n_tile,
+                        N,
+                        K,
+                        stride_activation_m,
+                        stride_activation_k,
+                        stride_weight_e,
+                        stride_weight_n,
+                        stride_weight_k,
+                        N,
+                        1,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        WEIGHT_EXPERT_BASE=0,
+                    )
+                else:
+                    _fc2_gemm_one_mn_tile(
+                        weighted_activation_ptr,
+                        replica_down_weight_ptr,
+                        peer_mem_ptr,
+                        expert_id,
+                        rb,
+                        rc,
+                        n_tile,
+                        N,
+                        K,
+                        stride_activation_m,
+                        stride_activation_k,
+                        stride_weight_e,
+                        stride_weight_n,
+                        stride_weight_k,
+                        N,
+                        1,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_K,
+                        WEIGHT_EXPERT_BASE=HOME_EXPERTS,
+                    )
+            # FC2 rows for this item are now visible in peer_mem.
+            al.sync_block_set(
+                "cube", "vector", _FC2_TO_PUT_EVENT,
+                al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2,
+            )
+
+    # AIV1 (sub-block 1): descriptor-based RMA transport once FC2 is ready.
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        if sub == 1:
+            for item in range(pid, num_items, ncore):
+                al.sync_block_wait(
+                    "cube", "vector", _FC2_TO_PUT_EVENT,
+                    al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2,
+                )
+                expert = tl.load(item_expert_ptr + item)
+                rb = tl.load(item_row_base_ptr + item).to(tl.int64)
+                rc = tl.load(item_row_count_ptr + item)
+                seg_base = expert * WORLD_SIZE
+                for source in tl.static_range(0, WORLD_SIZE):
+                    seg_id = seg_base + source
+                    rank = tl.load(pull_tile_rank_ptr + seg_id)
+                    seg_len = tl.load(
+                        pull_tile_row_count_ptr + seg_id
+                    ).to(tl.int64)
+                    if seg_len > 0:
+                        seg_lo = tl.load(
+                            pull_tile_src_start_ptr + seg_id
+                        ).to(tl.int64)
+                        ov_lo = tl.maximum(rb, seg_lo)
+                        ov_hi = tl.minimum(rb + rc, seg_lo + seg_len)
+                        ov_len = ov_hi - ov_lo
+                        if ov_len > 0:
+                            local_off = ov_lo - seg_lo
+                            dst_start = tl.load(
+                                pull_tile_dst_start_ptr + seg_id
+                            ).to(tl.int64)
+                            libshmem_device.putmem(
+                                fc2_buf_ptr
+                                + (dst_start + local_off) * stride_reverse_m,
+                                peer_mem_ptr + ov_lo * N,
+                                ov_len * N * 2,
+                                rank % WORLD_SIZE,
+                            )
+
+    # Fence every remote put before the caller's reduction kernel can run.
+    # ``barrier_all_vec`` is tied to one Vector block per AI-Core and is
+    # intentionally kept as a rank-wide tail (mirrors the proven transport
+    # barrier pattern); the per-item semaphores above already serialize the
+    # three stages on each program.
     libshmem_device.barrier_all_vec()
 
 
@@ -489,7 +588,167 @@ def prepare_fc2_device_put_metadata(
     )
 
 
-def _launch_fc2_device_put_pipeline(
+def _build_fc2_item_table(
+    received_routes_per_expert: torch.Tensor,
+    received_expert_offsets: torch.Tensor,
+    active_experts_per_rank: int,
+    block_m: int,
+    num_received_routes: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten (expert, M-window) work items from the received-row layout.
+
+    One entry is emitted for every non-empty ``block_m``-row window of each
+    active expert, in expert-major / M-window-minor order.  AIV0, AIC, and AIV1
+    all consume this exact item sequence (striped across AI cores), which is
+    what lets one per-core semaphore pair hand the activation / FC2 results
+    between the stages without cross-pid signal interference.
+
+    The table is built by a device kernel by default (see
+    ``_build_fc2_item_table_device``): the hot path must contain zero
+    ``.item()`` calls -- every ``.item()`` drains the whole stream queue, and
+    the previous host-side build turned the gap between
+    ``prepare_fc2_device_put_metadata`` and the mixed-kernel launch into a
+    multi-millisecond void where the device sat idle.  Set
+    ``FC2_V1_HOST_ITEM_TABLE=1`` to restore the synchronous host build for
+    one-variable A/B.
+    """
+    if os.environ.get("FC2_V1_HOST_ITEM_TABLE"):
+        return _build_fc2_item_table_host(
+            received_routes_per_expert,
+            received_expert_offsets,
+            active_experts_per_rank,
+            block_m,
+        )
+    return _build_fc2_item_table_device(
+        received_routes_per_expert,
+        received_expert_offsets,
+        active_experts_per_rank,
+        block_m,
+        num_received_routes,
+    )
+
+
+def _build_fc2_item_table_host(
+    received_routes_per_expert: torch.Tensor,
+    received_expert_offsets: torch.Tensor,
+    active_experts_per_rank: int,
+    block_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Synchronous host-side item-table build (diagnostic fallback)."""
+    device = received_routes_per_expert.device
+    expert, rb, rc = [], [], []
+    for e in range(active_experts_per_rank):
+        cnt = int(received_routes_per_expert[e].item())
+        base = int(received_expert_offsets[e].item())
+        for m in range(0, (cnt + block_m - 1) // block_m):
+            expert.append(e)
+            rb.append(base + m * block_m)
+            rc.append(min(block_m, cnt - m * block_m))
+    n = len(expert)
+    return (
+        torch.as_tensor(expert, dtype=torch.int32, device=device),
+        torch.as_tensor(rb, dtype=torch.int32, device=device),
+        torch.as_tensor(rc, dtype=torch.int32, device=device),
+        torch.as_tensor([n], dtype=torch.int32, device=device),
+    )
+
+
+def _build_fc2_item_table_device(
+    received_routes_per_expert: torch.Tensor,
+    received_expert_offsets: torch.Tensor,
+    active_experts_per_rank: int,
+    block_m: int,
+    num_received_routes: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the item table entirely on device -- no host sync on the hot path.
+
+    One program per active expert recomputes the expert-major item prefix
+    from the received counts (a scalar O(E) loop over at most a few dozen
+    experts), stores its own windows, and the last program stores the total.
+    Semantics match ``_build_fc2_item_table_host`` entry for entry: same
+    expert-major / M-window-minor order, same tail-window row-count shrink,
+    zero items for an empty expert.
+
+    Workspace sizing note: the table's true length is only known on device
+    (it depends on the per-expert received counts), so the buffers are
+    allocated at the static worst-case bound held by the caller --
+    ``num_received_routes`` entries (each M-window covers at least one
+    received row and windows never overlap, so the emitted item count can
+    never exceed the received-row count), floored at the expert count to
+    keep the E-sized program grid of the degenerate empty case valid.
+    Note ``received_routes_per_expert.numel()`` is the expert count, not a
+    row bound -- the first version sized the table to it and the window
+    stores ran off the end of an E-sized buffer, corrupting adjacent GM
+    allocations that later surfaced as faults in ``_kernel_local_topk_reduce``.
+    """
+    device = received_routes_per_expert.device
+    # TensorFactory warning noted elsewhere applies: base format is fine.
+    table_rows = max(num_received_routes, active_experts_per_rank)
+    expert = torch.empty(table_rows, dtype=torch.int32, device=device)
+    row_base = torch.empty_like(expert)
+    row_count = torch.empty_like(expert)
+    item_count = torch.zeros(1, dtype=torch.int32, device=device)
+    _build_fc2_item_table_kernel[(active_experts_per_rank, 1, 1)](
+        received_routes_per_expert,
+        received_expert_offsets,
+        expert,
+        row_base,
+        row_count,
+        item_count,
+        ACTIVE_EXPERTS=active_experts_per_rank,
+        BLOCK_M=block_m,
+    )
+    return expert, row_base, row_count, item_count
+
+
+@triton.jit
+def _build_fc2_item_table_kernel(
+    recv_per_expert_ptr,
+    recv_expert_offs_ptr,
+    item_expert_ptr,
+    item_row_base_ptr,
+    item_row_count_ptr,
+    item_count_ptr,
+    ACTIVE_EXPERTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Emit one M-window item per ``BLOCK_M`` rows of each active expert.
+
+    Program ``e`` owns expert ``e``'s windows.  Every program first sums
+    ``cdiv(count, BLOCK_M)`` over the *preceding* experts to find its
+    expert-major prefix -- a scalar O(E) loop that costs nothing at
+    E <= 32 -- so the flat item sequence is identical to the host build
+    without any host synchronization.
+    """
+    expert_id = tl.program_id(0)
+    prefix = tl.zeros((), dtype=tl.int32)
+    for prior in range(0, ACTIVE_EXPERTS):
+        prior_count = tl.load(recv_per_expert_ptr + prior)
+        prior_windows = tl.cdiv(prior_count, BLOCK_M)
+        if prior < expert_id:
+            prefix += prior_windows
+    count = tl.load(recv_per_expert_ptr + expert_id)
+    base = tl.load(recv_expert_offs_ptr + expert_id)
+    for window in range(0, tl.cdiv(count, BLOCK_M)):
+        item = prefix + window
+        tl.store(item_expert_ptr + item, expert_id)
+        tl.store(item_row_base_ptr + item, base + window * BLOCK_M)
+        tl.store(
+            item_row_count_ptr + item,
+            tl.minimum(BLOCK_M, count - window * BLOCK_M),
+        )
+    if expert_id == ACTIVE_EXPERTS - 1:
+        total = tl.load(recv_per_expert_ptr + ACTIVE_EXPERTS - 1)
+        windows = tl.cdiv(total, BLOCK_M)
+        for prior in range(0, ACTIVE_EXPERTS - 1):
+            prior_count = tl.load(recv_per_expert_ptr + prior)
+            windows += tl.cdiv(prior_count, BLOCK_M)
+        tl.store(item_count_ptr, windows)
+
+
+def _launch_fc2_combine_v0_kernel(
+    activation_fc1_output: torch.Tensor,
+    activation_routing_weights: torch.Tensor,
     weighted_activation: torch.Tensor,
     down_weight: torch.Tensor,
     replica_down_weight: torch.Tensor,
@@ -503,208 +762,77 @@ def _launch_fc2_device_put_pipeline(
     pull_tile_row_count: torch.Tensor,
     *,
     num_program_cores: int,
-    num_vector_programs: int,
     block_m: int,
     block_n: int,
     block_k: int,
     world_size: int,
     home_experts_per_rank: int,
-    physical_experts_per_rank: int,
     active_experts_per_rank: int,
-    pipeline_group_experts: int,
-    cube_stream,
-    vector_stream,
-    transfer_stream,
-    group_events,
-    start_event,
-    done_event,
-    prefetch_done_event,
-    activation_events,
-    activation_fc1_output,
-    activation_routing_weights,
-    activation_id: int = 0,
-    activation_situ_beta: float = 1.0,
-    activation_situ_linear_beta: float = 0.0,
-    activation_has_linear_beta: bool = False,
-    pipeline_group_ids: tuple[int, ...] | None = None,
+    activation_id: int,
+    activation_situ_beta: float,
+    activation_situ_linear_beta: float,
+    activation_has_linear_beta: bool,
 ) -> None:
-    """Overlap activation, coarse Cube groups, and device-put transport.
-
-    Activation, Cube, and transfer use separate streams. Runtime events publish
-    each completed expert group, and ``done_event`` gates the caller's
-    reduction.
-    """
-    experts_per_rank = active_experts_per_rank
-    num_dense_groups = (
-        experts_per_rank + pipeline_group_experts - 1
-    ) // pipeline_group_experts
-    if pipeline_group_ids is None:
-        scheduled_group_ids = range(num_dense_groups)
-    else:
-        # Events are compact step-local dependencies. Kernel group IDs remain
-        # physical so full-stride offsets and descriptors need no rewriting.
-        scheduled_group_ids = tuple(pipeline_group_ids)
-        if any(type(group_id) is not int for group_id in scheduled_group_ids):
-            raise TypeError("pipeline_group_ids must contain Python ints")
-        if scheduled_group_ids != tuple(sorted(set(scheduled_group_ids))):
-            raise ValueError(
-                "pipeline_group_ids must be strictly increasing and unique"
-            )
-        if any(
-            group_id < 0 or group_id >= num_dense_groups
-            for group_id in scheduled_group_ids
-        ):
-            raise ValueError("pipeline_group_ids contains an out-of-range group")
-    num_scheduled_groups = len(scheduled_group_ids)
-    if num_vector_programs <= 0:
-        raise ValueError("num_vector_programs must be positive")
-    if cube_stream is None or vector_stream is None or transfer_stream is None:
-        raise ValueError("FC2 pipeline streams must be provided")
-    if group_events is None or len(group_events) < num_scheduled_groups:
-        raise ValueError("FC2 pipeline requires one event per expert group")
-    if start_event is None or done_event is None:
-        raise ValueError("FC2 pipeline start and completion events must be provided")
-    if activation_events is None or len(activation_events) < num_scheduled_groups:
-        raise ValueError("FC2 production pipeline requires one activation event per expert group")
-    if activation_fc1_output is None or activation_routing_weights is None:
-        raise ValueError("FC2 production pipeline requires shadow activation inputs")
-
-    current_stream = torch.npu.current_stream(weighted_activation.device)
-    start_event.record(current_stream)
-    cube_stream.wait_event(start_event)
-    vector_stream.wait_event(start_event)
-    transfer_stream.wait_event(start_event)
-
+    """Launch the single CV activation/FC2/transport kernel."""
+    K = weighted_activation.shape[1]
     N = down_weight.shape[1]
-    K = down_weight.shape[2]
-    put_workers_per_source, put_worker_count = (
-        _fc2_device_put_worker_layout(
-            num_vector_programs,
-            world_size,
-            pipeline_group_experts,
-        )
+    launch_options = (
+        {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
+        if block_m * block_n > 128 * 256
+        else {}
     )
-    # Queue activation groups on the Vector stream. Cube consumes each group
-    # as soon as its event fires; device-put transport follows Cube on the
-    # independent transfer stream.
-    with torch.npu.stream(vector_stream):
-        for event_id, group_id in enumerate(scheduled_group_ids):
-            _weighted_activation_expert_group_kernel[(num_vector_programs,)](
-                activation_fc1_output,
-                activation_routing_weights,
-                weighted_activation,
-                received_expert_offsets,
-                group_id,
-                K,
-                activation_situ_beta,
-                activation_situ_linear_beta,
-                BLOCK_M=_WEIGHTED_BLOCK_M,
-                BLOCK_N=_WEIGHTED_BLOCK_N,
-                ACTIVATION=activation_id,
-                HAS_LINEAR_BETA=activation_has_linear_beta,
-                GROUP_EXPERTS=pipeline_group_experts,
-                EXPERTS_PER_RANK=experts_per_rank,
-            )
-            activation_events[event_id].record(vector_stream)
-
-    replica_prefetch_waited = False
-    for event_id, group_id in enumerate(scheduled_group_ids):
-        first_expert = group_id * pipeline_group_experts
-        last_expert = min(first_expert + pipeline_group_experts, experts_per_rank)
-        cube_stream.wait_event(activation_events[event_id])
-        with torch.npu.stream(cube_stream):
-            launch_options = (
-                {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
-                if block_m * block_n > 128 * 256
-                else {}
-            )
-            home_last = min(last_expert, home_experts_per_rank)
-            if first_expert < home_last:
-                _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
-                    weighted_activation,
-                    down_weight,
-                    peer_mem,
-                    received_routes_per_expert,
-                    received_expert_offsets,
-                    weighted_activation.stride(0),
-                    weighted_activation.stride(1),
-                    down_weight.stride(0),
-                    down_weight.stride(1),
-                    down_weight.stride(2),
-                    N,
-                    1,
-                    GROUP_FIRST_EXPERT=first_expert,
-                    GROUP_LAST_EXPERT=home_last,
-                    N=N,
-                    K=K,
-                    BLOCK_M=block_m,
-                    BLOCK_N=block_n,
-                    BLOCK_K=block_k,
-                    WEIGHT_EXPERT_BASE=0,
-                    **launch_options,
-                )
-            replica_first = max(first_expert, home_experts_per_rank)
-            if replica_first < last_expert:
-                if (
-                    prefetch_done_event is not None
-                    and not replica_prefetch_waited
-                ):
-                    cube_stream.wait_event(prefetch_done_event)
-                    replica_prefetch_waited = True
-                _kernel_fc2_expert_group[(num_program_cores, 1, 1)](
-                    weighted_activation,
-                    replica_down_weight,
-                    peer_mem,
-                    received_routes_per_expert,
-                    received_expert_offsets,
-                    weighted_activation.stride(0),
-                    weighted_activation.stride(1),
-                    replica_down_weight.stride(0),
-                    replica_down_weight.stride(1),
-                    replica_down_weight.stride(2),
-                    N,
-                    1,
-                    GROUP_FIRST_EXPERT=replica_first,
-                    GROUP_LAST_EXPERT=last_expert,
-                    N=N,
-                    K=K,
-                    BLOCK_M=block_m,
-                    BLOCK_N=block_n,
-                    BLOCK_K=block_k,
-                    WEIGHT_EXPERT_BASE=home_experts_per_rank,
-                    **launch_options,
-                )
-            group_events[event_id].record(cube_stream)
-
-    with torch.npu.stream(transfer_stream):
-        for event_id, group_id in enumerate(scheduled_group_ids):
-            transfer_stream.wait_event(group_events[event_id])
-            _kernel_remote_put_transport_group[(put_worker_count, 1, 1)](
-                fc2_buf,
-                peer_mem,
-                pull_tile_rank,
-                pull_tile_src_start,
-                pull_tile_dst_start,
-                pull_tile_row_count,
-                fc2_buf.stride(0),
-                GROUP_ID=group_id,
-                WORLD_SIZE=world_size,
-                EXPERTS_PER_RANK=experts_per_rank,
-                GROUP_EXPERTS=pipeline_group_experts,
-                WORKERS_PER_SOURCE=put_workers_per_source,
-                N=N,
-            )
-
-    # All group transports are ordered on the dedicated transfer stream.  A
-    # dedicated barrier-sized launch fences their RMA writes before the caller's
-    # current stream is released and before local reduction reads them.
-    with torch.npu.stream(transfer_stream):
-        if prefetch_done_event is not None:
-            transfer_stream.wait_event(prefetch_done_event)
-        _kernel_remote_put_barrier[(num_program_cores, 1, 1)]()
-
-    done_event.record(transfer_stream)
-    current_stream.wait_event(done_event)
+    (
+        item_expert,
+        item_row_base,
+        item_row_count,
+        item_count,
+    ) = _build_fc2_item_table(
+        received_routes_per_expert,
+        received_expert_offsets,
+        active_experts_per_rank,
+        block_m,
+        num_received_routes=weighted_activation.shape[0],
+    )
+    _kernel_fc2_combine_v0_mix[(num_program_cores, 1, 1)](
+        activation_fc1_output,
+        activation_routing_weights,
+        down_weight,
+        replica_down_weight,
+        peer_mem,
+        fc2_buf,
+        weighted_activation,
+        item_expert,
+        item_row_base,
+        item_row_count,
+        item_count,
+        pull_tile_rank,
+        pull_tile_src_start,
+        pull_tile_dst_start,
+        pull_tile_row_count,
+        weighted_activation.stride(0),
+        weighted_activation.stride(1),
+        down_weight.stride(0),
+        down_weight.stride(1),
+        down_weight.stride(2),
+        fc2_buf.stride(0),
+        N=N,
+        K=K,
+        WORLD_SIZE=world_size,
+        ACTIVE_EXPERTS=active_experts_per_rank,
+        HOME_EXPERTS=home_experts_per_rank,
+        ACT_BLOCK_M=_WEIGHTED_BLOCK_M,
+        ACT_BLOCK_N=_WEIGHTED_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        ACTIVATION=activation_id,
+        HAS_LINEAR_BETA=activation_has_linear_beta,
+        SITU_BETA=activation_situ_beta,
+        SITU_LINEAR_BETA=activation_situ_linear_beta,
+        disable_auto_inject_block_sync=True,
+        limit_auto_multi_buffer_buffer="no-limit",
+        **launch_options,
+    )
 
 
 def _launch_fc2_combine(
@@ -751,7 +879,7 @@ def _launch_fc2_combine(
     activation_has_linear_beta: bool = False,
     pipeline_group_ids: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Launch pipelined FC2, device-put transport, and local reduction."""
+    """Launch the fused FC2/combine kernel, then the local top-k reduction."""
     if weighted_activation.ndim != 2 or down_weight.ndim != 3:
         raise ValueError("weighted_activation must be [M, K] and down_weight must be [E, N, K]")
     if weighted_activation.dtype != torch.bfloat16 or down_weight.dtype != torch.bfloat16:
@@ -842,13 +970,11 @@ def _launch_fc2_combine(
         activation_routing_weights,
     )
     if any(value is None for value in activation_args):
-        raise ValueError("production FC2 requires all shadow activation arguments")
-    if pipeline_activation_events is None:
-        raise ValueError("coarse FC2 requires activation stream events")
-    if activation_fc1_output.shape != (M, 2 * K):
-        raise ValueError(
-            "shadow activation FC1 output must have shape [M, 2 * K]"
-        )
+        raise ValueError("fused FC2 requires activation inputs")
+    if activation_fc1_output.shape[1] != 2 * K:
+        raise ValueError("shadow activation FC1 output must have shape [M, 2 * K]")
+    if activation_fc1_output.ndim != 2:
+        raise ValueError("shadow activation FC1 output must be a 2D tensor")
     if activation_fc1_output.dtype != torch.bfloat16:
         raise TypeError("shadow activation FC1 output must use torch.bfloat16")
     if activation_routing_weights.shape != (M,):
@@ -920,7 +1046,12 @@ def _launch_fc2_combine(
 
     if reduce_block_n not in (256, 1024):
         raise ValueError("reduce_block_n must be the production value 256 or 1024")
-    _launch_fc2_device_put_pipeline(
+    # The fused CV kernel replaces the three per-group launches.  It consumes
+    # activation input directly, feeds FC2 through the GM working buffer, and
+    # performs all descriptor puts before returning to the caller's stream.
+    _launch_fc2_combine_v0_kernel(
+        activation_fc1_output,
+        activation_routing_weights,
         weighted_activation,
         down_weight,
         replica_down_weight,
@@ -933,32 +1064,20 @@ def _launch_fc2_combine(
         pull_tile_dst_start,
         pull_tile_row_count,
         num_program_cores=num_program_cores,
-        num_vector_programs=num_vector_programs,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         world_size=world_size,
         home_experts_per_rank=home_experts_per_rank,
-        physical_experts_per_rank=physical_experts_per_rank,
         active_experts_per_rank=active_experts_per_rank,
-        pipeline_group_experts=pipeline_group_experts,
-        pipeline_group_ids=pipeline_group_ids,
-        cube_stream=pipeline_cube_stream,
-        vector_stream=pipeline_vector_stream,
-        transfer_stream=pipeline_transfer_stream,
-        group_events=pipeline_group_events,
-        start_event=pipeline_start_event,
-        done_event=pipeline_done_event,
-        prefetch_done_event=prefetch_done_event,
-        activation_events=pipeline_activation_events,
-        activation_fc1_output=activation_fc1_output,
-        activation_routing_weights=activation_routing_weights,
         activation_id=activation_id,
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
         activation_has_linear_beta=activation_has_linear_beta,
     )
-    # The device-put barrier fences every route row before local reduction.
+
+    # The fused kernel has already fenced remote writes.  Keep the validated
+    # deterministic final route reduction on the caller stream.
     _kernel_local_topk_reduce[(num_vector_programs, 1, 1)](
         fc2_buf,
         route_to_send,
