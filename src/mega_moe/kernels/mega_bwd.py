@@ -162,6 +162,7 @@
 # ============================================================================
 
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -2247,6 +2248,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     device = dy.device
     rank = saved["ep_rank"]
     W = saved["world_size"]
+    # attribution probe: wrapper entry — splits the inter-launch gap into
+    # [prev launch -> entry] = framework autograd segment (pure host) vs
+    # [entry -> post-.item()] = wrapper prep + device drain of the queue.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-ent r{rank} t={time.time():.2f}]", flush=True)
 
     # P1 prep: expert-major gco (host gather) + cached dispatch maps.
     p1 = _prepare_dispatch_fc2_bwd(saved, dy)
@@ -2298,6 +2304,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # _mega_wgrad_sweep)
     max_rows_w = max(1, int(p4["expert_counts"].max().item()))
     pad_rows_w = max_rows_w
+    # attribution probe: right after the .item() device sync — everything
+    # queued by this rank's autograd up to here (prev mega kernel, framework
+    # dense backward, p1 gather) is now retired; the wall clock it took to
+    # get HERE past [mega-ent] is the device drain time.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-it r{rank} t={time.time():.2f}]", flush=True)
 
     # outputs (fresh, contiguous — strides passed to the kernel; the four
     # wgrad-sweep read targets carry the pad rows, returned keys are [:M]
@@ -2539,7 +2551,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     if os.environ.get("MOE_MEGA_COMBINE_BUF", "1") == "1":
         _rows = torch.tensor(
             [p4["B"] * p4["topk"]], dtype=torch.int64, device=device)
+        # attribution probe (attempt-4 perf anomaly): bracket the per-launch
+        # 1-elem sizing all_reduce — the 5-op baseline backward has no such
+        # collective and a degraded ~730ms/call would exactly explain the
+        # stable +17.5s/iter plateau from iter3 on.
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            print(f"[mega-ar r{rank} t={time.time():.2f}]", flush=True)
         dist.all_reduce(_rows, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            print(f"[mega-ar+done r{rank} t={time.time():.2f}]", flush=True)
         combine_buf = _ensure_mega_combine_buf(
             saved, int(_rows.item()) * (H + GATE_PAD))
     else:
@@ -2559,7 +2579,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             return t.data_ptr() - _base if t is not None else None
 
         print(
-            f"[mega-heap r{rank}] M={M} pad={pad_rows_w} "
+            f"[mega-heap r{rank} t={time.time():.2f}] M={M} pad={pad_rows_w} "
             f"peer_off={_off(peer_mem)} sig_off={_off(signal_mem)} "
             f"sig_n={signal_mem.numel()} "
             f"redis_off={_off(orig_in5) if saved_recompute else '-'} "
@@ -2741,6 +2761,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         kernel_moe_backward_mega[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             num_warps=8, **launch_options)
+    # attribution probe: launch call returned (async) — with [mega-it] this
+    # bounds the triton launch host overhead; with the NEXT [mega-ent] it
+    # bounds the pure-host autograd segment after this launch.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-post r{rank} t={time.time():.2f}]", flush=True)
 
     # expert-major peer_mem IS the sorted layout -> identity view (no gather),
     # exactly the alias step 1 returns.
