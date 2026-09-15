@@ -35,5 +35,5 @@ from .combine_fc1_bwd import (  # noqa: F401
 )
 from .mega_bwd import (  # noqa: F401
     mega_backward_triton,
-    kernel_moe_backward_mega,
+    kernel_moe_backward_mega_recompute,
 )

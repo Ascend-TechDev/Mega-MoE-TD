@@ -2263,8 +2263,11 @@ def run_moonep_backward_symmetric_hot_expert_case(
                         return_saved=True,
                     )
                     torch_result = backward_torch_baseline(home_saved, dy)
+                    # hidden_states kwarg: consumed only under
+                    # MOE_SAVED_RECOMPUTE=1 (backward-side recompute).
                     triton_result = moe_backward_triton(
-                        saved_phys, dy, peer_mem, grad_transport=transport
+                        saved_phys, dy, peer_mem, grad_transport=transport,
+                        hidden_states=hs,
                     )
                 _assert_moonep_replica_grad_shapes(
                     triton_result, saved_phys, experts_per_rank, hidden, ffn
@@ -2487,8 +2490,11 @@ def run_moonep_backward_symmetric_moderate_wide_case(
                         return_saved=True,
                     )
                     torch_result = backward_torch_baseline(home_saved, dy)
+                    # hidden_states kwarg: consumed only under
+                    # MOE_SAVED_RECOMPUTE=1 (backward-side recompute).
                     triton_result = moe_backward_triton(
-                        saved_phys, dy, peer_mem, grad_transport=transport
+                        saved_phys, dy, peer_mem, grad_transport=transport,
+                        hidden_states=hidden_states,
                     )
                 _assert_moonep_replica_grad_shapes(
                     triton_result, saved_phys, experts_per_rank, hidden, ffn
@@ -3827,8 +3833,11 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
                     )
                     torch_result = backward_torch_baseline(home_saved, dy)
                     # N3: the 5-op backward consumes the NATIVE saved dict.
+                    # hidden_states kwarg: consumed only under
+                    # MOE_SAVED_RECOMPUTE=1 (backward-side recompute).
                     triton_result = moe_backward_triton(
-                        native_saved, dy, peer_mem, grad_transport=transport
+                        native_saved, dy, peer_mem, grad_transport=transport,
+                        hidden_states=hs,
                     )
                 _assert_moonep_replica_grad_shapes(
                     triton_result, native_saved, experts_per_rank, hidden, ffn
