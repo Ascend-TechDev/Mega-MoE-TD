@@ -4393,6 +4393,217 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+def run_single_kernel_situglu_autograd_case(
+    rank: int, world_size: int
+) -> None:
+    """End-to-end gate for the single-kernel forward + mega recompute backward.
+
+    ``enable_single_kernel_forward`` returns the MINIMAL saved contract; ops/
+    function.py routes it through ``_single_saved_adapter`` (closed-form plan
+    tables + the two layout tripwires) and the backward runs the one-launch
+    mega kernel under ``MOE_BWD_MEGA=1`` + ``MOE_SAVED_RECOMPUTE=1``, which
+    recomputes the big activations in-launch instead of consuming them.  This
+    case pins that whole chain to the same SiTU eager golden as
+    ``run_megamoe_situglu_autograd_case`` — any layout drift in the adapter
+    (fc1_output / recv_weights_sorted pass-through) or the re-dispatch
+    recompute shows up as a gradient mismatch.
+    """
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
+    if MegaMoEFunction is None:
+        raise RuntimeError("MegaMoEFunction is unavailable")
+
+    # The single-kernel contract is only consumable by the recompute mega
+    # backward; set the gates for this case and restore them after (the suite
+    # may run other backward variants in the same process).
+    _bwd_env = {"MOE_BWD_MEGA": "1", "MOE_SAVED_RECOMPUTE": "1"}
+    _env_before = {k: os.environ.get(k) for k in _bwd_env}
+    os.environ.update(_bwd_env)
+
+    # E must stay <= 32: the kernel scatter's multi-bin-block path corrupts
+    # the send tables above 32 bins (adapter rejects it; see
+    # _single_saved_adapter).  At w8 use the exact Kimi-K3 integration shape
+    # (S=1024, H=7168, F=3072, topk=8, E=32, EPR=4); w2 is the small smoke.
+    if world_size == 8:
+        tokens, hidden, ffn, topk, num_experts = 1024, 7168, 3072, 8, 32
+    else:
+        tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = f"single-kernel-situglu-autograd-w{world_size}"
+
+    try:
+        with kit.aclshmem_session(
+            rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+        ):
+            peer_mem = kit.make_moonep_backward_peer_mem(
+                tokens * topk * world_size, tokens * topk, hidden, dtype, rank,
+                ep_group,
+            )
+            try:
+                op = FusedMoEForward(
+                    ep_group,
+                    max_tokens_per_rank=tokens,
+                    hidden_size=hidden,
+                    top_k=topk,
+                    num_experts=num_experts,
+                    config=MoEForwardConfig(
+                        receive_capacity_factor=float(world_size),
+                        activation="situglu",
+                        situ_beta=situ_beta,
+                        situ_linear_beta=situ_linear_beta,
+                        enable_single_kernel_forward=True,
+                        # single-kernel constraint: the two block sizes must
+                        # match (defaults are 256/256; set explicitly).
+                        fc1_gemm_block_size_m=256,
+                        fc2_combine_block_size_m=256,
+                    ),
+                )
+                try:
+                    w_gate, w_up = make_gate_up_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+                    packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                    w2 = make_down_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+                    # Droless inputs (no drop_frac): the adapter rejects
+                    # dropped routes — capacity_factor=world_size keeps them.
+                    hs, expert_indices = prepare_inputs(
+                        tokens, hidden, num_experts, topk, dtype, device,
+                        seed=2303 + rank,
+                    )
+                    routing_weights = make_routing_weights(
+                        tokens, topk, device, seed=2304 + rank
+                    )
+                    torch.manual_seed(2305 + rank)
+                    dy = torch.randn(
+                        tokens, hidden, dtype=dtype, device=device
+                    )
+
+                    # Same SiTU eager golden as the situglu autograd case.
+                    with torch.no_grad():
+                        _, golden_saved = moe_forward(
+                            hs, routing_weights, expert_indices, w_gate, w_up,
+                            w2, ep_group, topk, return_saved=True,
+                        )
+                        gate = golden_saved["gate"].float()
+                        up = golden_saved["up"].float()
+                        situ_a = (
+                            situ_beta
+                            * torch.tanh(gate / situ_beta)
+                            * torch.sigmoid(gate)
+                        )
+                        up_v = situ_linear_beta * torch.tanh(
+                            up / situ_linear_beta
+                        )
+                        golden_saved["swiglu_out_weighted"] = (
+                            situ_a
+                            * up_v
+                            * golden_saved["recv_weights_sorted"]
+                            .float()
+                            .unsqueeze(-1)
+                        ).to(dtype)
+                        golden_saved["activation"] = "situglu"
+                        golden_saved["situ_beta"] = situ_beta
+                        golden_saved["situ_linear_beta"] = situ_linear_beta
+                        golden = backward_torch_baseline(golden_saved, dy)
+
+                    state = SimpleNamespace(
+                        signal_mem=None, epoch=0, mega_persistent={}
+                    )
+
+                    def run_function_step():
+                        hidden_leaf = hs.clone().requires_grad_(True)
+                        routing_leaf = (
+                            routing_weights.clone().requires_grad_(True)
+                        )
+                        gate_up_leaf = packed_w1.clone().requires_grad_(True)
+                        down_leaf = w2.clone().requires_grad_(True)
+                        output = MegaMoEFunction.apply(
+                            op, hidden_leaf, routing_leaf, expert_indices,
+                            gate_up_leaf, down_leaf, peer_mem, state,
+                        )
+                        output.backward(dy)
+                        return (
+                            hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
+                        )
+
+                    dist.barrier()
+                    first_grads = _megamoe_function_grads(
+                        run_function_step(), ffn
+                    )
+                    for name, value in first_grads.items():
+                        if value is None or tuple(value.shape) != tuple(
+                            golden[name].shape
+                        ):
+                            raise AssertionError(
+                                f"{label}: grad {name} shape "
+                                f"{None if value is None else tuple(value.shape)}"
+                                f" != golden {tuple(golden[name].shape)}"
+                            )
+                    all_ok, details = compare_backward_gradients(
+                        first_grads, golden
+                    )
+                    epoch_after_first = state.epoch
+                    if state.signal_mem is None:
+                        raise AssertionError(
+                            f"{label}: the Function did not persist signal_mem "
+                            "in the caller state"
+                        )
+                    if not getattr(state, "mega_persistent", {}):
+                        raise AssertionError(
+                            f"{label}: the mega backward did not persist its "
+                            "slabs/epochs in state.mega_persistent"
+                        )
+
+                    # Slab/epoch reuse across steps must stay bitwise.
+                    second_grads = _megamoe_function_grads(
+                        run_function_step(), ffn
+                    )
+                    for name, again in second_grads.items():
+                        if not torch.equal(again, first_grads[name]):
+                            raise AssertionError(
+                                f"{label}: slab reuse changed grad {name}"
+                            )
+                    if state.epoch < epoch_after_first or state.epoch < 1:
+                        raise AssertionError(
+                            f"{label}: the Function did not advance/write back "
+                            f"the epoch (after first={epoch_after_first}, "
+                            f"after second={state.epoch})"
+                        )
+
+                    flag = torch.tensor(
+                        [1 if all_ok else 0], dtype=torch.int32, device=device
+                    )
+                    dist.all_reduce(
+                        flag, op=dist.ReduceOp.MIN, group=ep_group
+                    )
+                    if rank == 0 and not bool(flag.item()):
+                        print(
+                            f"{label} gradient details: {details}", flush=True
+                        )
+                    if not bool(flag.item()):
+                        raise AssertionError(
+                            f"{label}: single-kernel forward + mega recompute "
+                            "backward grads mismatched the SiTU eager golden"
+                        )
+                finally:
+                    op.finalize()
+            finally:
+                kit.ash.aclshmem_free_tensor(peer_mem)
+    finally:
+        for key, value in _env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 FUNCTIONAL_FORWARD_CASES = kit.make_pytest_params(
     select_cases(direction="forward", tags={"functional", "smoke"})
 )
@@ -4439,6 +4650,18 @@ def test_single_kernel_dynamic_waves_w8(dist_test, tokens, block_m):
 @pytest.mark.kimi
 def test_single_kernel_kimi_k3_t4k_w8(dist_test):
     dist_test(run_single_kernel_kimi_k3_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_situglu_autograd_w2(dist_test):
+    dist_test(run_single_kernel_situglu_autograd_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_situglu_autograd_w8(dist_test):
+    dist_test(run_single_kernel_situglu_autograd_case, world_size=8)
 
 
 @pytest.mark.dist

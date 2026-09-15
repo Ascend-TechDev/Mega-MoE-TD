@@ -122,11 +122,27 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # recv_hidden_sorted still aliases it would silently read garbage.
     recv_hidden_sorted = saved.get("recv_hidden_sorted")
     if recv_hidden_sorted is None:
-        raise ValueError(
-            "saved is missing recv_hidden_sorted; the fused backward requires "
-            "the activation section (replay saved or return_saved=True)"
+        # Single-kernel-forward minimal contract: the big activations are
+        # NOT saved — the fused mega backward re-derives them in-launch
+        # (recv_hidden via re-dispatch, act rows from fc1_output).  Only
+        # that one combination may run without recv_hidden_sorted; the
+        # 5-op orchestrator below still reads it directly.
+        _single_kernel_recompute = (
+            "recv_counts_by_source_expert" in saved
+            and "fc1_output" in saved
+            and "recv_weights_sorted" in saved
+            and os.environ.get("MOE_BWD_MEGA") == "1"
+            and os.environ.get("MOE_SAVED_RECOMPUTE", "0") == "1"
         )
-    if recv_hidden_sorted.data_ptr() == peer_mem.data_ptr():
+        if not _single_kernel_recompute:
+            raise ValueError(
+                "saved is missing recv_hidden_sorted; the fused backward requires "
+                "the activation section (replay saved or return_saved=True), or "
+                "the single-kernel minimal contract with MOE_BWD_MEGA=1 + "
+                "MOE_SAVED_RECOMPUTE=1"
+            )
+    if (recv_hidden_sorted is not None
+            and recv_hidden_sorted.data_ptr() == peer_mem.data_ptr()):
         raise ValueError(
             "saved['recv_hidden_sorted'] aliases peer_mem; the receive buffer "
             "is single-in-flight and was overwritten after dispatch — the "

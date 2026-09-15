@@ -94,6 +94,20 @@ class MegaMoEFunction(torch.autograd.Function):
                 routing_weights,
                 return_saved=True,
             )
+        if "recv_counts_by_source_expert" in saved:
+            # Single-kernel forward (enable_single_kernel_forward): the saved
+            # dict is the MINIMAL contract (fc1_output + receive-layout
+            # tables).  Expand it into the full backward contract — closed-form
+            # plan tables, weight references from the apply-time inputs (never
+            # the operator's per-call-refreshed staging buffers), scalars, and
+            # the two layout tripwires (see _single_saved_adapter).
+            from ._single_saved_adapter import enrich_single_kernel_saved
+            saved = enrich_single_kernel_saved(
+                op, saved,
+                hidden_states=hidden_states,
+                gate_up_weight=gate_up_weight,
+                down_weight=down_weight,
+            )
         # The saved intermediates are freshly computed views/clones (not the
         # forward inputs), and the weight views must stay pinned until the
         # backward — stash on ctx instead of save_for_backward, mirroring

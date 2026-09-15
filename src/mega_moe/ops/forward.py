@@ -1600,8 +1600,21 @@ class FusedMoEForward(torch.nn.Module):
         saved = {
             # Raw pre-activation gate/up GEMM results, expert-major receive
             # rows, [rows, gate F | up F] — one of the two intermediates the
-            # redesigned backward keeps.
-            "fc1_output": self._single_fc1_output[:num_received_routes],
+            # redesigned backward keeps.  Materialized as a copy: the mirror
+            # buffer is a fixed-address workspace rewritten by every call,
+            # and framework hosts share one operator across same-shape MoE
+            # layers, so the NEXT layer's forward would clobber this view
+            # before this layer's backward runs.
+            "fc1_output": self._single_fc1_output[:num_received_routes].clone(),
+            # Routing weight of each received row, same expert-major receive
+            # order as fc1_output (the dispatch wrote it beside every row;
+            # the combine consumed it per row).  The backward's swiglu
+            # backward and activation recompute both multiply by it.  FP32
+            # in transport, cast to BF16 here — the backward contract's
+            # dtype.
+            "recv_weights_sorted": self.context.routing_weight_mem[
+                :num_received_routes
+            ].to(torch.bfloat16),
             # Dispatch, saved in pre-dispatch form: the receive-side layout
             # tables the launch just wrote (receive row -> source segment ->
             # expert) plus references to the forward's own pre-dispatch
@@ -1628,11 +1641,14 @@ class FusedMoEForward(torch.nn.Module):
             "total_send": num_sent_routes,
             "total_recv": num_received_routes,
             "M": num_received_routes,
-            # Single-in-flight guards: every key above is either a workspace
-            # clone taken now, a fixed-address buffer slice rewritten by the
-            # next forward (fc1_output), or an input reference the caller
-            # must not mutate.  A later forward on this operator supersedes
-            # the whole dict.
+            # Single-in-flight guards: every key above is either a copy
+            # taken now (workspace clones / fc1_output / recv_weights_sorted)
+            # or an input reference the caller must not mutate
+            # (hidden_states / selected_experts / routing_weights — distinct
+            # tensors per layer, so a shared operator's next forward does
+            # not touch them).  A later forward on this operator still
+            # supersedes nothing but its own workspaces; the saved dict
+            # itself is now snapshot-safe across same-operator forwards.
             "_routing_generation": self._routing_generation,
             "_owner_token": id(self._routing_owner_token),
         }
