@@ -536,6 +536,8 @@ def run_single_kernel_forward_case(
                 )
             saved_keys = {
                 "fc1_output",
+                "fc1_output_scale",
+                "fc1_scale_group_size",
                 "hidden_states",
                 "selected_experts",
                 "routing_weights",
@@ -550,6 +552,8 @@ def run_single_kernel_forward_case(
                 "_owner_token",
             }
             experts_per_rank = num_experts // world_size
+            group_n = op.config.fc1_gemm_block_size_n // 2
+            num_groups = (2 * ffn) // group_n
             send_tables_ok = (
                 saved["send_token_indices"].shape
                 == saved["send_route_indices"].shape
@@ -587,14 +591,56 @@ def run_single_kernel_forward_case(
                 and recv_layout_ok
                 and tuple(saved["fc1_output"].shape)
                 == tuple(replay_saved["fc1_output"].shape)
+                # FP8 E4M3 payload + per-row/per-group FP32 scales.
+                and saved["fc1_output"].dtype == torch.float8_e4m3fn
+                and saved["fc1_output_scale"].dtype == torch.float32
+                and int(saved["fc1_scale_group_size"]) == group_n
+                and tuple(saved["fc1_output_scale"].shape)
+                == (int(saved["total_recv"]), num_groups)
             )
             if saved_ok:
                 try:
+                    # Grouped error bound for the E4M3 quantized save:
+                    # dequantize with the saved scales and compare against
+                    # the replay oracle per column group.  E4M3 round-to-
+                    # nearest is bounded by 1/16 of the value (a truncating
+                    # backend doubles that to 1/8), and the two GEMM
+                    # implementations themselves differ by ~2e-2, so a
+                    # 0.15 x group-amax bound covers both with margin.
+                    ref = replay_saved["fc1_output"].float()
+                    deq = (
+                        saved["fc1_output"].float()
+                        .view(int(saved["total_recv"]), num_groups, group_n)
+                        * saved["fc1_output_scale"][:, :, None]
+                    ).view(ref.shape)
+                    group_amax = (
+                        ref.view(ref.shape[0], num_groups, group_n)
+                        .abs()
+                        .amax(dim=-1)
+                    )
+                    err = (deq - ref).abs().view(
+                        ref.shape[0], num_groups, group_n
+                    )
+                    if not bool((err <= 0.15 * group_amax + 1e-3).all()):
+                        raise AssertionError(
+                            "dequantized fc1 exceeds the grouped error bound "
+                            f"(max {float(err.max().item()):.4f})"
+                        )
+                    # The scale must be the group amax / 448 (E4M3 max);
+                    # near-zero groups keep the kernel's 1/448 sentinel, and
+                    # the relative GEMM difference between the two sides
+                    # inflates small amaxes, so the bound stays loose — its
+                    # job is catching a misaligned scale table, which would
+                    # explode the error bound above, not re-measuring fp8.
+                    expected_scale = torch.where(
+                        group_amax > 1e-3, group_amax,
+                        torch.ones_like(group_amax),
+                    ) / 448.0
                     assert_close(
-                        saved["fc1_output"].float(),
-                        replay_saved["fc1_output"].float(),
-                        rtol=NATIVE_SAVED_H2_RTOL,
-                        atol=NATIVE_SAVED_H2_ATOL,
+                        saved["fc1_output_scale"],
+                        expected_scale,
+                        rtol=1e-1,
+                        atol=1e-3,
                     )
                 except AssertionError:
                     saved_ok = False

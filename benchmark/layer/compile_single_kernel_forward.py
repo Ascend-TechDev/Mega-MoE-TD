@@ -85,16 +85,22 @@ def main():
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",
         "peer_mem_ptr", "combine_buf_ptr", "fc2_output_ptr",
-        "weighted_activation_ptr", "fc1_output_ptr", "output_ptr",
+        "weighted_activation_ptr", "output_ptr",
         "replica_gate_ptr", "replica_down_ptr",
     }
-    fp32_inputs = {"routing_weights_ptr", "routing_weight_recv_ptr"}
+    # The saved FC1 mirror stores E4M3-quantized gate/up results.
+    fp8_inputs = {"fc1_output_ptr"}
+    fp32_inputs = {
+        "routing_weights_ptr", "routing_weight_recv_ptr", "fc1_scale_ptr",
+    }
     signature = {}
     for name in _kernel_fused_forward.arg_names:
         if name in constants:
             signature[name] = "constexpr"
         elif name in bf16_inputs:
             signature[name] = "*bf16"
+        elif name in fp8_inputs:
+            signature[name] = "*fp8e4nv"
         elif name in fp32_inputs:
             signature[name] = "*fp32"
         elif name in ("gate_notify_ptr", "down_notify_ptr"):
