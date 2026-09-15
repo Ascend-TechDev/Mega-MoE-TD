@@ -45,6 +45,7 @@ from mega_moe.kernels.weighted_swiglu import (
 )
 from tests import _moe_testkit as kit
 from tests._moe_baselines import (
+    _compare_full_output,
     backward_torch_baseline,
     build_backward_saved,
     compare_backward_gradients,
@@ -474,6 +475,137 @@ def run_single_kernel_forward_case(
                 rank,
                 device,
             )
+
+            # return_saved=True drives the same single launch and returns the
+            # redesigned backward contract: the raw FC1 GEMM result plus the
+            # dispatch in pre-dispatch form (input references + receive
+            # layout tables, no materialized receive clone).  The replay
+            # oracle cannot replay dropped routes, so this sub-case uses its
+            # own dropless inputs.
+            saved_hs, saved_experts = prepare_inputs(
+                tokens,
+                hidden,
+                num_experts,
+                topk,
+                dtype,
+                device,
+                seed=7300 + rank,
+            )
+            saved_weights = make_routing_weights(
+                tokens, topk, device, seed=7400 + rank,
+            )
+            dist.barrier(group=ep_group)
+            with torch.no_grad():
+                saved_output, saved = op.forward(
+                    saved_hs,
+                    saved_experts,
+                    packed_w1,
+                    w2,
+                    saved_weights,
+                    return_saved=True,
+                )
+            saved_golden = torch_moe_fwd_golden(
+                saved_hs,
+                saved_weights,
+                saved_experts,
+                w_gate,
+                w_up,
+                w2,
+                num_experts,
+                ep_group,
+            )
+            all_passed &= _compare_full_output(
+                saved_output,
+                saved_golden,
+                f"single-kernel-forward-w{world_size}-saved-output",
+                rank,
+                device,
+                ep_group,
+            )
+            with torch.no_grad():
+                _, replay_saved = moe_forward(
+                    saved_hs,
+                    saved_weights,
+                    saved_experts,
+                    w_gate,
+                    w_up,
+                    w2,
+                    ep_group,
+                    topk,
+                    return_saved=True,
+                )
+            saved_keys = {
+                "fc1_output",
+                "hidden_states",
+                "selected_experts",
+                "routing_weights",
+                "recv_expert_offsets",
+                "recv_counts_by_source_expert",
+                "send_token_indices",
+                "send_route_indices",
+                "total_send",
+                "total_recv",
+                "M",
+                "_routing_generation",
+                "_owner_token",
+            }
+            experts_per_rank = num_experts // world_size
+            send_tables_ok = (
+                saved["send_token_indices"].shape
+                == saved["send_route_indices"].shape
+                and int(saved["send_token_indices"].numel())
+                == int(saved["total_send"])
+                and int(saved["total_send"])
+                == int(replay_saved["total_send"])
+                and bool(
+                    (saved["send_token_indices"] >= 0).all()
+                    and (saved["send_token_indices"] < tokens).all()
+                )
+            )
+            recv_layout_ok = (
+                tuple(saved["recv_counts_by_source_expert"].shape)
+                == (world_size, experts_per_rank)
+                and int(saved["recv_counts_by_source_expert"].sum().item())
+                == int(saved["total_recv"])
+                and int(saved["recv_expert_offsets"].numel())
+                == experts_per_rank + 1
+                and int(saved["recv_expert_offsets"][-1].item())
+                == int(saved["total_recv"])
+            )
+            saved_ok = (
+                set(saved) == saved_keys
+                and saved.get("_owner_token") == id(op._routing_owner_token)
+                and saved.get("_routing_generation")
+                == op._routing_generation
+                # Pre-dispatch references are zero-copy views of the inputs.
+                and saved["hidden_states"] is saved_hs
+                and saved["selected_experts"] is saved_experts
+                and saved["routing_weights"] is saved_weights
+                and int(saved["total_recv"]) == int(replay_saved["total_recv"])
+                and int(saved["M"]) == int(saved["total_recv"])
+                and send_tables_ok
+                and recv_layout_ok
+                and tuple(saved["fc1_output"].shape)
+                == tuple(replay_saved["fc1_output"].shape)
+            )
+            if saved_ok:
+                try:
+                    assert_close(
+                        saved["fc1_output"].float(),
+                        replay_saved["fc1_output"].float(),
+                        rtol=NATIVE_SAVED_H2_RTOL,
+                        atol=NATIVE_SAVED_H2_ATOL,
+                    )
+                except AssertionError:
+                    saved_ok = False
+            if not saved_ok:
+                print(
+                    f"[rank {rank}] single-kernel-forward-w{world_size}: "
+                    "saved contract (fc1 + pre-dispatch tables) mismatched "
+                    "the replay oracle",
+                    flush=True,
+                )
+            all_passed &= saved_ok
         finally:
             op.finalize()
 

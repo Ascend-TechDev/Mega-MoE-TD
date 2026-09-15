@@ -324,16 +324,20 @@ def _wait_fc1_vector_ack(SLOT: tl.constexpr):
 @triton.jit
 def _partition_pipeline_fc1_activation_group_ub(
         pid, input_ptr, signal_mem_ptr, weight_ptr, routing_weight_ptr, output_ptr,
-        recv_expert_offs_ptr, recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+        fc1_output_ptr, recv_expert_offs_ptr, recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
         stride_input_m, stride_input_k, stride_weight_e, stride_weight_n, stride_weight_k,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_WINDOWS: tl.constexpr,
         FC1_CORES: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        FULL_GROUP: tl.constexpr, wave_expert, wave_row_start, wave_rows,
+        FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, wave_expert, wave_row_start, wave_rows,
         replica_ready_ptr, WEIGHT_EXPERT_BASE: tl.constexpr,
         WAIT_REPLICA: tl.constexpr):
-    """Pipeline FC1 gate/up tiles through UB directly into activation output."""
+    """Pipeline FC1 gate/up tiles through UB directly into activation output.
+
+    ``SAVE_FC1`` mirrors the raw gate/up Fixpipe results (pre-activation,
+    pre-routing-weight, BF16) into ``fc1_output_ptr`` using the historical
+    ``[rows, gate F | up F]`` FC1-output layout, for the saved forward."""
     pair_block_m: tl.constexpr = BLOCK_M
     pair_block_n: tl.constexpr = BLOCK_N // 2
     vector_block_m: tl.constexpr = pair_block_m // 2
@@ -547,15 +551,17 @@ def _partition_pipeline_fc1_activation_group_ub(
                     up_view_1 = up_buffer_1.subview([row_chunk, 0],
                                                     [activation_block_m, pair_block_n], [1, 1])
                     if previous_step % 2 == 0:
-                        gate = bl.to_tensor(gate_view_0,
-                                            writable=False).to(tl.float32)
-                        up = bl.to_tensor(up_view_0,
-                                          writable=False).to(tl.float32)
+                        gate_raw = bl.to_tensor(gate_view_0,
+                                                writable=False)
+                        up_raw = bl.to_tensor(up_view_0,
+                                              writable=False)
                     else:
-                        gate = bl.to_tensor(gate_view_1,
-                                            writable=False).to(tl.float32)
-                        up = bl.to_tensor(up_view_1,
-                                          writable=False).to(tl.float32)
+                        gate_raw = bl.to_tensor(gate_view_1,
+                                                writable=False)
+                        up_raw = bl.to_tensor(up_view_1,
+                                              writable=False)
+                    gate = gate_raw.to(tl.float32)
+                    up = up_raw.to(tl.float32)
                     if ACTIVATION == 0:
                         activated = gate * tl.sigmoid(gate) * up
                     else:
@@ -591,6 +597,21 @@ def _partition_pipeline_fc1_activation_group_ub(
                             cols[None, :],
                             activated,
                             mask=mask_m[:, None] & mask_n[None, :])
+                    if SAVE_FC1:
+                        # Raw gate/up GEMM results (pre-activation,
+                        # pre-routing-weight) in the historical
+                        # [rows, gate F | up F] FC1-output layout.
+                        fc1_group_ptr = (
+                            fc1_output_ptr + output_group_row * (2 * FFN))
+                        fc1_row_ptr = (
+                            fc1_group_ptr
+                            + (local_row_start + local_rows)[:, None]
+                            * (2 * FFN)
+                            + cols[None, :])
+                        fc1_store_mask = mask_m[:, None] & mask_n[None, :]
+                        tl.store(fc1_row_ptr, gate_raw, mask=fc1_store_mask)
+                        tl.store(fc1_row_ptr + FFN, up_raw,
+                                 mask=fc1_store_mask)
                 if previous_step % 2 == 0:
                     al.sync_block_set('vector', 'cube', 10,
                                       al.PIPE.PIPE_MTE3, al.PIPE.PIPE_FIX)
@@ -847,7 +868,7 @@ def _reduce_topk_rows(pid, combine_buf_ptr, route_to_send_ptr, output_ptr,
 def _run_dynamic_wave_pipeline(
         pid, hidden_states_ptr, gate_up_weight_ptr, down_weight_ptr, routing_weights_ptr,
         peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
-        weighted_activation_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
+        weighted_activation_ptr, fc1_output_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
@@ -858,7 +879,7 @@ def _run_dynamic_wave_pipeline(
         MAX_SOURCE_TILES: tl.constexpr, MAX_WAVES: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr,
         BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr, FC1_BLOCK_K: tl.constexpr,
         FC2_BLOCK_N: tl.constexpr, FC2_BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
-        ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+        ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr, SAVE_FC1: tl.constexpr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
     global_waves = 0
@@ -915,24 +936,24 @@ def _run_dynamic_wave_pipeline(
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, recv_expert_offs_ptr,
                                     recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, expert,
                                     begin, end - begin, gate_ready_ptr,
                                     HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
                             else:
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, recv_expert_offs_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, recv_expert_offs_ptr,
                                     recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, expert,
                                     begin, end - begin, gate_ready_ptr,
                                     HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
             with al.scope(core_mode='vector', disable_auto_sync=True):
@@ -972,7 +993,8 @@ def _run_dynamic_wave_pipeline(
 def _kernel_fused_forward(
         hidden_states_ptr, selected_experts_ptr, routing_weights_ptr, gate_up_weight_ptr,
         down_weight_ptr, peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
-        combine_buf_ptr, fc2_output_ptr, weighted_activation_ptr, output_ptr, counts_mem_ptr,
+        combine_buf_ptr, fc2_output_ptr, weighted_activation_ptr, fc1_output_ptr,
+        output_ptr, counts_mem_ptr,
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, recv_counts_re_ptr, recv_per_expert_ptr,
         recv_expert_offs_ptr, stats_ptr, core_bucket_cursor_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, pull_tile_dst_start_ptr, wave_expert_offsets_ptr,
@@ -991,7 +1013,7 @@ def _kernel_fused_forward(
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
         FC2_BLOCK_K: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
+        SAVE_FC1: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
@@ -1120,7 +1142,7 @@ def _kernel_fused_forward(
     _run_dynamic_wave_pipeline(
         pid, hidden_states_ptr, gate_up_weight_ptr, down_weight_ptr, routing_weights_ptr,
         peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
-        weighted_activation_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
+        weighted_activation_ptr, fc1_output_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
@@ -1129,6 +1151,7 @@ def _kernel_fused_forward(
         NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
         MAX_SOURCE_TILES, MAX_PIPELINE_GROUPS, DISPATCH_BLOCK_M, FC1_BLOCK_M, FC1_BLOCK_N,
         FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA,
+        SAVE_FC1,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         EXPERTS_PER_RANK, MOONEP)
     if MOONEP:

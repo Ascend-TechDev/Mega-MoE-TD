@@ -183,6 +183,7 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_row_count = None
         self._single_fc2_output = None
         self._single_weighted_activation = None
+        self._single_fc1_output = None
         self._single_pipeline_signal_storage = None
         self._single_pipeline_max_groups = 0
         self._single_core_bucket_cursors = None
@@ -350,6 +351,7 @@ class FusedMoEForward(torch.nn.Module):
         self._pull_tile_row_count = None
         self._single_fc2_output = None
         self._single_weighted_activation = None
+        self._single_fc1_output = None
         self._single_pipeline_max_groups = 0
         self._single_core_bucket_cursors = None
         self._single_send_token_indices = None
@@ -546,6 +548,7 @@ class FusedMoEForward(torch.nn.Module):
         device = self.context.peer_mem.device
 
         expected_activation = (max_recv, ffn_size)
+        expected_fc1_output = (max_recv, 2 * ffn_size)
         if self._single_fc2_output is None:
             self._single_fc2_output = torch.empty(
                 (max_recv, self.hidden_size),
@@ -554,6 +557,14 @@ class FusedMoEForward(torch.nn.Module):
             )
             self._single_weighted_activation = torch.empty(
                 expected_activation,
+                dtype=self.activation_dtype,
+                device=device,
+            )
+            # Raw pre-activation gate/up GEMM results for the saved forward;
+            # same [receive rows, gate F | up F] layout as the staged path's
+            # fc1_output workspace.
+            self._single_fc1_output = torch.empty(
+                expected_fc1_output,
                 dtype=self.activation_dtype,
                 device=device,
             )
@@ -595,7 +606,10 @@ class FusedMoEForward(torch.nn.Module):
                 device_id=self.rank,
             )
             self._single_pipeline_signal_storage.zero_()
-        elif tuple(self._single_weighted_activation.shape) != expected_activation:
+        elif (
+            tuple(self._single_weighted_activation.shape) != expected_activation
+            or tuple(self._single_fc1_output.shape) != expected_fc1_output
+        ):
             raise ValueError(
                 "single-kernel workspaces were initialized for a different "
                 "FFN size; recreate the operator"
@@ -1395,8 +1409,24 @@ class FusedMoEForward(torch.nn.Module):
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
         routing_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Launch routing, optional UDMA MoonEP, and compute exactly once."""
+        *,
+        return_saved: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """Launch routing, optional UDMA MoonEP, and compute exactly once.
+
+        With ``return_saved=True`` the kernel additionally mirrors the raw
+        FC1 (gate/up) GEMM results into ``_single_fc1_output`` and returns
+        ``(output, saved)``.  ``saved`` keeps two intermediates for the
+        redesigned backward — the raw FC1 GEMM result and the dispatch, the
+        latter in pre-dispatch form (receive-layout tables plus references
+        to the forward's own inputs; the dispatched rows are topk x larger
+        than the input, so the backward re-gathers them from
+        ``hidden_states`` instead of a materialized receive clone) — plus
+        the single-in-flight guard keys (``_routing_generation`` /
+        ``_owner_token``): the fc1 buffer is a fixed-address workspace
+        rewritten by every call, so a saved dict is only valid until the
+        operator's next forward.
+        """
         if self.enable_moonep:
             if self._replica_weight_buffers is None:
                 from triton_dist.language.extra import libshmem_device
@@ -1465,6 +1495,7 @@ class FusedMoEForward(torch.nn.Module):
             self._combine_fc2_buf,
             self._single_fc2_output,
             self._single_weighted_activation,
+            self._single_fc1_output if return_saved else None,
             output,
             self.context.metadata_counts_mem,
             self.context.metadata_send_bucket_starts,
@@ -1529,6 +1560,7 @@ class FusedMoEForward(torch.nn.Module):
             FC2_BLOCK_K=self.config.fc2_gemm_block_size_k,
             ACTIVATION=0 if self.activation == "swiglu" else 1,
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
+            SAVE_FC1=return_saved,
             PIPELINE_GROUP_WINDOWS=self.config.single_kernel_group_windows,
             MOONEP=self.enable_moonep,
             RAW_NUM_BINS=self.context.planning_num_bins,
@@ -1536,6 +1568,10 @@ class FusedMoEForward(torch.nn.Module):
             **launch_options,
         )
         self._tile_signal_epoch += 1
+        # Every call rewrites the shared metadata workspaces and the fc1
+        # buffer in place; the generation bump lets a consumer reject a saved
+        # dict superseded by any later forward on this operator.
+        self._routing_generation += 1
         self._routing_weights_keepalive = routing_weights
         if self.enable_moonep:
             # Always refresh in this path: the device planner may change slot
@@ -1551,7 +1587,56 @@ class FusedMoEForward(torch.nn.Module):
                     "smaller than the required receive size "
                     f"{required_received_routes}"
                 )
-        return output
+        if not return_saved:
+            return output
+        # The saved capture needs the receive row count on host; the .item()
+        # drains the launch (the only host sync on this path).
+        num_received_routes = int(self.context.metadata_stats[0].item())
+        # Dropped routes keep their route_to_send sentinel (-1); the send
+        # tables below are only populated for the valid prefix.
+        num_sent_routes = int(
+            (self._route_to_send[:num_routes] >= 0).sum().item()
+        )
+        saved = {
+            # Raw pre-activation gate/up GEMM results, expert-major receive
+            # rows, [rows, gate F | up F] — one of the two intermediates the
+            # redesigned backward keeps.
+            "fc1_output": self._single_fc1_output[:num_received_routes],
+            # Dispatch, saved in pre-dispatch form: the receive-side layout
+            # tables the launch just wrote (receive row -> source segment ->
+            # expert) plus references to the forward's own pre-dispatch
+            # inputs.  The dispatched rows themselves would be topk x larger
+            # (seq_len*mbs*topk*hidden) than the input
+            # (seq_len*mbs*hidden); the backward re-gathers them from
+            # hidden_states through these tables instead of a materialized
+            # [total_recv, hidden] clone.
+            "hidden_states": hidden_states,
+            "selected_experts": selected_experts,
+            "routing_weights": routing_weights,
+            "recv_expert_offsets": (
+                self.context.metadata_recv_expert_offs.clone()
+            ),
+            "recv_counts_by_source_expert": (
+                self.context.metadata_recv_counts_re.clone()
+            ),
+            "send_token_indices": (
+                self._single_send_token_indices[:num_sent_routes].clone()
+            ),
+            "send_route_indices": (
+                self._single_send_route_indices[:num_sent_routes].clone()
+            ),
+            "total_send": num_sent_routes,
+            "total_recv": num_received_routes,
+            "M": num_received_routes,
+            # Single-in-flight guards: every key above is either a workspace
+            # clone taken now, a fixed-address buffer slice rewritten by the
+            # next forward (fc1_output), or an input reference the caller
+            # must not mutate.  A later forward on this operator supersedes
+            # the whole dict.
+            "_routing_generation": self._routing_generation,
+            "_owner_token": id(self._routing_owner_token),
+        }
+        return output, saved
 
     # ===================== full forward ================================
     def forward(
@@ -1569,12 +1654,27 @@ class FusedMoEForward(torch.nn.Module):
         The caller provides selected experts and FP32 routing weights. Router
         matmul, softmax, and top-k selection are outside this boundary.
 
-        With ``return_saved=True`` the operator also returns the native
-        ``saved`` dict for the fused backward as ``(output, saved)`` — the
-        full home-layout contract (metadata / permutation / scalar /
-        activation / weight-reference sections, see
-        :mod:`mega_moe.ops._native_saved`), extended with the MoonEP
-        physical ``[home | replica]`` sections when ``enable_moonep``.
+        With ``return_saved=True`` the operator also returns the intermediates
+        the backward needs as ``(output, saved)``.  Which capture runs depends
+        on the configured execution path:
+
+        * ``enable_single_kernel_forward=True`` (production): the single
+          launch mirrors the raw FC1 gate/up GEMM result into a fixed-address
+          buffer, and ``saved`` holds that ``fc1_output`` tensor
+          (expert-major receive rows, ``[rows, gate F | up F]``) plus the
+          dispatch in pre-dispatch form — receive-layout tables and
+          references to the forward's own inputs, letting the backward
+          re-gather dispatched rows from ``hidden_states`` instead of a
+          materialized ``[total_recv, hidden]`` clone (topk x larger) — and
+          the single-in-flight guard keys (``_routing_generation`` /
+          ``_owner_token``): a saved dict is only valid until this
+          operator's next forward.
+        * otherwise (staged multi-kernel path): the full home-layout native
+          ``saved`` contract (metadata / permutation / scalar / activation /
+          weight-reference sections, see
+          :mod:`mega_moe.ops._native_saved`), extended with the MoonEP
+          physical ``[home | replica]`` sections when ``enable_moonep``.
+
         ``return_saved=False`` (default) keeps the previous behavior exactly.
         """
         # Preserve the public validation order before routing launches any work.
@@ -1604,14 +1704,13 @@ class FusedMoEForward(torch.nn.Module):
         # once here so both callers work; the fresh allocation also keeps
         # the replica weight cache honestly miss-per-step, which matches
         # optimizer-updated weights.
-        if (
-            self.enable_single_kernel_forward
-            and not return_saved
-            and not down_weight.is_contiguous()
-        ):
-            raise ValueError(
-                "single-kernel forward requires contiguous down_weight"
-            )
+        if self.enable_single_kernel_forward and not down_weight.is_contiguous():
+            # The one-launch kernel addresses the down table through raw
+            # strides, so stage a strided view into the operator's persistent
+            # fc2 buffer (fixed address, copy_-refreshed every step).  The
+            # single path re-pushes replica weights every call, so the
+            # constant buffer address cannot serve stale weights.
+            down_weight = self._materialize_down_weight(down_weight)
         if not down_weight.is_contiguous():
             down_weight = down_weight.contiguous()
         expected_down_shape = (
@@ -1641,13 +1740,14 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "configured FC1/FC2 N and K tiles must divide the weight dimensions"
             )
-        if self.enable_single_kernel_forward and not return_saved:
+        if self.enable_single_kernel_forward:
             return self._forward_single_kernel(
                 hidden_states,
                 selected_experts,
                 gate_up_weight,
                 down_weight,
                 routing_weights,
+                return_saved=return_saved,
             )
         # Symmetric replica allocations must be complete before any rank enters
         # the routing count exchange.  The planner then starts owner-push RMA
