@@ -4628,6 +4628,205 @@ def run_single_kernel_situglu_autograd_case(
                 os.environ[key] = value
 
 
+def run_single_kernel_shared_op_interleave_case(
+    rank: int, world_size: int
+) -> None:
+    """Shared-operator interleave: all forwards first, backwards in reverse.
+
+    With ``ep_plan.megamoe_shared_op: true`` a framework host runs every
+    same-shape MoE layer on ONE operator (one set of planning/mirror
+    workspaces, one state): layer1 fwd, layer2 fwd, ..., layerN bwd, ...,
+    layer1 bwd.  The second forward bumps the operator's routing
+    generation BEFORE layer1's backward runs — the guard in
+    MegaMoEFunction.backward must let that pass for the single-kernel
+    snapshot (``_single_kernel_snapshot``), while the backward of each
+    layer must still reproduce its own SiTU eager golden (the snapshot
+    must not alias anything the later forward rewrote).  Two steps on one
+    operator with DIFFERENT inputs mirror the two-layer interleaving; the
+    shared state also carries the mega slabs/epoch across both backwards.
+    """
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
+    if MegaMoEFunction is None:
+        raise RuntimeError("MegaMoEFunction is unavailable")
+
+    _bwd_env = {"MOE_BWD_MEGA": "1", "MOE_SAVED_RECOMPUTE": "1"}
+    _env_before = {k: os.environ.get(k) for k in _bwd_env}
+    os.environ.update(_bwd_env)
+
+    # small smoke shape (the interleave property is shape-independent; E<=32
+    # per the adapter's scatter guard)
+    tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = f"single-kernel-shared-op-interleave-w{world_size}"
+
+    try:
+        with kit.aclshmem_session(
+            rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+        ):
+            peer_mem = kit.make_moonep_backward_peer_mem(
+                tokens * topk * world_size, tokens * topk, hidden, dtype, rank,
+                ep_group,
+            )
+            try:
+                op = FusedMoEForward(
+                    ep_group,
+                    max_tokens_per_rank=tokens,
+                    hidden_size=hidden,
+                    top_k=topk,
+                    num_experts=num_experts,
+                    config=MoEForwardConfig(
+                        receive_capacity_factor=float(world_size),
+                        activation="situglu",
+                        situ_beta=situ_beta,
+                        situ_linear_beta=situ_linear_beta,
+                        enable_single_kernel_forward=True,
+                        fc1_gemm_block_size_m=256,
+                        fc2_combine_block_size_m=256,
+                    ),
+                )
+                try:
+                    w_gate, w_up = make_gate_up_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+                    packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                    w2 = make_down_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+
+                    def make_step_inputs(seed):
+                        hs, expert_indices = prepare_inputs(
+                            tokens, hidden, num_experts, topk, dtype, device,
+                            seed=seed + rank,
+                        )
+                        routing_weights = make_routing_weights(
+                            tokens, topk, device, seed=seed + 100 + rank
+                        )
+                        torch.manual_seed(seed + 200 + rank)
+                        dy = torch.randn(
+                            tokens, hidden, dtype=dtype, device=device
+                        )
+                        return hs, routing_weights, expert_indices, dy
+
+                    def make_golden(hs, routing_weights, expert_indices, dy):
+                        # same SiTU eager recipe as the situglu autograd case
+                        with torch.no_grad():
+                            _, golden_saved = moe_forward(
+                                hs, routing_weights, expert_indices, w_gate,
+                                w_up, w2, ep_group, topk, return_saved=True,
+                            )
+                            gate = golden_saved["gate"].float()
+                            up = golden_saved["up"].float()
+                            situ_a = (
+                                situ_beta
+                                * torch.tanh(gate / situ_beta)
+                                * torch.sigmoid(gate)
+                            )
+                            up_v = situ_linear_beta * torch.tanh(
+                                up / situ_linear_beta
+                            )
+                            golden_saved["swiglu_out_weighted"] = (
+                                situ_a
+                                * up_v
+                                * golden_saved["recv_weights_sorted"]
+                                .float()
+                                .unsqueeze(-1)
+                            ).to(dtype)
+                            golden_saved["activation"] = "situglu"
+                            golden_saved["situ_beta"] = situ_beta
+                            golden_saved["situ_linear_beta"] = situ_linear_beta
+                            return backward_torch_baseline(golden_saved, dy)
+
+                    steps = [
+                        make_step_inputs(2401),
+                        make_step_inputs(2402),
+                    ]
+                    goldens = [
+                        make_golden(hs, rw, ei, dy)
+                        for hs, rw, ei, dy in steps
+                    ]
+
+                    def apply_step(hs, rw, ei):
+                        hidden_leaf = hs.clone().requires_grad_(True)
+                        routing_leaf = rw.clone().requires_grad_(True)
+                        gate_up_leaf = (
+                            packed_w1.clone().requires_grad_(True)
+                        )
+                        down_leaf = w2.clone().requires_grad_(True)
+                        output = MegaMoEFunction.apply(
+                            op, hidden_leaf, routing_leaf, ei,
+                            gate_up_leaf, down_leaf, peer_mem, state,
+                        )
+                        return output, (
+                            hidden_leaf, routing_leaf, gate_up_leaf,
+                            down_leaf,
+                        )
+
+                    state = SimpleNamespace(
+                        signal_mem=None, epoch=0, mega_persistent={}
+                    )
+
+                    # all forwards first (the second bumps the routing
+                    # generation before the first backward), backwards in
+                    # reverse layer order afterwards
+                    dist.barrier()
+                    outs = [
+                        apply_step(hs, rw, ei)
+                        for hs, rw, ei, _dy in steps
+                    ]
+                    all_ok = True
+                    details = ""
+                    for idx in reversed(range(len(steps))):
+                        out, leaves = outs[idx]
+                        out.backward(steps[idx][3])
+                        grads = _megamoe_function_grads(leaves, ffn)
+                        ok, details = compare_backward_gradients(
+                            grads, goldens[idx]
+                        )
+                        all_ok = all_ok and ok
+                    if state.epoch < len(steps) or state.epoch < 1:
+                        raise AssertionError(
+                            f"{label}: shared state epoch did not advance "
+                            f"through both backwards (epoch={state.epoch})"
+                        )
+                    if not getattr(state, "mega_persistent", {}):
+                        raise AssertionError(
+                            f"{label}: the mega backward did not persist its "
+                            "slabs/epochs in the shared state"
+                        )
+
+                    flag = torch.tensor(
+                        [1 if all_ok else 0], dtype=torch.int32, device=device
+                    )
+                    dist.all_reduce(
+                        flag, op=dist.ReduceOp.MIN, group=ep_group
+                    )
+                    if rank == 0 and not bool(flag.item()):
+                        print(
+                            f"{label} gradient details: {details}", flush=True
+                        )
+                    if not bool(flag.item()):
+                        raise AssertionError(
+                            f"{label}: shared-operator interleaved backwards "
+                            "mismatched their SiTU eager goldens"
+                        )
+                finally:
+                    op.finalize()
+            finally:
+                kit.ash.aclshmem_free_tensor(peer_mem)
+    finally:
+        for key, value in _env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 FUNCTIONAL_FORWARD_CASES = kit.make_pytest_params(
     select_cases(direction="forward", tags={"functional", "smoke"})
 )
@@ -4703,6 +4902,12 @@ def test_single_kernel_situglu_autograd_fc1offload_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_situglu_autograd_w8(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_shared_op_interleave_w2(dist_test):
+    dist_test(run_single_kernel_shared_op_interleave_case, world_size=2)
 
 
 @pytest.mark.dist

@@ -134,19 +134,27 @@ class MegaMoEFunction(torch.autograd.Function):
     def backward(ctx, dy):
         op = ctx.op
         saved = ctx.saved
-        if (
-            saved.get("_owner_token") != id(op._routing_owner_token)
-            or saved.get("_routing_generation") != op._routing_generation
-        ):
-            wrong_owner = (
-                saved.get("_owner_token") != id(op._routing_owner_token)
-            )
+        if saved.get("_owner_token") != id(op._routing_owner_token):
             raise RuntimeError(
-                "the saved dict belongs to "
-                + ("another operator instance" if wrong_owner
-                   else "a routing plan this operator has already superseded")
-                + "; run backward before the next forward on the operator"
+                "the saved dict belongs to another operator instance; run "
+                "the forward and backward on the same operator"
             )
+        if (
+            saved.get("_routing_generation") != op._routing_generation
+            and not saved.get("_single_kernel_snapshot")
+        ):
+            raise RuntimeError(
+                "the saved dict belongs to a routing plan this operator "
+                "has already superseded; run backward before the next "
+                "forward on the operator"
+            )
+        # _single_kernel_snapshot skips the generation check: that dict is a
+        # full snapshot (every tensor is a clone / cast copy / fresh build /
+        # caller-held input ref — see _single_saved_adapter), so a later
+        # forward on the SAME operator (a framework host sharing one operator
+        # across same-shape MoE layers, ep_plan.megamoe_shared_op) cannot
+        # rewrite anything it reads.  The 5-op saved contract aliases the
+        # operator's planning workspaces and keeps the strict check.
         # Host swap back: if the forward offloaded fc1_output, H2D it onto
         # a fresh device tensor now — every consumer below (the mega launch
         # and the orchestrator) runs on this stream, ordered after the copy.

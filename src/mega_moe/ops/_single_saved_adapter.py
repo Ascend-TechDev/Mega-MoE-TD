@@ -241,6 +241,17 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     )
     saved.update(_weight_reference_section(gate_up_weight, down_weight,
                                            int(gate_up_weight.shape[2] // 2)))
+    # Full-snapshot marker: after enrichment every tensor in this dict is a
+    # clone / dtype-cast copy / closed-form fresh build / caller-held input
+    # reference — nothing aliases the operator's planning or mirror
+    # workspaces.  MegaMoEFunction.backward relaxes its routing-generation
+    # equality guard for marked dicts, which is what lets a framework host
+    # share ONE operator (and its ~GB-scale fixed workspaces) across all
+    # same-shape MoE layers: layer N's forward may bump the generation
+    # before layer N-1's backward runs, and that is fine here (the 5-op
+    # saved contract DOES alias those workspaces, so the guard stays
+    # strict for it).
+    saved["_single_kernel_snapshot"] = True
     _situ_beta = getattr(op, "situ_beta", None)
     _situ_linear_beta = getattr(op, "situ_linear_beta", None)
     saved.update(
