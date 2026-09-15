@@ -108,6 +108,14 @@ class MegaMoEFunction(torch.autograd.Function):
                 gate_up_weight=gate_up_weight,
                 down_weight=down_weight,
             )
+        # Optional host swap of the ONE big saved activation: with
+        # MEGAMOE_FC1_OFFLOAD=1 fc1_output moves to a pooled pinned host
+        # buffer on a side stream (framework async_offload.py SwapTensor
+        # idiom — the native saved dict is invisible to
+        # saved_tensors_hooks, so the framework mechanism can't do this)
+        # and the backward entry H2Ds it back before anything reads it.
+        from ._fc1_host_offload import maybe_offload_fc1
+        maybe_offload_fc1(saved)
         # The saved intermediates are freshly computed views/clones (not the
         # forward inputs), and the weight views must stay pinned until the
         # backward — stash on ctx instead of save_for_backward, mirroring
@@ -139,6 +147,11 @@ class MegaMoEFunction(torch.autograd.Function):
                    else "a routing plan this operator has already superseded")
                 + "; run backward before the next forward on the operator"
             )
+        # Host swap back: if the forward offloaded fc1_output, H2D it onto
+        # a fresh device tensor now — every consumer below (the mega launch
+        # and the orchestrator) runs on this stream, ordered after the copy.
+        from ._fc1_host_offload import maybe_reload_fc1
+        maybe_reload_fc1(saved)
         # §3.4 state injection: reuse the persistent symmetric tile-signal
         # slots and keep the SET epoch monotonically advancing.  The first
         # epoch must be >= 1 — a freshly zeroed slot already reads as 0.

@@ -4394,7 +4394,7 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
 
 
 def run_single_kernel_situglu_autograd_case(
-    rank: int, world_size: int
+    rank: int, world_size: int, fc1_offload: bool = False
 ) -> None:
     """End-to-end gate for the single-kernel forward + mega recompute backward.
 
@@ -4407,6 +4407,11 @@ def run_single_kernel_situglu_autograd_case(
     ``run_megamoe_situglu_autograd_case`` — any layout drift in the adapter
     (fc1_output / recv_weights_sorted pass-through) or the re-dispatch
     recompute shows up as a gradient mismatch.
+
+    ``fc1_offload=True`` additionally sets ``MEGAMOE_FC1_OFFLOAD=1``: the
+    forward D2Hs ``fc1_output`` to a pooled pinned host buffer on a side
+    stream and the backward entry H2Ds it back (the SwapTensor idiom from
+    the framework's async_offload.py) — the grads must stay identical.
     """
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
@@ -4417,6 +4422,8 @@ def run_single_kernel_situglu_autograd_case(
     # backward; set the gates for this case and restore them after (the suite
     # may run other backward variants in the same process).
     _bwd_env = {"MOE_BWD_MEGA": "1", "MOE_SAVED_RECOMPUTE": "1"}
+    if fc1_offload:
+        _bwd_env["MEGAMOE_FC1_OFFLOAD"] = "1"
     _env_before = {k: os.environ.get(k) for k in _bwd_env}
     os.environ.update(_bwd_env)
 
@@ -4577,6 +4584,23 @@ def run_single_kernel_situglu_autograd_case(
                             f"after second={state.epoch})"
                         )
 
+                    if fc1_offload:
+                        # The swap must have actually run on BOTH steps —
+                        # one D2H per forward, one H2D per backward — and
+                        # the device-side round trip is stream-ordered
+                        # behind the grad checks above, so the counters are
+                        # final here.
+                        from mega_moe.ops._fc1_host_offload import (
+                            fc1_offload_stats,
+                        )
+                        d2h_n, h2d_n, d2h_bytes = fc1_offload_stats()
+                        if d2h_n < 2 or h2d_n < 2 or d2h_bytes <= 0:
+                            raise AssertionError(
+                                f"{label}: fc1 host offload did not run "
+                                f"(d2h={d2h_n} h2d={h2d_n} "
+                                f"bytes={d2h_bytes})"
+                            )
+
                     flag = torch.tensor(
                         [1 if all_ok else 0], dtype=torch.int32, device=device
                     )
@@ -4656,6 +4680,23 @@ def test_single_kernel_kimi_k3_t4k_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_situglu_autograd_w2(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_situglu_autograd_fc1offload_w2(dist_test):
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=2, args=(True,)
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.kimi
+def test_single_kernel_situglu_autograd_fc1offload_w8(dist_test):
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=8, args=(True,)
+    )
 
 
 @pytest.mark.dist
