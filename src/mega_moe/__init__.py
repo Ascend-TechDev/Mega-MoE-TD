@@ -5,9 +5,9 @@ from .ops.forward import DispatchFC1Result, FusedMoEForward, pack_gate_up_weight
 # Backward.
 from .ops.backward import (
     MegaMoEBackwardFunction,
-    MegaMoEFunction,
     moe_backward_triton,
 )
+from .ops.function import MegaMoEFunction
 # Configuration & routing plan.
 from .config import MoEForwardConfig
 from .runtime.routing import MoERoutingPlan

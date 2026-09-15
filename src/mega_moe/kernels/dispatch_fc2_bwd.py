@@ -496,12 +496,29 @@ def _ensure_bwd_signal_mem(saved, W, EPR, MAX_BWD_TILES):
     source id. 16 int32 elements per slot (= 64 bytes) mirrors the forward
     workspace's signal slot granularity. Shared by the standalone step-1
     launcher and the one-kernel mega backward (mega_bwd.py); the SET epoch
-    lives alongside it in ``saved["_bwd_tile_signal_epoch"]``."""
+    lives alongside it in ``saved["_bwd_tile_signal_epoch"]``.
+
+    ROUTING-INDEPENDENT FLOOR (integrated-framework hunt, 2026-09-15): a
+    (source, expert) send bucket can hold at most every route one source
+    rank dispatches (B*topk rows), so its tile count is <= cdiv(B*topk, 64)
+    whatever the routing. This slab is allocated ONCE (no grow branch
+    below), while the kernel's slot stride MAX_BWD_TILES is a routing-
+    derived per-call constexpr — a later fatter routing recompiles with a
+    larger stride and its slot writes run past the first-alloc slab's end
+    into the next symmetric-heap region (kimi mock w8: first-alloc strides
+    9/10 at 9216/10240 elems while the re-dispatch slab starts at exactly
+    sig_off + sig_n*4). Floor the allocation at the bound so any stride a
+    launcher passes stays inside the slab."""
     import shmem as ash
+    try:
+        _bound = max(
+            1, -(-int(saved["batch_size"]) * int(saved["topk"]) // 64))
+    except (KeyError, TypeError, ValueError):
+        _bound = MAX_BWD_TILES
     signal_mem = saved.get("_bwd_tile_signal_mem")
     if signal_mem is None:
         signal_mem = ash.aclshmem_create_tensor(
-            [W * EPR * MAX_BWD_TILES * 16],
+            [W * EPR * max(MAX_BWD_TILES, _bound) * 16],
             dtype=torch.int32,
             device_id=saved["ep_rank"])
         signal_mem.zero_()
