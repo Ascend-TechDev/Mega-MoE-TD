@@ -1610,8 +1610,27 @@ def kernel_moe_backward_mega(
 # the mega kernel — fused backward-recompute variant
 # (MOE_SAVED_RECOMPUTE=1): ONE launch carries the whole backward plus
 # the saved-activation recompute riding the P1 window
+#
+# do_not_specialize: every ROUTING-DERIVED int must be listed here.  Triton's
+# int specialization (divisible-by-16 / equal-to-1) is part of the cache key,
+# so any of these crossing a ÷16 boundary mid-run mints a fresh key and pays
+# a full ~6.5s JIT recompile inside the launch — one rank compiling stalls
+# the whole job's iteration (msprof 2026-09-16: device idle ~6.5s windows,
+# op_summary shows the launch stretched to 6518-6668ms; /root/.triton/cache
+# kept minting variants through the run, e.g. max_rows_w flipping div16).
+# Shape-fixed ints (N/K dims, num_tn*/num_tk*, strides, H, ffn) keep their
+# specialization hints — they never vary, so their keys are stable, and the
+# div16 hints can matter for address codegen.  The original
+# kernel_moe_backward_mega above stays verbatim (user directive), and its
+# callers hit the same trap only under non-recompute runs with shifting
+# routing — fix it there too if that path is ever performance-relevant.
 # ============================================================================
-@triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
+@triton.jit(do_not_specialize=[
+    "signal_epoch", "b3_epoch", "b1_epoch",
+    "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
+    "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
+    "w5_split", "w5_total",                      # P5 wgrad split geometry
+])
 def kernel_moe_backward_mega_recompute(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
     gco_ptr, peer_mem_ptr, signal_mem_ptr,
