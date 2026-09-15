@@ -28,6 +28,9 @@ def main():
     parser.add_argument("--cores", type=int, default=32)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--moonep", action="store_true")
+    parser.add_argument("--save-fc1", action="store_true",
+                        help="compile the return_saved variant that mirrors "
+                             "the raw FC1 GEMM results")
     parser.add_argument("--wave-windows", type=int,
                         help="M tiles per compute wave (default: 32 with MoonEP, otherwise 16)")
     parser.add_argument("--dump-sync-ir", action="store_true")
@@ -74,14 +77,15 @@ def main():
             max_recv + case.experts_per_rank * (2 if args.moonep else 1) * (fc1_m - 1), windows * fc1_m),
         DISPATCH_BLOCK_M=128, FC1_BLOCK_M=fc1_m, FC1_BLOCK_N=fc1_n,
         FC1_BLOCK_K=fc1_k, FC2_BLOCK_N=fc2_n, FC2_BLOCK_K=fc2_k,
-        ACTIVATION=0, HAS_LINEAR_BETA=False, PIPELINE_GROUP_WINDOWS=windows,
+        ACTIVATION=0, HAS_LINEAR_BETA=False, SAVE_FC1=args.save_fc1,
+        PIPELINE_GROUP_WINDOWS=windows,
         MOONEP=args.moonep, RAW_NUM_BINS=triton.next_power_of_2(case.num_experts + 1),
         UDMA_CHUNK_ELEMENTS=32 * 1024 * 1024,
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",
         "peer_mem_ptr", "combine_buf_ptr", "fc2_output_ptr",
-        "weighted_activation_ptr", "output_ptr",
+        "weighted_activation_ptr", "fc1_output_ptr", "output_ptr",
         "replica_gate_ptr", "replica_down_ptr",
     }
     fp32_inputs = {"routing_weights_ptr", "routing_weight_recv_ptr"}
