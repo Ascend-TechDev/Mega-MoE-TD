@@ -2259,7 +2259,20 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     replica_fc2 = p1.get("replica_fc2", p1["fc2"])
     home_e = int(p1.get("home_experts", EPR))
     active_e = int(p1.get("active_experts", EPR))
-    signal_mem = _ensure_bwd_signal_mem(saved, W, EPR, p1["max_bwd_tiles"])
+    # P1 signal slots: allocate AND stride at the ROUTING-INDEPENDENT tile
+    # bound (cdiv(B*topk, 64) — a (source, expert) bucket cannot exceed one
+    # source rank's whole dispatch). Passing the bound as the kernel
+    # constexpr keeps the slot stride IDENTICAL across routings: the
+    # routing-derived stride recompiled the kernel on every new value AND,
+    # against the once-alloc signal slab, wrote slots past the first-alloc
+    # slab's end when a fatter routing arrived (integrated kimi mock w8,
+    # 2026-09-15: first-alloc strides 9/10, micro5 pads 2.5-3.9k rows, the
+    # 4KB stride-overflow landing in the re-dispatch slab head — the slab
+    # starts at exactly sig_off + sig_n*4). Consumers iterate ACTUAL tile
+    # counts from the recv tables, so the wider stride costs nothing.
+    sig_tiles_bound = max(
+        1, -(-int(saved["batch_size"]) * int(saved["topk"]) // 64))
+    signal_mem = _ensure_bwd_signal_mem(saved, W, EPR, sig_tiles_bound)
     # SET-mode epoch: producer writes signal_epoch, consumer waits the same
     # value; bump after launch so the next call sees a fresh one (SET
     # overwrites — no slot zeroing). Same keys MegaMoEFunction.backward
@@ -2320,15 +2333,23 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         orig_in3[:M].copy_(saved["swiglu_out_weighted"])
     grad_fc2 = torch.empty(EPR, H, ffn, dtype=dy.dtype, device=device)
     if saved_recompute:
-        # P5's B matrix = the symmetric re-dispatch slab.  Sizing from the
-        # cross-rank MAX of M+pad rows (every rank stores onto its peers —
-        # rank-local sizes skew the symmetric heap); the [M, M+pad) tail only
-        # backs P5's masked-lane address validation, garbage like the padded
-        # torch buffer it replaces.
-        _rows5 = torch.tensor(
-            [M + pad_rows_w], dtype=torch.int64, device=device)
-        dist.all_reduce(_rows5, op=dist.ReduceOp.MAX, group=saved["ep_group"])
-        orig_in5 = _ensure_mega_redispatch_buf(saved, int(_rows5.item()) * H)
+        # P5's B matrix = the symmetric re-dispatch slab.  Pre-sized to the
+        # ROUTING-INDEPENDENT bound on the first allocation and never grown:
+        # M <= B*topk*W (every route lands on some rank) and
+        # pad(=max_rows_w) <= B*topk, so rows <= B*topk*(W+1) covers every
+        # routing.  The grow-on-demand form (cross-rank MAX of M+pad per
+        # call, free+re-alloc when a later routing fatter pads arrives) hung
+        # the FIRST same-layer mega launch after the first regrow in the
+        # integrated framework loop (kimi mock w8, 2026-09-15: micro5 regrow
+        # 41889792->43352064 elems, micro6 kernel spin -> aicore 507014;
+        # heap offsets stayed rank-aligned across the regrow, so the failure
+        # is the regrow itself, not offset divergence).  The bound is uniform
+        # across ranks by construction (B/topk/W identical), so no
+        # all_reduce is needed to keep the symmetric heap aligned.
+        # [M, M+pad) tail only backs P5's masked-lane address validation,
+        # garbage like the padded torch buffer it replaces.
+        _rows_bound = int(saved["batch_size"]) * int(saved["topk"]) * (W + 1)
+        orig_in5 = _ensure_mega_redispatch_buf(saved, _rows_bound * H)
         in5_sm, in5_sk = H, 1
         # the forward producer's source table: expert-major send slot -> row
         # in the single pre-dispatch copy (== bwd_expert_sort // topk, since
@@ -2524,6 +2545,30 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     else:
         combine_buf = peer_mem
 
+    # MOE_MEGA_HEAP_PROBE=1: per-launch symmetric-heap audit (host-side
+    # pointer arithmetic only, no device sync).  Prints every symmetric
+    # slab's offset RELATIVE TO peer_mem — cross-rank DIRECT_REMOTE_STORE
+    # addressing assumes these offsets are identical on every rank, so any
+    # divergence between the printed offsets across ranks means stores land
+    # in the wrong peer slab (the suspected iter-3 hang mechanism: clobbered
+    # phase signals -> barrier spin -> aicore timeout).
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        _base = peer_mem.data_ptr()
+
+        def _off(t):
+            return t.data_ptr() - _base if t is not None else None
+
+        print(
+            f"[mega-heap r{rank}] M={M} pad={pad_rows_w} "
+            f"peer_off={_off(peer_mem)} sig_off={_off(signal_mem)} "
+            f"sig_n={signal_mem.numel()} "
+            f"redis_off={_off(orig_in5) if saved_recompute else '-'} "
+            f"redis_n={orig_in5.numel() if saved_recompute else 0} "
+            f"comb_off={_off(combine_buf)} comb_n={combine_buf.numel()} "
+            f"ep={signal_epoch} b3e={b3_epoch} b1e={b1_epoch} "
+            f"gr={int(grad_reduce)}",
+            flush=True)
+
     # P4a dual weight tables (MoonEP): replica_weight is the plan's packed
     # replica gate/up table as a stride-only [B, 2F, H] view; tiles are
     # expert-major so tile_home_bound splits home/replica tiles with one
@@ -2662,7 +2707,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         # constexpr
         D_BM=dbm, D_BN=dbn, D_BK=dbk, PUSH_BLOCK_M=64,
         WORLD_SIZE=W, EXPERTS_PER_RANK=EPR,
-        MAX_BWD_TILES=p1["max_bwd_tiles"], LOCAL_RANK=rank,
+        MAX_BWD_TILES=sig_tiles_bound, LOCAL_RANK=rank,
         BLOCK_H_PUSH=256,
         BLOCK_SIZE=triton.next_power_of_2(ffn),
         ACTIVATION=act, HAS_LINEAR_BETA=has_lb,
