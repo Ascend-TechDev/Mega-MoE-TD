@@ -4394,7 +4394,8 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
 
 
 def run_single_kernel_situglu_autograd_case(
-    rank: int, world_size: int, fc1_offload: bool = False
+    rank: int, world_size: int, fc1_offload: bool = False,
+    down_direct: bool = False,
 ) -> None:
     """End-to-end gate for the single-kernel forward + mega recompute backward.
 
@@ -4412,6 +4413,14 @@ def run_single_kernel_situglu_autograd_case(
     forward D2Hs ``fc1_output`` to a pooled pinned host buffer on a side
     stream and the backward entry H2Ds it back (the SwapTensor idiom from
     the framework's async_offload.py) — the grads must stay identical.
+
+    ``down_direct=True`` additionally sets ``MOE_DOWN_DIRECT=1`` and hands
+    the op the FRAMEWORK'S down-projection view — a transposed stride view
+    of an ``[E, F, H]`` table (values identical, strides ``(F*H, 1, H)``)
+    — instead of a contiguous ``[E, H, F]`` table: the single-kernel
+    forward and the mega backward must address it through their stride
+    parameters with no staging (no ``_fc2_ws``, no backward
+    ``.contiguous()``).
     """
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
@@ -4424,6 +4433,8 @@ def run_single_kernel_situglu_autograd_case(
     _bwd_env = {"MOE_BWD_MEGA": "1", "MOE_SAVED_RECOMPUTE": "1"}
     if fc1_offload:
         _bwd_env["MEGAMOE_FC1_OFFLOAD"] = "1"
+    if down_direct:
+        _bwd_env["MOE_DOWN_DIRECT"] = "1"
     _env_before = {k: os.environ.get(k) for k in _bwd_env}
     os.environ.update(_bwd_env)
 
@@ -4478,6 +4489,20 @@ def run_single_kernel_situglu_autograd_case(
                         num_experts, hidden, ffn, world_size, rank, dtype,
                         device,
                     )
+                    if down_direct:
+                        # framework hand-off pattern: a transposed stride
+                        # view of the host's [E, F, H] table (identical
+                        # values, strides (F*H, 1, H), non-contiguous)
+                        w2_view = (
+                            w2.transpose(1, 2).contiguous().transpose(1, 2)
+                        )
+                        if w2_view.is_contiguous() or not torch.equal(
+                            w2_view, w2
+                        ):
+                            raise AssertionError(
+                                "down_direct setup failed to build a "
+                                "value-identical strided view"
+                            )
                     # Droless inputs (no drop_frac): the adapter rejects
                     # dropped routes — capacity_factor=world_size keeps them.
                     hs, expert_indices = prepare_inputs(
@@ -4530,7 +4555,13 @@ def run_single_kernel_situglu_autograd_case(
                             routing_weights.clone().requires_grad_(True)
                         )
                         gate_up_leaf = packed_w1.clone().requires_grad_(True)
-                        down_leaf = w2.clone().requires_grad_(True)
+                        if down_direct:
+                            # the strided view itself is the leaf — cloning
+                            # would materialize a contiguous table and
+                            # defeat the point
+                            down_leaf = w2_view.requires_grad_(True)
+                        else:
+                            down_leaf = w2.clone().requires_grad_(True)
                         output = MegaMoEFunction.apply(
                             op, hidden_leaf, routing_leaf, expert_indices,
                             gate_up_leaf, down_leaf, peer_mem, state,
@@ -4566,6 +4597,11 @@ def run_single_kernel_situglu_autograd_case(
                         raise AssertionError(
                             f"{label}: the mega backward did not persist its "
                             "slabs/epochs in state.mega_persistent"
+                        )
+                    if down_direct and op._fc2_ws is not None:
+                        raise AssertionError(
+                            f"{label}: MOE_DOWN_DIRECT staged the down weight "
+                            "anyway (op._fc2_ws is allocated)"
                         )
 
                     # Slab/epoch reuse across steps must stay bitwise.
@@ -4908,6 +4944,15 @@ def test_single_kernel_situglu_autograd_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_shared_op_interleave_w2(dist_test):
     dist_test(run_single_kernel_shared_op_interleave_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_situglu_autograd_downdirect_w2(dist_test):
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=2,
+        args=(False, True),
+    )
 
 
 @pytest.mark.dist

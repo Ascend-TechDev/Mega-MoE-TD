@@ -1720,14 +1720,28 @@ class FusedMoEForward(torch.nn.Module):
         # once here so both callers work; the fresh allocation also keeps
         # the replica weight cache honestly miss-per-step, which matches
         # optimizer-updated weights.
-        if self.enable_single_kernel_forward and not down_weight.is_contiguous():
+        # MOE_DOWN_DIRECT=1 (single-kernel, non-MoonEP only): the fused
+        # kernel addresses the down table through its stride parameters, so
+        # the caller's strided view can flow through UNSTAGED — no ~88MB/layer
+        # persistent _fc2_ws, no per-step copy_ (and the backward drops its
+        # .contiguous() twin, see dispatch_fc2_bwd).  Strides are constexpr:
+        # (E*F*H, 1, H) for the caller's view vs (E*H*F, F, 1) staged — one
+        # stable specialization either way, but K-major vs N-major
+        # contiguity differs, hence the perf A/B before defaulting it on.
+        _down_direct = (
+            self.enable_single_kernel_forward
+            and not self.enable_moonep
+            and os.environ.get("MOE_DOWN_DIRECT", "0") == "1"
+        )
+        if (self.enable_single_kernel_forward
+                and not down_weight.is_contiguous() and not _down_direct):
             # The one-launch kernel addresses the down table through raw
             # strides, so stage a strided view into the operator's persistent
             # fc2 buffer (fixed address, copy_-refreshed every step).  The
             # single path re-pushes replica weights every call, so the
             # constant buffer address cannot serve stale weights.
             down_weight = self._materialize_down_weight(down_weight)
-        if not down_weight.is_contiguous():
+        if not down_weight.is_contiguous() and not _down_direct:
             down_weight = down_weight.contiguous()
         expected_down_shape = (
             self.experts_per_rank,
@@ -1743,9 +1757,11 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "down_weight must be BF16 with shape "
                 f"{expected_down_shape} on the input device (a strided view "
-                "is staged into the operator's persistent fc2 buffer)"
+                "is staged into the operator's persistent fc2 buffer, or "
+                "flows through unstaged under MOE_DOWN_DIRECT=1)"
             )
-        down_weight = self._materialize_down_weight(down_weight)
+        if not _down_direct:
+            down_weight = self._materialize_down_weight(down_weight)
         ffn_size = gate_up_weight.shape[2] // 2
         if (
             gate_up_weight.shape[2] % self.config.fc1_gemm_block_size_n
