@@ -999,10 +999,12 @@ def _mega_stamp(ts_ptr, slot: tl.constexpr, pid, TS_SLOTS: tl.constexpr):
 # it (idempotent stores, the P6 window's proven mixed shape) — overlapping
 # P1's cube fc2-dgrad.  B1 publishes the act rows cross-program for P3 and
 # the remote slab stores cross-rank (P5 first reads them two barriers
-# later); no barrier is added or moved.  SAVED_RECOMPUTE (constexpr) compiles
-# both bodies out of the default launch.  The forward is not adapted: its
-# workspace still carries both keys, the mega path just stops consuming
-# them.
+# later); no barrier is added or moved.  The wrapper launches the ORIGINAL
+# kernel_moe_backward_mega (kept verbatim in this file) for the default =0
+# path and this variant for =1; the variant's SAVED_RECOMPUTE constexpr
+# compiles both recompute bodies out as a guard.  The forward is not
+# adapted: its workspace still carries both keys, the mega path just
+# stops consuming them.
 # ============================================================================
 @triton.jit
 def _redispatch_hidden_direct(
@@ -1099,7 +1101,514 @@ def _recompute_act_rows(
 
 
 # ============================================================================
-# the mega kernel
+# the ORIGINAL mega kernel — kernel_moe_backward_mega (kept verbatim,
+# 2026-09-15): the pre-recompute binary and still the DEFAULT
+# MOE_SAVED_RECOMPUTE=0 launch.  The fused variant below is this exact
+# body plus the P0 re-dispatch + act recompute spliced into the P1
+# window and the six tail args; its SAVED_RECOMPUTE=0 instantiation
+# compiles both bodies out and is equivalent to this kernel.  Keep the
+# shared phase bodies in sync when editing either copy.
+# ============================================================================
+@triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
+def kernel_moe_backward_mega(
+    # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
+    gco_ptr, peer_mem_ptr, signal_mem_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    H: tl.constexpr, stride_gm,
+    fc2_ptr, grad_swiglu_ptr,
+    recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+    N1, K1,
+    stride_we1, stride_wk1, stride_wn1,
+    signal_epoch,
+    # ---- P2: swiglu/situ backward (dC == grad_swiglu_ptr, stride N1) ----
+    AB_ptr,                     # fc1_output [M, 2*ffn] contiguous (stride K4)
+    scale_ptr,                  # recv_weights_sorted [M]
+    dAB_ptr,                    # grad_fc1_output out [M, 2*ffn] (== inp4_ptr)
+    dscale_ptr,                 # grad_gate out [M] (== grad_gate_ptr)
+    ffn, n_rows,
+    situ_beta, situ_linear_beta,
+    # ---- P3: fc2 wgrad (grad_out == peer_mem alias [M, H], strides H/1) ----
+    orig_in3_ptr, stride_om3, stride_ok3,      # swiglu_out_weighted [M, ffn]
+    grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
+    split_cum_ptr, expert_counts_ptr,          # shared by P3/P5
+    N3, K3, num_tn3, num_tk3, w3_total, max_rows_w,
+    # ---- P4a: fc1 dgrad GEMM (inp == dAB_ptr, strides im/ik) ----
+    fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
+    hidden_buf_ptr,
+    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+    N4, K4, num_tiles_n4, num_tiles_m4,
+    stride_im4, stride_ik4,
+    # ---- P4b: reverse-A2A push ----
+    write_rank_by_src_ptr, write_off_by_src_ptr,
+    M4,
+    # ---- P4c: topk reduce ----
+    inv_sort_ptr, grad_hidden_ptr, grad_routing_ptr,
+    B4, topk4,
+    # ---- P5: fc1 wgrad (grad_out == dAB_ptr [M, 2*ffn], strides K4/1) ----
+    orig_in5_ptr, stride_om5, stride_ok5,      # recv_hidden_sorted [M, H]
+    grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
+    N5, K5, num_tn5, num_tk5, w5_split, w5_total,
+    # ---- constexpr tiles / flags ----
+    D_BM: tl.constexpr, D_BN: tl.constexpr, D_BK: tl.constexpr,
+    PUSH_BLOCK_M: tl.constexpr,
+    WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+    MAX_BWD_TILES: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    BLOCK_H_PUSH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+    W_BM: tl.constexpr, W_BN: tl.constexpr, W_BK: tl.constexpr,
+    W_NS: tl.constexpr,
+    C_BM: tl.constexpr, C_BN: tl.constexpr, C_BK: tl.constexpr,
+    C_NS: tl.constexpr,
+    BLOCK_N_PUSH: tl.constexpr, GATE_PAD_C: tl.constexpr,
+    P1_ON: tl.constexpr, P23_ON: tl.constexpr,
+    P4_ON: tl.constexpr, P5_ON: tl.constexpr,
+    # ---- B3 signalization (MOE_MEGA_TILE_B3=1): per-tile readiness ----
+    b3_signal_ptr, b3_epoch,
+    TILE_B3: tl.constexpr,
+    # ---- B1 signalization (MOE_MEGA_TILE_B1=1): per-window grad_swiglu ----
+    b1_signal_ptr, b1_epoch, num_n_tiles1,
+    TILE_B1: tl.constexpr,
+    # ---- P4a+P4b fusion (MOE_MEGA_FUSE_P4=1): self-produce-self-push ----
+    FUSE_P4: tl.constexpr,
+    # ---- step-2 wave evolution: dedicated symmetric return slab ----
+    # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
+    #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
+    combine_buf_ptr,
+    # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
+    replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
+    replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
+    tile_home_bound4, home_base4,
+    # ---- MoonEP M3 grad_reduce (grad_transport): P6 tail operands ----
+    acc_gate_up_ptr, acc_down_ptr,           # fp32 [epn, H, 2F] / [epn, H, F]
+    gate_up_slot_ptr, down_slot_ptr,         # borrowed symmetric bf16 tables
+    desc_peer6_ptr, desc_slot6_ptr, home_off6_ptr,
+    consumed6_ptr, consumed_count6,
+    staging_gu_ptr, staging_dn_ptr,          # [ncore, chunk] per-program rows
+    gu6_elems, dn6_elems,
+    HOME_E: tl.constexpr, ACTIVE_E: tl.constexpr,
+    GRAD_REDUCE: tl.constexpr,
+    EPN6: tl.constexpr,
+    GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
+    TM6: tl.constexpr, TN6: tl.constexpr, BLK6: tl.constexpr,
+    # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
+    ts_ptr, wait1_ptr,
+    TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
+):
+    """One launch for the whole non-MoonEP MoE backward — see the module
+    docstring for the phase/barrier map and the M0 probe evidence.  Grid MUST
+    be (ncore(), 1, 1): barrier_all is the mixed-scope cross-rank collective
+    and every program reaches all four barriers unconditionally."""
+    pid = tl.program_id(axis=0)
+    num_cores = tl.num_programs(axis=0)
+    if TIMING:
+        _mega_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
+
+    # ---------------- P1: dispatch + fc2 input-grad ----------------
+    if P1_ON:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                _dispatch_grad_source_tiles(
+                    pid, num_cores,
+                    gco_ptr, peer_mem_ptr, signal_mem_ptr,
+                    send_bucket_starts_ptr, send_counts_re_ptr,
+                    send_bucket_dst_starts_ptr,
+                    signal_epoch, H, stride_gm,
+                    LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
+                    MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
+        if TIMING:
+            _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            # Home sweep stops at HOME_E (=EPR without MoonEP): fc2_ptr is the
+            # HOME-only table, so consuming replica slots here too would read
+            # weights past its end AND race the replica sweep's programs on the
+            # same grad_swiglu rows (the standalone step-1 kernel's split).
+            _fc2_bwd_gemm_merged_tiles_wait(
+                pid, num_cores,
+                peer_mem_ptr, signal_mem_ptr, fc2_ptr, grad_swiglu_ptr,
+                recv_per_expert_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+                signal_epoch,
+                N1, K1,
+                H, 1, stride_we1, stride_wk1, stride_wn1, N1, 1,
+                D_BM, D_BN, D_BK, PUSH_BLOCK_M,
+                WORLD_SIZE, EXPERTS_PER_RANK,
+                0, HOME_E, 0,
+                MAX_BWD_TILES, tl.bfloat16,
+                b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
+                LOCAL_RANK=LOCAL_RANK,
+                wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+            # MoonEP dual weight table: the replica slot range [HOME_E,
+            # ACTIVE_E) re-runs the sweep against replica_fc2 re-based at
+            # HOME_E (the standalone step-1 kernel's second launch, inlined).
+            if ACTIVE_E > HOME_E:
+                _fc2_bwd_gemm_merged_tiles_wait(
+                    pid, num_cores,
+                    peer_mem_ptr, signal_mem_ptr, replica_fc2_ptr,
+                    grad_swiglu_ptr,
+                    recv_per_expert_ptr, recv_expert_offs_ptr,
+                    recv_counts_re_ptr,
+                    signal_epoch,
+                    N1, K1,
+                    H, 1, stride_rwe1, stride_rwk1, stride_rwn1, N1, 1,
+                    D_BM, D_BN, D_BK, PUSH_BLOCK_M,
+                    WORLD_SIZE, EXPERTS_PER_RANK,
+                    HOME_E, ACTIVE_E, HOME_E,
+                    MAX_BWD_TILES, tl.bfloat16,
+                    b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
+                    LOCAL_RANK=LOCAL_RANK,
+                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+        if TIMING:
+            _mega_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
+    # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
+    # TILE_B1 replaces the barrier: P1's cube GEMM SETs a local slot per
+    # (expert, n_tile, m_window) grad_swiglu tile, the P2 windowed consumer
+    # merged-waits its slots, and P3 re-waits the dispatch slots itself
+    # (SET values persist — a second consumer just re-reads them).  Uniform
+    # constexpr, so the remaining barriers stay unconditional.
+    if not TILE_B1:
+        libshmem_device.barrier_all()
+    if TIMING:
+        _mega_stamp(ts_ptr, 3, pid, TS_SLOTS)   # post-B1
+
+    # ---------------- P2 (vector) ∥ P3 (cube) ----------------
+    if P23_ON:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if TILE_B1:
+                # dl.wait/consume_token must not run twice per program —
+                # sub_vec0 gate (probe 3's consumer shape).
+                if sub_vec_id() == 0:
+                    _mega_swiglu_bwd_windowed(
+                        pid, num_cores,
+                        grad_swiglu_ptr, N1,
+                        AB_ptr, K4,
+                        ffn, scale_ptr, dAB_ptr, dscale_ptr,
+                        recv_per_expert_ptr, recv_expert_offs_ptr,
+                        b1_signal_ptr, b1_epoch,
+                        num_n_tiles1,
+                        situ_beta, situ_linear_beta,
+                        EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
+                        BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
+                        HAS_LINEAR_BETA=HAS_LINEAR_BETA)
+            else:
+                _mega_swiglu_bwd(
+                    pid, num_cores,
+                    grad_swiglu_ptr, N1,
+                    AB_ptr, K4,
+                    ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
+                    situ_beta, situ_linear_beta,
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
+            _mega_wgrad_sweep(
+                pid, num_cores,
+                peer_mem_ptr, H, 1,
+                orig_in3_ptr, stride_om3, stride_ok3,
+                grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
+                split_cum_ptr, expert_counts_ptr,
+                N3, K3, num_tn3, num_tk3, 0, w3_total, max_rows_w,
+                W_BM, W_BN, W_BK, W_NS,
+                WAIT_DISP=TILE_B1,
+                signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
+                recv_counts_re_ptr=recv_counts_re_ptr,
+                WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
+                MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
+    if TIMING:
+        _mega_stamp(ts_ptr, 4, pid, TS_SLOTS)   # P2∥P3 window done
+    # B2: publishes P2's outputs (dAB for P4a/P5, dscale for P4b) across
+    # programs.  Step 2 removed this barrier's cross-rank job — with the
+    # dedicated combine_buf the return push no longer overwrites peer_mem's
+    # dispatch area while remote P3s still read it (the =0 fallback keeps
+    # that hazard and this barrier remains its only protection).
+    libshmem_device.barrier_all()
+    if TIMING:
+        _mega_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
+
+    # ---- transport wave window 1 (GRAD_REDUCE): fc2-grad seed+sink ∥ P4a ----
+    # grad_fc2 is final at P3/B2, and this window's vector engine is idle
+    # (P4a — or the FUSE_P4 loop's first iteration — is cube-only), so the
+    # DOWN half of the old P6a rides here as the leading [vec] scope of a
+    # P2∥P3-style adjacent pair.  The sunk slots are cross-rank published by
+    # the very next hard barrier (B3, or B4 when B3 is signalized/unrolled)
+    # and the only consumer is the B5->B6 owner-pull — no new barrier needed.
+    if GRAD_REDUCE:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            _mega_grad_seed_sink(
+                pid, num_cores,
+                grad_fc1_ptr, grad_fc2_ptr,
+                acc_gate_up_ptr, acc_down_ptr,
+                gate_up_slot_ptr, down_slot_ptr,
+                consumed6_ptr, consumed_count6,
+                EPN6, H, ffn,
+                TM6, TN6, BLK6,
+                SINK_GU=0, SINK_DN=1)
+
+    # ---------------- P4a+P4b: fc1 input-grad GEMM + reverse-A2A push ------
+    if FUSE_P4:
+        # MOE_MEGA_FUSE_P4=1: each program owns a strided set of m-tiles and
+        # SELF-PRODUCES then SELF-PUSHES each one — cube scope computes all
+        # n-tiles of tile_m and signals its slot, the adjacent vector scope
+        # waits that SAME slot and pushes the tile's rows.  B3 disappears
+        # entirely (the handoff is intra-program, never cross-program), and
+        # iteration i+1's cube GEMM overlaps iteration i's vector push — the
+        # P2∥P3 adjacent-scope recipe applied per tile, the structural
+        # equivalent of MoonEP's AIC/AIV wave pipeline (on A5's independent
+        # engine arrays this is true concurrent transport).  No barrier sits
+        # inside the loop and B1/B2/B4 remain unconditional; probe 4 gates
+        # the scope-alternation-in-loop + self-signal chain.  MoonEP dual
+        # weight table = TWO m-tile loops (home [0, tile_home_bound4) then
+        # replica), never a runtime weight-pointer select in the loop body
+        # (TritonToUnstructure does not lower it — see _mega_combine_gemm).
+        for tile_m in range(pid, tile_home_bound4, num_cores):
+            with al.scope(core_mode="cube", disable_auto_sync=True):
+                _mega_gemm_mtile(
+                    tile_m,
+                    dAB_ptr, stride_im4, stride_ik4,
+                    fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
+                    0,
+                    hidden_buf_ptr,
+                    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                    N4, K4, num_tiles_n4,
+                    b3_signal_ptr, b3_epoch,
+                    C_BM, C_BN, C_BK, C_NS, LOCAL_RANK=LOCAL_RANK)
+            with al.scope(core_mode="vector", disable_auto_sync=True):
+                if sub_vec_id() == 0:
+                    _mega_push_mtile(
+                        tile_m,
+                        hidden_buf_ptr,
+                        write_rank_by_src_ptr, write_off_by_src_ptr,
+                        combine_buf_ptr, dscale_ptr,
+                        tile_row0_ptr, tile_rows_ptr,
+                        b3_signal_ptr, b3_epoch,
+                        H,
+                        BLOCK_N_PUSH, GATE_PAD_C)
+        if ACTIVE_E > HOME_E:
+            # first replica m-tile on this program's stride class (ids stay
+            # ≡ pid mod num_cores across the cut; pid < num_cores keeps
+            # tl.cdiv's truncating divide exact for the negative remainder)
+            rep_m0 = pid + tl.cdiv(tile_home_bound4 - pid, num_cores) * num_cores
+            for tile_m in range(rep_m0, num_tiles_m4, num_cores):
+                with al.scope(core_mode="cube", disable_auto_sync=True):
+                    _mega_gemm_mtile(
+                        tile_m,
+                        dAB_ptr, stride_im4, stride_ik4,
+                        replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,
+                        home_base4,
+                        hidden_buf_ptr,
+                        tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                        N4, K4, num_tiles_n4,
+                        b3_signal_ptr, b3_epoch,
+                        C_BM, C_BN, C_BK, C_NS, LOCAL_RANK=LOCAL_RANK)
+                with al.scope(core_mode="vector", disable_auto_sync=True):
+                    if sub_vec_id() == 0:
+                        _mega_push_mtile(
+                            tile_m,
+                            hidden_buf_ptr,
+                            write_rank_by_src_ptr, write_off_by_src_ptr,
+                            combine_buf_ptr, dscale_ptr,
+                            tile_row0_ptr, tile_rows_ptr,
+                            b3_signal_ptr, b3_epoch,
+                            H,
+                            BLOCK_N_PUSH, GATE_PAD_C)
+    else:
+        # ---------------- P4a: fc1 input-grad GEMM ----------------
+        if P4_ON:
+            with al.scope(core_mode="cube", disable_auto_sync=True):
+                # MoonEP dual weight table as TWO single-table M-TILE-range
+                # sweeps (home m-tiles [0, tile_home_bound4) then replica);
+                # the alternative — a runtime weight-pointer/stride select
+                # inside the loop — does not lower (TritonToUnstructure, w2
+                # 910B1).
+                _mega_combine_gemm(
+                    pid, num_cores,
+                    dAB_ptr, stride_im4, stride_ik4,
+                    fc1_combined_ptr, stride_we4, stride_wk4, stride_wn4,
+                    0,
+                    hidden_buf_ptr,
+                    tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                    N4, K4, num_tiles_n4, num_tiles_m4,
+                    0, tile_home_bound4,
+                    b3_signal_ptr, b3_epoch,
+                    C_BM, C_BN, C_BK, C_NS,
+                    SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+                if ACTIVE_E > HOME_E:
+                    # replica m-tiles [tile_home_bound4, num_tiles_m4) against
+                    # the replica gate/up table — the m-tile range IS the split
+                    # (the old global-task-range cut mixed home and replica
+                    # tiles across the two sweeps; see the helper's 2026-09-12
+                    # bugfix note)
+                    _mega_combine_gemm(
+                        pid, num_cores,
+                        dAB_ptr, stride_im4, stride_ik4,
+                        replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,
+                        home_base4,
+                        hidden_buf_ptr,
+                        tile_expert_ptr, tile_row0_ptr, tile_rows_ptr,
+                        N4, K4, num_tiles_n4, num_tiles_m4,
+                        tile_home_bound4, num_tiles_m4,
+                        b3_signal_ptr, b3_epoch,
+                        C_BM, C_BN, C_BK, C_NS,
+                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+        # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
+        # barrier with per-(tile,n) readiness signals (uniform constexpr —
+        # every program takes the same branch, so the barrier contract is
+        # intact and B1/B2/B4 remain unconditional).
+        if not TILE_B3:
+            libshmem_device.barrier_all()
+
+        # ------- P4b (vec push) ∥ P5a (cube wgrad, first half of tasks) -------
+        # The P2∥P3 concurrency recipe: adjacent vector/cube scopes overlap on
+        # their engines. P5 needs only P2's dAB (published at B2), so its first
+        # task half rides the push window — msprof showed the vector engine
+        # ~97% idle across the kernel, so this window was pure loss before.
+        if P4_ON:
+            with al.scope(core_mode="vector", disable_auto_sync=True):
+                if sub_vec_id() == 0:
+                    if TILE_B3:
+                        _mega_push_rows_tiled(
+                            pid, num_cores,
+                            hidden_buf_ptr,
+                            write_rank_by_src_ptr, write_off_by_src_ptr,
+                            combine_buf_ptr, dscale_ptr,
+                            tile_row0_ptr, tile_rows_ptr,
+                            b3_signal_ptr, b3_epoch,
+                            num_tiles_m4, num_tiles_n4,
+                            H, M4,
+                            BLOCK_N_PUSH, GATE_PAD_C)
+                    else:
+                        _mega_push_rows(
+                            pid, num_cores,
+                            hidden_buf_ptr,
+                            write_rank_by_src_ptr, write_off_by_src_ptr,
+                            combine_buf_ptr, dscale_ptr,
+                            H, M4,
+                            BLOCK_N_PUSH, GATE_PAD_C)
+
+    # P5a (cube wgrad, first half of tasks): with FUSE_P4 it follows the
+    # fused loop, overlapping only the per-program tail pushes (adjacent
+    # vec->cube scopes); otherwise it rides the P4b window as before.
+    if TIMING:
+        _mega_stamp(ts_ptr, 6, pid, TS_SLOTS)   # P4a/FUSE_P4 (+P4b) done
+    if P5_ON:
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            _mega_wgrad_sweep(
+                pid, num_cores,
+                dAB_ptr, K4, 1,
+                orig_in5_ptr, stride_om5, stride_ok5,
+                grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
+                split_cum_ptr, expert_counts_ptr,
+                N5, K5, num_tn5, num_tk5, 0, w5_split, max_rows_w,
+                W_BM, W_BN, W_BK, W_NS,
+                WAIT_DISP=0,
+                signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
+                recv_counts_re_ptr=recv_counts_re_ptr,
+                WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
+                MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
+    if TIMING:
+        _mega_stamp(ts_ptr, 7, pid, TS_SLOTS)   # P5a done
+    # B4: cross-rank — every push landed before any rank reduces local rows.
+    libshmem_device.barrier_all()
+    if TIMING:
+        _mega_stamp(ts_ptr, 8, pid, TS_SLOTS)   # post-B4
+
+    # ------- P4c (vec reduce) ∥ P5b (cube wgrad, second half) — no B5 ----
+    # After B4 no rank writes another rank's memory, so no trailing barrier
+    # is needed: programs exit when their own reduce + wgrad remainder finish
+    # (probe 2a proved a strictly longer FIVE-barrier chain; four is a
+    # subset).
+    if P4_ON:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            _mega_reduce(
+                pid, num_cores,
+                inv_sort_ptr, combine_buf_ptr,
+                grad_hidden_ptr, grad_routing_ptr,
+                B4, topk4, H,
+                H, 1,
+                BLOCK_N_PUSH, GATE_PAD_C)
+    if P5_ON:
+        with al.scope(core_mode="cube", disable_auto_sync=True):
+            _mega_wgrad_sweep(
+                pid, num_cores,
+                dAB_ptr, K4, 1,
+                orig_in5_ptr, stride_om5, stride_ok5,
+                grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
+                split_cum_ptr, expert_counts_ptr,
+                N5, K5, num_tn5, num_tk5, w5_split, w5_total, max_rows_w,
+                W_BM, W_BN, W_BK, W_NS,
+                WAIT_DISP=0,
+                signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
+                recv_counts_re_ptr=recv_counts_re_ptr,
+                WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
+                MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
+    if TIMING:
+        _mega_stamp(ts_ptr, 9, pid, TS_SLOTS)   # exit (pre-P6 tail)
+
+    # ---------------- P6: MoonEP grad_reduce (GRAD_REDUCE) ----------------
+    # The ReplicaGradTransport chain inlined as tail phases, restructured
+    # into the transport wave (2026-09-10): the old serial chain [seed+sink
+    # BOTH tables -> B6 -> pull BOTH tables] is split by table and hidden in
+    # windows that already existed —
+    #   window 1 (B2->B3, ∥ cube P4a, above): seed acc_down + sink down
+    #   window 2 (B5->B6, below): sink gate/up (ungated, idempotent) ∥
+    #     owner-pull + accumulate the DOWN slots (sub_vec0-gated RMW)
+    #   window 3 (B6->exit, below): owner-pull + accumulate GATE/UP
+    # B5 publishes the wave's last producer dependency (P5's grad_fc1 — the
+    # down slots were published by B3/B4 already); B6 publishes the window-2
+    # gate/up slots for window 3.  Barrier count is unchanged (B1..B6) and
+    # each table's (peer, slot) descriptor order is untouched, so the fp32
+    # accumulators stay bit-identical to the fused transport kernel's.  The
+    # transport's third stage (zeroing the consumed slots) and its barrier
+    # #2 remain the kernel exit + a stream-ordered HOST zero after the
+    # launch — purely local work, see the module docstring.  GRAD_REDUCE is
+    # a uniform constexpr: non-MoonEP launches compile the whole tail —
+    # barriers included — out, leaving the chain exactly as probes proved
+    # it.
+    if GRAD_REDUCE:
+        libshmem_device.barrier_all()
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            # pull FIRST: the getmem stream (blocking per chunk) starts
+            # while other programs are still in the ungated sink below —
+            # comm latency hides under the local transposes at engine level.
+            if sub_vec_id() == 0:
+                _mega_grad_owner_pull(
+                    pid, num_cores,
+                    acc_gate_up_ptr, acc_down_ptr,
+                    gate_up_slot_ptr, down_slot_ptr,
+                    desc_peer6_ptr, desc_slot6_ptr, home_off6_ptr,
+                    staging_gu_ptr, staging_dn_ptr,
+                    gu6_elems, dn6_elems,
+                    EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
+                    ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
+                    PULL_GU=0, PULL_DN=1)
+            # ungated like the old P6a: idempotent plain stores, so running
+            # on BOTH vector subcores with the same pid is harmless.
+            _mega_grad_seed_sink(
+                pid, num_cores,
+                grad_fc1_ptr, grad_fc2_ptr,
+                acc_gate_up_ptr, acc_down_ptr,
+                gate_up_slot_ptr, down_slot_ptr,
+                consumed6_ptr, consumed_count6,
+                EPN6, H, ffn,
+                TM6, TN6, BLK6,
+                SINK_GU=1, SINK_DN=0)
+        libshmem_device.barrier_all()
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                _mega_grad_owner_pull(
+                    pid, num_cores,
+                    acc_gate_up_ptr, acc_down_ptr,
+                    gate_up_slot_ptr, down_slot_ptr,
+                    desc_peer6_ptr, desc_slot6_ptr, home_off6_ptr,
+                    staging_gu_ptr, staging_dn_ptr,
+                    gu6_elems, dn6_elems,
+                    EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
+                    ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
+                    PULL_GU=1, PULL_DN=0)
+
+
+# ============================================================================
+# the mega kernel — fused backward-recompute variant
+# (MOE_SAVED_RECOMPUTE=1): ONE launch carries the whole backward plus
+# the saved-activation recompute riding the P1 window
 # ============================================================================
 @triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
 def kernel_moe_backward_mega_recompute(
@@ -2092,7 +2601,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
         if cbm * cbn > 128 * 256 else {}
     )
-    kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
+    # Shared launch bindings: everything after the P5 group binds BY
+    # KEYWORD (the signature's constexpr block (D_BM..FUSE_P4) sits between
+    # the P5 group and the MoonEP tail, so positional binding would land on
+    # the tile constexprs).  The two kernels share the entire pre-recompute
+    # signature, so one args/kwargs pair serves both launch sites.
+    mega_args = (
         # P1
         p1["gco"], peer_mem, signal_mem,
         p1["send_bucket_starts"], p1["send_counts_re"], p1["send_bucket_dst_starts"],
@@ -2130,10 +2644,8 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         orig_in5, in5_sm, in5_sk,
         grad_fc1, grad_fc1.stride(0), grad_fc1.stride(1), grad_fc1.stride(2),
         2 * ffn, H, num_tn5, num_tk5, w5_split, w5_total,
-        # MoonEP dual tables + P6 tail operands (dead-arg pattern when off).
-        # Passed BY KEYWORD: the signature's constexpr block (D_BM..FUSE_P4)
-        # sits between the P5 group and these, so positional binding would
-        # land on the tile constexprs.
+    )
+    mega_kwargs = dict(
         replica_fc2_ptr=replica_fc2,
         stride_rwe1=replica_fc2.stride(0), stride_rwk1=replica_fc2.stride(1),
         stride_rwn1=replica_fc2.stride(2),
@@ -2164,17 +2676,26 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         TILE_B1=tile_b1,
         FUSE_P4=fuse_p4 and _flag("MOE_MEGA_P4"),
         combine_buf_ptr=combine_buf,
-        # SAVED_RECOMPUTE operands (dead-arg pattern when off)
-        redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
-        send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
-        SAVED_RECOMPUTE=saved_recompute, REDIS_BM=64, REDIS_BN=1024,
         HOME_E=home_e, ACTIVE_E=active_e,
         GRAD_REDUCE=grad_reduce, EPN6=epn6,
         GU_CHUNK=gu_chunk6, DN_CHUNK=dn_chunk6,
         ACC_BLK=blk6, TM6=tm6, TN6=tn6, BLK6=blk6,
         ts_ptr=ts_buf, wait1_ptr=wait1_buf,
         TS_SLOTS=MEGA_TS_SLOTS, TIMING=timing_on,
-        num_warps=8, **launch_options)
+    )
+    if saved_recompute:
+        kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
+            *mega_args, **mega_kwargs,
+            redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
+            send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
+            SAVED_RECOMPUTE=True, REDIS_BM=64, REDIS_BN=1024,
+            num_warps=8, **launch_options)
+    else:
+        # the ORIGINAL kernel (kept verbatim above): the non-recompute
+        # path launches it exactly as before the fused variant existed
+        kernel_moe_backward_mega[(ncore(), 1, 1)](
+            *mega_args, **mega_kwargs,
+            num_warps=8, **launch_options)
 
     # expert-major peer_mem IS the sorted layout -> identity view (no gather),
     # exactly the alias step 1 returns.
