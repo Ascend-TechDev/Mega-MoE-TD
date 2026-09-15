@@ -47,6 +47,22 @@ from ..kernels import (
 )
 from ..kernels.fused_swiglu_bwd_fc2_wgrad import fused_swiglu_bwd_fc2_wgrad
 
+# Cross-step runtime state of the ONE-launch mega backward
+# (MOE_BWD_MEGA=1) that caches on `saved` but must outlive it: the
+# grow-on-demand symmetric slabs (re-dispatch source under
+# MOE_SAVED_RECOMPUTE=1, the dedicated combine return slab, the optional
+# tile-signal slabs) plus the SET-epoch counters that have to stay
+# monotonic over them.  An integrated framework builds a FRESH saved dict
+# every forward (return_saved=True per step), so without carrying these on
+# the caller-owned `state` every backward would re-allocate its slabs
+# (skewing the symmetric heap upward ~235MB/layer/iter at the kimi mock
+# shape) and restart the epochs at 1 over stale slot values.
+_MEGA_PERSISTENT_KEYS = (
+    "_mega_redispatch_buf", "_mega_combine_buf",
+    "_mega_b3_signal_mem", "_mega_b1_signal_mem",
+    "_mega_b3_signal_epoch", "_mega_b1_signal_epoch",
+    "_mega_ts_buf", "_mega_wait1_buf",
+)
 
 def _grouped_wgrad_torch(grad_out, orig_in, expert_counts, ec_list=None):
     """Torch fallback for the grouped weight-grad GEMM ``grad_w[E,N,K] =
@@ -536,6 +552,12 @@ class MegaMoEFunction(torch.autograd.Function):
             saved["_bwd_tile_signal_epoch"] = max(
                 int(getattr(ctx.state, "epoch", 0)), 1
             )
+            # mega-bwd slabs/epochs (see _MEGA_PERSISTENT_KEYS): seed the
+            # fresh saved dict from the persistent state so the wrapper's
+            # _ensure_* helpers find and reuse last step's allocations.
+            for key, val in getattr(ctx.state, "mega_persistent", {}).items():
+                if val is not None:
+                    saved[key] = val
         # MoonEP physical saved (Stage N): sink the replica weight gradients
         # into the borrowed symmetric tables and owner-pull every copy — the
         # §3.3 autograd-side transport hookup.  Lending invalidates the
@@ -553,6 +575,10 @@ class MegaMoEFunction(torch.autograd.Function):
         if ctx.state is not None:
             ctx.state.signal_mem = saved.get("_bwd_tile_signal_mem")
             ctx.state.epoch = saved.get("_bwd_tile_signal_epoch", 1)
+            ctx.state.mega_persistent = {
+                key: saved[key] for key in _MEGA_PERSISTENT_KEYS
+                if key in saved
+            }
         # The wgrad halves are [E, F, H]; merge back into the packed Kimi
         # [E, H, 2F] layout of the gate_up_weight input.
         grad_gate_up = torch.cat(
@@ -570,3 +596,4 @@ class MegaMoEFunction(torch.autograd.Function):
             None,                           # peer_mem
             None,                           # state
         )
+
