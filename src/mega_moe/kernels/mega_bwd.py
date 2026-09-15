@@ -19,7 +19,10 @@
 #
 #  Phase map (mirrors ops.backward.moe_backward_triton's 5-op order):
 #
-#    P1   dispatch A2A (vec, putmem+signal) + fc2 dgrad (cube, dl.wait)   ]
+#    P1   dispatch A2A (vec, putmem+signal) + fc2 dgrad (cube, dl.wait);
+#         MOE_SAVED_RECOMPUTE=1 rides the same vector scope: the P0
+#         re-dispatch sweep (forward producer mechanism, dl.symm_at direct
+#         stores into the symmetric slab P5 reads) + act-row recompute   ]
 #    B1   barrier_all  — publish P1's remote puts + grad_swiglu.          ] step 1
 #         (MOE_MEGA_TILE_B1=1 replaces it with per-window SET slots — 910B1
 #         only; 950DT lowering boundary, see the knob paragraph below):
@@ -970,10 +973,136 @@ def _mega_stamp(ts_ptr, slot: tl.constexpr, pid, TS_SLOTS: tl.constexpr):
 
 
 # ============================================================================
+# MOE_SAVED_RECOMPUTE=1: backward-side activation recompute (2026-09-14
+# design "后向最新带重算方案"; fused into the mega launch 9/15).  The mega
+# kernel itself rebuilds the two large saved activations it would otherwise
+# read from the forward's fixed-address workspace blocks — ONE launch, no
+# pre-pass kernel:
+#   * recv_hidden_sorted  [M, H] — recomputed by re-dispatching the saved
+#     single PRE-DISPATCH token copy over the same (dst, expert) maps P1
+#     uses ("the fc1 input recomputes as one all2all").  The re-dispatch
+#     reuses the FORWARD dispatch producer's mechanism (dispatch_fc1's
+#     _dispatch_one_source_tile_task): each send slot gathers its source
+#     row from the single token copy (send_src_idx = bwd_expert_sort //
+#     topk, the forward's send_src_idx equivalent) and stores it straight
+#     into the destination rank's symmetric re-dispatch slab — no host-side
+#     topk-x gathered copy (hco), no landing in peer_mem, no clone-out;
+#     P5's wgrad B matrix reads the slab directly.
+#   * swiglu_out_weighted [M, F] — recomputed from fc1_output and the saved
+#     routing weights (H = act(F1) * F2, Hp = p * H, p kept — one scalar per
+#     row, cheap to save).
+# fc1_output is NOT recomputed: the forward keeps saving it and the backward
+# reads it from memory (the fp8 + framework-side offload variant is
+# orthogonal and needs no code here).  Both recompute bodies ride the P1
+# window's vector scope — the remote-store sweep behind the sub_vec0 gate
+# right after P1's own gco putmem sweep, the activation rows ungated beside
+# it (idempotent stores, the P6 window's proven mixed shape) — overlapping
+# P1's cube fc2-dgrad.  B1 publishes the act rows cross-program for P3 and
+# the remote slab stores cross-rank (P5 first reads them two barriers
+# later); no barrier is added or moved.  SAVED_RECOMPUTE (constexpr) compiles
+# both bodies out of the default launch.  The forward is not adapted: its
+# workspace still carries both keys, the mega path just stops consuming
+# them.
+# ============================================================================
+@triton.jit
+def _redispatch_hidden_direct(
+    pid, nprogs,
+    hidden_ptr, stride_rm,
+    send_src_idx_ptr, redis_buf_ptr,
+    send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    H: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    EXPERTS_PER_RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """The forward dispatch producer's DIRECT_REMOTE_STORE branch
+    (dispatch_fc1._dispatch_one_source_tile_task), re-aimed at the
+    re-dispatch slab: per send slot the source row is GATHERED FROM THE
+    SINGLE pre-dispatch token copy (send_src_idx — no host-side topk-x
+    materialization) and stored straight into the destination rank's
+    symmetric slab via dl.symm_at, 64x1024 store blocks like the forward.
+    Same (dst, expert) bucket walk and work-id decode as the P1 gco sweep
+    (_dispatch_grad_source_tiles), so rows land in the identical expert-major
+    receive layout recv_hidden_sorted has — P5 reads the slab as a drop-in
+    B matrix.  No signal chain: B1's barrier publishes the remote stores
+    (module docstring rule; dl.symm_at resolves non-first slabs on 950DT,
+    probe 6b) and P5's first read sits behind B2/B3 anyway."""
+    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
+    rows = tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    for work_id in range(pid, num_tasks, nprogs):
+        dst_rank = work_id % WORLD_SIZE
+        expert_id = work_id // WORLD_SIZE
+        task_id = dst_rank * EXPERTS_PER_RANK + expert_id
+        task_start = tl.load(send_bucket_starts_ptr + task_id)
+        task_count = tl.load(send_counts_re_ptr + task_id)
+        task_dst_start = tl.load(send_bucket_dst_starts_ptr + task_id)
+        remote = dl.symm_at(redis_buf_ptr, dst_rank)
+        for tile_start in range(0, task_count, BLOCK_M):
+            tile_rows = tile_start + rows
+            row_mask = tile_rows < task_count
+            source_rows = tl.load(
+                send_src_idx_ptr + task_start + tile_rows,
+                mask=row_mask, other=0).to(tl.int64)
+            dst_rows = (task_dst_start + tile_rows).to(tl.int64)
+            for col_start in range(0, H, BLOCK_N):
+                cc = col_start + cols
+                col_mask = cc < H
+                values = tl.load(
+                    hidden_ptr + source_rows[:, None] * stride_rm + cc[None, :],
+                    mask=row_mask[:, None] & col_mask[None, :], other=0.0)
+                tl.store(
+                    remote + dst_rows[:, None] * H + cc[None, :], values,
+                    mask=row_mask[:, None] & col_mask[None, :])
+
+
+@triton.jit
+def _recompute_act_rows(
+    pid, nprogs,
+    fc1_out_ptr, stride_om,
+    scale_ptr,
+    actw_ptr, stride_am,
+    ffn, n_rows,
+    situ_beta, situ_linear_beta,
+    BLOCK_SIZE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+):
+    """weighted_swiglu's row formula verbatim (tl.math.tanh, fp32
+    intermediates, BF16 store) over the SAVED fc1_output — bit-identical to
+    the forward product except the scale, which arrives as the BF16 saved
+    recv_weights_sorted instead of the forward's FP32 routing weights
+    (ulp-level, gate tolerance covers it).  Rides the P1 window's vector
+    scope UNGATED beside the sub_vec0 remote bodies: pure-function stores,
+    so running on both vector subcores with the same pid-strided rows is
+    idempotent (the P6 seed_sink shape)."""
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < ffn
+    for row in range(pid, n_rows, nprogs):
+        r64 = row.to(tl.int64)
+        gate = tl.load(fc1_out_ptr + r64 * stride_om + offs,
+                       mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(fc1_out_ptr + r64 * stride_om + ffn + offs,
+                     mask=mask, other=0.0).to(tl.float32)
+        if ACTIVATION == 0:
+            act = gate * tl.sigmoid(gate) * up
+        else:
+            situ_a = situ_beta * tl.math.tanh(gate / situ_beta) * tl.sigmoid(gate)
+            if HAS_LINEAR_BETA:
+                up = situ_linear_beta * tl.math.tanh(up / situ_linear_beta)
+            act = situ_a * up
+        sc = tl.load(scale_ptr + r64).to(tl.float32)
+        act = act * sc
+        tl.store(actw_ptr + r64 * stride_am + offs,
+                 act.to(actw_ptr.dtype.element_ty), mask=mask)
+
+
+# ============================================================================
 # the mega kernel
 # ============================================================================
 @triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
-def kernel_moe_backward_mega(
+def kernel_moe_backward_mega_recompute(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
     gco_ptr, peer_mem_ptr, signal_mem_ptr,
     send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
@@ -1057,6 +1186,14 @@ def kernel_moe_backward_mega(
     # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
+    # ---- MOE_SAVED_RECOMPUTE=1: P0 re-dispatch + act recompute operands
+    # (fused into the P1 window; dead-arg pattern when SAVED_RECOMPUTE=0
+    # compiles both bodies out — see the recompute block comment above) ----
+    redis_src_ptr, stride_rm,              # pre-dispatch token copy [B, H]
+    send_src_idx_ptr,                      # send slot -> source row (sort//topk)
+    redis_buf_ptr,                         # symmetric slab [rows, H] = P5's B
+    SAVED_RECOMPUTE: tl.constexpr,
+    REDIS_BM: tl.constexpr, REDIS_BN: tl.constexpr,
 ):
     """One launch for the whole non-MoonEP MoE backward — see the module
     docstring for the phase/barrier map and the M0 probe evidence.  Grid MUST
@@ -1068,6 +1205,10 @@ def kernel_moe_backward_mega(
         _mega_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
 
     # ---------------- P1: dispatch + fc2 input-grad ----------------
+    # (+ SAVED_RECOMPUTE: the P0 re-dispatch sweep and the act-row recompute
+    # ride this window's vector scope, overlapping the cube fc2-dgrad — see
+    # the recompute block comment.  gco's putmem sweep stays FIRST: its
+    # signal chain unblocks the cube dgrad waiters, the critical path.)
     if P1_ON:
         with al.scope(core_mode="vector", disable_auto_sync=True):
             if sub_vec_id() == 0:
@@ -1079,6 +1220,23 @@ def kernel_moe_backward_mega(
                     signal_epoch, H, stride_gm,
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
+                if SAVED_RECOMPUTE:
+                    _redispatch_hidden_direct(
+                        pid, num_cores,
+                        redis_src_ptr, stride_rm,
+                        send_src_idx_ptr, redis_buf_ptr,
+                        send_bucket_starts_ptr, send_counts_re_ptr,
+                        send_bucket_dst_starts_ptr,
+                        H, WORLD_SIZE, EXPERTS_PER_RANK,
+                        REDIS_BM, REDIS_BN)
+            if SAVED_RECOMPUTE:
+                _recompute_act_rows(
+                    pid, num_cores,
+                    AB_ptr, K4,
+                    scale_ptr,
+                    orig_in3_ptr, stride_om3,
+                    ffn, n_rows, situ_beta, situ_linear_beta,
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
         if TIMING:
             _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -1491,6 +1649,30 @@ def _ensure_mega_combine_buf(saved, elems):
     return mem
 
 
+def _ensure_mega_redispatch_buf(saved, elems):
+    """Lazy/grow-alloc the symmetric re-dispatch slab (MOE_SAVED_RECOMPUTE=1):
+    P0's direct remote stores land here and P5's wgrad sweep reads it as the
+    recv_hidden B matrix. bf16 like peer_mem, grow-on-demand, mirroring
+    _ensure_mega_combine_buf's discipline.  Read rows [0, M) are fully
+    rewritten each launch (send_bucket_dst_starts covers every (dst, slot)
+    row exactly once); the [M, M+pad) tail only backs P5's masked-lane
+    address validation (garbage semantics, same as the padded torch buffer
+    it replaces).  elems MUST come from a cross-rank MAX — every rank stores
+    onto its peers, so a rank-local size skews the symmetric heap (see the
+    b3_signal sizing note in the wrapper)."""
+    import shmem as ash
+    mem = saved.get("_mega_redispatch_buf")
+    if mem is not None and mem.numel() >= elems:
+        return mem
+    if mem is not None:
+        ash.aclshmem_free_tensor(mem)
+    mem = ash.aclshmem_create_tensor(
+        [elems], dtype=torch.bfloat16, device_id=saved["ep_rank"])
+    mem.zero_()
+    saved["_mega_redispatch_buf"] = mem
+    return mem
+
+
 def _ensure_mega_signal_local(saved, key, slots):
     """Lazy/grow-alloc a LOCAL readiness signal slab on `saved` under `key`:
     one SET slot per task, 16 int32 elements (64B) per slot, mirroring
@@ -1511,7 +1693,8 @@ def _ensure_mega_signal_local(saved, key, slots):
     return mem
 
 
-def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
+def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
+                         hidden_states=None):
     """MOE_BWD_MEGA=1 backward: the whole 5-step backward in ONE kernel
     launch. Non-MoonEP saved dicts return the SAME 10-key dict as the
     orchestrator's non-MoonEP branch; MoonEP saved dicts (use_moonep) return
@@ -1530,7 +1713,17 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     are REPLACED by the in-kernel chain; sunk/reduced are set on return and
     the fp32 accumulators are cast out stream-ordered after the launch.  The
     slot tables are borrowed-destructively exactly as the host transport
-    borrows them."""
+    borrows them.
+
+    hidden_states: the forward INPUT token copy [B, H] (pre-dispatch).  Only
+    MOE_SAVED_RECOMPUTE=1 reads it — the fused P0 phase (in the P1 window)
+    re-dispatches it over P1's send maps with the forward producer's
+    per-token gather mechanism (dl.symm_at direct stores into a dedicated
+    symmetric slab, which P5 then reads as its B matrix), and the act rows
+    are rewritten from fc1_output in the same window.  ONE launch carries
+    the whole backward plus the recompute; the two saved workspace keys are
+    simply not consumed and the forward is not adapted (its workspace still
+    carries them)."""
     use_moonep = bool(saved.get("use_moonep"))
     # MOE_MEGA_P6=0 compiles the MoonEP dual tables without the grad_reduce
     # tail (bisect/escape hatch; default on).  950DT CAVEAT (2026-09-10): the
@@ -1588,6 +1781,25 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     # wgrad-sweep read targets carry the pad rows, returned keys are [:M]
     # views)
     fc1_output = saved["fc1_output"].contiguous()      # [M, 2*ffn]
+    # MOE_SAVED_RECOMPUTE=1 (the 9/14 backward-side recompute design, fused
+    # into this launch 9/15): the two large saved activations below are NOT
+    # read — orig_in5 becomes the symmetric re-dispatch slab P0 fills in the
+    # P1 window (the forward producer's per-token gather mechanism, no
+    # host-side topk-x copy), and orig_in3's rows are recomputed from
+    # fc1_output in the same window (see the recompute block comment above
+    # the mega kernel).  fc1_output itself stays saved and read from memory.
+    # The forward is not adapted: its workspace still allocates both keys,
+    # the mega path just stops consuming them.
+    saved_recompute = os.environ.get("MOE_SAVED_RECOMPUTE", "0") == "1"
+    if saved_recompute:
+        if hidden_states is None:
+            raise ValueError(
+                "MOE_SAVED_RECOMPUTE=1 needs the forward input hidden_states "
+                "(the saved pre-dispatch token copy) passed into the backward")
+        if tuple(hidden_states.shape) != (saved["batch_size"], H):
+            raise ValueError(
+                f"hidden_states {tuple(hidden_states.shape)} does not match "
+                f"the saved forward input {(saved['batch_size'], H)}")
     grad_swiglu = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)[:M]
     grad_fc1_output = torch.empty(
@@ -1595,11 +1807,35 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     grad_gate = torch.empty(M, dtype=fc1_output.dtype, device=device)
     orig_in3 = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)
-    orig_in3[:M].copy_(saved["swiglu_out_weighted"])
+    if not saved_recompute:
+        orig_in3[:M].copy_(saved["swiglu_out_weighted"])
     grad_fc2 = torch.empty(EPR, H, ffn, dtype=dy.dtype, device=device)
-    orig_in5 = torch.empty(
-        M + pad_rows_w, H, dtype=dy.dtype, device=device)
-    orig_in5[:M].copy_(saved["recv_hidden_sorted"])
+    if saved_recompute:
+        # P5's B matrix = the symmetric re-dispatch slab.  Sizing from the
+        # cross-rank MAX of M+pad rows (every rank stores onto its peers —
+        # rank-local sizes skew the symmetric heap); the [M, M+pad) tail only
+        # backs P5's masked-lane address validation, garbage like the padded
+        # torch buffer it replaces.
+        _rows5 = torch.tensor(
+            [M + pad_rows_w], dtype=torch.int64, device=device)
+        dist.all_reduce(_rows5, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        orig_in5 = _ensure_mega_redispatch_buf(saved, int(_rows5.item()) * H)
+        in5_sm, in5_sk = H, 1
+        # the forward producer's source table: expert-major send slot -> row
+        # in the single pre-dispatch copy (== bwd_expert_sort // topk, since
+        # flat route ids are repeat_interleave order — the exact gather the
+        # hco build used, minus the topk-x materialization)
+        send_src_idx = (p1["bwd_expert_sort"].to(torch.int64)
+                        // saved["topk"]).to(torch.int32).contiguous()
+        redis_src = hidden_states.to(dy.dtype).contiguous()
+    else:
+        orig_in5 = torch.empty(
+            M + pad_rows_w, H, dtype=dy.dtype, device=device)
+        orig_in5[:M].copy_(saved["recv_hidden_sorted"])
+        in5_sm, in5_sk = orig_in5.stride(0), orig_in5.stride(1)
+        # dead args (SAVED_RECOMPUTE=0 compiles the P0/act bodies out)
+        send_src_idx = p1["send_counts_re"]
+        redis_src = fc1_output
     grad_fc1 = torch.empty(EPR, 2 * ffn, H, dtype=dy.dtype, device=device)
     hidden_buf = torch.empty(
         M + pad_rows_w, H, dtype=dy.dtype, device=device)
@@ -1737,6 +1973,18 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
     # 2026-09-10 was reverted the same day).
     tile_b1 = (os.environ.get("MOE_MEGA_TILE_B1", "0") == "1"
                and _flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23"))
+    if saved_recompute:
+        # The recompute bodies ride the P1 window's vector scope and publish
+        # through B1: the act rows are read CROSS-PROGRAM by P3, and
+        # TILE_B1's signal chain only covers grad_swiglu tiles — so the
+        # barrier must stay.  Same reason the window knobs are requirements,
+        # not suggestions: P1 off leaves the recompute bodies nowhere to run.
+        if not (_flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23")):
+            raise ValueError(
+                "MOE_SAVED_RECOMPUTE=1 rides the P1 window's vector scope "
+                "and publishes through B1 for P3 — it needs MOE_MEGA_P1 and "
+                "MOE_MEGA_P23 on")
+        tile_b1 = False
     if tile_b1:
         num_n_tiles1 = (N1 + dbn - 1) // dbn
         b1_signal = _ensure_mega_signal_local(
@@ -1844,7 +2092,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
         if cbm * cbn > 128 * 256 else {}
     )
-    kernel_moe_backward_mega[(ncore(), 1, 1)](
+    kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
         # P1
         p1["gco"], peer_mem, signal_mem,
         p1["send_bucket_starts"], p1["send_counts_re"], p1["send_bucket_dst_starts"],
@@ -1877,8 +2125,9 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         # P4c
         p4["inv_sort"], grad_hidden, grad_routing,
         p4["B"], p4["topk"],
-        # P5
-        orig_in5, orig_in5.stride(0), orig_in5.stride(1),
+        # P5 (orig_in5 = the re-dispatch slab under SAVED_RECOMPUTE, the
+        # padded torch clone of recv_hidden_sorted otherwise)
+        orig_in5, in5_sm, in5_sk,
         grad_fc1, grad_fc1.stride(0), grad_fc1.stride(1), grad_fc1.stride(2),
         2 * ffn, H, num_tn5, num_tk5, w5_split, w5_total,
         # MoonEP dual tables + P6 tail operands (dead-arg pattern when off).
@@ -1915,6 +2164,10 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None):
         TILE_B1=tile_b1,
         FUSE_P4=fuse_p4 and _flag("MOE_MEGA_P4"),
         combine_buf_ptr=combine_buf,
+        # SAVED_RECOMPUTE operands (dead-arg pattern when off)
+        redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
+        send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
+        SAVED_RECOMPUTE=saved_recompute, REDIS_BM=64, REDIS_BN=1024,
         HOME_E=home_e, ACTIVE_E=active_e,
         GRAD_REDUCE=grad_reduce, EPN6=epn6,
         GU_CHUNK=gu_chunk6, DN_CHUNK=dn_chunk6,

@@ -95,7 +95,8 @@ def _grouped_wgrad_npu(grad_out, orig_in, expert_counts):
 # ============================================================================
 # 1.  5-op orchestrator
 # ============================================================================
-def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
+def moe_backward_triton(saved, dy, peer_mem, grad_transport=None,
+                        hidden_states=None):
     """Run the 5 triton mega-ops end-to-end. peer_mem is ONE shared symmetric
     buffer at heap offset 0 (dl.symm_at only resolves correctly at offset 0 with
     a varying rank), reused by step 1 and step 4 (which run sequentially). The
@@ -141,7 +142,8 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None):
         # MoonEP saved (use_moonep) rides the same launch with the dual weight
         # tables and, when grad_transport is lent, the P6 grad_reduce tail; the
         # non-MoonEP layout is unchanged.
-        return mega_backward_triton(saved, dy, peer_mem, grad_transport)
+        return mega_backward_triton(saved, dy, peer_mem, grad_transport,
+                                    hidden_states=hidden_states)
     use_triton_wgrad = os.environ.get("MOE_WGRAD_TRITON") == "1"
     use_torch_wgrad = os.environ.get("MOE_WGRAD_TORCH") == "1"  # fallback; default is npu
     use_fused = (not use_moonep) and os.environ.get("MOE_FUSED_SWIGLU_WGRAD") == "1"  # step2+step3 fused (Cube/Vector concurrent)
@@ -497,11 +499,15 @@ class MegaMoEFunction(torch.autograd.Function):
         # The saved intermediates are freshly computed views/clones (not the
         # forward inputs), and the weight views must stay pinned until the
         # backward — stash on ctx instead of save_for_backward, mirroring
-        # MegaMoEBackwardFunction.
+        # MegaMoEBackwardFunction.  hidden_states (the pre-dispatch token
+        # copy) rides along the same way: only MOE_SAVED_RECOMPUTE=1 reads
+        # it (the backward-side re-dispatch recompute), everything else
+        # ignores it.
         ctx.op = op
         ctx.saved = saved
         ctx.peer_mem = peer_mem
         ctx.state = state
+        ctx.hidden_states = hidden_states
         return output
 
     @staticmethod
@@ -539,7 +545,9 @@ class MegaMoEFunction(torch.autograd.Function):
         if saved.get("use_moonep"):
             grad_transport = op.lend_replica_weight_tables_for_grad()
         grads = moe_backward_triton(saved, dy, ctx.peer_mem,
-                                    grad_transport=grad_transport)
+                                    grad_transport=grad_transport,
+                                    hidden_states=getattr(
+                                        ctx, "hidden_states", None))
         # Write the lazily allocated signal memory and the bumped epoch back
         # so the next step reuses both.
         if ctx.state is not None:
