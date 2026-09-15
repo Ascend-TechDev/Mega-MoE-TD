@@ -8,9 +8,9 @@ without reaching into the implementation modules.
 
 from .backward import (
     MegaMoEBackwardFunction,
-    MegaMoEFunction,
     moe_backward_triton,
 )
+from .function import MegaMoEFunction
 from .forward import DispatchFC1Result, FusedMoEForward, pack_gate_up_weights
 
 __all__ = [

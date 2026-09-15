@@ -104,7 +104,7 @@ try:
     from mega_moe.ops import MegaMoEFunction  # noqa: E402
 except ImportError:
     try:
-        from mega_moe.ops.backward import MegaMoEFunction  # noqa: E402
+        from mega_moe.ops.function import MegaMoEFunction  # noqa: E402
     except ImportError:
         MegaMoEFunction = None
 
