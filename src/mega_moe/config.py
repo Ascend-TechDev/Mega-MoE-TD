@@ -160,6 +160,13 @@ class MoEForwardConfig:
     # Uses dynamic waves, dual Vector activation, and explicit CV events.
     # MoonEP uses upstream PIPE_S UDMA; saved-forward uses the multi-kernel path.
     enable_single_kernel_forward: bool = False
+    # Saved-forward FC1 format. False (default) keeps the BF16 raw gate/up
+    # save; True quantizes to FP8 E4M3 plus per-row/per-group FP32 scales
+    # (origin/main !59) — about half the save memory, but the in-kernel
+    # quantize leg pushes the fused launch's Unified Buffer over budget on
+    # some tile shapes (ub overflow at the w2 suite config, 2026-09-17), so
+    # it stays opt-in until the buffer pressure is tuned.
+    fc1_save_fp8: bool = False
     # A Kimi gate/up payload (42 MiB) fits one asynchronous UDMA request.
     moonep_udma_chunk_bytes: int = 64 * 1024 * 1024
     # M tiles per compute wave. None selects 32 for MoonEP, 16 for home routing.

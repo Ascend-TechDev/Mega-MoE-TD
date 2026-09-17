@@ -224,10 +224,15 @@ def _mega_swiglu_bwd_row(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """One row of the step-2 swiglu/situ backward (kernels/swiglu_bwd.py:32-70
     verbatim); dC_ready_ptr is grad_swiglu either behind a consume_token (the
-    TILE_B1 windowed consumer) or the plain pointer."""
+    TILE_B1 windowed consumer) or the plain pointer.  FC1_FP8 dequantizes the
+    saved gate/up halves at the load (!59's single-kernel save format: FP8
+    E4M3 payload, one FP32 scale per row per FC1_GROUP_N-wide column group,
+    gate groups then up groups over the [rows, 2F] row)."""
     offs = tl.arange(0, BLOCK_SIZE)
     r64 = row.to(tl.int64)
     a_ptr = AB_ptr + r64 * AB_stride          # gate half
@@ -237,6 +242,12 @@ def _mega_swiglu_bwd_row(
     dc = tl.load(dc_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    if FC1_FP8:
+        scale_row = fc1_scale_ptr + r64 * ((2 * ffn) // FC1_GROUP_N)
+        a = a * tl.load(scale_row + offs // FC1_GROUP_N,
+                        mask=mask, other=0.0)
+        b = b * tl.load(scale_row + (ffn + offs) // FC1_GROUP_N,
+                        mask=mask, other=0.0)
     if ACTIVATION == 0:
         sigmoid_a = tl.sigmoid(a)
         act_a = a * sigmoid_a
@@ -258,8 +269,10 @@ def _mega_swiglu_bwd_row(
     sc = tl.load(scale_ptr + r64)
     da = dc * dact_a * v * sc
     db = dc * act_a * dv * sc
-    tl.store(dAB_ptr + r64 * AB_stride + offs, da.to(AB_ptr.dtype.element_ty), mask=mask)
-    tl.store(dAB_ptr + r64 * AB_stride + ffn + offs, db.to(AB_ptr.dtype.element_ty), mask=mask)
+    # store in dAB's element type (BF16), never AB's: under FC1_FP8 the load
+    # side dequantized into fp32, and the gradient must NOT round back to FP8
+    tl.store(dAB_ptr + r64 * AB_stride + offs, da.to(dAB_ptr.dtype.element_ty), mask=mask)
+    tl.store(dAB_ptr + r64 * AB_stride + ffn + offs, db.to(dAB_ptr.dtype.element_ty), mask=mask)
     tl.store(dscale_ptr + r64, tl.sum(act_a * v * dc))
 
 
@@ -277,6 +290,8 @@ def _mega_swiglu_bwd(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """Step-2 body (kernels/swiglu_bwd.py:32-70 verbatim): ungated vector
     work, rows partitioned by pid over the mega grid (= ncore())."""
@@ -285,7 +300,8 @@ def _mega_swiglu_bwd(
             row, dC_ptr, dC_stride, AB_ptr, AB_stride, ffn,
             scale_ptr, dAB_ptr, dscale_ptr,
             situ_beta, situ_linear_beta,
-            BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+            BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+            fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
 
 
 @triton.jit
@@ -306,6 +322,8 @@ def _mega_swiglu_bwd_windowed(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """MOE_MEGA_TILE_B1=1 consumer for P2: WINDOW-strided ownership.  The P1
     cube GEMM signals every (expert, n_tile, m_window) tile of grad_swiglu it
@@ -339,7 +357,8 @@ def _mega_swiglu_bwd_windowed(
                         row0 + r, dC_ready, dC_stride, AB_ptr, AB_stride, ffn,
                         scale_ptr, dAB_ptr, dscale_ptr,
                         situ_beta, situ_linear_beta,
-                        BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                        BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                        fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
             gw += 1
 
 
@@ -1089,15 +1108,18 @@ def _recompute_act_rows(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """weighted_swiglu's row formula verbatim (tl.math.tanh, fp32
     intermediates, BF16 store) over the SAVED fc1_output — bit-identical to
     the forward product except the scale, which arrives as the BF16 saved
     recv_weights_sorted instead of the forward's FP32 routing weights
-    (ulp-level, gate tolerance covers it).  Rides the P1 window's vector
-    scope UNGATED beside the sub_vec0 remote bodies: pure-function stores,
-    so running on both vector subcores with the same pid-strided rows is
-    idempotent (the P6 seed_sink shape)."""
+    (ulp-level, gate tolerance covers it).  FC1_FP8 dequantizes the saved
+    gate/up halves at the load (same contract as _mega_swiglu_bwd_row).
+    Rides the P1 window's vector scope UNGATED beside the sub_vec0 remote
+    bodies: pure-function stores, so running on both vector subcores with
+    the same pid-strided rows is idempotent (the P6 seed_sink shape)."""
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < ffn
     for row in range(pid, n_rows, nprogs):
@@ -1106,6 +1128,12 @@ def _recompute_act_rows(
                        mask=mask, other=0.0).to(tl.float32)
         up = tl.load(fc1_out_ptr + r64 * stride_om + ffn + offs,
                      mask=mask, other=0.0).to(tl.float32)
+        if FC1_FP8:
+            scale_row = fc1_scale_ptr + r64 * ((2 * ffn) // FC1_GROUP_N)
+            gate = gate * tl.load(scale_row + offs // FC1_GROUP_N,
+                                  mask=mask, other=0.0)
+            up = up * tl.load(scale_row + (ffn + offs) // FC1_GROUP_N,
+                              mask=mask, other=0.0)
         if ACTIVATION == 0:
             act = gate * tl.sigmoid(gate) * up
         else:
@@ -1175,6 +1203,9 @@ def kernel_moe_backward_mega(
     BLOCK_H_PUSH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+    # ---- fc1_output save format (!59): FP8 E4M3 + per-row/per-group scales
+    # dequantized at the two load sites; False keeps the BF16 staged save ----
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
     W_BM: tl.constexpr, W_BN: tl.constexpr, W_BK: tl.constexpr,
     W_NS: tl.constexpr,
     C_BM: tl.constexpr, C_BN: tl.constexpr, C_BK: tl.constexpr,
@@ -1194,6 +1225,9 @@ def kernel_moe_backward_mega(
     # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
     #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
     combine_buf_ptr,
+    # ---- fc1 FP8 save scales [M, 2F // FC1_GROUP_N] FP32 (dead arg when
+    # FC1_FP8=False — the launch signature is fixed) ----
+    fc1_scale_ptr,
     # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
     replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
     replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
@@ -1307,7 +1341,9 @@ def kernel_moe_backward_mega(
                         situ_beta, situ_linear_beta,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
-                        HAS_LINEAR_BETA=HAS_LINEAR_BETA)
+                        HAS_LINEAR_BETA=HAS_LINEAR_BETA,
+                        fc1_scale_ptr=fc1_scale_ptr,
+                        FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
             else:
                 _mega_swiglu_bwd(
                     pid, num_cores,
@@ -1315,7 +1351,8 @@ def kernel_moe_backward_mega(
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
                     situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
             _mega_wgrad_sweep(
@@ -1695,6 +1732,9 @@ def kernel_moe_backward_mega_recompute(
     BLOCK_H_PUSH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+    # ---- fc1_output save format (!59): FP8 E4M3 + per-row/per-group scales
+    # dequantized at the two load sites; False keeps the BF16 staged save ----
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
     W_BM: tl.constexpr, W_BN: tl.constexpr, W_BK: tl.constexpr,
     W_NS: tl.constexpr,
     C_BM: tl.constexpr, C_BN: tl.constexpr, C_BK: tl.constexpr,
@@ -1714,6 +1754,9 @@ def kernel_moe_backward_mega_recompute(
     # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
     #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
     combine_buf_ptr,
+    # ---- fc1 FP8 save scales [M, 2F // FC1_GROUP_N] FP32 (dead arg when
+    # FC1_FP8=False — the launch signature is fixed) ----
+    fc1_scale_ptr,
     # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
     replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
     replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
@@ -1781,7 +1824,8 @@ def kernel_moe_backward_mega_recompute(
                     scale_ptr,
                     orig_in3_ptr, stride_om3,
                     ffn, n_rows, situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         if TIMING:
             _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -1854,7 +1898,9 @@ def kernel_moe_backward_mega_recompute(
                         situ_beta, situ_linear_beta,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
-                        HAS_LINEAR_BETA=HAS_LINEAR_BETA)
+                        HAS_LINEAR_BETA=HAS_LINEAR_BETA,
+                        fc1_scale_ptr=fc1_scale_ptr,
+                        FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
             else:
                 _mega_swiglu_bwd(
                     pid, num_cores,
@@ -1862,7 +1908,8 @@ def kernel_moe_backward_mega_recompute(
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
                     situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
             _mega_wgrad_sweep(
@@ -2372,6 +2419,31 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # wgrad-sweep read targets carry the pad rows, returned keys are [:M]
     # views)
     fc1_output = saved["fc1_output"].contiguous()      # [M, 2*ffn]
+    # !59's single-kernel forward saves fc1_output as FP8 E4M3 plus one FP32
+    # scale per row and per FC1_GROUP_N-wide column group ("fc1_output_scale"
+    # / "fc1_scale_group_size").  The mega kernel dequantizes AT ITS TWO LOAD
+    # SITES (the P2 swiglu-bwd rows and the P1-window act recompute) — no
+    # host-side BF16 materialization, the half-width save survives end to
+    # end.  Staged-path saves stay BF16 and compile the dequant out
+    # (FC1_FP8=False).
+    fc1_fp8 = fc1_output.dtype == torch.float8_e4m3fn
+    if fc1_fp8:
+        fc1_scale = saved["fc1_output_scale"].contiguous()
+        fc1_group_n = int(saved["fc1_scale_group_size"])
+        if (
+            fc1_scale.dtype != torch.float32
+            or fc1_output.shape[1] % fc1_group_n
+            or tuple(fc1_scale.shape)
+            != (M, fc1_output.shape[1] // fc1_group_n)
+        ):
+            raise ValueError(
+                "fc1_output_scale must be FP32 [rows, 2F // "
+                "fc1_scale_group_size] matching the FP8 fc1_output")
+    else:
+        # dead args (FC1_FP8=False compiles the loads out); the launch
+        # signature is fixed
+        fc1_scale = fc1_output
+        fc1_group_n = 1
     # MOE_SAVED_RECOMPUTE=1 (the 9/14 backward-side recompute design, fused
     # into this launch 9/15): the two large saved activations below are NOT
     # read — orig_in5 becomes the symmetric re-dispatch slab the B2->B3
@@ -2394,9 +2466,13 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
                 f"the saved forward input {(saved['batch_size'], H)}")
     grad_swiglu = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)[:M]
+    # grad outputs stay BF16 (the backward contract dtype) even when
+    # fc1_output is the FP8 save: grad_fc1_output/grad_gate are fresh GEMM /
+    # reduction operands downstream (P4a/P5 read dAB, the return dict hands
+    # both out), not mirrors of AB's dtype.
     grad_fc1_output = torch.empty(
-        M + pad_rows_w, 2 * ffn, dtype=fc1_output.dtype, device=device)[:M]
-    grad_gate = torch.empty(M, dtype=fc1_output.dtype, device=device)
+        M + pad_rows_w, 2 * ffn, dtype=torch.bfloat16, device=device)[:M]
+    grad_gate = torch.empty(M, dtype=torch.bfloat16, device=device)
     orig_in3 = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)
     if not saved_recompute:
@@ -2787,6 +2863,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         2 * ffn, H, num_tn5, num_tk5, w5_split, w5_total,
     )
     mega_kwargs = dict(
+        fc1_scale_ptr=fc1_scale,
         replica_fc2_ptr=replica_fc2,
         stride_rwe1=replica_fc2.stride(0), stride_rwk1=replica_fc2.stride(1),
         stride_rwn1=replica_fc2.stride(2),
@@ -2807,6 +2884,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         BLOCK_H_PUSH=256,
         BLOCK_SIZE=triton.next_power_of_2(ffn),
         ACTIVATION=act, HAS_LINEAR_BETA=has_lb,
+        FC1_FP8=fc1_fp8, FC1_GROUP_N=fc1_group_n,
         W_BM=wbm, W_BN=wbn, W_BK=wbk, W_NS=wns,
         C_BM=cbm, C_BN=cbn, C_BK=cbk, C_NS=max(cns, 1),
         BLOCK_N_PUSH=_push_block(), GATE_PAD_C=GATE_PAD,

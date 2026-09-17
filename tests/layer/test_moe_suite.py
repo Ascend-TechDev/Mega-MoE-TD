@@ -536,6 +536,10 @@ def run_single_kernel_forward_case(
                 )
             saved_keys = {
                 "fc1_output",
+                # megaknl_zjg's mega backward recompute consumes the per-row
+                # routing weight (ops/backward.py scale_ptr contract), so the
+                # single-kernel saved dict carries one key past origin/main.
+                "recv_weights_sorted",
                 "hidden_states",
                 "selected_experts",
                 "routing_weights",
@@ -587,6 +591,8 @@ def run_single_kernel_forward_case(
                 and recv_layout_ok
                 and tuple(saved["fc1_output"].shape)
                 == tuple(replay_saved["fc1_output"].shape)
+                # Default format: raw BF16 gate/up tiles, no scale keys.
+                and saved["fc1_output"].dtype == torch.bfloat16
             )
             if saved_ok:
                 try:
@@ -606,6 +612,113 @@ def run_single_kernel_forward_case(
                     flush=True,
                 )
             all_passed &= saved_ok
+
+            # fc1_save_fp8=True opt-in (!59 contract): FP8 E4M3 payload plus
+            # per-row/per-group FP32 scales.  The in-kernel quantize leg
+            # raises the fused launch's Unified Buffer demand, so this op
+            # halves the M tile to stay under budget at this suite shape.
+            fp8_op = FusedMoEForward(
+                ep_group,
+                max_tokens_per_rank=tokens,
+                hidden_size=hidden,
+                top_k=topk,
+                num_experts=num_experts,
+                config=MoEForwardConfig(
+                    receive_capacity_factor=float(world_size),
+                    enable_single_kernel_forward=True,
+                    fc1_gemm_block_size_m=min(fc1_block_m, 128),
+                    fc2_combine_block_size_m=min(fc1_block_m, 128),
+                    fc1_save_fp8=True,
+                ),
+            )
+            try:
+                dist.barrier(group=ep_group)
+                with torch.no_grad():
+                    _, fp8_saved = fp8_op.forward(
+                        saved_hs,
+                        saved_experts,
+                        packed_w1,
+                        w2,
+                        saved_weights,
+                        return_saved=True,
+                    )
+                fp8_keys = saved_keys | {
+                    "fc1_output_scale",
+                    "fc1_scale_group_size",
+                }
+                fp8_group_n = fp8_op.config.fc1_gemm_block_size_n // 2
+                fp8_num_groups = (2 * ffn) // fp8_group_n
+                fp8_ok = (
+                    set(fp8_saved) == fp8_keys
+                    and fp8_saved["fc1_output"].dtype == torch.float8_e4m3fn
+                    and fp8_saved["fc1_output_scale"].dtype == torch.float32
+                    and int(fp8_saved["fc1_scale_group_size"]) == fp8_group_n
+                    and tuple(fp8_saved["fc1_output_scale"].shape)
+                    == (int(fp8_saved["total_recv"]), fp8_num_groups)
+                    and int(fp8_saved["total_recv"])
+                    == int(replay_saved["total_recv"])
+                )
+                if fp8_ok:
+                    try:
+                        # Grouped error bound for the E4M3 quantized save:
+                        # dequantize with the saved scales and compare against
+                        # the replay oracle per column group.  E4M3 round-to-
+                        # nearest is bounded by 1/16 of the value (a
+                        # truncating backend doubles that to 1/8), and the two
+                        # GEMM implementations themselves differ by ~2e-2, so
+                        # a 0.15 x group-amax bound covers both with margin.
+                        ref = replay_saved["fc1_output"].float()
+                        deq = (
+                            fp8_saved["fc1_output"].float()
+                            .view(
+                                int(fp8_saved["total_recv"]),
+                                fp8_num_groups,
+                                fp8_group_n,
+                            )
+                            * fp8_saved["fc1_output_scale"][:, :, None]
+                        ).view(ref.shape)
+                        group_amax = (
+                            ref.view(ref.shape[0], fp8_num_groups, fp8_group_n)
+                            .abs()
+                            .amax(dim=-1, keepdim=True)
+                        )
+                        err = (deq - ref).abs().view(
+                            ref.shape[0], fp8_num_groups, fp8_group_n
+                        )
+                        if not bool((err <= 0.15 * group_amax + 1e-3).all()):
+                            raise AssertionError(
+                                "dequantized fc1 exceeds the grouped error "
+                                "bound "
+                                f"(max {float(err.max().item()):.4f})"
+                            )
+                        # The scale must be the group amax / 448 (E4M3 max);
+                        # near-zero groups keep the kernel's 1/448 sentinel,
+                        # and the relative GEMM difference between the two
+                        # sides inflates small amaxes, so the bound stays
+                        # loose — its job is catching a misaligned scale
+                        # table, which would explode the error bound above,
+                        # not re-measuring fp8.
+                        expected_scale = torch.where(
+                            group_amax > 1e-3, group_amax,
+                            torch.ones_like(group_amax),
+                        ).squeeze(-1) / 448.0
+                        assert_close(
+                            fp8_saved["fc1_output_scale"],
+                            expected_scale,
+                            rtol=1e-1,
+                            atol=1e-3,
+                        )
+                    except AssertionError:
+                        fp8_ok = False
+                if not fp8_ok:
+                    print(
+                        f"[rank {rank}] single-kernel-forward-w{world_size}: "
+                        "FP8 saved contract mismatched the replay oracle",
+                        flush=True,
+                    )
+                all_passed &= fp8_ok
+            finally:
+                fp8_op.finalize()
         finally:
             op.finalize()
 
@@ -4878,8 +4991,6 @@ def test_forward_suite(dist_test, case: CaseSpec):
     dist_test(run_forward_case, world_size=case.world_size, args=(case,))
 
 
-@pytest.mark.dist
-@pytest.mark.functional
 def test_single_kernel_forward_w2(dist_test):
     dist_test(run_single_kernel_forward_case, world_size=2)
 
