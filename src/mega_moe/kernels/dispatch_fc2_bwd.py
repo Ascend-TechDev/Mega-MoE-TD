@@ -67,7 +67,20 @@ def _dispatch_static_maps(saved):
     recv_per_expert = recv_counts_re.sum(0).to(torch.int32)                     # [EPR]
     recv_expert_offs = torch.zeros(EPR + 1, dtype=torch.int32, device=device)
     recv_expert_offs[1:] = recv_per_expert.cumsum(0).to(torch.int32)            # [EPR+1]
-    bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True).to(torch.int32)  # [total_send]
+    # Plan B (2026-09-16): a single-kernel saved contract carries the
+    # forward's own send table (forward_send_route, set by
+    # _single_saved_adapter).  Adopt it as the canonical send order: the
+    # re-dispatch reproduces the forward's receive placement, so the saved
+    # fc1_output / recv_weights_sorted pass through un-reordered.  Every
+    # consumer of this table is positional (gco gather, re-dispatch source
+    # rows, push-back offsets, reduce scatter), so swapping it keeps them
+    # mutually consistent.  Multi-kernel / MoonEP dicts carry no such key
+    # and keep the stable-argsort reconstruction.
+    fwd_send = saved.get("forward_send_route")
+    if fwd_send is not None:
+        bwd_expert_sort = fwd_send.to(device, torch.int32).contiguous()
+    else:
+        bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True).to(torch.int32)  # [total_send]
     send_counts_flat = send_counts_re.reshape(-1)
     send_bucket_starts = torch.zeros(W * EPR + 1, dtype=torch.int32, device=device)
     send_bucket_starts[1:] = send_counts_flat.cumsum(0).to(torch.int32)

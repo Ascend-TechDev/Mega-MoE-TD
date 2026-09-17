@@ -14,24 +14,27 @@ references, and the scalar section.  This module derives all of that from
 the minimal contract in closed form — no activation is rebuilt or permuted
 here.
 
-Layout alignment: the single-kernel planner's ``_build_destination_metadata``
-computes ``send_bucket_dst_starts = expert_base + source_prefix`` with
-expert-major ``expert_base`` and ascending-source ``source_prefix`` — the
-exact algebra of the backward's ``_dispatch_static_maps`` — so the SEGMENT
-structure (expert-major, source-minor) is identical on both sides.  The
-WITHIN-segment order, however, genuinely differs: ``_scatter_stable_routes``
-walks contiguous per-core route slices with per-core bucket cursors
-(``_convert_counts_to_stable_cursors``), giving core-major-then-flat order,
-while the backward's re-dispatch sends in stable-argsort (flat-ascending)
-order.  Route ids are unique, so the adapter reorders ``fc1_output`` /
-``recv_weights_sorted`` by ``argsort(send_route_indices)`` — the forward
-positions in backward order — and derives every permutation from the
-backward's own stable argsort.  The deferred plan-B alternative (feed
-``send_route_indices`` to the backward's map build so the re-dispatch itself
-reproduces the forward order, zero reorder copies) is recorded in the
-integration notes.  Two cheap tripwires below still verify the segment
-algebra and the reorderability of the send order at runtime — never silence
-them.
+Layout alignment (plan B, 2026-09-16): the single-kernel planner's
+``_build_destination_metadata`` computes ``send_bucket_dst_starts =
+expert_base + source_prefix`` with expert-major ``expert_base`` and
+ascending-source ``source_prefix`` — the exact algebra of the backward's
+``_dispatch_static_maps`` — so the SEGMENT structure (expert-major,
+source-minor) is identical on both sides.  The WITHIN-segment order also
+differs (``_scatter_stable_routes`` walks contiguous per-core route slices
+with per-core bucket cursors, giving core-major-then-flat order, while the
+backward's own reconstruction is a stable argsort) — but instead of bending
+the forward artifacts to the backward (the original adapter
+``index_select``-reordered ``fc1_output`` / ``recv_weights_sorted`` by
+``argsort(send_route_indices)``, one ~[M, 2F] gather copy per layer per
+step), the backward now bends to the forward: this adapter exports the
+forward's send table as ``forward_send_route`` / ``sort_idxs`` and
+``_dispatch_static_maps`` adopts it as the canonical send order, so the
+re-dispatch itself reproduces the forward placement and both saved
+activations pass through un-reordered.  Every backward map (gco gather,
+re-dispatch source rows, push-back offsets, reduce scatter) is POSITIONAL
+over the send table, so swapping the table keeps them mutually consistent.
+Two cheap tripwires below still verify the segment algebra and the send
+table's layout at runtime — never silence them.
 
 Droless routing is REQUIRED: the backward's map build asserts
 ``bincount(selected_experts).sum() == total_send``, so dropped routes
@@ -117,45 +120,56 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
             "recv_counts_by_source_expert sums)"
         )
 
-    # Tripwire 2: the kernel's actual send order vs the backward's own stable
-    # argsort of the flat expert ids.  These genuinely DIFFER: the kernel's
-    # `_scatter_stable_routes` splits the routes into contiguous per-core
-    # slices and gives each core its own bucket cursor
-    # (`_convert_counts_to_stable_cursors`), so its within-bucket order is
-    # core-major-then-flat, while the backward's re-dispatch sends in stable
-    # argsort order (flat-ascending within every (expert, source) segment).
-    # Route ids are unique, so argsort(send_route) is exactly the forward
-    # positions in backward order — reorder the two saved activations by it
-    # (the adapter-side handling; the deferred plan-B alternative is feeding
-    # send_route_indices to the backward's map build instead).
+    # Tripwire 2: the send table this adapter is about to hand the backward
+    # as its canonical send order (plan B).  Two structural requirements:
+    # (1) it is a permutation of 0..total_send-1 — the re-dispatch's source
+    #     gather (send_src_idx = sort_idxs // topk) and the reduce's
+    #     inv_sort scatter are only well-defined over a true permutation;
+    # (2) it is bucket-segmented — flat expert ids non-decreasing along the
+    #     table.  The backward's sweeps walk (dst, expert) buckets through
+    #     send_bucket_starts, so a table laid out in any other order would
+    #     push rows into the wrong receive slots.  The forward's
+    #     `_scatter_stable_routes` bucket cursors guarantee both.  (The old
+    #     adapter instead index_select-reordered fc1_output /
+    #     recv_weights_sorted INTO the backward's stable-argsort order —
+    #     plan B flips the direction and drops both copies.)
     send_route = saved["send_route_indices"].to(torch.int64)
-    bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True)
-    if not torch.equal(send_route, bwd_expert_sort):
-        sorted_route = torch.sort(send_route).values
-        if not torch.equal(
-            sorted_route,
-            torch.arange(total_send, dtype=torch.int64, device=device),
-        ):
-            raise RuntimeError(
-                "single-kernel send_route_indices is not a permutation of "
-                "0..total_send-1 — the reorder cannot be derived: "
-                f"len={send_route.numel()} total_send={total_send} "
-                f"min={int(sorted_route[0]) if sorted_route.numel() else -1} "
-                f"max={int(sorted_route[-1]) if sorted_route.numel() else -1} "
-                f"distinct={int(torch.unique(send_route).numel())} "
-                f"head={send_route[:8].tolist()}"
-            )
-        perm = torch.argsort(send_route.to(torch.float32))
-        fc1_output = saved["fc1_output"]
-        if int(fc1_output.shape[0]) != total_recv:
-            raise RuntimeError(
-                "fc1_output rows do not match the contract's receive count: "
-                f"{int(fc1_output.shape[0])} != {total_recv}"
-            )
-        saved["fc1_output"] = fc1_output.index_select(0, perm)
-        saved["recv_weights_sorted"] = saved[
-            "recv_weights_sorted"
-        ].index_select(0, perm)
+    sorted_route = torch.sort(send_route).values
+    if not torch.equal(
+        sorted_route,
+        torch.arange(total_send, dtype=torch.int64, device=device),
+    ):
+        raise RuntimeError(
+            "single-kernel send_route_indices is not a permutation of "
+            "0..total_send-1 — it cannot serve as the backward's send "
+            f"order: len={send_route.numel()} total_send={total_send} "
+            f"min={int(sorted_route[0]) if sorted_route.numel() else -1} "
+            f"max={int(sorted_route[-1]) if sorted_route.numel() else -1} "
+            f"distinct={int(torch.unique(send_route).numel())} "
+            f"head={send_route[:8].tolist()}"
+        )
+    expert_seq = flat[send_route]
+    if bool((expert_seq[1:] < expert_seq[:-1]).any()):
+        raise RuntimeError(
+            "single-kernel send_route_indices is not bucket-segmented "
+            "(flat expert ids decrease along the table): the backward's "
+            "(dst, expert) bucket walk would scatter rows to wrong slots"
+        )
+    # inv_sort: the send position of each route id (int argsort falls back
+    # to AICPU on Ascend — float32, routing.py precedent).  This is exactly
+    # the old reorder permutation, now consumed by the reduce scatter.
+    perm = torch.argsort(send_route.to(torch.float32))
+    fc1_output = saved["fc1_output"]
+    if int(fc1_output.shape[0]) != total_recv:
+        raise RuntimeError(
+            "fc1_output rows do not match the contract's receive count: "
+            f"{int(fc1_output.shape[0])} != {total_recv}"
+        )
+    # The canonical send order for the backward's map build (consumed by
+    # _dispatch_static_maps as bwd_expert_sort): with this in place,
+    # fc1_output / recv_weights_sorted ride along in the forward's own
+    # receive order — no index_select, no fresh ~[M, 2F] block per step.
+    saved["forward_send_route"] = send_route.to(torch.int32).contiguous()
 
     # ---- plan tables (closed forms; mirrors _native_saved
     # _snapshot_home_plan_sections, fed from the contract instead of a
@@ -213,12 +227,12 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
 
     # Permutation invariants, from the arrival algebra (int argsort falls
     # back to AICPU on Ascend — every argsort goes through float32,
-    # routing.py precedent).  sort_idxs is the BACKWARD's send order — the
-    # re-dispatch P0 walks routes in this order, matching the reordered
-    # fc1_output / recv_weights_sorted above (never the forward's core-major
-    # send_route order).
-    sort_idxs = bwd_expert_sort.contiguous()
-    inv_sort = torch.argsort(sort_idxs.to(torch.float32))
+    # routing.py precedent).  sort_idxs IS the forward's send table (plan
+    # B): the re-dispatch P0 walks routes in this order, rows land in the
+    # forward's receive layout, and fc1_output / recv_weights_sorted ride
+    # along un-reordered.  inv_sort is its inverse (== perm above).
+    sort_idxs = send_route.contiguous()
+    inv_sort = perm
     slot_starts = recv_expert_offs[:-1]
     local_sort_idxs = _arrival_to_slot_permutation(recv_counts64, slot_starts)
     inv_local = torch.argsort(local_sort_idxs.to(torch.float32))

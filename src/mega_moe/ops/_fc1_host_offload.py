@@ -6,7 +6,8 @@ forward/backward boundary: ``fc1_output`` ([total_recv, 2F] bf16, ~100MB at
 the kimi mock shape, up to ~805MB at capacity routing).  With
 ``MEGAMOE_FC1_OFFLOAD=1`` the MegaMoEFunction layer copies it to a pinned
 host buffer on a side NPU stream right after the saved dict is finalized
-(post enrichment — the adapter's reorder copy is what lands on host) and
+(post enrichment — what lands on host is the forward's own fc1_output
+snapshot; since the plan-B adapter no longer reorder-copies it) and
 releases the device block immediately; the backward entry copies it back
 (H2D) before anything reads it.  Everything else stays on device.
 
