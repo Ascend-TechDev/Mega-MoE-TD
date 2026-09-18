@@ -42,13 +42,8 @@ _ACLSHMEM_PUTMEM_MAX_BYTES = (1 << 32) - 1
 #             (PIPE_MTE3 store -> PIPE_MTE2 load);
 #   event 2: AIC -> AIV1  "FC2 window ready in GM peer_mem"
 #             (PIPE_FIX store -> PIPE_MTE2 load).
-# Instantiated constexpr (not the `x: tl.constexpr = v` annotation form):
-# UDMA triton 3.6 only resolves globals that ARE tl.constexpr instances —
-# the annotation form compiles on the CANN wheel but is rejected here with
-# "Cannot access global variable _ACT_TO_FC2_EVENT" (fc2 combine v0, w2,
-# blocks every 5-op forward test in the UDMA env).
-_ACT_TO_FC2_EVENT = tl.constexpr(0)
-_FC2_TO_PUT_EVENT = tl.constexpr(2)
+_ACT_TO_FC2_EVENT: tl.constexpr = 0
+_FC2_TO_PUT_EVENT: tl.constexpr = 2
 
 
 def _fc2_reduce_block_n(num_rows: int) -> int:

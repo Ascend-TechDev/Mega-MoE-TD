@@ -31,11 +31,8 @@ from ..runtime.routing import (
     build_routing_plan,
 )
 from ..runtime.replica_weight_prefetch import (
-    acquire_replica_weight_buffers,
     allocate_replica_weight_buffers,
     fence_replica_weight_prefetch_async,
-    release_replica_weight_buffers,
-    replica_pool_enabled,
     replica_weight_push_geometry,
 )
 from ..runtime.workspace import create_moe_forward_context
@@ -199,10 +196,6 @@ class FusedMoEForward(torch.nn.Module):
         self._single_wave_expert_offsets = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
-        # True when _replica_weight_buffers came from the session pool
-        # (MEGAMOE_REPLICA_POOL=1): finalize then RELEASEes the reference
-        # instead of freeing the shared tables.
-        self._replica_weight_pooled = False
         self._replica_weight_cache_key = None
         self._replica_weight_cache_valid = False
         self._replica_experts_cache = None
@@ -328,16 +321,8 @@ class FusedMoEForward(torch.nn.Module):
             ash.aclshmem_free_tensor(self._combine_fc2_storage)
             self._combine_fc2_storage = None
         if self._replica_weight_buffers is not None:
-            if self._replica_weight_pooled:
-                # Pooled: drop this layer's reference; the symmetric pair
-                # dies only with the last same-shape user (or the pool
-                # drain) — freeing here would rip the tables out from under
-                # the other layers.
-                release_replica_weight_buffers(self._replica_weight_buffers)
-            else:
-                self._replica_weight_buffers.finalize()
+            self._replica_weight_buffers.finalize()
             self._replica_weight_buffers = None
-        self._replica_weight_pooled = False
         self._replica_weight_cache_key = None
         self._replica_weight_cache_valid = False
         self._replica_experts_cache = None
@@ -384,42 +369,18 @@ class FusedMoEForward(torch.nn.Module):
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
     ) -> None:
-        """Allocate fixed-B symmetric tables before routing collectives.
-
-        MEGAMOE_REPLICA_POOL=1 routes the allocation through the session
-        pool instead: same-shape layers share ONE pair of tables (the
-        whole-net memory fix).  A pool hit performs no collective — hit/miss
-        is rank-uniform because every rank walks the layer shapes in the
-        same order — and the epoch counter riding the pooled buffers keeps
-        every layer's forward push and backward re-push on one monotonic
-        SET sequence.
-        """
+        """Allocate fixed-B symmetric tables before routing collectives."""
         if not self.enable_moonep:
             return
         if self._replica_weight_buffers is None:
-            if replica_pool_enabled():
-                self._replica_weight_buffers, fresh = (
-                    acquire_replica_weight_buffers(
-                        gate_up_weight,
-                        down_weight,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                    )
-                )
-                self._replica_weight_pooled = True
-            else:
-                self._replica_weight_buffers = (
-                    allocate_replica_weight_buffers(
-                        gate_up_weight,
-                        down_weight,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                    )
-                )
-                fresh = True
-            if fresh:
-                torch.npu.synchronize(gate_up_weight.device)
-                torch.distributed.barrier(group=self.ep_group)
+            self._replica_weight_buffers = allocate_replica_weight_buffers(
+                gate_up_weight,
+                down_weight,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            torch.npu.synchronize(gate_up_weight.device)
+            torch.distributed.barrier(group=self.ep_group)
 
     def _begin_replica_prefetch(
         self,
@@ -454,10 +415,7 @@ class FusedMoEForward(torch.nn.Module):
             down_weight.data_ptr(),
             down_weight._version,
         )
-        # Pooled tables are shared across layers: a weight_key "hit" says
-        # nothing about the table CONTENT (some other layer's forward has
-        # since overwritten it), so the replica cache is inert under pooling.
-        if self.config.moonep_enable_replica_cache and not self._replica_weight_pooled:
+        if self.config.moonep_enable_replica_cache:
             local_cache_hit = (
                 self._replica_weight_cache_valid
                 and weight_key == self._replica_weight_cache_key
@@ -489,17 +447,11 @@ class FusedMoEForward(torch.nn.Module):
             self._replica_prefetch_stream = torch.npu.Stream(device=device)
             self._replica_dispatch_done_event = torch.npu.Event()
             self._replica_prefetch_done_event = torch.npu.Event()
-        # Table-level monotonic mint (pooling contract, 2026-09-17): the
-        # counter rides the buffers object so every layer's forward push and
-        # the backward re-prefetch share ONE SET sequence; the floor honors
-        # reservations the single-kernel path makes against its aliasing
-        # tile epoch (see the _tile_signal_epoch max() in the single-kernel
-        # launch).  With no reservation in flight this mints exactly the
-        # sequence the old per-operator counter produced.
-        epoch = self._replica_weight_buffers.next_push_epoch(
-            floor=self._replica_weight_epoch - 1
-        )
-        self._replica_weight_epoch = epoch + 1
+        epoch = self._replica_weight_epoch
+        if epoch >= torch.iinfo(torch.int32).max:
+            raise RuntimeError(
+                "replica weight readiness epoch exhausted; recreate the operator"
+            )
         # Count and compact only owner-local remote copies.  The mixed MTE
         # dispatch/FC1 kernel consumes this list directly.
         local_owner_start = self.rank * self.experts_per_rank
@@ -531,6 +483,7 @@ class FusedMoEForward(torch.nn.Module):
         self._replica_prefetch_pending = True
         self._replica_weight_cache_valid = False
         self._active_replica_weight_epoch = epoch
+        self._replica_weight_epoch += 1
         self._replica_weight_cache_key = weight_key
         self._replica_experts_cache = experts_to_copy_cpu.clone()
         self._replica_weight_source_refs = (gate_up_weight, down_weight)
@@ -1275,14 +1228,6 @@ class FusedMoEForward(torch.nn.Module):
         a slot by an aborted backward can never be consumed as a weight, and the
         next forward re-pushes every replica it needs.
 
-        The lend no longer requires the weight cache to be VALID: sinking
-        gradients only needs the slots, not the weight content — and under
-        table pooling (MEGAMOE_REPLICA_POOL=1) the content at backward time
-        is by construction some other layer's weights (the mega backward
-        re-prefetches this layer's tables in-launch before reading them,
-        MOE_MEGA_REPREFETCH=1).  A full forward must still have run on this
-        operator (the ETC snapshot below is its product).
-
         Returns a :class:`mega_moe.runtime.replica_grad_transport.ReplicaGradTransport`
         holding a *reference* to the live buffers plus cloned planning
         snapshots (the routing workspace is reused in place, and a later
@@ -1292,11 +1237,13 @@ class FusedMoEForward(torch.nn.Module):
             raise RuntimeError("replica grad transport requires MoonEP")
         if self._replica_weight_buffers is None:
             raise RuntimeError("replica weight buffers have not been allocated")
-        if self._replica_experts_cache is None:
+        if self._replica_weight_cache_key is None or not self._replica_weight_cache_valid:
             raise RuntimeError(
-                "no replica layout snapshot is available; run a full forward "
-                "before lending the tables"
+                "replica weights are not published; run a full forward before "
+                "lending the tables"
             )
+        if self._replica_experts_cache is None:
+            raise RuntimeError("no replica layout snapshot is available to lend")
 
         from ..runtime.replica_grad_transport import ReplicaGradTransport
 

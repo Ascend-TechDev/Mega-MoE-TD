@@ -297,15 +297,6 @@ def _attach_moonep_plan_sections(op, plan: MoERoutingPlan, snapshot: dict):
         # live symmetric replica tables ([B, H, 2F] / [B, H, F] views)
         replica_gate_up=op._replica_weight_buffers.gate_up,
         replica_down=op._replica_weight_buffers.down,
-        # pooling-era additions (2026-09-17, MOE_MEGA_REPREFETCH contract):
-        # the buffers OBJECT (not just the views) so the backward re-push
-        # mints its SET epochs from the same table-level monotonic counter
-        # the forward pushes used, plus the fixed-address symmetric ready
-        # slab slices (per-operator signal_mem regions, workspace.py) the
-        # in-kernel re-push signals and the P1/P4a consumers dl.wait.
-        replica_buffers=op._replica_weight_buffers,
-        replica_gate_ready=op.context.replica_gate_ready,
-        replica_down_ready=op.context.replica_down_ready,
     )
 
 
