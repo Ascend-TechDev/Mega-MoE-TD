@@ -183,10 +183,10 @@ MOE_FUSED_ASH_SIZE_GB=6 python -m pytest tests/layer/test_fwd_phase_timing.py \
 三次采集），跨分支混比 μs/ms 会引入该量级误差。
 
 8 卡 Kimi-K3 t4k、fp16 保存（warmup 5 / samples 20，校准 982.7 ticks/µs）
-的 p50 结果（2026-09-18）。段名按段内实际工作命名——打点落在各 barrier
-之后，2026-09-18 之前的段名整体错位一格：旧 JSON 的
-`routing_zero_count`/`stable_cursors` 键分别对应此表的
-`counts_publish`/`route_scatter`：
+的 p50 结果（2026-09-18，优化前基线；段名按段内实际工作命名——打点落在
+barrier 之后，2026-09-18 之前的段名整体错位一格，旧 JSON 的
+`routing_zero_count`/`stable_cursors` 键分别对应此表的 `counts_publish`/
+`route_scatter`）：
 
 | 阶段（段，按内容命名） | p50 µs | 波管线内部（每核累计） | p50 |
 |---|---:|---|---:|
@@ -206,9 +206,15 @@ FC2 按波墙钟（21 波）：wall p50 1.84 ms，从首波 1.58 ms 爬升到第
 结论（优化方向依据）：
 
 - **routing 元数据 10.0 ms（kernel 的 35%）是首要优化目标**：其中
-  route_scatter（稳定散射）5.66 ms + counts_publish（pid0 单核对
-  896 bucket × 32 core 直方图的串行标量归并，~28.7k 次依赖链 load）
-  2.68 ms 占 8.3 ms，两者均无 GEMM 工作。
+  route_scatter 5.66 ms + counts_publish 2.68 ms 占 8.3 ms——前者是单
+  vector lane 上的稳定散射（另一个子核整段空转，且 pad bin 扫描有 12.5%
+  纯浪费），后者是 pid0 单核对 896 bucket × 32 core 的逐标量串行归并
+  （~28 672 次依赖链 load，~93 ns/次，与 2.68 ms 严丝合缝）。两者均无
+  GEMM 工作；`feat/single-kernel-routing-metadata` 针对性优化（发布向量化、
+  散射双 lane 分摊 + pad bin 裁剪，输出保持逐位相同的稳定序）已测到
+  **routing_metadata_total 10.0 → 3.4 ms、e2e min 28.0 → 23.0 ms**
+  （2026-09-19 两轮）；逐位稳定序的回归仍待 NPU 跑 test_moe_suite 单
+  kernel 节点。
 - **激活 lane 不对称：dispatch 竞争已否，"是否占关键路径"待一个消除实验**：
   vact lane0 0.46 ms vs lane1 5.76 ms（12×；全量 case 每 rank 65536 routes /
   112 专家 ≈ 585 行/专家，lane0 的 0.46 ms 就是这段激活的真实工作量级）。

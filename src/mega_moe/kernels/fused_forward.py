@@ -202,18 +202,22 @@ def _publish_count_row(
 ):
     cursor_stride: tl.constexpr = CURSOR_STRIDE if CURSOR_STRIDE else NUM_BINS_PAD
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
-    for bucket in range(0, NUM_BINS_PAD):
-        count = 0
-        if bucket < NUM_EXPERTS:
-            for core_id in range(0, NUM_PROGRAM_CORES):
-                count += tl.load(
-                    core_bucket_cursor_ptr
-                    + core_id * cursor_stride
-                    + bucket
-                )
-        if MOONEP:
-            count = tl.where(bucket == NUM_EXPERTS, num_routes, count)
-        tl.store(local_row_ptr + bucket, count)
+    # One whole-row vector load per AICore histogram row, added lane-parallel
+    # over the padded bin axis.  The old per-bucket serial chain (one scalar
+    # load per core per bucket — 28k dependent loads, 2.68 ms on the launch's
+    # critical path at the Kimi w8 shape, 2026-09-18) ran on pid 0 alone.
+    bin_offsets = tl.arange(0, NUM_BINS_PAD)
+    counts = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
+    for core_id in range(0, NUM_PROGRAM_CORES):
+        counts += tl.load(
+            core_bucket_cursor_ptr
+            + core_id * cursor_stride
+            + bin_offsets
+        )
+    counts = tl.where(bin_offsets < NUM_EXPERTS, counts, 0)
+    if MOONEP:
+        counts = tl.where(bin_offsets == NUM_EXPERTS, num_routes, counts)
+    tl.store(local_row_ptr + bin_offsets, counts)
 
     # Scalar stores must reach GM before MTE reads the published count row.
     libshmem_device.fence()
@@ -335,13 +339,29 @@ def _scatter_stable_routes(pid, selected_experts_ptr, core_bucket_cursor_ptr,
                            NUM_EXPERTS: tl.constexpr,
                            NUM_BINS_PAD: tl.constexpr, TOPK: tl.constexpr,
                            BLOCK_SIZE: tl.constexpr):
+    """Scatter this core's route chunk to its stable send-row positions.
+
+    Both Vector subcores run this helper and split the bin blocks
+    (lane-interleaved, one whole bin block per step).  A bin's send rows
+    depend only on that bin's own cursor and cumsum chain over the core's
+    route blocks in order — bins are independent — so the split keeps the
+    output byte-for-byte identical to the single-lane walk while halving
+    the wall (the second subcore idled through the whole routing phase
+    before, 2026-09-18).  Writes stay race-free: each lane touches only
+    its own bins' cursor slices, send-row segments, and route_to_send
+    entries."""
     routes_per_core = tl.cdiv(num_routes, NUM_PROGRAM_CORES)
     route_start = pid * routes_per_core
     route_end = tl.minimum(route_start + routes_per_core, num_routes)
     route_offsets = tl.arange(0, BLOCK_SIZE)
     # Bound the cumsum's bin-by-route matrix for full-expert configurations.
     bin_block: tl.constexpr = 32 if NUM_BINS_PAD > 32 else NUM_BINS_PAD
-    for bin_start in range(0, NUM_BINS_PAD, bin_block):
+    # Sweep only padded-bin blocks that can hold a real expert: at the Kimi
+    # w8 shape (896 experts in 1024 padded bins) the old full-pad sweep
+    # re-read the route chunk 32x where 28 blocks suffice.
+    bin_sweep = ((NUM_EXPERTS + bin_block - 1) // bin_block) * bin_block
+    lane = sub_vec_id()
+    for bin_start in range(lane * bin_block, bin_sweep, 2 * bin_block):
         bin_offsets = bin_start + tl.arange(0, bin_block)
         cursors = tl.load(core_bucket_cursor_ptr + pid * NUM_BINS_PAD +
                           bin_offsets)
@@ -1509,21 +1529,23 @@ def _kernel_fused_forward(
     if TIMING:
         _fwd_stamp_lane0(ts_row, 5, ts_dummy)   # stable cursors done
     with al.scope(core_mode='vector', disable_auto_sync=True):
-        if sub_vec_id() == 0:
-            if MOONEP:
+        if MOONEP:
+            if sub_vec_id() == 0:
                 _single_moonep_scatter(
                     pid, selected_experts_ptr, core_bucket_cursor_ptr, raw_counts_ptr,
                     alloc_cumsum_ptr, inverse_ptr, send_bucket_starts_ptr,
                     send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
                     num_routes, NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, NUM_EXPERTS,
                     EXPERTS_PER_RANK, NUM_BINS_PAD, RAW_NUM_BINS, TOPK, _SCATTER_BLOCK)
-            else:
-                _scatter_stable_routes(pid, selected_experts_ptr,
-                                       core_bucket_cursor_ptr,
-                                       send_token_indices_ptr,
-                                       send_route_indices_ptr, route_to_send_ptr,
-                                       num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS,
-                                       NUM_BINS_PAD, TOPK, _SCATTER_BLOCK)
+        else:
+            # Both Vector subcores: _scatter_stable_routes splits its bin
+            # blocks lane-interleaved (byte-identical output, half the wall).
+            _scatter_stable_routes(pid, selected_experts_ptr,
+                                   core_bucket_cursor_ptr,
+                                   send_token_indices_ptr,
+                                   send_route_indices_ptr, route_to_send_ptr,
+                                   num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS,
+                                   NUM_BINS_PAD, TOPK, _SCATTER_BLOCK)
     _mixed_forward_barrier()
     if TIMING:
         _fwd_stamp_lane0(ts_row, 6, ts_dummy)   # routing metadata complete
