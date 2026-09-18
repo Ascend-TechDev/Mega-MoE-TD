@@ -2301,17 +2301,34 @@ def _assert_forward_after_grad_transport(
     the cache) and the second must be a cache hit — a slot left holding a
     gradient, or a slot zeroed after the push, only survives that second hit
     unnoticed. Both outputs are compared against the same forward golden.
+
+    Pooled-tables mode (MEGAMOE_REPLICA_POOL=1, 2026-09-17): the replica cache
+    is inert by design (same-shape layers share the tables, so a weight-key
+    "hit" says nothing about the content) and EVERY forward pushes; with
+    MOE_MEGA_REPREFETCH=1 the backward's in-kernel re-push also mints from the
+    same table-level monotonic counter.  The epoch arithmetic below absorbs
+    those mints; the output checks are unchanged and stay the point of the
+    helper.
     """
-    epoch_after_push = epoch_before_lend + 1
+    pooled = os.environ.get("MEGAMOE_REPLICA_POOL") == "1"
+    # the backward's in-kernel re-push minted from the shared counter iff the
+    # mega path ran with the knob on (every caller of this helper has replica
+    # traffic, i.e. active_e > home_e, so the wrapper's reprefetch was live)
+    bwd_mints = 1 if (
+        os.environ.get("MOE_BWD_MEGA") == "1"
+        and os.environ.get("MOE_MEGA_REPREFETCH") == "1"
+        and getattr(op, "enable_moonep", False)
+    ) else 0
+    epoch_after_push = epoch_before_lend + 1 + bwd_mints
     reloaded = op.forward(
         hidden_states, expert_indices, packed_w1, w2, routing_weights
     )
     if op._replica_weight_epoch != epoch_after_push:
         raise AssertionError(
             f"{label}: the post-backward forward re-pushed "
-            f"{op._replica_weight_epoch - epoch_before_lend} times, expected 1"
+            f"{op._replica_weight_epoch - epoch_before_lend - bwd_mints} times, expected 1"
         )
-    if not op._replica_weight_cache_valid:
+    if not pooled and not op._replica_weight_cache_valid:
         raise AssertionError(
             f"{label}: the post-backward forward left the replica cache invalid"
         )
@@ -2320,9 +2337,13 @@ def _assert_forward_after_grad_transport(
     cached = op.forward(
         hidden_states, expert_indices, packed_w1, w2, routing_weights
     )
-    if op._replica_weight_epoch != epoch_after_push:
+    if not pooled and op._replica_weight_epoch != epoch_after_push:
         raise AssertionError(
             f"{label}: the second post-backward forward was not a cache hit"
+        )
+    if pooled and op._replica_weight_epoch != epoch_after_push + 1:
+        raise AssertionError(
+            f"{label}: the pooled second post-backward forward did not re-push"
         )
     assert_close(cached, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
 
