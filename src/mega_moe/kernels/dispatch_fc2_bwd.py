@@ -100,18 +100,13 @@ def _dispatch_static_maps(saved):
     _local_max = torch.tensor([int(send_counts_re.max().item())], dtype=torch.int64, device=device)
     dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
     _global_max_bwd_tiles = max(1, (int(_local_max.item()) + 64 - 1) // 64)
-    # MOE_DOWN_DIRECT=1 + the one-launch mega path: the caller's strided
-    # down view flows through unstaged — the kernel addresses fc2 through
-    # its stride parameters (p1["fc2"].stride(0/1/2) at the launch), so the
-    # .contiguous() copy (~88MB/layer/step at the kimi shape) buys nothing.
-    # The 5-op orchestrator path keeps the contiguous copy.
-    _down_direct = (
-        os.environ.get("MOE_DOWN_DIRECT", "0") == "1"
-        and os.environ.get("MOE_BWD_MEGA") == "1"
-    )
+    # The caller's strided down view flows through unstaged on every path —
+    # the kernels address fc2 through its stride parameters
+    # (fc2.stride(0/1/2) at the launches below), so the .contiguous() copy
+    # (~88MB/layer/step at the kimi shape) buys nothing.
     cache = dict(
         M=saved["M"], N=saved["ffn_dim"], K=H, E=EPR,
-        fc2=(saved["fc2"] if _down_direct else saved["fc2"].contiguous()),
+        fc2=saved["fc2"],
         total_send=total_send, H=H, total_recv=saved["total_recv"],
         # expert-major signal/wait metadata
         send_counts_re=send_counts_flat.contiguous(), send_bucket_starts=send_bucket_starts,
