@@ -330,16 +330,19 @@ def _partition_pipeline_fc1_activation_group_ub(
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_WINDOWS: tl.constexpr,
         FC1_CORES: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, wave_expert, wave_row_start, wave_rows,
+        FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr,
+        wave_expert, wave_row_start, wave_rows,
         replica_ready_ptr, WEIGHT_EXPERT_BASE: tl.constexpr,
         WAIT_REPLICA: tl.constexpr):
     """Pipeline FC1 gate/up tiles through UB directly into activation output.
 
-    ``SAVE_FC1`` quantizes the raw gate/up Fixpipe results (pre-activation,
-    pre-routing-weight) to FP8 E4M3 and stores them into ``fc1_output_ptr``
-    using the historical ``[rows, gate F | up F]`` FC1-output layout, with one
-    FP32 scale per row and per ``pair_block_n``-wide column group in
-    ``fc1_scale_ptr`` (``scale = amax / 448``), for the saved forward."""
+    ``SAVE_FC1`` stores the raw gate/up Fixpipe results (pre-activation,
+    pre-routing-weight) into ``fc1_output_ptr`` using the historical
+    ``[rows, gate F | up F]`` FC1-output layout.  ``FC1_FP8`` selects the
+    format: True quantizes to FP8 E4M3 with one FP32 scale per row and per
+    ``pair_block_n``-wide column group in ``fc1_scale_ptr``
+    (``scale = amax / 448``); False keeps the raw BF16 tiles (fc1_scale_ptr
+    is a dead argument)."""
     pair_block_m: tl.constexpr = BLOCK_M
     pair_block_n: tl.constexpr = BLOCK_N // 2
     vector_block_m: tl.constexpr = pair_block_m // 2
@@ -601,10 +604,8 @@ def _partition_pipeline_fc1_activation_group_ub(
                             mask=mask_m[:, None] & mask_n[None, :])
                     if SAVE_FC1:
                         # Raw gate/up GEMM results (pre-activation,
-                        # pre-routing-weight), quantized to FP8 E4M3 with one
-                        # scale per row and per pair_block_n-wide column
-                        # group, in the historical [rows, gate F | up F]
-                        # FC1-output layout.
+                        # pre-routing-weight), in the historical
+                        # [rows, gate F | up F] FC1-output layout.
                         fc1_group_ptr = (
                             fc1_output_ptr + output_group_row * (2 * FFN))
                         fc1_row_ptr = (
@@ -613,44 +614,56 @@ def _partition_pipeline_fc1_activation_group_ub(
                             * (2 * FFN)
                             + cols[None, :])
                         fc1_store_mask = mask_m[:, None] & mask_n[None, :]
-                        gate_f = gate_raw.to(tl.float32)
-                        up_f = up_raw.to(tl.float32)
-                        # One tile is exactly one column group (pair_block_n
-                        # wide), so the per-group amax is a single in-tile
-                        # row reduction; masked-out lanes contribute zero.
-                        gate_amax = tl.max(
-                            tl.where(mask_n[None, :], tl.abs(gate_f), 0.0),
-                            axis=1)
-                        up_amax = tl.max(
-                            tl.where(mask_n[None, :], tl.abs(up_f), 0.0),
-                            axis=1)
-                        # E4M3 max finite value; a zero row keeps q = 0 and a
-                        # unit scale so the dequantized value stays exactly 0.
-                        fp8_max: tl.constexpr = 448.0
-                        gate_safe = tl.where(gate_amax > 0.0, gate_amax, 1.0)
-                        up_safe = tl.where(up_amax > 0.0, up_amax, 1.0)
-                        tl.store(
-                            fc1_row_ptr,
-                            (gate_f * (fp8_max / gate_safe)[:, None]).to(
-                                tl.float8e4nv),
-                            mask=fc1_store_mask)
-                        tl.store(
-                            fc1_row_ptr + FFN,
-                            (up_f * (fp8_max / up_safe)[:, None]).to(
-                                tl.float8e4nv),
-                            mask=fc1_store_mask)
-                        # Scale table: [rows, 2F / pair_block_n], gate group
-                        # then up group per column pair.
-                        fc1_scale_row_ptr = (
-                            fc1_scale_ptr
-                            + output_group_row * (2 * FFN // pair_block_n)
-                            + (local_row_start + local_rows)
-                            * (2 * FFN // pair_block_n)
-                            + col_start // pair_block_n)
-                        tl.store(fc1_scale_row_ptr, gate_safe / fp8_max,
-                                 mask=mask_m)
-                        tl.store(fc1_scale_row_ptr + FFN // pair_block_n,
-                                 up_safe / fp8_max, mask=mask_m)
+                        if FC1_FP8:
+                            # One FP8 E4M3 quantized tile plus one FP32 scale
+                            # per row and per pair_block_n-wide column group.
+                            gate_f = gate_raw.to(tl.float32)
+                            up_f = up_raw.to(tl.float32)
+                            # One tile is exactly one column group
+                            # (pair_block_n wide), so the per-group amax is a
+                            # single in-tile row reduction; masked-out lanes
+                            # contribute zero.
+                            gate_amax = tl.max(
+                                tl.where(mask_n[None, :], tl.abs(gate_f), 0.0),
+                                axis=1)
+                            up_amax = tl.max(
+                                tl.where(mask_n[None, :], tl.abs(up_f), 0.0),
+                                axis=1)
+                            # E4M3 max finite value; a zero row keeps q = 0
+                            # and a unit scale so the dequantized value stays
+                            # exactly 0.
+                            fp8_max: tl.constexpr = 448.0
+                            gate_safe = tl.where(
+                                gate_amax > 0.0, gate_amax, 1.0)
+                            up_safe = tl.where(up_amax > 0.0, up_amax, 1.0)
+                            tl.store(
+                                fc1_row_ptr,
+                                (gate_f * (fp8_max / gate_safe)[:, None]).to(
+                                    tl.float8e4nv),
+                                mask=fc1_store_mask)
+                            tl.store(
+                                fc1_row_ptr + FFN,
+                                (up_f * (fp8_max / up_safe)[:, None]).to(
+                                    tl.float8e4nv),
+                                mask=fc1_store_mask)
+                            # Scale table: [rows, 2F / pair_block_n], gate
+                            # group then up group per column pair.
+                            fc1_scale_row_ptr = (
+                                fc1_scale_ptr
+                                + output_group_row * (2 * FFN // pair_block_n)
+                                + (local_row_start + local_rows)
+                                * (2 * FFN // pair_block_n)
+                                + col_start // pair_block_n)
+                            tl.store(fc1_scale_row_ptr, gate_safe / fp8_max,
+                                     mask=mask_m)
+                            tl.store(
+                                fc1_scale_row_ptr + FFN // pair_block_n,
+                                up_safe / fp8_max, mask=mask_m)
+                        else:
+                            tl.store(fc1_row_ptr, gate_raw,
+                                     mask=fc1_store_mask)
+                            tl.store(fc1_row_ptr + FFN, up_raw,
+                                     mask=fc1_store_mask)
                 if previous_step % 2 == 0:
                     al.sync_block_set('vector', 'cube', 10,
                                       al.PIPE.PIPE_MTE3, al.PIPE.PIPE_FIX)
@@ -919,6 +932,7 @@ def _run_dynamic_wave_pipeline(
         BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr, FC1_BLOCK_K: tl.constexpr,
         FC2_BLOCK_N: tl.constexpr, FC2_BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
         ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr, SAVE_FC1: tl.constexpr,
+        FC1_FP8: tl.constexpr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
     global_waves = 0
@@ -980,7 +994,7 @@ def _run_dynamic_wave_pipeline(
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, FC1_FP8, expert,
                                     begin, end - begin, gate_ready_ptr,
                                     HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
                             else:
@@ -992,7 +1006,7 @@ def _run_dynamic_wave_pipeline(
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, FC1_FP8, expert,
                                     begin, end - begin, gate_ready_ptr,
                                     HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
             with al.scope(core_mode='vector', disable_auto_sync=True):
@@ -1052,7 +1066,7 @@ def _kernel_fused_forward(
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
         FC2_BLOCK_K: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        SAVE_FC1: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
+        SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
@@ -1190,7 +1204,7 @@ def _kernel_fused_forward(
         NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
         MAX_SOURCE_TILES, MAX_PIPELINE_GROUPS, DISPATCH_BLOCK_M, FC1_BLOCK_M, FC1_BLOCK_N,
         FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA,
-        SAVE_FC1,
+        SAVE_FC1, FC1_FP8,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         EXPERTS_PER_RANK, MOONEP)
     if MOONEP:

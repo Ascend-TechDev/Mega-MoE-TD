@@ -20,9 +20,8 @@
 #  Phase map (mirrors ops.backward.moe_backward_triton's 5-op order):
 #
 #    P1   dispatch A2A (vec, putmem+signal) + fc2 dgrad (cube, dl.wait);
-#         MOE_SAVED_RECOMPUTE=1 rides the same vector scope: the P0
-#         re-dispatch sweep (forward producer mechanism, dl.symm_at direct
-#         stores into the symmetric slab P5 reads) + act-row recompute   ]
+#         MOE_SAVED_RECOMPUTE=1's act-row recompute rides the same vector
+#         scope (ungated, published to P3 by B1)                        ]
 #    B1   barrier_all  — publish P1's remote puts + grad_swiglu.          ] step 1
 #         (MOE_MEGA_TILE_B1=1 replaces it with per-window SET slots — 910B1
 #         only; 950DT lowering boundary, see the knob paragraph below):
@@ -38,7 +37,15 @@
 #         into combine_buf, the dedicated symmetric return slab — step 2) ]
 #      ∥ P5a  fc1 wgrad first half (cube) — the P2∥P3 adjacent-scope      ] step 5
 #             concurrency recipe; P5 needs only B2's dAB, and msprof
-#             showed the vector engine ~97% idle across the kernel
+#             showed the vector engine ~97% idle across the kernel.
+#             The split is STRUCTURAL (2026-09-17 revert of a whole-sweep
+#             merge): P4c must follow B4 (every push landed) and the only
+#             cube work that can cover it is dW1's tail, so one whole
+#             sweep either exposes the reduce (before B4) or the push
+#             (after B4).  Any split with W - r >= push and r >= reduce
+#             keeps both vec phases hidden at wall = P4a + W; the 50/50
+#             point sits on both sides of the measured t4k rank0 operating
+#             point (push 4.91ms vs W/2 4.95ms)
 #    B4   barrier_all  — cross-rank: all pushes landed before any reduce  ]
 #    P4c  topk reduce (vec) -> grad_hidden + grad_routing_weights         ]
 #      ∥ P5b  fc1 wgrad second half (cube) — no trailing barrier: after B4
@@ -54,9 +61,12 @@
 #  already existed — the old form ran it serially after B5 as
 #  [seed+sink both -> B6 -> pull both]):
 #
-#    w1   seed acc_down + sink down slots (vec) — grad_fc2 is final at B2,
-#         so this rides the B2->B3 window BESIDE the cube P4a (whose vector
-#         engine sat idle); published by B3/B4
+#    w1   re-dispatch sweep (MOE_SAVED_RECOMPUTE — moved here from the P1
+#         window 2026-09-16: the P1 vec leg was the hot rank's window bound
+#         while this window's vector engine sits idle under the cube-bound
+#         fc1-dgrad GEMM) + seed acc_down + sink down slots (vec) — grad_fc2
+#         is final at B2, so the seed/sink rides the same B2->B3 window
+#         BESIDE the cube P4a; slab stores/sunk slots published by B3(/B4)
 #    B5   barrier_all  — publish P5's physical grad_fc1 (the wave's last
 #         producer dependency)
 #    w2   ∥ (vec, one scope): sink gate/up slots (ungated, idempotent plain
@@ -162,6 +172,7 @@
 # ============================================================================
 
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -213,10 +224,15 @@ def _mega_swiglu_bwd_row(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """One row of the step-2 swiglu/situ backward (kernels/swiglu_bwd.py:32-70
     verbatim); dC_ready_ptr is grad_swiglu either behind a consume_token (the
-    TILE_B1 windowed consumer) or the plain pointer."""
+    TILE_B1 windowed consumer) or the plain pointer.  FC1_FP8 dequantizes the
+    saved gate/up halves at the load (!59's single-kernel save format: FP8
+    E4M3 payload, one FP32 scale per row per FC1_GROUP_N-wide column group,
+    gate groups then up groups over the [rows, 2F] row)."""
     offs = tl.arange(0, BLOCK_SIZE)
     r64 = row.to(tl.int64)
     a_ptr = AB_ptr + r64 * AB_stride          # gate half
@@ -226,6 +242,12 @@ def _mega_swiglu_bwd_row(
     dc = tl.load(dc_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    if FC1_FP8:
+        scale_row = fc1_scale_ptr + r64 * ((2 * ffn) // FC1_GROUP_N)
+        a = a * tl.load(scale_row + offs // FC1_GROUP_N,
+                        mask=mask, other=0.0)
+        b = b * tl.load(scale_row + (ffn + offs) // FC1_GROUP_N,
+                        mask=mask, other=0.0)
     if ACTIVATION == 0:
         sigmoid_a = tl.sigmoid(a)
         act_a = a * sigmoid_a
@@ -247,8 +269,10 @@ def _mega_swiglu_bwd_row(
     sc = tl.load(scale_ptr + r64)
     da = dc * dact_a * v * sc
     db = dc * act_a * dv * sc
-    tl.store(dAB_ptr + r64 * AB_stride + offs, da.to(AB_ptr.dtype.element_ty), mask=mask)
-    tl.store(dAB_ptr + r64 * AB_stride + ffn + offs, db.to(AB_ptr.dtype.element_ty), mask=mask)
+    # store in dAB's element type (BF16), never AB's: under FC1_FP8 the load
+    # side dequantized into fp32, and the gradient must NOT round back to FP8
+    tl.store(dAB_ptr + r64 * AB_stride + offs, da.to(dAB_ptr.dtype.element_ty), mask=mask)
+    tl.store(dAB_ptr + r64 * AB_stride + ffn + offs, db.to(dAB_ptr.dtype.element_ty), mask=mask)
     tl.store(dscale_ptr + r64, tl.sum(act_a * v * dc))
 
 
@@ -266,6 +290,8 @@ def _mega_swiglu_bwd(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """Step-2 body (kernels/swiglu_bwd.py:32-70 verbatim): ungated vector
     work, rows partitioned by pid over the mega grid (= ncore())."""
@@ -274,7 +300,8 @@ def _mega_swiglu_bwd(
             row, dC_ptr, dC_stride, AB_ptr, AB_stride, ffn,
             scale_ptr, dAB_ptr, dscale_ptr,
             situ_beta, situ_linear_beta,
-            BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+            BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+            fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
 
 
 @triton.jit
@@ -295,6 +322,8 @@ def _mega_swiglu_bwd_windowed(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """MOE_MEGA_TILE_B1=1 consumer for P2: WINDOW-strided ownership.  The P1
     cube GEMM signals every (expert, n_tile, m_window) tile of grad_swiglu it
@@ -328,7 +357,8 @@ def _mega_swiglu_bwd_windowed(
                         row0 + r, dC_ready, dC_stride, AB_ptr, AB_stride, ffn,
                         scale_ptr, dAB_ptr, dscale_ptr,
                         situ_beta, situ_linear_beta,
-                        BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                        BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                        fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
             gw += 1
 
 
@@ -993,13 +1023,18 @@ def _mega_stamp(ts_ptr, slot: tl.constexpr, pid, TS_SLOTS: tl.constexpr):
 #     row, cheap to save).
 # fc1_output is NOT recomputed: the forward keeps saving it and the backward
 # reads it from memory (the fp8 + framework-side offload variant is
-# orthogonal and needs no code here).  Both recompute bodies ride the P1
-# window's vector scope — the remote-store sweep behind the sub_vec0 gate
-# right after P1's own gco putmem sweep, the activation rows ungated beside
-# it (idempotent stores, the P6 window's proven mixed shape) — overlapping
-# P1's cube fc2-dgrad.  B1 publishes the act rows cross-program for P3 and
-# the remote slab stores cross-rank (P5 first reads them two barriers
-# later); no barrier is added or moved.  The wrapper launches the ORIGINAL
+# orthogonal and needs no code here).  Window split (2026-09-16 move): the
+# act-row recompute rides the P1 window's vector scope UNGATED beside P1's
+# own gco putmem sweep (idempotent stores, the P6 window's proven mixed
+# shape), overlapping P1's cube fc2-dgrad, with B1 publishing the rows
+# cross-program for P3.  The re-dispatch sweep rides the B2->B3 window's
+# leading vector scope BESIDE the cube P4a (the fc1-dgrad GEMM) — moved
+# out of the P1 window, where the vec leg (gco putmem + re-dispatch, both
+# sub_vec0) was the hot rank's critical path, into a window whose vector
+# engine sits idle under the cube-bound GEMM.  B3 publishes the remote
+# slab stores cross-rank and P5a (the only consumer) sits behind B3, so no
+# barrier is added or moved (the wrapper forces TILE_B3/FUSE_P4 off under
+# recompute — both would remove B3).  The wrapper launches the ORIGINAL
 # kernel_moe_backward_mega (kept verbatim in this file) for the default =0
 # path and this variant for =1; the variant's SAVED_RECOMPUTE constexpr
 # compiles both recompute bodies out as a guard.  The forward is not
@@ -1027,9 +1062,12 @@ def _redispatch_hidden_direct(
     Same (dst, expert) bucket walk and work-id decode as the P1 gco sweep
     (_dispatch_grad_source_tiles), so rows land in the identical expert-major
     receive layout recv_hidden_sorted has — P5 reads the slab as a drop-in
-    B matrix.  No signal chain: B1's barrier publishes the remote stores
-    (module docstring rule; dl.symm_at resolves non-first slabs on 950DT,
-    probe 6b) and P5's first read sits behind B2/B3 anyway."""
+    B matrix.  No signal chain: the window's closing B3 barrier publishes
+    the remote stores (module docstring rule; dl.symm_at resolves non-first
+    slabs on 950DT, probe 6b) and P5a — the only consumer — sits behind
+    B3.  Rides the B2->B3 window's leading vec scope beside the cube P4a
+    (moved out of the P1 window 2026-09-16; see the recompute block
+    comment)."""
     num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
     rows = tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_N)
@@ -1070,15 +1108,18 @@ def _recompute_act_rows(
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    fc1_scale_ptr,
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
 ):
     """weighted_swiglu's row formula verbatim (tl.math.tanh, fp32
     intermediates, BF16 store) over the SAVED fc1_output — bit-identical to
     the forward product except the scale, which arrives as the BF16 saved
     recv_weights_sorted instead of the forward's FP32 routing weights
-    (ulp-level, gate tolerance covers it).  Rides the P1 window's vector
-    scope UNGATED beside the sub_vec0 remote bodies: pure-function stores,
-    so running on both vector subcores with the same pid-strided rows is
-    idempotent (the P6 seed_sink shape)."""
+    (ulp-level, gate tolerance covers it).  FC1_FP8 dequantizes the saved
+    gate/up halves at the load (same contract as _mega_swiglu_bwd_row).
+    Rides the P1 window's vector scope UNGATED beside the sub_vec0 remote
+    bodies: pure-function stores, so running on both vector subcores with
+    the same pid-strided rows is idempotent (the P6 seed_sink shape)."""
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < ffn
     for row in range(pid, n_rows, nprogs):
@@ -1087,6 +1128,12 @@ def _recompute_act_rows(
                        mask=mask, other=0.0).to(tl.float32)
         up = tl.load(fc1_out_ptr + r64 * stride_om + ffn + offs,
                      mask=mask, other=0.0).to(tl.float32)
+        if FC1_FP8:
+            scale_row = fc1_scale_ptr + r64 * ((2 * ffn) // FC1_GROUP_N)
+            gate = gate * tl.load(scale_row + offs // FC1_GROUP_N,
+                                  mask=mask, other=0.0)
+            up = up * tl.load(scale_row + (ffn + offs) // FC1_GROUP_N,
+                              mask=mask, other=0.0)
         if ACTIVATION == 0:
             act = gate * tl.sigmoid(gate) * up
         else:
@@ -1156,6 +1203,9 @@ def kernel_moe_backward_mega(
     BLOCK_H_PUSH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+    # ---- fc1_output save format (!59): FP8 E4M3 + per-row/per-group scales
+    # dequantized at the two load sites; False keeps the BF16 staged save ----
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
     W_BM: tl.constexpr, W_BN: tl.constexpr, W_BK: tl.constexpr,
     W_NS: tl.constexpr,
     C_BM: tl.constexpr, C_BN: tl.constexpr, C_BK: tl.constexpr,
@@ -1175,6 +1225,9 @@ def kernel_moe_backward_mega(
     # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
     #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
     combine_buf_ptr,
+    # ---- fc1 FP8 save scales [M, 2F // FC1_GROUP_N] FP32 (dead arg when
+    # FC1_FP8=False — the launch signature is fixed) ----
+    fc1_scale_ptr,
     # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
     replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
     replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
@@ -1288,7 +1341,9 @@ def kernel_moe_backward_mega(
                         situ_beta, situ_linear_beta,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
-                        HAS_LINEAR_BETA=HAS_LINEAR_BETA)
+                        HAS_LINEAR_BETA=HAS_LINEAR_BETA,
+                        fc1_scale_ptr=fc1_scale_ptr,
+                        FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
             else:
                 _mega_swiglu_bwd(
                     pid, num_cores,
@@ -1296,7 +1351,8 @@ def kernel_moe_backward_mega(
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
                     situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
             _mega_wgrad_sweep(
@@ -1609,8 +1665,27 @@ def kernel_moe_backward_mega(
 # the mega kernel — fused backward-recompute variant
 # (MOE_SAVED_RECOMPUTE=1): ONE launch carries the whole backward plus
 # the saved-activation recompute riding the P1 window
+#
+# do_not_specialize: every ROUTING-DERIVED int must be listed here.  Triton's
+# int specialization (divisible-by-16 / equal-to-1) is part of the cache key,
+# so any of these crossing a ÷16 boundary mid-run mints a fresh key and pays
+# a full ~6.5s JIT recompile inside the launch — one rank compiling stalls
+# the whole job's iteration (msprof 2026-09-16: device idle ~6.5s windows,
+# op_summary shows the launch stretched to 6518-6668ms; /root/.triton/cache
+# kept minting variants through the run, e.g. max_rows_w flipping div16).
+# Shape-fixed ints (N/K dims, num_tn*/num_tk*, strides, H, ffn) keep their
+# specialization hints — they never vary, so their keys are stable, and the
+# div16 hints can matter for address codegen.  The original
+# kernel_moe_backward_mega above stays verbatim (user directive), and its
+# callers hit the same trap only under non-recompute runs with shifting
+# routing — fix it there too if that path is ever performance-relevant.
 # ============================================================================
-@triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
+@triton.jit(do_not_specialize=[
+    "signal_epoch", "b3_epoch", "b1_epoch",
+    "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
+    "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
+    "w5_split", "w5_total",                      # P5 wgrad split geometry
+])
 def kernel_moe_backward_mega_recompute(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
     gco_ptr, peer_mem_ptr, signal_mem_ptr,
@@ -1657,6 +1732,9 @@ def kernel_moe_backward_mega_recompute(
     BLOCK_H_PUSH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
+    # ---- fc1_output save format (!59): FP8 E4M3 + per-row/per-group scales
+    # dequantized at the two load sites; False keeps the BF16 staged save ----
+    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
     W_BM: tl.constexpr, W_BN: tl.constexpr, W_BK: tl.constexpr,
     W_NS: tl.constexpr,
     C_BM: tl.constexpr, C_BN: tl.constexpr, C_BK: tl.constexpr,
@@ -1676,6 +1754,9 @@ def kernel_moe_backward_mega_recompute(
     # (the P4b/P4c/FUSE_P4 push+reduce target; combine_buf under
     #  MOE_MEGA_COMBINE_BUF, peer_mem in the =0 fallback)
     combine_buf_ptr,
+    # ---- fc1 FP8 save scales [M, 2F // FC1_GROUP_N] FP32 (dead arg when
+    # FC1_FP8=False — the launch signature is fixed) ----
+    fc1_scale_ptr,
     # ---- MoonEP physical saved (use_moonep): dual weight tables + P6 tail ----
     replica_fc2_ptr, stride_rwe1, stride_rwk1, stride_rwn1,   # P1 replica fc2
     replica_w4_ptr, stride_rwe4, stride_rwk4, stride_rwn4,    # P4a replica gate/up
@@ -1696,8 +1777,10 @@ def kernel_moe_backward_mega_recompute(
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
     # ---- MOE_SAVED_RECOMPUTE=1: P0 re-dispatch + act recompute operands
-    # (fused into the P1 window; dead-arg pattern when SAVED_RECOMPUTE=0
-    # compiles both bodies out — see the recompute block comment above) ----
+    # (fused into the launch — the re-dispatch sweep rides the B2->B3
+    # window, the act rows the P1 window; dead-arg pattern when
+    # SAVED_RECOMPUTE=0 compiles both bodies out — see the recompute block
+    # comment above) ----
     redis_src_ptr, stride_rm,              # pre-dispatch token copy [B, H]
     send_src_idx_ptr,                      # send slot -> source row (sort//topk)
     redis_buf_ptr,                         # symmetric slab [rows, H] = P5's B
@@ -1714,10 +1797,15 @@ def kernel_moe_backward_mega_recompute(
         _mega_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
 
     # ---------------- P1: dispatch + fc2 input-grad ----------------
-    # (+ SAVED_RECOMPUTE: the P0 re-dispatch sweep and the act-row recompute
-    # ride this window's vector scope, overlapping the cube fc2-dgrad — see
-    # the recompute block comment.  gco's putmem sweep stays FIRST: its
-    # signal chain unblocks the cube dgrad waiters, the critical path.)
+    # (+ SAVED_RECOMPUTE: the act-row recompute rides this window's vector
+    # scope UNGATED beside the gco putmem sweep, overlapping the cube
+    # fc2-dgrad and published to P3 by B1 — see the recompute block comment.
+    # The re-dispatch sweep moved to the B2->B3 window beside the cube P4a
+    # (2026-09-16): the P1 vec leg (gco + re-dispatch, both sub_vec0) was
+    # this window's critical path on the hot rank, while the fc1-dgrad
+    # window's vector engine sits idle under the cube-bound GEMM.  gco's
+    # putmem sweep stays FIRST: its signal chain unblocks the cube dgrad
+    # waiters, the critical path.)
     if P1_ON:
         with al.scope(core_mode="vector", disable_auto_sync=True):
             if sub_vec_id() == 0:
@@ -1729,15 +1817,6 @@ def kernel_moe_backward_mega_recompute(
                     signal_epoch, H, stride_gm,
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
-                if SAVED_RECOMPUTE:
-                    _redispatch_hidden_direct(
-                        pid, num_cores,
-                        redis_src_ptr, stride_rm,
-                        send_src_idx_ptr, redis_buf_ptr,
-                        send_bucket_starts_ptr, send_counts_re_ptr,
-                        send_bucket_dst_starts_ptr,
-                        H, WORLD_SIZE, EXPERTS_PER_RANK,
-                        REDIS_BM, REDIS_BN)
             if SAVED_RECOMPUTE:
                 _recompute_act_rows(
                     pid, num_cores,
@@ -1745,7 +1824,8 @@ def kernel_moe_backward_mega_recompute(
                     scale_ptr,
                     orig_in3_ptr, stride_om3,
                     ffn, n_rows, situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         if TIMING:
             _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -1818,7 +1898,9 @@ def kernel_moe_backward_mega_recompute(
                         situ_beta, situ_linear_beta,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
-                        HAS_LINEAR_BETA=HAS_LINEAR_BETA)
+                        HAS_LINEAR_BETA=HAS_LINEAR_BETA,
+                        fc1_scale_ptr=fc1_scale_ptr,
+                        FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
             else:
                 _mega_swiglu_bwd(
                     pid, num_cores,
@@ -1826,7 +1908,8 @@ def kernel_moe_backward_mega_recompute(
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
                     situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA)
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
             _mega_wgrad_sweep(
@@ -1853,13 +1936,34 @@ def kernel_moe_backward_mega_recompute(
     if TIMING:
         _mega_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
 
-    # ---- transport wave window 1 (GRAD_REDUCE): fc2-grad seed+sink ∥ P4a ----
-    # grad_fc2 is final at P3/B2, and this window's vector engine is idle
-    # (P4a — or the FUSE_P4 loop's first iteration — is cube-only), so the
-    # DOWN half of the old P6a rides here as the leading [vec] scope of a
-    # P2∥P3-style adjacent pair.  The sunk slots are cross-rank published by
+    # ---- recompute re-dispatch + transport wave window 1: leading vec scope
+    # beside the cube P4a (the fc1-dgrad window) ----
+    # MOE_SAVED_RECOMPUTE (2026-09-16 move): the re-dispatch sweep rides here
+    # instead of the P1 window's vector scope — the P1 vec leg (gco putmem +
+    # re-dispatch, both behind the sub_vec0 gate) was the hot rank's P1
+    # critical path (the v2 recompute A/B at kimi t4k measured +3.9 ms/layer
+    # non-MoonEP for the whole recompute addition), while this window's
+    # vector engine sits idle under the cube-bound fc1-dgrad GEMM (the same
+    # idle-vec argument that put the DOWN seed+sink here).  The sweep has no
+    # producer dependency (it reads only the forward's saved token copy and
+    # the host send tables) and its only consumer is P5a, behind B3 — the
+    # barrier that publishes the remote slab stores cross-rank (the wrapper
+    # forces TILE_B3/FUSE_P4 off under recompute: both remove that barrier).
+    # GRAD_REDUCE's fc2-grad seed+sink rides the same scope as before:
+    # grad_fc2 is final at P3/B2, the sunk slots are cross-rank published by
     # the very next hard barrier (B3, or B4 when B3 is signalized/unrolled)
     # and the only consumer is the B5->B6 owner-pull — no new barrier needed.
+    if SAVED_RECOMPUTE:
+        with al.scope(core_mode="vector", disable_auto_sync=True):
+            if sub_vec_id() == 0:
+                _redispatch_hidden_direct(
+                    pid, num_cores,
+                    redis_src_ptr, stride_rm,
+                    send_src_idx_ptr, redis_buf_ptr,
+                    send_bucket_starts_ptr, send_counts_re_ptr,
+                    send_bucket_dst_starts_ptr,
+                    H, WORLD_SIZE, EXPERTS_PER_RANK,
+                    REDIS_BM, REDIS_BN)
     if GRAD_REDUCE:
         with al.scope(core_mode="vector", disable_auto_sync=True):
             _mega_grad_seed_sink(
@@ -2225,11 +2329,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     borrows them.
 
     hidden_states: the forward INPUT token copy [B, H] (pre-dispatch).  Only
-    MOE_SAVED_RECOMPUTE=1 reads it — the fused P0 phase (in the P1 window)
+    MOE_SAVED_RECOMPUTE=1 reads it — the fused re-dispatch sweep (riding the
+    B2->B3 window beside the cube P4a since the 2026-09-16 move out of P1)
     re-dispatches it over P1's send maps with the forward producer's
     per-token gather mechanism (dl.symm_at direct stores into a dedicated
     symmetric slab, which P5 then reads as its B matrix), and the act rows
-    are rewritten from fc1_output in the same window.  ONE launch carries
+    are rewritten from fc1_output in the P1 window.  ONE launch carries
     the whole backward plus the recompute; the two saved workspace keys are
     simply not consumed and the forward is not adapted (its workspace still
     carries them)."""
@@ -2247,6 +2352,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     device = dy.device
     rank = saved["ep_rank"]
     W = saved["world_size"]
+    # attribution probe: wrapper entry — splits the inter-launch gap into
+    # [prev launch -> entry] = framework autograd segment (pure host) vs
+    # [entry -> post-.item()] = wrapper prep + device drain of the queue.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-ent r{rank} t={time.time():.2f}]", flush=True)
 
     # P1 prep: expert-major gco (host gather) + cached dispatch maps.
     p1 = _prepare_dispatch_fc2_bwd(saved, dy)
@@ -2298,20 +2408,52 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # _mega_wgrad_sweep)
     max_rows_w = max(1, int(p4["expert_counts"].max().item()))
     pad_rows_w = max_rows_w
+    # attribution probe: right after the .item() device sync — everything
+    # queued by this rank's autograd up to here (prev mega kernel, framework
+    # dense backward, p1 gather) is now retired; the wall clock it took to
+    # get HERE past [mega-ent] is the device drain time.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-it r{rank} t={time.time():.2f}]", flush=True)
 
     # outputs (fresh, contiguous — strides passed to the kernel; the four
     # wgrad-sweep read targets carry the pad rows, returned keys are [:M]
     # views)
     fc1_output = saved["fc1_output"].contiguous()      # [M, 2*ffn]
+    # !59's single-kernel forward saves fc1_output as FP8 E4M3 plus one FP32
+    # scale per row and per FC1_GROUP_N-wide column group ("fc1_output_scale"
+    # / "fc1_scale_group_size").  The mega kernel dequantizes AT ITS TWO LOAD
+    # SITES (the P2 swiglu-bwd rows and the P1-window act recompute) — no
+    # host-side BF16 materialization, the half-width save survives end to
+    # end.  Staged-path saves stay BF16 and compile the dequant out
+    # (FC1_FP8=False).
+    fc1_fp8 = fc1_output.dtype == torch.float8_e4m3fn
+    if fc1_fp8:
+        fc1_scale = saved["fc1_output_scale"].contiguous()
+        fc1_group_n = int(saved["fc1_scale_group_size"])
+        if (
+            fc1_scale.dtype != torch.float32
+            or fc1_output.shape[1] % fc1_group_n
+            or tuple(fc1_scale.shape)
+            != (M, fc1_output.shape[1] // fc1_group_n)
+        ):
+            raise ValueError(
+                "fc1_output_scale must be FP32 [rows, 2F // "
+                "fc1_scale_group_size] matching the FP8 fc1_output")
+    else:
+        # dead args (FC1_FP8=False compiles the loads out); the launch
+        # signature is fixed
+        fc1_scale = fc1_output
+        fc1_group_n = 1
     # MOE_SAVED_RECOMPUTE=1 (the 9/14 backward-side recompute design, fused
     # into this launch 9/15): the two large saved activations below are NOT
-    # read — orig_in5 becomes the symmetric re-dispatch slab P0 fills in the
-    # P1 window (the forward producer's per-token gather mechanism, no
-    # host-side topk-x copy), and orig_in3's rows are recomputed from
-    # fc1_output in the same window (see the recompute block comment above
-    # the mega kernel).  fc1_output itself stays saved and read from memory.
-    # The forward is not adapted: its workspace still allocates both keys,
-    # the mega path just stops consuming them.
+    # read — orig_in5 becomes the symmetric re-dispatch slab the B2->B3
+    # window's leading vec sweep fills beside the cube P4a (the forward
+    # producer's per-token gather mechanism, no host-side topk-x copy; moved
+    # out of the P1 window 2026-09-16), and orig_in3's rows are recomputed
+    # from fc1_output in the P1 window (see the recompute block comment
+    # above the mega kernel).  fc1_output itself stays saved and read from
+    # memory.  The forward is not adapted: its workspace still allocates
+    # both keys, the mega path just stops consuming them.
     saved_recompute = os.environ.get("MOE_SAVED_RECOMPUTE", "0") == "1"
     if saved_recompute:
         if hidden_states is None:
@@ -2324,9 +2466,13 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
                 f"the saved forward input {(saved['batch_size'], H)}")
     grad_swiglu = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)[:M]
+    # grad outputs stay BF16 (the backward contract dtype) even when
+    # fc1_output is the FP8 save: grad_fc1_output/grad_gate are fresh GEMM /
+    # reduction operands downstream (P4a/P5 read dAB, the return dict hands
+    # both out), not mirrors of AB's dtype.
     grad_fc1_output = torch.empty(
-        M + pad_rows_w, 2 * ffn, dtype=fc1_output.dtype, device=device)[:M]
-    grad_gate = torch.empty(M, dtype=fc1_output.dtype, device=device)
+        M + pad_rows_w, 2 * ffn, dtype=torch.bfloat16, device=device)[:M]
+    grad_gate = torch.empty(M, dtype=torch.bfloat16, device=device)
     orig_in3 = torch.empty(
         M + pad_rows_w, ffn, dtype=dy.dtype, device=device)
     if not saved_recompute:
@@ -2420,7 +2566,16 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     num_tk5 = (H + wbk - 1) // wbk
     w3_total = EPR * num_tn3 * num_tk3
     w5_total = EPR * num_tn5 * num_tk5
-    w5_split = w5_total // 2   # P5a/P5b half-and-half over the P4b/P4c windows
+    # P5a/P5b half-and-half over the P4b/P4c windows.  The split is what
+    # keeps BOTH vec phases covered (2026-09-17: a whole-sweep merge was
+    # tried and reverted — it hid dW1 under the push but left the post-B4
+    # reduce exposed; P4c cannot move before B4, and past B4 only dW1's
+    # tail can cover it, so the sweep must straddle B4.  With
+    # w5_total - w5_split >= push and w5_split >= reduce the wall stays
+    # cube-bound at P4a + W with nothing exposed; the 50/50 point
+    # satisfies both at the measured t4k rank0 numbers, push 4.91ms vs
+    # W/2 4.95ms).
+    w5_split = w5_total // 2
 
     # step-2 activation derivative selection (ops/backward.py semantics)
     activation = saved.get("activation", "swiglu")
@@ -2477,8 +2632,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # byte identically, so heap divergence is NOT that failure's cause (root
     # cause: the codegen limitation documented in the module docstring).
     m_bound = W * EPR * p1["max_bwd_tiles"] * 64
-    tile_b3 = os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
-    fuse_p4 = os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
+    # SAVED_RECOMPUTE forces both B3-removing knobs off: the re-dispatch
+    # sweep rides the B2->B3 window and its remote slab stores are published
+    # cross-rank BY the B3 barrier — TILE_B3 (per-tile signals) and FUSE_P4
+    # (self-produce-self-push) would leave P5a no publication edge for the
+    # slab (both default-off perf knobs; the tile_b1 force-off precedent).
+    tile_b3 = (os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
+               and not saved_recompute)
+    fuse_p4 = (os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
+               and not saved_recompute)
     if fuse_p4 or tile_b3:
         tiles_bound = (m_bound + cbm - 1) // cbm + EPR
         b3_signal = _ensure_mega_signal_local(
@@ -2504,11 +2666,13 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     tile_b1 = (os.environ.get("MOE_MEGA_TILE_B1", "0") == "1"
                and _flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23"))
     if saved_recompute:
-        # The recompute bodies ride the P1 window's vector scope and publish
-        # through B1: the act rows are read CROSS-PROGRAM by P3, and
-        # TILE_B1's signal chain only covers grad_swiglu tiles — so the
+        # The act-row recompute rides the P1 window's vector scope and
+        # publishes through B1: the act rows are read CROSS-PROGRAM by P3,
+        # and TILE_B1's signal chain only covers grad_swiglu tiles — so the
         # barrier must stay.  Same reason the window knobs are requirements,
-        # not suggestions: P1 off leaves the recompute bodies nowhere to run.
+        # not suggestions: P1 off leaves the act recompute nowhere to run.
+        # (The re-dispatch sweep rides the B2->B3 window instead — its knob
+        # constraints are enforced at the tile_b3/fuse_p4 definitions above.)
         if not (_flag("MOE_MEGA_P1") and _flag("MOE_MEGA_P23")):
             raise ValueError(
                 "MOE_SAVED_RECOMPUTE=1 rides the P1 window's vector scope "
@@ -2539,7 +2703,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     if os.environ.get("MOE_MEGA_COMBINE_BUF", "1") == "1":
         _rows = torch.tensor(
             [p4["B"] * p4["topk"]], dtype=torch.int64, device=device)
+        # attribution probe (attempt-4 perf anomaly): bracket the per-launch
+        # 1-elem sizing all_reduce — the 5-op baseline backward has no such
+        # collective and a degraded ~730ms/call would exactly explain the
+        # stable +17.5s/iter plateau from iter3 on.
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            print(f"[mega-ar r{rank} t={time.time():.2f}]", flush=True)
         dist.all_reduce(_rows, op=dist.ReduceOp.MAX, group=saved["ep_group"])
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            print(f"[mega-ar+done r{rank} t={time.time():.2f}]", flush=True)
         combine_buf = _ensure_mega_combine_buf(
             saved, int(_rows.item()) * (H + GATE_PAD))
     else:
@@ -2559,7 +2731,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             return t.data_ptr() - _base if t is not None else None
 
         print(
-            f"[mega-heap r{rank}] M={M} pad={pad_rows_w} "
+            f"[mega-heap r{rank} t={time.time():.2f}] M={M} pad={pad_rows_w} "
             f"peer_off={_off(peer_mem)} sig_off={_off(signal_mem)} "
             f"sig_n={signal_mem.numel()} "
             f"redis_off={_off(orig_in5) if saved_recompute else '-'} "
@@ -2691,6 +2863,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         2 * ffn, H, num_tn5, num_tk5, w5_split, w5_total,
     )
     mega_kwargs = dict(
+        fc1_scale_ptr=fc1_scale,
         replica_fc2_ptr=replica_fc2,
         stride_rwe1=replica_fc2.stride(0), stride_rwk1=replica_fc2.stride(1),
         stride_rwn1=replica_fc2.stride(2),
@@ -2711,6 +2884,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         BLOCK_H_PUSH=256,
         BLOCK_SIZE=triton.next_power_of_2(ffn),
         ACTIVATION=act, HAS_LINEAR_BETA=has_lb,
+        FC1_FP8=fc1_fp8, FC1_GROUP_N=fc1_group_n,
         W_BM=wbm, W_BN=wbn, W_BK=wbk, W_NS=wns,
         C_BM=cbm, C_BN=cbn, C_BK=cbk, C_NS=max(cns, 1),
         BLOCK_N_PUSH=_push_block(), GATE_PAD_C=GATE_PAD,
@@ -2741,6 +2915,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         kernel_moe_backward_mega[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             num_warps=8, **launch_options)
+    # attribution probe: launch call returned (async) — with [mega-it] this
+    # bounds the triton launch host overhead; with the NEXT [mega-ent] it
+    # bounds the pure-host autograd segment after this launch.
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-post r{rank} t={time.time():.2f}]", flush=True)
 
     # expert-major peer_mem IS the sorted layout -> identity view (no gather),
     # exactly the alias step 1 returns.

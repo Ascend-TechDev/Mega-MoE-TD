@@ -94,6 +94,28 @@ class MegaMoEFunction(torch.autograd.Function):
                 routing_weights,
                 return_saved=True,
             )
+        if "recv_counts_by_source_expert" in saved:
+            # Single-kernel forward (enable_single_kernel_forward): the saved
+            # dict is the MINIMAL contract (fc1_output + receive-layout
+            # tables).  Expand it into the full backward contract — closed-form
+            # plan tables, weight references from the apply-time inputs (never
+            # the operator's per-call-refreshed staging buffers), scalars, and
+            # the two layout tripwires (see _single_saved_adapter).
+            from ._single_saved_adapter import enrich_single_kernel_saved
+            saved = enrich_single_kernel_saved(
+                op, saved,
+                hidden_states=hidden_states,
+                gate_up_weight=gate_up_weight,
+                down_weight=down_weight,
+            )
+        # Optional host swap of the ONE big saved activation: with
+        # MEGAMOE_FC1_OFFLOAD=1 fc1_output moves to a pooled pinned host
+        # buffer on a side stream (framework async_offload.py SwapTensor
+        # idiom — the native saved dict is invisible to
+        # saved_tensors_hooks, so the framework mechanism can't do this)
+        # and the backward entry H2Ds it back before anything reads it.
+        from ._fc1_host_offload import maybe_offload_fc1
+        maybe_offload_fc1(saved)
         # The saved intermediates are freshly computed views/clones (not the
         # forward inputs), and the weight views must stay pinned until the
         # backward — stash on ctx instead of save_for_backward, mirroring
@@ -112,19 +134,32 @@ class MegaMoEFunction(torch.autograd.Function):
     def backward(ctx, dy):
         op = ctx.op
         saved = ctx.saved
-        if (
-            saved.get("_owner_token") != id(op._routing_owner_token)
-            or saved.get("_routing_generation") != op._routing_generation
-        ):
-            wrong_owner = (
-                saved.get("_owner_token") != id(op._routing_owner_token)
-            )
+        if saved.get("_owner_token") != id(op._routing_owner_token):
             raise RuntimeError(
-                "the saved dict belongs to "
-                + ("another operator instance" if wrong_owner
-                   else "a routing plan this operator has already superseded")
-                + "; run backward before the next forward on the operator"
+                "the saved dict belongs to another operator instance; run "
+                "the forward and backward on the same operator"
             )
+        if (
+            saved.get("_routing_generation") != op._routing_generation
+            and not saved.get("_single_kernel_snapshot")
+        ):
+            raise RuntimeError(
+                "the saved dict belongs to a routing plan this operator "
+                "has already superseded; run backward before the next "
+                "forward on the operator"
+            )
+        # _single_kernel_snapshot skips the generation check: that dict is a
+        # full snapshot (every tensor is a clone / cast copy / fresh build /
+        # caller-held input ref — see _single_saved_adapter), so a later
+        # forward on the SAME operator (a framework host sharing one operator
+        # across same-shape MoE layers, ep_plan.megamoe_shared_op) cannot
+        # rewrite anything it reads.  The 5-op saved contract aliases the
+        # operator's planning workspaces and keeps the strict check.
+        # Host swap back: if the forward offloaded fc1_output, H2D it onto
+        # a fresh device tensor now — every consumer below (the mega launch
+        # and the orchestrator) runs on this stream, ordered after the copy.
+        from ._fc1_host_offload import maybe_reload_fc1
+        maybe_reload_fc1(saved)
         # §3.4 state injection: reuse the persistent symmetric tile-signal
         # slots and keep the SET epoch monotonically advancing.  The first
         # epoch must be >= 1 — a freshly zeroed slot already reads as 0.

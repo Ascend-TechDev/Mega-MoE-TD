@@ -67,7 +67,20 @@ def _dispatch_static_maps(saved):
     recv_per_expert = recv_counts_re.sum(0).to(torch.int32)                     # [EPR]
     recv_expert_offs = torch.zeros(EPR + 1, dtype=torch.int32, device=device)
     recv_expert_offs[1:] = recv_per_expert.cumsum(0).to(torch.int32)            # [EPR+1]
-    bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True).to(torch.int32)  # [total_send]
+    # Plan B (2026-09-16): a single-kernel saved contract carries the
+    # forward's own send table (forward_send_route, set by
+    # _single_saved_adapter).  Adopt it as the canonical send order: the
+    # re-dispatch reproduces the forward's receive placement, so the saved
+    # fc1_output / recv_weights_sorted pass through un-reordered.  Every
+    # consumer of this table is positional (gco gather, re-dispatch source
+    # rows, push-back offsets, reduce scatter), so swapping it keeps them
+    # mutually consistent.  Multi-kernel / MoonEP dicts carry no such key
+    # and keep the stable-argsort reconstruction.
+    fwd_send = saved.get("forward_send_route")
+    if fwd_send is not None:
+        bwd_expert_sort = fwd_send.to(device, torch.int32).contiguous()
+    else:
+        bwd_expert_sort = torch.argsort(flat.to(torch.float32), stable=True).to(torch.int32)  # [total_send]
     send_counts_flat = send_counts_re.reshape(-1)
     send_bucket_starts = torch.zeros(W * EPR + 1, dtype=torch.int32, device=device)
     send_bucket_starts[1:] = send_counts_flat.cumsum(0).to(torch.int32)
@@ -87,9 +100,18 @@ def _dispatch_static_maps(saved):
     _local_max = torch.tensor([int(send_counts_re.max().item())], dtype=torch.int64, device=device)
     dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
     _global_max_bwd_tiles = max(1, (int(_local_max.item()) + 64 - 1) // 64)
+    # MOE_DOWN_DIRECT=1 + the one-launch mega path: the caller's strided
+    # down view flows through unstaged — the kernel addresses fc2 through
+    # its stride parameters (p1["fc2"].stride(0/1/2) at the launch), so the
+    # .contiguous() copy (~88MB/layer/step at the kimi shape) buys nothing.
+    # The 5-op orchestrator path keeps the contiguous copy.
+    _down_direct = (
+        os.environ.get("MOE_DOWN_DIRECT", "0") == "1"
+        and os.environ.get("MOE_BWD_MEGA") == "1"
+    )
     cache = dict(
         M=saved["M"], N=saved["ffn_dim"], K=H, E=EPR,
-        fc2=saved["fc2"].contiguous(),
+        fc2=(saved["fc2"] if _down_direct else saved["fc2"].contiguous()),
         total_send=total_send, H=H, total_recv=saved["total_recv"],
         # expert-major signal/wait metadata
         send_counts_re=send_counts_flat.contiguous(), send_bucket_starts=send_bucket_starts,

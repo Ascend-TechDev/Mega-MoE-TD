@@ -128,6 +128,9 @@ class FusedMoEForward(torch.nn.Module):
         )
         self.num_aicore_programs = self.config.num_aicore_programs
         self.num_aivector_programs = self.config.num_aivector_programs
+        # Saved-forward FC1 format switch (see MoEForwardConfig.fc1_save_fp8):
+        # fixes the workspace dtype for this operator's lifetime.
+        self._fc1_save_fp8 = self.config.fc1_save_fp8
         if (
             self.enable_single_kernel_forward
             and self.world_size > self.num_aicore_programs
@@ -567,13 +570,19 @@ class FusedMoEForward(torch.nn.Module):
                 dtype=self.activation_dtype,
                 device=device,
             )
-            # Raw pre-activation gate/up GEMM results for the saved forward,
-            # quantized to FP8 E4M3 (same [receive rows, gate F | up F]
-            # layout as the staged path's fc1_output workspace) plus the
-            # per-row/per-group FP32 scales — roughly half the BF16 memory.
+            # Raw pre-activation gate/up GEMM results for the saved forward
+            # (same [receive rows, gate F | up F] layout as the staged path's
+            # fc1_output workspace).  fc1_save_fp8=True quantizes to FP8 E4M3
+            # plus the per-row/per-group FP32 scales — roughly half the BF16
+            # memory; the default keeps the raw BF16 tiles (the quantize leg
+            # overflows UB on some tile shapes, see the config field).
             self._single_fc1_output = torch.empty(
                 expected_fc1_output,
-                dtype=torch.float8_e4m3fn,
+                dtype=(
+                    torch.float8_e4m3fn
+                    if self._fc1_save_fp8
+                    else self.activation_dtype
+                ),
                 device=device,
             )
             self._single_fc1_scale = torch.empty(
@@ -1578,6 +1587,7 @@ class FusedMoEForward(torch.nn.Module):
             ACTIVATION=0 if self.activation == "swiglu" else 1,
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
             SAVE_FC1=return_saved,
+            FC1_FP8=self._fc1_save_fp8,
             PIPELINE_GROUP_WINDOWS=self.config.single_kernel_group_windows,
             MOONEP=self.enable_moonep,
             RAW_NUM_BINS=self.context.planning_num_bins,
@@ -1616,17 +1626,27 @@ class FusedMoEForward(torch.nn.Module):
         )
         saved = {
             # Raw pre-activation gate/up GEMM results, expert-major receive
-            # rows, [rows, gate F | up F], quantized to FP8 E4M3 — one of the
-            # two intermediates the redesigned backward keeps.  The companion
-            # FP32 scale tensor carries one value per row and per
-            # fc1_scale_group_size-wide column group (dequant:
-            # fc1_output.float() * scale[:, group]); together they cost about
-            # half the BF16 save.
-            "fc1_output": self._single_fc1_output[:num_received_routes],
-            "fc1_output_scale": self._single_fc1_scale[:num_received_routes],
-            "fc1_scale_group_size": (
-                self.config.fc1_gemm_block_size_n // 2
-            ),
+            # rows, [rows, gate F | up F] — one of the two intermediates the
+            # redesigned backward keeps.  With fc1_save_fp8=True this tensor
+            # is FP8 E4M3 and the companion FP32 scale pair below carries one
+            # value per row and per fc1_scale_group_size-wide column group
+            # (dequant: fc1_output.float() * scale[:, group]), together about
+            # half the BF16 save; the default keeps the raw BF16 tiles and
+            # omits the scale keys.  Either way it is materialized as a copy:
+            # the source is a fixed-address workspace rewritten by every
+            # call, and framework hosts share one operator across same-shape
+            # MoE layers, so the NEXT layer's forward would clobber the view
+            # before this layer's backward runs.
+            "fc1_output": self._single_fc1_output[:num_received_routes].clone(),
+            # Routing weight of each received row, same expert-major receive
+            # order as fc1_output (the dispatch wrote it beside every row;
+            # the combine consumed it per row).  The backward's swiglu
+            # backward and activation recompute both multiply by it.  FP32
+            # in transport, cast to BF16 here — the backward contract's
+            # dtype.
+            "recv_weights_sorted": self.context.routing_weight_mem[
+                :num_received_routes
+            ].to(torch.bfloat16),
             # Dispatch, saved in pre-dispatch form: the receive-side layout
             # tables the launch just wrote (receive row -> source segment ->
             # expert) plus references to the forward's own pre-dispatch
@@ -1653,14 +1673,24 @@ class FusedMoEForward(torch.nn.Module):
             "total_send": num_sent_routes,
             "total_recv": num_received_routes,
             "M": num_received_routes,
-            # Single-in-flight guards: every key above is either a workspace
-            # clone taken now, a fixed-address buffer slice rewritten by the
-            # next forward (fc1_output), or an input reference the caller
-            # must not mutate.  A later forward on this operator supersedes
-            # the whole dict.
+            # Single-in-flight guards: every key above is either a copy
+            # taken now (workspace clones / fc1_output / recv_weights_sorted)
+            # or an input reference the caller must not mutate
+            # (hidden_states / selected_experts / routing_weights — distinct
+            # tensors per layer, so a shared operator's next forward does
+            # not touch them).  A later forward on this operator still
+            # supersedes nothing but its own workspaces; the saved dict
+            # itself is now snapshot-safe across same-operator forwards.
             "_routing_generation": self._routing_generation,
             "_owner_token": id(self._routing_owner_token),
         }
+        if self._fc1_save_fp8:
+            saved["fc1_output_scale"] = self._single_fc1_scale[
+                :num_received_routes
+            ].clone()
+            saved["fc1_scale_group_size"] = (
+                self.config.fc1_gemm_block_size_n // 2
+            )
         return output, saved
 
     # ===================== full forward ================================
@@ -1684,11 +1714,13 @@ class FusedMoEForward(torch.nn.Module):
         on the configured execution path:
 
         * ``enable_single_kernel_forward=True`` (production): the single
-          launch quantizes the raw FC1 gate/up GEMM result to FP8 E4M3 into
-          fixed-address buffers, and ``saved`` holds that ``fc1_output``
-          tensor (expert-major receive rows, ``[rows, gate F | up F]``) with
-          its per-row/per-column-group FP32 ``fc1_output_scale`` (about half
-          the BF16 memory), plus the dispatch in pre-dispatch form —
+          launch saves the raw FC1 gate/up GEMM result into a fixed-address
+          buffer, and ``saved`` holds that ``fc1_output`` tensor
+          (expert-major receive rows, ``[rows, gate F | up F]``).  With
+          ``config.fc1_save_fp8=True`` it is quantized to FP8 E4M3 with
+          per-row/per-column-group FP32 ``fc1_output_scale`` (about half the
+          BF16 memory); the default keeps raw BF16.  Plus the dispatch in
+          pre-dispatch form —
           receive-layout tables and references to the forward's own inputs,
           letting the backward re-gather dispatched rows from
           ``hidden_states`` instead of a materialized
@@ -1731,14 +1763,28 @@ class FusedMoEForward(torch.nn.Module):
         # once here so both callers work; the fresh allocation also keeps
         # the replica weight cache honestly miss-per-step, which matches
         # optimizer-updated weights.
-        if self.enable_single_kernel_forward and not down_weight.is_contiguous():
+        # MOE_DOWN_DIRECT=1 (single-kernel, non-MoonEP only): the fused
+        # kernel addresses the down table through its stride parameters, so
+        # the caller's strided view can flow through UNSTAGED — no ~88MB/layer
+        # persistent _fc2_ws, no per-step copy_ (and the backward drops its
+        # .contiguous() twin, see dispatch_fc2_bwd).  Strides are constexpr:
+        # (E*F*H, 1, H) for the caller's view vs (E*H*F, F, 1) staged — one
+        # stable specialization either way, but K-major vs N-major
+        # contiguity differs, hence the perf A/B before defaulting it on.
+        _down_direct = (
+            self.enable_single_kernel_forward
+            and not self.enable_moonep
+            and os.environ.get("MOE_DOWN_DIRECT", "0") == "1"
+        )
+        if (self.enable_single_kernel_forward
+                and not down_weight.is_contiguous() and not _down_direct):
             # The one-launch kernel addresses the down table through raw
             # strides, so stage a strided view into the operator's persistent
             # fc2 buffer (fixed address, copy_-refreshed every step).  The
             # single path re-pushes replica weights every call, so the
             # constant buffer address cannot serve stale weights.
             down_weight = self._materialize_down_weight(down_weight)
-        if not down_weight.is_contiguous():
+        if not down_weight.is_contiguous() and not _down_direct:
             down_weight = down_weight.contiguous()
         expected_down_shape = (
             self.experts_per_rank,
@@ -1754,9 +1800,11 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "down_weight must be BF16 with shape "
                 f"{expected_down_shape} on the input device (a strided view "
-                "is staged into the operator's persistent fc2 buffer)"
+                "is staged into the operator's persistent fc2 buffer, or "
+                "flows through unstaged under MOE_DOWN_DIRECT=1)"
             )
-        down_weight = self._materialize_down_weight(down_weight)
+        if not _down_direct:
+            down_weight = self._materialize_down_weight(down_weight)
         ffn_size = gate_up_weight.shape[2] // 2
         if (
             gate_up_weight.shape[2] % self.config.fc1_gemm_block_size_n
