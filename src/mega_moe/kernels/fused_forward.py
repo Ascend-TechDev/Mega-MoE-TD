@@ -13,6 +13,7 @@ from triton.language.extra.cann.extension import sub_vec_id
 import triton.language.extra.cann.extension as al
 from triton_dist.language.extra import libshmem_device
 
+from .common import _sys_cnt_tick
 from .dispatch_fc1 import _dispatch_one_source_tile_task
 from .fc2_combine import _fc2_gemm_one_mn_tile
 from .moonep_planning import (
@@ -26,6 +27,85 @@ from .fused_moonep import (
 _ROUTE_BLOCK = tl.constexpr(256)
 _SCATTER_BLOCK = tl.constexpr(128)
 _REDUCE_BLOCK_N = tl.constexpr(4096)
+
+# ----------------------------------------------------------------------------
+# MOE_FWD_TIMING=1 (single-kernel forward): per-program SYS_CNT products.
+# The wrapper hands every launch three buffers (dead-arg pattern — TIMING=0
+# compiles every read below out and leaves the default binary unchanged):
+#   ts   [cores, FWD_TS_SLOTS]      — one stamp per pipeline-wide checkpoint.
+#                                     Every checkpoint sits right after a full
+#                                     _mixed_forward_barrier (or at kernel
+#                                     entry/exit), so it is exact: engines
+#                                     have drained.  The host reduces each
+#                                     segment to max(end over cores) -
+#                                     min(start over cores).
+#   acc  [cores*3, FWD_ACC_SLOTS] — issue-stream busy ticks the program
+#                                     spends inside the wave pipeline's
+#                                     overlap participants (dispatch / FC2 /
+#                                     return per lane / return-wait /
+#                                     reduce per lane), one row per part
+#                                     (core*3 + {vec lane 0, vec lane 1,
+#                                     cube}) like the ring: each part
+#                                     stores its whole (8,) accumulator
+#                                     (zeros in the columns it does not
+#                                     own) and the host takes the per-column
+#                                     max over the three rows.  The parts
+#                                     overlap across cores: these compare
+#                                     per part, never sum to a wall time.
+#   ring [cores*3, FWD_RING_SLOTS, FWD_RING_COLS] — one [cube traversal,
+#                                     vector activation, save] tick triple
+#                                     per FC1 group call, rows
+#                                     core*3 + {0: vec lane 0, 1: vec lane 1,
+#                                     2: cube}.  The save column is the
+#                                     SAVE_FC1 FP8-E4M3 quantize/store block;
+#                                     the vector-activation column starts
+#                                     after the cube->vector ack wait, so it
+#                                     is compute+store, not pipeline bubble.
+#                                     Ring stores are clamped to
+#                                     FWD_RING_SLOTS (sized host-side).
+# Slot tables live host-side in benchmark/layer/_fwd_phase_timing.py; the
+# benchmark asserts the two definitions match.  Caveat (same as the mega
+# backward stamps): a tick read on an issuing stream measures issue time —
+# only the dl.wait regions and post-barrier stamps are exact.
+# ----------------------------------------------------------------------------
+FWD_TS_SLOTS = 10
+FWD_ACC_SLOTS = 8
+FWD_RING_COLS = tl.constexpr(4)
+FWD_RING_CUBE = tl.constexpr(0)
+FWD_RING_VACT = tl.constexpr(1)
+FWD_RING_SAVE = tl.constexpr(2)
+FWD_RING_VACT_RAW = tl.constexpr(3)
+
+
+@triton.jit
+def _fwd_stamp_lane0(ts_row_ptr, slot: tl.constexpr, dummy):
+    """Single-writer forward stamp: lane 0 only.
+
+    The mixed kernel's top level executes on BOTH Vector subcores, and
+    ungated stamps were stored twice — same slot, two subcore clocks —
+    so the surviving value depended on store order.  Subcore clock skew
+    of tens-to-hundreds of ticks turned the tightest adjacent pairs into
+    apparent per-core regressions (2026-09-18 NPU: 26~502-tick slot-6->7
+    regressions on the 68-tick route_scatter pair, with a physically
+    monotonic per-core SYS_CNT).  Gate the store to one lane; the
+    post-barrier semantics of every checkpoint are unchanged."""
+    with al.scope(core_mode='vector', disable_auto_sync=True):
+        if sub_vec_id() == 0:
+            t = _sys_cnt_tick(dummy)
+            tl.store(ts_row_ptr + slot + dummy, t)
+
+
+def fwd_ring_slots(max_pipeline_groups, physical_experts_per_rank):
+    """Per-program FC1 group-call ring capacity (host-side sizing).
+
+    A program makes at most one FC1 group call per expert per wave per
+    weight table (home/replica under MoonEP).  Rounded up to a power of two
+    with a floor of 64; the kernel clamps the ring store, so an undersized
+    ring only drops per-call resolution.  benchmark/layer/_fwd_phase_timing
+    keeps the same formula — the NPU smoke test asserts they agree.
+    """
+    bound = 2 * max_pipeline_groups * physical_experts_per_rank
+    return max(64, 1 << (bound - 1).bit_length())
 
 
 @triton.jit
@@ -330,19 +410,25 @@ def _partition_pipeline_fc1_activation_group_ub(
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_WINDOWS: tl.constexpr,
         FC1_CORES: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr,
-        wave_expert, wave_row_start, wave_rows,
+        FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, wave_expert, wave_row_start, wave_rows,
         replica_ready_ptr, WEIGHT_EXPERT_BASE: tl.constexpr,
-        WAIT_REPLICA: tl.constexpr):
+        WAIT_REPLICA: tl.constexpr, FC1_FP8: tl.constexpr,
+        FC1_SAVE_FP16: tl.constexpr,
+        # MOE_FWD_TIMING=1 only: this program's ring row base and the call's
+        # ring slot (dead args when TIMING=0; stores clamp to RING_SLOTS).
+        ring_base=None, ring_slot=0,
+        TIMING: tl.constexpr = False, RING_SLOTS: tl.constexpr = 0):
     """Pipeline FC1 gate/up tiles through UB directly into activation output.
 
     ``SAVE_FC1`` stores the raw gate/up Fixpipe results (pre-activation,
     pre-routing-weight) into ``fc1_output_ptr`` using the historical
-    ``[rows, gate F | up F]`` FC1-output layout.  ``FC1_FP8`` selects the
-    format: True quantizes to FP8 E4M3 with one FP32 scale per row and per
-    ``pair_block_n``-wide column group in ``fc1_scale_ptr``
-    (``scale = amax / 448``); False keeps the raw BF16 tiles (fc1_scale_ptr
-    is a dead argument)."""
+    ``[rows, gate F | up F]`` FC1-output layout.  ``FC1_FP8`` and
+    ``FC1_SAVE_FP16`` select the format: FP8 E4M3 with one FP32 scale per
+    row and per ``pair_block_n``-wide column group in ``fc1_scale_ptr``
+    (``scale = amax / 448``), a plain FP16 copy of the raw values (no
+    scale table — the A/B experiment that trades the quantize cost
+    against 2x the save traffic), or the default raw BF16 tiles (both
+    flags off; fc1_scale_ptr is a dead argument)."""
     pair_block_m: tl.constexpr = BLOCK_M
     pair_block_n: tl.constexpr = BLOCK_N // 2
     vector_block_m: tl.constexpr = pair_block_m // 2
@@ -357,6 +443,24 @@ def _partition_pipeline_fc1_activation_group_ub(
     up_buffer_1 = bl.alloc(tl.bfloat16, [vector_block_m, pair_block_n],
                            al.ascend_address_space.UB)
     group_ready_token = 0
+    # MOE_FWD_TIMING scratch, allocated once and only under TIMING.  The
+    # Cube engine has NO vector/scalar ALU: any data-path arithmetic
+    # inside a cube scope (tick deltas, tl.where, +=) is illegal there and
+    # the compiler drops the whole block including its stores (the
+    # fc1_cube=0 / fc2_issue=0 finding, 2026-09-18).  The cube is instead
+    # bracketed from the VECTOR side on its own clock: after the UB
+    # release ack (events 10/11) and at the next fixpipe publication
+    # (events 8/9) — a wall clock that includes the dispatch readiness
+    # wait, the CV handshake, and whatever cube compute remained after
+    # the ack.  Lane 0 is the single writer.
+    if TIMING:
+        dummy_ts = tl.arange(0, 1)
+        cube_wall = tl.zeros((1,), dtype=tl.int64)
+        # Two-step shift of the UB-release ack ticks: the publication
+        # observed at iteration K pairs with the ack from iteration K-2
+        # (same buffer parity — the first fixpipe that ack enabled).
+        _ub_ack_1 = tl.zeros((1,), dtype=tl.int64)
+        _ub_ack_2 = tl.zeros((1,), dtype=tl.int64)
     cube_expert_id = wave_expert
     cube_expert_off = tl.load(recv_expert_offs_ptr + wave_expert)
     cube_group_start = wave_row_start
@@ -378,6 +482,8 @@ def _partition_pipeline_fc1_activation_group_ub(
     pipeline_tiles = cube_lane_tiles
     for pipeline_step in range(0, pipeline_tiles + 1):
         with al.scope(core_mode='cube', disable_auto_sync=True):
+            # No timing here: the Cube engine cannot execute data-path
+            # arithmetic (see the scratch comment above).
             tile_id = pid + pipeline_step * FC1_CORES
             row_part = tile_id % cube_group_row_parts
             n_tile = tile_id // cube_group_row_parts
@@ -543,6 +649,22 @@ def _partition_pipeline_fc1_activation_group_ub(
                 else:
                     al.sync_block_wait('cube', 'vector', 9, al.PIPE.PIPE_FIX,
                                        al.PIPE.PIPE_V)
+                if TIMING:
+                    if sub_vec_id() == 0:
+                        # Cube wall bracket end, vector clock: this
+                        # publication pairs with the UB-release ack from
+                        # two steps back (same buffer parity — the first
+                        # fixpipe that ack enabled).  The bracket covers
+                        # the cube's dispatch-readiness wait, whatever
+                        # compute remained after the ack, and the fixpipe.
+                        if _ub_ack_2 > 0:
+                            cube_wall += _sys_cnt_tick(dummy_ts) - _ub_ack_2
+                        _ub_ack_2 = _ub_ack_1
+                    # vact starts after the cube->vector ack wait: compute+store
+                    # time of this call's activation (and save) rows, not the
+                    # pipeline bubble waiting on the Cube fixpipe.
+                    _v0 = _sys_cnt_tick(dummy_ts)
+                    save_ticks = tl.zeros((1,), dtype=tl.int64)
                 activation_rows = vector_block_m
                 for row_chunk in range(0, activation_rows, activation_block_m):
                     gate_view_0 = gate_buffer_0.subview([row_chunk, 0],
@@ -606,6 +728,8 @@ def _partition_pipeline_fc1_activation_group_ub(
                         # Raw gate/up GEMM results (pre-activation,
                         # pre-routing-weight), in the historical
                         # [rows, gate F | up F] FC1-output layout.
+                        if TIMING:
+                            _s0 = _sys_cnt_tick(dummy_ts)
                         fc1_group_ptr = (
                             fc1_output_ptr + output_group_row * (2 * FFN))
                         fc1_row_ptr = (
@@ -614,15 +738,25 @@ def _partition_pipeline_fc1_activation_group_ub(
                             * (2 * FFN)
                             + cols[None, :])
                         fc1_store_mask = mask_m[:, None] & mask_n[None, :]
-                        if FC1_FP8:
-                            # One FP8 E4M3 quantized tile plus one FP32 scale
-                            # per row and per pair_block_n-wide column group.
+                        if FC1_SAVE_FP16:
+                            # Plain FP16 copy of the raw values — no
+                            # quantize, no scale table.
+                            tl.store(
+                                fc1_row_ptr,
+                                gate_raw.to(tl.float16),
+                                mask=fc1_store_mask)
+                            tl.store(
+                                fc1_row_ptr + FFN,
+                                up_raw.to(tl.float16),
+                                mask=fc1_store_mask)
+                        elif FC1_FP8:
+                            # FP8 E4M3 with one scale per row and per
+                            # pair_block_n-wide column group.  One tile is
+                            # exactly one column group, so the per-group
+                            # amax is a single in-tile row reduction;
+                            # masked-out lanes contribute zero.
                             gate_f = gate_raw.to(tl.float32)
                             up_f = up_raw.to(tl.float32)
-                            # One tile is exactly one column group
-                            # (pair_block_n wide), so the per-group amax is a
-                            # single in-tile row reduction; masked-out lanes
-                            # contribute zero.
                             gate_amax = tl.max(
                                 tl.where(mask_n[None, :], tl.abs(gate_f), 0.0),
                                 axis=1)
@@ -630,11 +764,10 @@ def _partition_pipeline_fc1_activation_group_ub(
                                 tl.where(mask_n[None, :], tl.abs(up_f), 0.0),
                                 axis=1)
                             # E4M3 max finite value; a zero row keeps q = 0
-                            # and a unit scale so the dequantized value stays
-                            # exactly 0.
+                            # and a unit scale so the dequantized value
+                            # stays exactly 0.
                             fp8_max: tl.constexpr = 448.0
-                            gate_safe = tl.where(
-                                gate_amax > 0.0, gate_amax, 1.0)
+                            gate_safe = tl.where(gate_amax > 0.0, gate_amax, 1.0)
                             up_safe = tl.where(up_amax > 0.0, up_amax, 1.0)
                             tl.store(
                                 fc1_row_ptr,
@@ -656,20 +789,67 @@ def _partition_pipeline_fc1_activation_group_ub(
                                 + col_start // pair_block_n)
                             tl.store(fc1_scale_row_ptr, gate_safe / fp8_max,
                                      mask=mask_m)
-                            tl.store(
-                                fc1_scale_row_ptr + FFN // pair_block_n,
-                                up_safe / fp8_max, mask=mask_m)
+                            tl.store(fc1_scale_row_ptr + FFN // pair_block_n,
+                                     up_safe / fp8_max, mask=mask_m)
                         else:
+                            # Default: the raw BF16 tiles.
                             tl.store(fc1_row_ptr, gate_raw,
                                      mask=fc1_store_mask)
                             tl.store(fc1_row_ptr + FFN, up_raw,
                                      mask=fc1_store_mask)
+                        if TIMING:
+                            save_ticks += (
+                                _sys_cnt_tick(dummy_ts) - _s0)
+                if TIMING:
+                    _v1 = _sys_cnt_tick(dummy_ts)
+                    if ring_slot < RING_SLOTS:
+                        _lane_slot = sub_vec_id() * RING_SLOTS + ring_slot
+                        tl.store(
+                            ring_base + _lane_slot * FWD_RING_COLS
+                            + FWD_RING_VACT + tl.arange(0, 1),
+                            _v1 - _v0)
+                        # Raw bracket start: a collapsed read pair (start
+                        # == end, delta 0) is distinguishable from a real
+                        # measurement only with the raw value kept.
+                        tl.store(
+                            ring_base + _lane_slot * FWD_RING_COLS
+                            + FWD_RING_VACT_RAW + tl.arange(0, 1),
+                            _v0)
+                        if SAVE_FC1:
+                            # Only the saved launch writes the save column;
+                            # the unsaved variant skips the store entirely
+                            # and the per-launch zero_() keeps the column 0
+                            # (2026-09-17 NPU: the unsaved build leaked a
+                            # stamp-scale value into save_ticks despite the
+                            # constexpr SAVE_FC1 guard — do not trust DCE
+                            # for the accumulator chain).
+                            tl.store(
+                                ring_base + _lane_slot * FWD_RING_COLS
+                                + FWD_RING_SAVE + tl.arange(0, 1),
+                                save_ticks)
                 if previous_step % 2 == 0:
                     al.sync_block_set('vector', 'cube', 10,
                                       al.PIPE.PIPE_MTE3, al.PIPE.PIPE_FIX)
                 else:
                     al.sync_block_set('vector', 'cube', 11,
                                       al.PIPE.PIPE_MTE3, al.PIPE.PIPE_FIX)
+                if TIMING:
+                    if sub_vec_id() == 0:
+                        # This ack releases the buffer parity the cube's
+                        # next-but-one fixpipe needs — it starts that
+                        # step's wall bracket.
+                        _ub_ack_1 = _sys_cnt_tick(dummy_ts)
+                        if pipeline_step == pipeline_tiles:
+                            # Per-call cube wall into the ring's cube
+                            # column (written by lane 0; the cube engine
+                            # cannot do the arithmetic itself).
+                            if ring_slot < RING_SLOTS:
+                                tl.store(
+                                    ring_base
+                                    + (2 * RING_SLOTS + ring_slot)
+                                    * FWD_RING_COLS + FWD_RING_CUBE
+                                    + tl.arange(0, 1),
+                                    cube_wall)
 
 
 @triton.jit
@@ -829,7 +1009,12 @@ def _return_dynamic_wave(
         pull_tile_dst_start_ptr, pipeline_signal_ptr, wave_expert_offsets_ptr, signal_epoch,
         NUM_CORES: tl.constexpr, LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr, HIDDEN: tl.constexpr,
-        BLOCK_M: tl.constexpr, WAVE_WINDOWS: tl.constexpr):
+        BLOCK_M: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
+        # MOE_FWD_TIMING=1 only: this function's dl.wait is the FC2-wave
+        # wall-bracket END point (vector clock — the Cube engine cannot
+        # execute tick arithmetic).  The caller passes the wave's start
+        # tick (its activation signal) and receives the end tick back.
+        fc2_wave_start=None, TIMING: tl.constexpr = False, dummy=None):
     completion_base: tl.constexpr = MAX_WAVES * NUM_CORES
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
     worker = worker.to(tl.int32)
@@ -839,6 +1024,11 @@ def _return_dynamic_wave(
     ready = dl.wait(
         pipeline_signal_ptr + (completion_base + wave * NUM_CORES) * 16,
         NUM_CORES, 'gpu', 'acquire', waitValue=signal_epoch)
+    fc2_wave_end = None
+    if TIMING:
+        # Right after the completion wait: the wave's FC2 (every core's
+        # GEMM for this wave) is done.
+        fc2_wave_end = _sys_cnt_tick(dummy)
     wave_fc2 = dl.consume_token(fc2_output_ptr, ready)
     for expert in range(EXPERTS_PER_RANK):
         begin, end, expert_offset, _ = _dynamic_wave_expert_range(
@@ -868,6 +1058,8 @@ def _return_dynamic_wave(
     libshmem_device.signal_op(
         pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + LOCAL_RANK) * 16,
         1, libshmem_device.ACLSHMEM_SIGNAL_ADD, source)
+    if TIMING:
+        return fc2_wave_end
 
 
 @triton.jit
@@ -932,9 +1124,14 @@ def _run_dynamic_wave_pipeline(
         BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr, FC1_BLOCK_K: tl.constexpr,
         FC2_BLOCK_N: tl.constexpr, FC2_BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
         ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr, SAVE_FC1: tl.constexpr,
-        FC1_FP8: tl.constexpr,
+        FC1_FP8: tl.constexpr, FC1_SAVE_FP16: tl.constexpr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
-        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
+        HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr,
+        # MOE_FWD_TIMING=1 only (dead args when TIMING=0): per-program busy
+        # accumulators and the per-call FC1 ring.
+        acc_ptr=None, ring_ptr=None, fc2w_ptr=None,
+        TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,
+        RING_SLOTS: tl.constexpr = 0):
     global_waves = 0
     for rank in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
@@ -945,10 +1142,37 @@ def _run_dynamic_wave_pipeline(
     local_waves = tl.where(capacity_ok, tl.cdiv(local_blocks, WAVE_WINDOWS), 0)
     global_waves = tl.where(capacity_ok, global_waves, 0)
     fc1_n_tiles: tl.constexpr = (FFN + FC1_BLOCK_N // 2 - 1) // (FC1_BLOCK_N // 2)
+    # MOE_FWD_TIMING scratch is allocated ONCE up front and shared by every
+    # tick site in this function: one dummy (doubling as the stores' (1,)
+    # offset), one acc row base, and ONE (8,) accumulator whose lanes are
+    # the acc columns (each part updates only its own columns with a
+    # tl.where mask).  The scattered per-site form cost one auto-buffer UB
+    # allocation per tiny value and overflowed UB (2026-09-17).  Everything
+    # sits inside `if TIMING:` so the default binary carries none of it.
+    # The Cube engine cannot execute any of this arithmetic (no vector/
+    # scalar ALU — 2026-09-18), so every Cube-side quantity is bracketed
+    # from the Vector lanes instead; columns 0/1 hold the last dispatch
+    # site's RAW entry/exit ticks (the in-kernel delta collapsed to 0 via
+    # read merging) and column 7 the FC2-wave wall sum.
+    if TIMING:
+        dummy_ts = tl.arange(0, 1)
+        acc_row_ptr = acc_ptr + pid * 3 * ACC_SLOTS
+        busy = tl.zeros((8,), dtype=tl.int64)
+        busy_offs = tl.arange(0, 8)
+        # FC2-wave wall brackets, vector clock: start = the wave's
+        # activation signal, end = the return worker's completion wait
+        # (the return at iteration K waits FC2 wave K-2, hence the
+        # two-step shift).
+        fc2_wall = tl.zeros((1,), dtype=tl.int64)
+        _fc2_s1 = tl.zeros((1,), dtype=tl.int64)
+        _fc2_s2 = tl.zeros((1,), dtype=tl.int64)
+    fc1_ring_call = 0
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 1:
             for prepared_wave in range(2):
                 if prepared_wave < global_waves:
+                    if TIMING:
+                        _d0 = _sys_cnt_tick(dummy_ts)
                     _dispatch_dynamic_wave(
                         pid, prepared_wave, hidden_states_ptr, peer_mem_ptr,
                         routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
@@ -958,11 +1182,24 @@ def _run_dynamic_wave_pipeline(
                         stride_hidden_m, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                         EXPERTS_PER_RANK, HIDDEN, BLOCK_M, WAVE_WINDOWS,
                         MAX_SOURCE_TILES, DISPATCH_BLOCK_M)
+                    if TIMING:
+                        # Raw pair (cols 0/1, last site wins): the in-kernel
+                        # delta read pair collapsed to 0 (2026-09-18), so
+                        # store both raw ticks and subtract on the host.
+                        busy = tl.where(busy_offs == 0, _d0, busy)
+                        busy = tl.where(busy_offs == 1,
+                                        _sys_cnt_tick(dummy_ts), busy)
     # Empty receive ranks still dispatch every global wave. Keeping dispatch
     # ahead of all return waits prevents a cross-rank dependency cycle.
     for step in range(global_waves + 2):
+        if TIMING:
+            # Per-iteration FC2-wave start tick (set by this step's
+            # activation signal below; pure SSA, engine-agnostic).
+            _fc2_s_new = tl.zeros((1,), dtype=tl.int64)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (sub_vec_id() == 1) & (step > 0) & (step + 1 < global_waves):
+                if TIMING:
+                    _d0 = _sys_cnt_tick(dummy_ts)
                 _dispatch_dynamic_wave(
                     pid, step + 1, hidden_states_ptr, peer_mem_ptr,
                     routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
@@ -972,6 +1209,10 @@ def _run_dynamic_wave_pipeline(
                     stride_hidden_m, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                     EXPERTS_PER_RANK, HIDDEN, BLOCK_M, WAVE_WINDOWS,
                     MAX_SOURCE_TILES, DISPATCH_BLOCK_M)
+                if TIMING:
+                    busy = tl.where(busy_offs == 0, _d0, busy)
+                    busy = tl.where(busy_offs == 1,
+                                    _sys_cnt_tick(dummy_ts), busy)
         if step < local_waves:
             for expert in range(EXPERTS_PER_RANK):
                 begin, end, _, first_block = _dynamic_wave_expert_range(
@@ -985,6 +1226,13 @@ def _run_dynamic_wave_pipeline(
                     # block-pointer pass cannot merge home/replica pointers.
                     for replica_kind in tl.static_range(2 if MOONEP else 1):
                         if (not MOONEP) or ((expert >= HOME_EXPERTS) == (replica_kind == 1)):
+                            ring_slot = fc1_ring_call
+                            fc1_ring_call += 1
+                            # Dead-arg pattern: the wrapper always hands a
+                            # real ring; TIMING=0 compiles the stores out.
+                            ring_base = (ring_ptr
+                                         + pid * 3 * RING_SLOTS
+                                         * FWD_RING_COLS)
                             if full_rows:
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
@@ -994,9 +1242,17 @@ def _run_dynamic_wave_pipeline(
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, FC1_FP8, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, expert,
                                     begin, end - begin, gate_ready_ptr,
-                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
+                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
+                                    # Trailing knobs pass by keyword: the
+                                    # positional run stops at WAIT_REPLICA so
+                                    # inserted params cannot shift the group
+                                    # geometry args again.
+                                    FC1_FP8=FC1_FP8,
+                                    FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                    ring_base=ring_base, ring_slot=ring_slot,
+                                    TIMING=TIMING, RING_SLOTS=RING_SLOTS)
                             else:
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
@@ -1006,15 +1262,27 @@ def _run_dynamic_wave_pipeline(
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, FC1_FP8, expert,
+                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, expert,
                                     begin, end - begin, gate_ready_ptr,
-                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1)
+                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
+                                    FC1_FP8=FC1_FP8,
+                                    FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                    ring_base=ring_base, ring_slot=ring_slot,
+                                    TIMING=TIMING, RING_SLOTS=RING_SLOTS)
             with al.scope(core_mode='vector', disable_auto_sync=True):
                 libshmem_device.fence()
                 libshmem_device.signal_op(
                     pipeline_signal_ptr + (step * NUM_CORES + pid) * 16,
                     1, libshmem_device.ACLSHMEM_SIGNAL_ADD, LOCAL_RANK)
+                if TIMING:
+                    # FC2-wave wall bracket start (vector clock): this
+                    # signal releases wave `step`'s FC2.
+                    _fc2_s_new = _sys_cnt_tick(dummy_ts)
         with al.scope(core_mode='cube', disable_auto_sync=True):
+            # No timing here: the Cube engine cannot execute data-path
+            # arithmetic (tick deltas, tl.where) — such blocks are dropped
+            # whole (2026-09-18).  FC2 is bracketed from the Vector side
+            # instead (see the return block below).
             if (step > 0) & (step - 1 < local_waves):
                 _fc2_dynamic_wave(
                     pid, step - 1, weighted_activation_ptr, down_weight_ptr, fc2_output_ptr,
@@ -1024,22 +1292,68 @@ def _run_dynamic_wave_pipeline(
                     replica_down_ptr, down_ready_ptr, HOME_EXPERTS, MOONEP)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (step >= 2) & (step - 2 < local_waves):
-                _return_dynamic_wave(
+                if TIMING:
+                    _r0 = _sys_cnt_tick(dummy_ts)
+                _fc2_end = _return_dynamic_wave(
                     pid * 2 + sub_vec_id(), step - 2, combine_buf_ptr,
                     fc2_output_ptr, recv_counts_re_ptr, pull_tile_dst_start_ptr, pipeline_signal_ptr,
                     wave_expert_offsets_ptr, signal_epoch, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
-                    EXPERTS_PER_RANK, MAX_WAVES, HIDDEN, BLOCK_M, WAVE_WINDOWS)
+                    EXPERTS_PER_RANK, MAX_WAVES, HIDDEN, BLOCK_M, WAVE_WINDOWS,
+                    fc2_wave_start=_fc2_s2, TIMING=TIMING, dummy=dummy_ts)
+                if TIMING:
+                    # Column 2 + lane: each vector lane its own return
+                    # column (both lanes run this region).
+                    busy += tl.where(busy_offs == 2 + sub_vec_id(),
+                                     _sys_cnt_tick(dummy_ts) - _r0, 0)
+                    # FC2 wave (step-2) wall: activation signal -> the
+                    # completion wait that just returned.
+                    if _fc2_s2 > 0:
+                        fc2_wall += _fc2_end - _fc2_s2
+                        if sub_vec_id() == 0:
+                            # Per-wave wall for the host's per-wave table
+                            # (single writer per core; the summed wall
+                            # above rides acc column 7).
+                            tl.store(
+                                fc2w_ptr + pid * MAX_WAVES + (step - 2)
+                                + dummy_ts,
+                                _fc2_end - _fc2_s2)
+        if TIMING:
+            # Shift AFTER the return block consumed s2: s2 <- s1 <- this
+            # step's activation-signal tick.
+            _fc2_s2 = _fc2_s1
+            _fc2_s1 = _fc2_s_new
     with al.scope(core_mode='vector', disable_auto_sync=True):
         return_ready = 0
         if capacity_ok:
+            if TIMING:
+                _w0 = _sys_cnt_tick(dummy_ts)
             return_ready = _wait_dynamic_wave_returns(
                 wave_expert_offsets_ptr, pipeline_signal_ptr, NUM_CORES, LOCAL_RANK,
                 WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)
+            if TIMING:
+                # dl.wait blocks the issuing stream: this one is exact.
+                # Column 4 is reported from lane 0 (both lanes wait).
+                busy += tl.where(busy_offs == 4,
+                                 _sys_cnt_tick(dummy_ts) - _w0, 0)
         ready_combine = dl.consume_token(combine_buf_ptr, return_ready)
         reduce_block_n: tl.constexpr = _REDUCE_BLOCK_N if HIDDEN >= 2048 else 1024
+        if TIMING:
+            _e0 = _sys_cnt_tick(dummy_ts)
         _reduce_topk_rows(
             pid * 2 + sub_vec_id(), ready_combine, route_to_send_ptr, output_ptr,
             num_routes // TOPK, capacity_ok, 2 * NUM_CORES, HIDDEN, TOPK, reduce_block_n)
+        if TIMING:
+            busy += tl.where(busy_offs == 5 + sub_vec_id(),
+                             _sys_cnt_tick(dummy_ts) - _e0, 0)
+            # Column 7: the FC2-wave wall sum (vector-measured; the cube
+            # engine cannot do the arithmetic itself).
+            busy = tl.where(busy_offs == 7, fc2_wall, busy)
+            # Whole-vector store into this lane's acc row (rows core*3 +
+            # lane): no per-column extraction, no cross-lane races — each
+            # part's copy holds zeros in the columns it does not own and
+            # the host takes the max over the three part rows.
+            tl.store(acc_row_ptr + sub_vec_id() * ACC_SLOTS + busy_offs,
+                     busy)
 
 
 @triton.jit(do_not_specialize=['num_routes', 'signal_epoch'])
@@ -1055,7 +1369,9 @@ def _kernel_fused_forward(
         experts_to_copy_ptr, inverse_ptr, replica_counts_ptr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         gate_notify_ptr, down_notify_ptr,
-        num_routes, signal_epoch, situ_beta, situ_linear_beta, stride_hidden_m: tl.constexpr,
+        num_routes, signal_epoch, situ_beta, situ_linear_beta,
+        ts_ptr, acc_ptr, ring_ptr, fc2w_ptr,
+        stride_hidden_m: tl.constexpr,
         stride_hidden_k: tl.constexpr, stride_gate_up_e: tl.constexpr,
         stride_gate_up_n: tl.constexpr, stride_gate_up_k: tl.constexpr, stride_down_e: tl.constexpr,
         stride_down_n: tl.constexpr, stride_down_k: tl.constexpr, NUM_PROGRAM_CORES: tl.constexpr,
@@ -1066,10 +1382,19 @@ def _kernel_fused_forward(
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
         FC2_BLOCK_K: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
-        SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
-        RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr):
+        SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr,
+        FC1_SAVE_FP16: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
+        RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
+        TS_SLOTS: tl.constexpr, ACC_SLOTS: tl.constexpr,
+        RING_SLOTS: tl.constexpr, TIMING: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
+    # One shared dummy + one precomputed ts row for all ten stamps (the
+    # scattered per-site aranges/multiplies are what overflowed UB).
+    if TIMING:
+        ts_dummy = tl.arange(0, 1)
+        ts_row = ts_ptr + pid * TS_SLOTS
+        _fwd_stamp_lane0(ts_row, 0, ts_dummy)   # entry
     physical_experts: tl.constexpr = EXPERTS_PER_RANK * (2 if MOONEP else 1)
     pipeline_counter_count: tl.constexpr = MAX_PIPELINE_GROUPS * (
         2 * NUM_PROGRAM_CORES + WORLD_SIZE)
@@ -1089,6 +1414,8 @@ def _kernel_fused_forward(
                                   NUM_PROGRAM_CORES, NUM_EXPERTS, NUM_BINS_PAD,
                                   _ROUTE_BLOCK)
     _mixed_forward_barrier()
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 1, ts_dummy)   # zero + histogram done
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if (sub_vec_id() == 0) & (pid == 0):
             if MOONEP:
@@ -1100,6 +1427,8 @@ def _kernel_fused_forward(
                                    LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
                                    NUM_EXPERTS, NUM_BINS_PAD)
     _mixed_forward_barrier()
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 2, ts_dummy)   # counts published
     if MOONEP:
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (sub_vec_id() == 0) & (pid == 0):
@@ -1145,6 +1474,8 @@ def _kernel_fused_forward(
                         EXPERTS_PER_RANK, HIDDEN, FFN, UDMA_CHUNK_ELEMENTS)
             libshmem_device.fence()
         al.sync_block_all('all', 15)
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 3, ts_dummy)   # MoonEP planning done
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if (sub_vec_id() == 0) & (pid < WORLD_SIZE):
             _build_destination_metadata(
@@ -1156,6 +1487,8 @@ def _kernel_fused_forward(
                 pid, counts_mem_ptr, wave_expert_offsets_ptr, WORLD_SIZE,
                 physical_experts, NUM_BINS_PAD, FC1_BLOCK_M)
     _mixed_forward_barrier()
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 4, ts_dummy)   # destination metadata done
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
             _convert_counts_to_stable_cursors(pid, core_bucket_cursor_ptr,
@@ -1173,6 +1506,8 @@ def _kernel_fused_forward(
                         max_received, tl.load(stats_ptr + 2 + dst_rank))
                 tl.store(stats_ptr + 1, max_received)
     _mixed_forward_barrier()
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 5, ts_dummy)   # stable cursors done
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
             if MOONEP:
@@ -1190,8 +1525,12 @@ def _kernel_fused_forward(
                                        num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS,
                                        NUM_BINS_PAD, TOPK, _SCATTER_BLOCK)
     _mixed_forward_barrier()
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 6, ts_dummy)   # routing metadata complete
     capacity_ok = tl.load(stats_ptr + 1) <= MAX_RECEIVED_ROUTES
     local_counts_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 7, ts_dummy)   # wave pipeline entry
     _run_dynamic_wave_pipeline(
         pid, hidden_states_ptr, gate_up_weight_ptr, down_weight_ptr, routing_weights_ptr,
         peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
@@ -1204,9 +1543,13 @@ def _kernel_fused_forward(
         NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
         MAX_SOURCE_TILES, MAX_PIPELINE_GROUPS, DISPATCH_BLOCK_M, FC1_BLOCK_M, FC1_BLOCK_N,
         FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA,
-        SAVE_FC1, FC1_FP8,
+        SAVE_FC1, FC1_FP8, FC1_SAVE_FP16,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
-        EXPERTS_PER_RANK, MOONEP)
+        EXPERTS_PER_RANK, MOONEP,
+        acc_ptr=acc_ptr, ring_ptr=ring_ptr, fc2w_ptr=fc2w_ptr,
+        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS)
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 8, ts_dummy)   # pipeline + reduce done
     if MOONEP:
         # Drain outstanding WQEs before releasing source aliases. The next
         # call's initial rank barrier protects consumer slots from overwrite.
@@ -1214,3 +1557,5 @@ def _kernel_fused_forward(
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (sub_vec_id() == 1) & (pid < WORLD_SIZE) & (pid != LOCAL_RANK):
                 _udma_quiet(pid)
+    if TIMING:
+        _fwd_stamp_lane0(ts_row, 9, ts_dummy)   # exit

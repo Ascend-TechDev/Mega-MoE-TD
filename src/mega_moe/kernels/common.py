@@ -9,6 +9,8 @@
 import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
+import triton
+import triton.language as tl
 from triton.backends.ascend.driver import NPUUtils
 
 # GEMM dot-tiles for the input-grad GEMMs (step1 dispatch_fc2, step4 combine_fc1).
@@ -79,3 +81,50 @@ def all_gather_list(t, group):
     out = [torch.empty_like(t) for _ in range(dist.get_world_size(group))]
     dist.all_gather(out, t, group=group)
     return out
+
+
+@triton.jit
+def _sys_cnt_tick(dummy):
+    """Read the NPU system clock (SYS_CNT, ~1 GHz on this part — measured
+    977.97 ticks/us on 2026-09-18, not the ~20 MHz this comment long
+    claimed — calibrate host-side against a known-duration launch).  The
+    inline-asm form is the sb_rw_benchmark.py pattern, proven to lower on
+    this toolchain; ``is_pure`` must be False or the compiler hoists/CSEs
+    the reads away."""
+    return tl.inline_asm_elementwise(
+        asm="MOV $0, SYS_CNT;",
+        constraints="=l,l",
+        args=[dummy],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _phase_stamp(ts_ptr, slot: tl.constexpr, pid, TS_SLOTS: tl.constexpr):
+    """Store one SYS_CNT reading into ``ts[pid, slot]``.
+
+    Shared by the mega backward (MOE_MEGA_TIMING) and the single-kernel
+    forward (MOE_FWD_TIMING): both stamp per-program checkpoints right after
+    full barriers, so a stamp is the issuing stream's clock once every
+    engine has drained; the host reduces each segment to
+    ``max(end over cores) - min(start over cores)``.  TIMING=0 call sites
+    compile every stamp out (dead-arg pattern)."""
+    dummy = tl.arange(0, 1)
+    t = _sys_cnt_tick(dummy)
+    tl.store(ts_ptr + pid * TS_SLOTS + slot + dummy, t)
+
+
+@triton.jit
+def _phase_stamp_row(ts_row_ptr, slot: tl.constexpr, dummy):
+    """Row-based _phase_stamp for UB-constrained kernels.
+
+    The caller precomputes ``ts_ptr + pid * TS_SLOTS`` once and shares one
+    ``dummy = tl.arange(0, 1)`` across every stamp site (the dummy doubles
+    as the store's (1,) offset).  One arange and one scalar multiply per
+    kernel instead of one per stamp — the scattered form's per-site
+    auto-buffer allocations overflowed UB on the single-kernel forward
+    (2026-09-17: requires 2003712 bits vs 1769472 available)."""
+    t = _sys_cnt_tick(dummy)
+    tl.store(ts_row_ptr + slot + dummy, t)

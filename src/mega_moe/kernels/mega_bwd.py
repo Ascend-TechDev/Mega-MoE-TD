@@ -184,7 +184,7 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
-from .common import ncore, NPUUtils
+from .common import NPUUtils, _phase_stamp, ncore
 from .dispatch_fc2_bwd import (
     _prepare_dispatch_fc2_bwd,
     _dispatch_grad_source_tiles,
@@ -995,13 +995,6 @@ def _mega_grad_owner_pull(
 MEGA_TS_SLOTS = 10
 
 
-@triton.jit
-def _mega_stamp(ts_ptr, slot: tl.constexpr, pid, TS_SLOTS: tl.constexpr):
-    dummy = tl.arange(0, 1)
-    t = _sys_cnt_tick(dummy)
-    tl.store(ts_ptr + pid * TS_SLOTS + slot + dummy, t)
-
-
 # ============================================================================
 # MOE_SAVED_RECOMPUTE=1: backward-side activation recompute (2026-09-14
 # design "后向最新带重算方案"; fused into the mega launch 9/15).  The mega
@@ -1255,7 +1248,7 @@ def kernel_moe_backward_mega(
     pid = tl.program_id(axis=0)
     num_cores = tl.num_programs(axis=0)
     if TIMING:
-        _mega_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
+        _phase_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
 
     # ---------------- P1: dispatch + fc2 input-grad ----------------
     if P1_ON:
@@ -1270,7 +1263,7 @@ def kernel_moe_backward_mega(
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
         if TIMING:
-            _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
+            _phase_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # Home sweep stops at HOME_E (=EPR without MoonEP): fc2_ptr is the
             # HOME-only table, so consuming replica slots here too would read
@@ -1311,7 +1304,7 @@ def kernel_moe_backward_mega(
                     LOCAL_RANK=LOCAL_RANK,
                     wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
         if TIMING:
-            _mega_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
+            _phase_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
     # TILE_B1 replaces the barrier: P1's cube GEMM SETs a local slot per
     # (expert, n_tile, m_window) grad_swiglu tile, the P2 windowed consumer
@@ -1321,7 +1314,7 @@ def kernel_moe_backward_mega(
     if not TILE_B1:
         libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 3, pid, TS_SLOTS)   # post-B1
+        _phase_stamp(ts_ptr, 3, pid, TS_SLOTS)   # post-B1
 
     # ---------------- P2 (vector) ∥ P3 (cube) ----------------
     if P23_ON:
@@ -1369,7 +1362,7 @@ def kernel_moe_backward_mega(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 4, pid, TS_SLOTS)   # P2∥P3 window done
+        _phase_stamp(ts_ptr, 4, pid, TS_SLOTS)   # P2∥P3 window done
     # B2: publishes P2's outputs (dAB for P4a/P5, dscale for P4b) across
     # programs.  Step 2 removed this barrier's cross-rank job — with the
     # dedicated combine_buf the return push no longer overwrites peer_mem's
@@ -1377,7 +1370,7 @@ def kernel_moe_backward_mega(
     # that hazard and this barrier remains its only protection).
     libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
+        _phase_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
 
     # ---- transport wave window 1 (GRAD_REDUCE): fc2-grad seed+sink ∥ P4a ----
     # grad_fc2 is final at P3/B2, and this window's vector engine is idle
@@ -1543,7 +1536,7 @@ def kernel_moe_backward_mega(
     # fused loop, overlapping only the per-program tail pushes (adjacent
     # vec->cube scopes); otherwise it rides the P4b window as before.
     if TIMING:
-        _mega_stamp(ts_ptr, 6, pid, TS_SLOTS)   # P4a/FUSE_P4 (+P4b) done
+        _phase_stamp(ts_ptr, 6, pid, TS_SLOTS)   # P4a/FUSE_P4 (+P4b) done
     if P5_ON:
         with al.scope(core_mode="cube", disable_auto_sync=True):
             _mega_wgrad_sweep(
@@ -1560,11 +1553,11 @@ def kernel_moe_backward_mega(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 7, pid, TS_SLOTS)   # P5a done
+        _phase_stamp(ts_ptr, 7, pid, TS_SLOTS)   # P5a done
     # B4: cross-rank — every push landed before any rank reduces local rows.
     libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 8, pid, TS_SLOTS)   # post-B4
+        _phase_stamp(ts_ptr, 8, pid, TS_SLOTS)   # post-B4
 
     # ------- P4c (vec reduce) ∥ P5b (cube wgrad, second half) — no B5 ----
     # After B4 no rank writes another rank's memory, so no trailing barrier
@@ -1596,7 +1589,7 @@ def kernel_moe_backward_mega(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 9, pid, TS_SLOTS)   # exit (pre-P6 tail)
+        _phase_stamp(ts_ptr, 9, pid, TS_SLOTS)   # exit (pre-P6 tail)
 
     # ---------------- P6: MoonEP grad_reduce (GRAD_REDUCE) ----------------
     # The ReplicaGradTransport chain inlined as tail phases, restructured
@@ -1794,7 +1787,7 @@ def kernel_moe_backward_mega_recompute(
     pid = tl.program_id(axis=0)
     num_cores = tl.num_programs(axis=0)
     if TIMING:
-        _mega_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
+        _phase_stamp(ts_ptr, 0, pid, TS_SLOTS)   # entry
 
     # ---------------- P1: dispatch + fc2 input-grad ----------------
     # (+ SAVED_RECOMPUTE: the act-row recompute rides this window's vector
@@ -1827,7 +1820,7 @@ def kernel_moe_backward_mega_recompute(
                     BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                     fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         if TIMING:
-            _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
+            _phase_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # Home sweep stops at HOME_E (=EPR without MoonEP): fc2_ptr is the
             # HOME-only table, so consuming replica slots here too would read
@@ -1868,7 +1861,7 @@ def kernel_moe_backward_mega_recompute(
                     LOCAL_RANK=LOCAL_RANK,
                     wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
         if TIMING:
-            _mega_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
+            _phase_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
     # TILE_B1 replaces the barrier: P1's cube GEMM SETs a local slot per
     # (expert, n_tile, m_window) grad_swiglu tile, the P2 windowed consumer
@@ -1878,7 +1871,7 @@ def kernel_moe_backward_mega_recompute(
     if not TILE_B1:
         libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 3, pid, TS_SLOTS)   # post-B1
+        _phase_stamp(ts_ptr, 3, pid, TS_SLOTS)   # post-B1
 
     # ---------------- P2 (vector) ∥ P3 (cube) ----------------
     if P23_ON:
@@ -1926,7 +1919,7 @@ def kernel_moe_backward_mega_recompute(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 4, pid, TS_SLOTS)   # P2∥P3 window done
+        _phase_stamp(ts_ptr, 4, pid, TS_SLOTS)   # P2∥P3 window done
     # B2: publishes P2's outputs (dAB for P4a/P5, dscale for P4b) across
     # programs.  Step 2 removed this barrier's cross-rank job — with the
     # dedicated combine_buf the return push no longer overwrites peer_mem's
@@ -1934,7 +1927,7 @@ def kernel_moe_backward_mega_recompute(
     # that hazard and this barrier remains its only protection).
     libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
+        _phase_stamp(ts_ptr, 5, pid, TS_SLOTS)   # post-B2
 
     # ---- recompute re-dispatch + transport wave window 1: leading vec scope
     # beside the cube P4a (the fc1-dgrad window) ----
@@ -2121,7 +2114,7 @@ def kernel_moe_backward_mega_recompute(
     # fused loop, overlapping only the per-program tail pushes (adjacent
     # vec->cube scopes); otherwise it rides the P4b window as before.
     if TIMING:
-        _mega_stamp(ts_ptr, 6, pid, TS_SLOTS)   # P4a/FUSE_P4 (+P4b) done
+        _phase_stamp(ts_ptr, 6, pid, TS_SLOTS)   # P4a/FUSE_P4 (+P4b) done
     if P5_ON:
         with al.scope(core_mode="cube", disable_auto_sync=True):
             _mega_wgrad_sweep(
@@ -2138,11 +2131,11 @@ def kernel_moe_backward_mega_recompute(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 7, pid, TS_SLOTS)   # P5a done
+        _phase_stamp(ts_ptr, 7, pid, TS_SLOTS)   # P5a done
     # B4: cross-rank — every push landed before any rank reduces local rows.
     libshmem_device.barrier_all()
     if TIMING:
-        _mega_stamp(ts_ptr, 8, pid, TS_SLOTS)   # post-B4
+        _phase_stamp(ts_ptr, 8, pid, TS_SLOTS)   # post-B4
 
     # ------- P4c (vec reduce) ∥ P5b (cube wgrad, second half) — no B5 ----
     # After B4 no rank writes another rank's memory, so no trailing barrier
@@ -2174,7 +2167,7 @@ def kernel_moe_backward_mega_recompute(
                 WORLD_SIZE_C=WORLD_SIZE, EPR_C=EXPERTS_PER_RANK,
                 MAX_BWD_TILES_C=MAX_BWD_TILES, TILE_M_C=64)
     if TIMING:
-        _mega_stamp(ts_ptr, 9, pid, TS_SLOTS)   # exit (pre-P6 tail)
+        _phase_stamp(ts_ptr, 9, pid, TS_SLOTS)   # exit (pre-P6 tail)
 
     # ---------------- P6: MoonEP grad_reduce (GRAD_REDUCE) ----------------
     # The ReplicaGradTransport chain inlined as tail phases, restructured
