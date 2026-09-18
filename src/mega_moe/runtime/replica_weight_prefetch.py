@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Lifecycle and synchronous owner-push prefetch for replica expert weights."""
 
+import os
 from dataclasses import dataclass
 from math import prod
 from typing import Optional
@@ -110,6 +111,33 @@ class ReplicaWeightBuffers:
     gate_up_expert_shape: tuple[int, int]
     down_expert_shape: tuple[int, int]
     rank: int
+    # Table-level SET-epoch counter (pooling era, 2026-09-17): EVERY push
+    # into these slots — forward prefetch or backward re-prefetch, any layer
+    # sharing the pool entry — mints the next value here.  Monotonic
+    # numbering per slot-set is the SET-wait correctness contract: a
+    # consumer's dl.wait(epoch) may only be satisfied by the push that SET
+    # that value, which holds iff no two pushes into one ready slab ever
+    # share a number.  The historical per-operator counter breaks under
+    # pooling (two layers mint overlapping epochs -> a stale slot passes the
+    # new wait -> silently wrong weights; same family as the mega_persistent
+    # epoch-reset bug).
+    push_epoch: int = 0
+
+    def next_push_epoch(self, floor: int = 0) -> int:
+        """Mint the next push epoch, never at or below ``floor``.
+
+        ``floor`` lets the caller honor reservations made against other epoch
+        sequences that share these slabs (the single-kernel path's
+        ``_tile_signal_epoch`` aliasing guard lifts the tile sequence above
+        minted replica epochs and reserves the next one).
+        """
+        value = max(self.push_epoch, floor) + 1
+        if value >= torch.iinfo(torch.int32).max:
+            raise RuntimeError(
+                "replica weight push epoch exhausted; recreate the operator "
+                "(or pool)")
+        self.push_epoch = value
+        return value
 
     @property
     def closed(self) -> bool:
@@ -202,6 +230,95 @@ def allocate_replica_weight_buffers(
     )
 
 
+# ---------------------------------------------------------------------------
+# Session-level replica-table pool (MEGAMOE_REPLICA_POOL=1)
+#
+# The integrated net runs one operator instance per MoE layer, and every
+# instance used to allocate its OWN pair of symmetric replica tables
+# (~0.67 GB/layer at the kimi mock shape) held for the process lifetime —
+# the whole-net memory blow-up.  Under pooling all same-shape layers share
+# ONE pair: the pool below is keyed by shape, entries are reference counted,
+# and the real allocation (with its rank-collective ordering) happens only on
+# the first miss.  Layer serialization (standard autograd: at most one
+# layer's forward OR backward uses the tables at any instant) makes a pool
+# depth of 1 sufficient; 1F1B/interleaved schedules would need a deeper
+# pool and are explicitly out of scope.
+#
+# Sharing the TABLES is only correct because the backward re-prefetches
+# (MOE_MEGA_REPREFETCH): by a layer's backward time the pooled content is
+# some other layer's weights, so the mega backward must re-push this
+# layer's weights before reading them.  Enabling the pool for a multi-layer
+# model without the backward re-prefetch reads foreign weights silently.
+# ----------------------------------------------------------------------------
+
+# key -> [ReplicaWeightBuffers, live refcount]
+_REPLICA_POOL: dict[tuple, list] = {}
+
+
+def replica_pool_enabled() -> bool:
+    return os.environ.get("MEGAMOE_REPLICA_POOL", "0") == "1"
+
+
+def acquire_replica_weight_buffers(
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[ReplicaWeightBuffers, bool]:
+    """Take a pooled handle; returns ``(buffers, fresh)``.
+
+    ``fresh`` marks a real allocation: only that caller runs the collective
+    drain/barrier dance after the call (every rank visits layer shapes in
+    the same order, so hit/miss decisions are rank-uniform and the ACLSHMEM
+    allocation order stays collective-safe).
+    """
+    experts_per_rank, _, _ = _validate_local_weight_pair(
+        gate_up_weight, down_weight
+    )
+    key = (
+        world_size,
+        experts_per_rank,
+        tuple(gate_up_weight.shape[1:]),
+        tuple(down_weight.shape[1:]),
+    )
+    entry = _REPLICA_POOL.get(key)
+    if entry is not None and not entry[0].closed:
+        entry[1] += 1
+        return entry[0], False
+    buffers = allocate_replica_weight_buffers(
+        gate_up_weight, down_weight, rank=rank, world_size=world_size
+    )
+    _REPLICA_POOL[key] = [buffers, 1]
+    return buffers, True
+
+
+def release_replica_weight_buffers(buffers: ReplicaWeightBuffers) -> None:
+    """Drop one pooled reference; the last one frees the symmetric tables."""
+    for key, entry in _REPLICA_POOL.items():
+        if entry[0] is buffers:
+            entry[1] -= 1
+            if entry[1] <= 0:
+                del _REPLICA_POOL[key]
+                buffers.finalize()
+            return
+    # Never pooled (or the pool was drained underneath): plain finalize.
+    buffers.finalize()
+
+
+def drain_replica_weight_pool() -> None:
+    """Force-finalize every pooled entry regardless of refcounts (tests)."""
+    for _key, entry in list(_REPLICA_POOL.items()):
+        if not entry[0].closed:
+            entry[0].finalize()
+    _REPLICA_POOL.clear()
+
+
+def replica_pool_snapshot() -> dict[tuple, int]:
+    """Live pool state as ``{shape key: live refcount}`` (regression tests)."""
+    return {key: entry[1] for key, entry in _REPLICA_POOL.items()}
+
+
 def fence_replica_weight_prefetch_async(*, num_barrier_programs: int) -> None:
     """Queue the collective fence that makes all replica tables visible.
 
@@ -224,4 +341,9 @@ __all__ = [
     "ReplicaWeightBuffers",
     "allocate_replica_weight_buffers",
     "fence_replica_weight_prefetch_async",
+    "acquire_replica_weight_buffers",
+    "release_replica_weight_buffers",
+    "drain_replica_weight_pool",
+    "replica_pool_enabled",
+    "replica_pool_snapshot",
 ]

@@ -307,6 +307,13 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     # splitting P1 into "stalled on dispatch" vs "GEMM".  Default-off keeps the
     # standalone step-1 kernel's binary untouched (dead-arg pattern).
     wait_acc_ptr=None, WAIT_ACC: tl.constexpr = 0,
+    # MOE_MEGA_REPREFETCH=1 only (mega backward, pooled tables): wait this
+    # sweep's replica WEIGHT slots before first dereference — the forward
+    # dispatch_fc1 WAIT_REPLICA_WEIGHTS pattern mirrored.  The re-push rides
+    # the same launch's P1 vector subcore, so the wait pairs pushes and
+    # reads of ONE kernel.  Default-off keeps the standalone binary intact.
+    replica_weight_ready_ptr=None, replica_weight_epoch=0,
+    WAIT_REPLICA_WEIGHTS: tl.constexpr = 0,
 ):
     """Consume merged expert M windows as their source tiles become ready. Adapted
     from forward _triton_grouped_gemm_expert_n_merged_tiles_wait
@@ -354,6 +361,19 @@ def _fc2_bwd_gemm_merged_tiles_wait(
         expert_size = tl.load(recv_per_expert_ptr + expert_id)
         expert_off = tl.load(recv_expert_offs_ptr + expert_id)
         if expert_size > 0:
+            if WAIT_REPLICA_WEIGHTS:
+                # Pooled-table re-prefetch: this expert's replica weight
+                # slot must hold THIS layer's push (table-level epoch) —
+                # slot ids are table-local, base WEIGHT_EXPERT_BASE into
+                # the replica table (the forward's consumer shape).
+                replica_slot = expert_id - WEIGHT_EXPERT_BASE
+                weight_token = dl.wait(
+                    replica_weight_ready_ptr + replica_slot * 16,
+                    1, "gpu", "acquire",
+                    waitValue=replica_weight_epoch)
+                sweep_weight_ptr = dl.consume_token(fc2_ptr, weight_token)
+            else:
+                sweep_weight_ptr = fc2_ptr
             num_m_windows = tl.cdiv(expert_size, BLOCK_M)
             for m_window in range(num_m_windows):
                 window_start = m_window * BLOCK_M
@@ -399,7 +419,7 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                     wait_ticks += _w1 - _w0
                 ready_input_ptr = dl.consume_token(peer_mem_ptr, ready_token)
                 _fc2_bwd_gemm_one_mn_tile(
-                    ready_input_ptr, fc2_ptr, output_ptr,
+                    ready_input_ptr, sweep_weight_ptr, output_ptr,
                     expert_id, expert_off + window_start, window_size, n_tile, N, K,
                     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
                     BLOCK_M, BLOCK_N, BLOCK_K, WEIGHT_EXPERT_BASE, dtype)

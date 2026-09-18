@@ -201,6 +201,11 @@ from .combine_fc1_bwd import (
     GATE_PAD,
 )
 from .fused_swiglu_bwd_fc2_wgrad import FUSED_WBM, FUSED_WBN, FUSED_WBK
+from .replica_weight_prefetch import (
+    _kernel_compact_local_replica_descriptors,
+    _push_compact_replica_weight_descriptors,
+)
+from ..runtime.replica_weight_prefetch import replica_weight_push_geometry
 from .replica_grad_reduce import (
     build_owner_pull_descriptors_by_home,
     zero_consumed_replica_slots,
@@ -486,6 +491,11 @@ def _mega_combine_gemm(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    # MOE_MEGA_REPREFETCH=1 replica-call only: wait this m-tile's replica
+    # gate/up weight slot before first dereference (P1's in-launch re-push
+    # publishes it; deadline cushion = the whole P1 + P2||P3 windows).
+    replica_weight_ready_ptr=None, replica_weight_epoch=0,
+    WAIT_REPLICA_WEIGHTS: tl.constexpr = 0,
 ):
     """fc1 input-grad GEMM ``hidden_buf[m, :] = grad_fc1_output[m, :] @
     weight[e]`` over the M-TILE range [tile_m_begin, tile_m_end) against ONE
@@ -535,6 +545,16 @@ def _mega_combine_gemm(
         mm = om < rem
         mn = on_ < (N - n_start)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        if WAIT_REPLICA_WEIGHTS:
+            # slot ids are table-local: expert_base == home_base on the
+            # replica call, so (expert_id - expert_base) IS the replica slot
+            replica_slot = expert_id - expert_base
+            weight_token = dl.wait(
+                replica_weight_ready_ptr + replica_slot * 16,
+                1, "gpu", "acquire", waitValue=replica_weight_epoch)
+            sweep_weight_ptr = dl.consume_token(weight_ptr, weight_token)
+        else:
+            sweep_weight_ptr = weight_ptr
         wb = (expert_id.to(tl.int64) - expert_base) * stride_we
         row_base = row_start.to(tl.int64) + om.to(tl.int64)
         for ks in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
@@ -542,7 +562,7 @@ def _mega_combine_gemm(
             ao = row_base[:, None] * stride_im + (ks + ok[None, :]) * stride_ik
             a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
             bo = wb + (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-            b = tl.load(weight_ptr + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+            b = tl.load(sweep_weight_ptr + bo, mask=mk[:, None] & mn[None, :], other=0.0)
             acc += tl.dot(a, b)
         co = row_base[:, None] * N + (n_start + on_[None, :])
         tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
@@ -1156,7 +1176,10 @@ def _recompute_act_rows(
 # compiles both bodies out and is equivalent to this kernel.  Keep the
 # shared phase bodies in sync when editing either copy.
 # ============================================================================
-@triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
+@triton.jit(do_not_specialize=[
+    "signal_epoch", "b3_epoch", "b1_epoch",
+    "repref_epoch", "repref_desc_count",   # re-prefetch routing geometry
+])
 def kernel_moe_backward_mega(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
     gco_ptr, peer_mem_ptr, signal_mem_ptr,
@@ -1244,6 +1267,17 @@ def kernel_moe_backward_mega(
     EPN6: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     TM6: tl.constexpr, TN6: tl.constexpr, BLK6: tl.constexpr,
+    # ---- MoonEP re-prefetch (MOE_MEGA_REPREFETCH=1, pooled tables) ----
+    # P1's idle second vector subcore re-pushes THIS layer's replica tables
+    # from the home weights (values are bit-exact at backward time — the
+    # optimizer has not stepped); the P1 replica sweep (down) and the P4a
+    # replica m-tiles (gate/up) dl.wait their slots.  Dead-arg pattern when
+    # off: pointers stay valid tensors, epochs 0, pushes compiled out.
+    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+    repref_gate_ready_ptr, repref_down_ready_ptr, repref_epoch,
+    REPREFETCH: tl.constexpr,
+    RREF_GU_ELEMS: tl.constexpr, RREF_GU_CHUNK: tl.constexpr, RREF_GU_NCHUNK: tl.constexpr,
+    RREF_DN_ELEMS: tl.constexpr, RREF_DN_CHUNK: tl.constexpr, RREF_DN_NCHUNK: tl.constexpr,
     # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
@@ -1269,6 +1303,48 @@ def kernel_moe_backward_mega(
                     signal_epoch, H, stride_gm,
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
+            elif REPREFETCH:
+                # P1's idle second vector subcore re-pushes THIS layer's
+                # replica weights from the home tables — the forward
+                # dispatch kernel's sub_vec1 weight-push orchestration
+                # mirrored (dispatch_fc1.py's PREFETCH_REPLICA_DOWN branch),
+                # minus its early-prefix split: here the subcore owns the
+                # whole push, so each table is one full striped sweep.
+                # DOWN first (its deadline is THIS window's replica fc2-dgrad
+                # sweep, cushioned by the home sweep), gate/up second (its
+                # consumers only run at P4a, two windows away).  Sources are
+                # the contiguous home tables' base pointers — flat,
+                # layout-preserving RMA copies into the pooled symmetric
+                # slots; EXPERTS_PER_RANK in the push is the ETC table stride
+                # (home epn), NOT this kernel's physical slot stride.
+                _push_compact_replica_weight_descriptors(
+                    pid, num_cores,
+                    fc2_ptr, replica_fc2_ptr,
+                    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+                    repref_down_ready_ptr, repref_epoch,
+                    LOCAL_RANK, HOME_E,
+                    RREF_DN_ELEMS, RREF_DN_CHUNK, RREF_DN_NCHUNK)
+                _push_compact_replica_weight_descriptors(
+                    pid, num_cores,
+                    fc1_combined_ptr, replica_w4_ptr,
+                    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+                    repref_gate_ready_ptr, repref_epoch,
+                    LOCAL_RANK, HOME_E,
+                    RREF_GU_ELEMS, RREF_GU_CHUNK, RREF_GU_NCHUNK)
+                # Drain this program's push putmems at the ENGINE before the
+                # scope exits.  putmem is non-blocking: the program reaches B1
+                # (and the peers their P6 sinks) while RMA writes may still be
+                # in flight — and P6's grad transport REUSES these very pooled
+                # slots as sink targets (window 1 down / window 2 gate-up),
+                # which only barrier-order program flow, never the engine.  A
+                # late-landing weight put would overwrite the sunk gradients
+                # ahead of the owner pull (the w2 A-arm deterministic 0.47
+                # grad_fc1 loss: gate/up pushed second landed after SINK_GU;
+                # down survived by issuing first).  quiet() per issuing
+                # program + the following barrier_all = globally drained
+                # before any sink window; latency hides behind the B1 wait
+                # (weight consumers wait on the per-slot signals, not this).
+                libshmem_device.quiet()
         if TIMING:
             _mega_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -1309,7 +1385,10 @@ def kernel_moe_backward_mega(
                     MAX_BWD_TILES, tl.bfloat16,
                     b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
                     LOCAL_RANK=LOCAL_RANK,
-                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING,
+                    replica_weight_ready_ptr=repref_down_ready_ptr,
+                    replica_weight_epoch=repref_epoch,
+                    WAIT_REPLICA_WEIGHTS=REPREFETCH)
         if TIMING:
             _mega_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
@@ -1503,7 +1582,10 @@ def kernel_moe_backward_mega(
                         tile_home_bound4, num_tiles_m4,
                         b3_signal_ptr, b3_epoch,
                         C_BM, C_BN, C_BK, C_NS,
-                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK,
+                        replica_weight_ready_ptr=repref_gate_ready_ptr,
+                        replica_weight_epoch=repref_epoch,
+                        WAIT_REPLICA_WEIGHTS=REPREFETCH)
         # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
         # barrier with per-(tile,n) readiness signals (uniform constexpr —
         # every program takes the same branch, so the barrier contract is
@@ -1682,6 +1764,7 @@ def kernel_moe_backward_mega(
 # ============================================================================
 @triton.jit(do_not_specialize=[
     "signal_epoch", "b3_epoch", "b1_epoch",
+    "repref_epoch", "repref_desc_count",         # re-prefetch routing geometry
     "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
     "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
     "w5_split", "w5_total",                      # P5 wgrad split geometry
@@ -1773,6 +1856,17 @@ def kernel_moe_backward_mega_recompute(
     EPN6: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     TM6: tl.constexpr, TN6: tl.constexpr, BLK6: tl.constexpr,
+    # ---- MoonEP re-prefetch (MOE_MEGA_REPREFETCH=1, pooled tables) ----
+    # P1's idle second vector subcore re-pushes THIS layer's replica tables
+    # from the home weights (values are bit-exact at backward time — the
+    # optimizer has not stepped); the P1 replica sweep (down) and the P4a
+    # replica m-tiles (gate/up) dl.wait their slots.  Dead-arg pattern when
+    # off: pointers stay valid tensors, epochs 0, pushes compiled out.
+    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+    repref_gate_ready_ptr, repref_down_ready_ptr, repref_epoch,
+    REPREFETCH: tl.constexpr,
+    RREF_GU_ELEMS: tl.constexpr, RREF_GU_CHUNK: tl.constexpr, RREF_GU_NCHUNK: tl.constexpr,
+    RREF_DN_ELEMS: tl.constexpr, RREF_DN_CHUNK: tl.constexpr, RREF_DN_NCHUNK: tl.constexpr,
     # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
@@ -1817,6 +1911,48 @@ def kernel_moe_backward_mega_recompute(
                     signal_epoch, H, stride_gm,
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
+            elif REPREFETCH:
+                # P1's idle second vector subcore re-pushes THIS layer's
+                # replica weights from the home tables — the forward
+                # dispatch kernel's sub_vec1 weight-push orchestration
+                # mirrored (dispatch_fc1.py's PREFETCH_REPLICA_DOWN branch),
+                # minus its early-prefix split: here the subcore owns the
+                # whole push, so each table is one full striped sweep.
+                # DOWN first (its deadline is THIS window's replica fc2-dgrad
+                # sweep, cushioned by the home sweep), gate/up second (its
+                # consumers only run at P4a, two windows away).  Sources are
+                # the contiguous home tables' base pointers — flat,
+                # layout-preserving RMA copies into the pooled symmetric
+                # slots; EXPERTS_PER_RANK in the push is the ETC table stride
+                # (home epn), NOT this kernel's physical slot stride.
+                _push_compact_replica_weight_descriptors(
+                    pid, num_cores,
+                    fc2_ptr, replica_fc2_ptr,
+                    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+                    repref_down_ready_ptr, repref_epoch,
+                    LOCAL_RANK, HOME_E,
+                    RREF_DN_ELEMS, RREF_DN_CHUNK, RREF_DN_NCHUNK)
+                _push_compact_replica_weight_descriptors(
+                    pid, num_cores,
+                    fc1_combined_ptr, replica_w4_ptr,
+                    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+                    repref_gate_ready_ptr, repref_epoch,
+                    LOCAL_RANK, HOME_E,
+                    RREF_GU_ELEMS, RREF_GU_CHUNK, RREF_GU_NCHUNK)
+                # Drain this program's push putmems at the ENGINE before the
+                # scope exits.  putmem is non-blocking: the program reaches B1
+                # (and the peers their P6 sinks) while RMA writes may still be
+                # in flight — and P6's grad transport REUSES these very pooled
+                # slots as sink targets (window 1 down / window 2 gate-up),
+                # which only barrier-order program flow, never the engine.  A
+                # late-landing weight put would overwrite the sunk gradients
+                # ahead of the owner pull (the w2 A-arm deterministic 0.47
+                # grad_fc1 loss: gate/up pushed second landed after SINK_GU;
+                # down survived by issuing first).  quiet() per issuing
+                # program + the following barrier_all = globally drained
+                # before any sink window; latency hides behind the B1 wait
+                # (weight consumers wait on the per-slot signals, not this).
+                libshmem_device.quiet()
             if SAVED_RECOMPUTE:
                 _recompute_act_rows(
                     pid, num_cores,
@@ -1866,7 +2002,10 @@ def kernel_moe_backward_mega_recompute(
                     MAX_BWD_TILES, tl.bfloat16,
                     b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
                     LOCAL_RANK=LOCAL_RANK,
-                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING,
+                    replica_weight_ready_ptr=repref_down_ready_ptr,
+                    replica_weight_epoch=repref_epoch,
+                    WAIT_REPLICA_WEIGHTS=REPREFETCH)
         if TIMING:
             _mega_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
@@ -2081,7 +2220,10 @@ def kernel_moe_backward_mega_recompute(
                         tile_home_bound4, num_tiles_m4,
                         b3_signal_ptr, b3_epoch,
                         C_BM, C_BN, C_BK, C_NS,
-                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK,
+                        replica_weight_ready_ptr=repref_gate_ready_ptr,
+                        replica_weight_epoch=repref_epoch,
+                        WAIT_REPLICA_WEIGHTS=REPREFETCH)
         # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
         # barrier with per-(tile,n) readiness signals (uniform constexpr —
         # every program takes the same branch, so the barrier contract is
@@ -2632,6 +2774,27 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # byte identically, so heap divergence is NOT that failure's cause (root
     # cause: the codegen limitation documented in the module docstring).
     m_bound = W * EPR * p1["max_bwd_tiles"] * 64
+    # MOE_MEGA_REPREFETCH=1 (pooled tables, the 2026-09-17 Plan A): re-push
+    # this layer's replica weights INSIDE the launch — P1's idle second
+    # vector subcore issues the owner pushes beside the gco dispatch
+    # (deadline-aware order: down first, its P1 replica-sweep consumers wait
+    # in-window; gate/up's consumers only run at P4a).  v1 is mutually
+    # exclusive with the P4-phase restructuring knobs below (their
+    # combinations reshape the P4a/B3/B4 phases this rides on), so it forces
+    # both off.  Default off = the status-quo semantics (the backward reads
+    # whatever the forward left in the tables; correct only with per-layer
+    # tables, i.e. pool OFF).
+    reprefetch = (use_moonep and active_e > home_e
+                  and os.environ.get("MOE_MEGA_REPREFETCH", "0") == "1")
+    if reprefetch and (
+        os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
+        or os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
+    ):
+        print(f"[mega r{rank}] MOE_MEGA_REPREFETCH=1 forces "
+              f"MOE_MEGA_TILE_B3/FUSE_P4 off (v1 mutual exclusion)",
+              flush=True)
+        os.environ["MOE_MEGA_TILE_B3"] = "0"
+        os.environ["MOE_MEGA_FUSE_P4"] = "0"
     # SAVED_RECOMPUTE forces both B3-removing knobs off: the re-dispatch
     # sweep rides the B2->B3 window and its remote slab stores are published
     # cross-rank BY the B3 barrier — TILE_B3 (per-tile signals) and FUSE_P4
@@ -2814,6 +2977,68 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         gu_chunk6 = dn_chunk6 = 1
         tm6 = tn6 = blk6 = 1
 
+    # ---- MOE_MEGA_REPREFETCH operands (dead-arg pattern when off) ----
+    # Push geometry mirrors the forward config defaults (gate/up 16MB, down
+    # 4MB chunks), env-tunable for the RMA-contention sweep.
+    gu_elems = 2 * ffn * H
+    dn_elems = ffn * H
+    gu_chunk, gu_nchunk = replica_weight_push_geometry(
+        gu_elems,
+        chunk_bytes=int(os.environ.get(
+            "MOE_REPREF_GU_CHUNK_BYTES", str(16 * 1024 * 1024))),
+    )
+    dn_chunk, dn_nchunk = replica_weight_push_geometry(
+        dn_elems,
+        chunk_bytes=int(os.environ.get(
+            "MOE_REPREF_DN_CHUNK_BYTES", str(4 * 1024 * 1024))),
+    )
+    if reprefetch:
+        try:
+            repref_buffers = saved["replica_buffers"]
+            repref_gate_ready = saved["replica_gate_ready"]
+            repref_down_ready = saved["replica_down_ready"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "MOE_MEGA_REPREFETCH=1 needs the pooling-era saved contract "
+                "(replica_buffers / replica_gate_ready / replica_down_ready); "
+                "re-run the forward on a current operator") from exc
+        # table-level monotonic mint: same sequence the forward pushes of
+        # EVERY pooled layer took — a waiter's epoch can only be satisfied
+        # by this launch's own pushes
+        repref_epoch = repref_buffers.next_push_epoch()
+        # the flat, layout-preserving RMA pushes need the HOME tables'
+        # natural contiguous storage: fc1_combined is a transpose stride
+        # view of the packed [E, H, 2F] table (its base pointer IS the
+        # natural layout), a non-contiguous home storage would scramble the
+        # element order into the [B, H, 2F] replica slots
+        if not saved["fc1_combined"].transpose(1, 2).is_contiguous():
+            raise ValueError(
+                "MOE_MEGA_REPREFETCH=1 requires a contiguous home gate/up "
+                "table (flat layout-preserving RMA push)")
+        repref_etc = saved["experts_to_copy"]
+        repref_etc_cpu = saved["experts_to_copy_cpu"]
+        lo = rank * home_e
+        owned = (repref_etc_cpu >= lo) & (repref_etc_cpu < lo + home_e)
+        repref_desc_count = int(
+            owned.sum().item() - owned[rank].sum().item())
+        desc_ids = saved.get("_mega_repref_desc_ids")
+        if desc_ids is None or desc_ids.numel() < W * home_e:
+            desc_ids = torch.empty(
+                W * home_e, dtype=torch.int32, device=device)
+            saved["_mega_repref_desc_ids"] = desc_ids
+        # slot-major owner-local descriptor compaction on the device — the
+        # forward's exact pre-launch step (_begin_replica_prefetch),
+        # stream-ordered ahead of the mega launch with nothing consuming it
+        # in between: no exposure
+        _kernel_compact_local_replica_descriptors[1, 1, 1](
+            repref_etc, desc_ids,
+            LOCAL_RANK=rank, WORLD_SIZE=W, EXPERTS_PER_RANK=home_e)
+    else:
+        repref_epoch = 0
+        repref_desc_count = 0
+        repref_etc = desc_ids = p1["recv_per_expert"]
+        repref_gate_ready = repref_down_ready = signal_mem
+
     launch_options = (
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
         if cbm * cbn > 128 * 256 else {}
@@ -2901,6 +3126,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         ACC_BLK=blk6, TM6=tm6, TN6=tn6, BLK6=blk6,
         ts_ptr=ts_buf, wait1_ptr=wait1_buf,
         TS_SLOTS=MEGA_TS_SLOTS, TIMING=timing_on,
+        # re-prefetch (dead-arg pattern when REPREFETCH=False)
+        repref_etc_ptr=repref_etc, repref_desc_ids_ptr=desc_ids,
+        repref_desc_count=repref_desc_count,
+        repref_gate_ready_ptr=repref_gate_ready,
+        repref_down_ready_ptr=repref_down_ready,
+        repref_epoch=repref_epoch,
+        REPREFETCH=reprefetch,
+        RREF_GU_ELEMS=gu_elems, RREF_GU_CHUNK=gu_chunk, RREF_GU_NCHUNK=gu_nchunk,
+        RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
     if saved_recompute:
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
