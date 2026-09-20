@@ -20,23 +20,14 @@ from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
-from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
-
-
-@triton.jit
-def _sys_cnt_tick(dummy):
-    """Read the NPU system clock (SYS_CNT, ~20 MHz on this part — calibrate
-    host-side against a known-duration launch).  The inline-asm form is the
-    sb_rw_benchmark.py pattern, proven to lower on this toolchain; ``is_pure``
-    must be False or the compiler hoists/CSEs the reads away."""
-    return tl.inline_asm_elementwise(
-        asm="MOV $0, SYS_CNT;",
-        constraints="=l,l",
-        args=[dummy],
-        dtype=tl.int64,
-        is_pure=False,
-        pack=1,
-    )
+from .common import (
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    _sys_cnt_tick,
+    all_gather_list,
+    ncore,
+)
 
 
 def _dispatch_static_maps(saved):
