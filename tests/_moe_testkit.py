@@ -214,7 +214,14 @@ class TimingSpec:
 # These values are safe to import in CPU-only registry tests; timing functions
 # are only invoked inside the distributed runners.
 FORWARD_TIMING = TimingSpec(clock="npu_event")
-BACKWARD_TIMING = TimingSpec(clock="host_wall")
+# Env-overridable sample counts (default protocol unchanged): hang-bisect
+# runs set MOE_BENCH_BWD_WARMUP/ITERS small to cut the per-sample cost of the
+# transport loop (2026-09-21, E896 w8 aicore-timeout bisect).
+BACKWARD_TIMING = TimingSpec(
+    warmup=int(os.environ.get("MOE_BENCH_BWD_WARMUP", "5")),
+    iterations=int(os.environ.get("MOE_BENCH_BWD_ITERS", "50")),
+    clock="host_wall",
+)
 
 
 @dataclass(frozen=True)

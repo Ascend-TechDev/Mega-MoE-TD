@@ -37,6 +37,7 @@ from mega_moe.runtime.moonep_planning import (
     build_inverse_experts_to_copy,
     plan_moonep_b0_b3,
 )
+from mega_moe.runtime.replica_weight_prefetch import replica_pool_snapshot
 from benchmark.layer import bench_moe_suite as bench_module
 from mega_moe.kernels.weighted_swiglu import (
     _BLOCK_M as _WEIGHTED_BLOCK_M,
@@ -1795,6 +1796,12 @@ def _assert_gradients_match_golden(
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
     if rank == 0 and not bool(flag.item()):
         print(f"{label} gradient details: {details}", flush=True)
+    # research instrumentation (2026-09-18): the collective MIN reduce means
+    # the failing rank's details never print when rank0 is fine — always
+    # print on the locally-failing rank.
+    if not all_ok:
+        print(f"{label} rank{rank} LOCAL-FAIL gradient details: {details}",
+              flush=True)
     if not bool(flag.item()):
         raise AssertionError(
             f"{label} physical backward mismatched the logical golden"
@@ -2301,17 +2308,34 @@ def _assert_forward_after_grad_transport(
     the cache) and the second must be a cache hit — a slot left holding a
     gradient, or a slot zeroed after the push, only survives that second hit
     unnoticed. Both outputs are compared against the same forward golden.
+
+    Pooled-tables mode (MEGAMOE_REPLICA_POOL=1, 2026-09-17): the replica cache
+    is inert by design (same-shape layers share the tables, so a weight-key
+    "hit" says nothing about the content) and EVERY forward pushes; with
+    MOE_MEGA_REPREFETCH=1 the backward's in-kernel re-push also mints from the
+    same table-level monotonic counter.  The epoch arithmetic below absorbs
+    those mints; the output checks are unchanged and stay the point of the
+    helper.
     """
-    epoch_after_push = epoch_before_lend + 1
+    pooled = os.environ.get("MEGAMOE_REPLICA_POOL") == "1"
+    # the backward's in-kernel re-push minted from the shared counter iff the
+    # mega path ran with the knob on (every caller of this helper has replica
+    # traffic, i.e. active_e > home_e, so the wrapper's reprefetch was live)
+    bwd_mints = 1 if (
+        os.environ.get("MOE_BWD_MEGA") == "1"
+        and os.environ.get("MOE_MEGA_REPREFETCH") == "1"
+        and getattr(op, "enable_moonep", False)
+    ) else 0
+    epoch_after_push = epoch_before_lend + 1 + bwd_mints
     reloaded = op.forward(
         hidden_states, expert_indices, packed_w1, w2, routing_weights
     )
     if op._replica_weight_epoch != epoch_after_push:
         raise AssertionError(
             f"{label}: the post-backward forward re-pushed "
-            f"{op._replica_weight_epoch - epoch_before_lend} times, expected 1"
+            f"{op._replica_weight_epoch - epoch_before_lend - bwd_mints} times, expected 1"
         )
-    if not op._replica_weight_cache_valid:
+    if not pooled and not op._replica_weight_cache_valid:
         raise AssertionError(
             f"{label}: the post-backward forward left the replica cache invalid"
         )
@@ -2320,9 +2344,13 @@ def _assert_forward_after_grad_transport(
     cached = op.forward(
         hidden_states, expert_indices, packed_w1, w2, routing_weights
     )
-    if op._replica_weight_epoch != epoch_after_push:
+    if not pooled and op._replica_weight_epoch != epoch_after_push:
         raise AssertionError(
             f"{label}: the second post-backward forward was not a cache hit"
+        )
+    if pooled and op._replica_weight_epoch != epoch_after_push + 1:
+        raise AssertionError(
+            f"{label}: the pooled second post-backward forward did not re-push"
         )
     assert_close(cached, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
 
@@ -2699,6 +2727,14 @@ def run_moonep_backward_symmetric_moderate_wide_case(
                     op._replica_weight_buffers.down,
                     ep_group=ep_group,
                 )
+                # Pooling-era contract keys (MOE_MEGA_REPREFETCH=1): the
+                # oracle-built saved predates pooling, so mirror the three
+                # entries _native_saved._attach_moonep_plan_sections adds.
+                saved_phys.update(
+                    replica_buffers=op._replica_weight_buffers,
+                    replica_gate_ready=op.context.replica_gate_ready,
+                    replica_down_ready=op.context.replica_down_ready,
+                )
                 _assert_physical_saved_layout(saved_phys, tokens, topk)
                 assert_close(
                     output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
@@ -2897,11 +2933,11 @@ NATIVE_SAVED_H2_FLOAT_KEYS = (
 NATIVE_SAVED_H2_RTOL = 2e-2
 NATIVE_SAVED_H2_ATOL = 2e-2
 
-# Zero-copy weight references (§3.1 F).  The native side saves views of the
-# forward inputs — ``fc1_combined`` is ``gate_up_weight.transpose(1, 2)`` as a
-# stride view, ``fc1_1``/``fc1_2`` are slice-transpose views, ``fc2`` is the
-# down weight itself — while the replay side rebuilds its twins from the
-# unpacked weights (its ``fc1_combined`` is the contiguous ``cat`` product).
+# Zero-copy weight references (§3.1 F).  Both sides save ``fc1_combined`` as
+# ``gate_up_weight.transpose(1, 2)`` stride views of the packed table (the
+# replay side matches the production layout since the MOE_MEGA_REPREFETCH
+# flat RMA push reads its natural storage order), ``fc1_1``/``fc1_2`` are
+# slice-transpose views, ``fc2`` is the down weight itself.
 # ``pack_gate_up_weights`` is the exact inverse of those views and both sides
 # of this harness are built from the same ``w_gate``/``w_up``/``w2`` tensors,
 # so values, dtype, and shape must agree bit-for-bit.  Aliasing the forward
@@ -4126,6 +4162,239 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+def _perturb_weights_layer_local(
+    w_local, layer, rank, world_size, num_experts, amp=0.05,
+):
+    """Add layer-only, rank-sliced full-table ±amp noise to local weights.
+
+    The session pool hands every same-shape layer the same symmetric replica
+    table, and the stock weight makers use fixed seeds — every layer would
+    own identical weights and a stale-table read would be invisible.  The
+    noise comes from a FULL ``[num_experts, ...]`` table seeded only by the
+    layer, sliced to this rank's experts, so every rank agrees on every
+    expert's true weight while each layer differs measurably.
+    """
+    epr = num_experts // world_size
+    g = torch.Generator(device="cpu").manual_seed(9100 + 13 * layer)
+    full = (
+        torch.rand((num_experts,) + tuple(w_local.shape[1:]), generator=g) * 2
+        - 1
+    ) * amp
+    return (
+        w_local
+        + full[rank * epr:(rank + 1) * epr].to(
+            dtype=w_local.dtype, device=w_local.device
+        )
+    ).contiguous()
+
+
+def run_moonep_multilayer_pool_epoch_case(rank: int, world_size: int) -> None:
+    """Cross-layer staleness regression for the pooled replica tables.
+
+    L same-shape operators (one per MoE layer) share the session-level
+    replica-table pool.  Every layer runs forward -> native backward +
+    symmetric grad transport in order, twice: step 2 reseeds the inputs, so a
+    layer consuming a stale pooled table — another layer's weights, its own
+    step-1 weights, or gradients/zeroes left by a previous transport — fails
+    the gradient oracle.  The pooled epochs must also advance strictly across
+    the whole (layer, step) sequence, all layers must resolve to one buffers
+    object with pool refcount L, and finalize must drain the pool.
+    """
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the multi-layer pool epoch case requires two or four ranks"
+        )
+    if os.environ.get("MEGAMOE_REPLICA_POOL") != "1":
+        raise RuntimeError(
+            "the multi-layer pool epoch case requires MEGAMOE_REPLICA_POOL=1"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError(
+            "the multi-layer pool epoch case requires NPU and ACLSHMEM"
+        )
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    num_layers = 3
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "moonep-multilayer-pool-epoch"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # Backward scratch, reused layer by layer (the session's first
+        # symmetric allocation keeps the dl.symm_at offset-0 contract).
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        ops = []
+        layer_weights = []
+        try:
+            for layer in range(num_layers):
+                op = FusedMoEForward(
+                    ep_group,
+                    max_tokens_per_rank=tokens,
+                    hidden_size=hidden,
+                    top_k=topk,
+                    num_experts=num_experts,
+                    config=MoEForwardConfig(
+                        receive_capacity_factor=1.0,
+                        enable_moonep=True,
+                    ),
+                )
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                w_gate = _perturb_weights_layer_local(
+                    w_gate, layer, rank, world_size, num_experts
+                )
+                w_up = _perturb_weights_layer_local(
+                    w_up, layer, rank, world_size, num_experts
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = _perturb_weights_layer_local(
+                    make_down_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype, device
+                    ),
+                    layer, rank, world_size, num_experts,
+                )
+                ops.append(op)
+                layer_weights.append((packed_w1, w2, w_gate, w_up))
+
+            if os.environ.get("MOONEP_TEST_BALANCED") == "1":
+                # M1 discriminator (2026-09-20): near-uniform round-robin
+                # routing — the documented concentrated-routing whole-kernel
+                # miscompile (mega_bwd.py:147-164) must not fire here.
+                expert_indices = (
+                    torch.arange(tokens * topk, dtype=torch.int32)
+                    .view(tokens, topk) % num_experts
+                ).to(device)
+            else:
+                expert_indices = torch.zeros(
+                    (tokens, topk), dtype=torch.int32, device=device
+                )
+            routing_weights = torch.empty(
+                (tokens, topk), dtype=torch.float32, device=device
+            )
+            routing_weights[:, 0] = 0.25
+            routing_weights[:, 1] = 0.75
+
+            epoch_sequence = []
+            for step in (0, 1):
+                for layer, (op, (packed_w1, w2, w_gate, w_up)) in enumerate(
+                    zip(ops, layer_weights)
+                ):
+                    hs, _ = prepare_inputs(
+                        tokens,
+                        hidden,
+                        num_experts,
+                        topk,
+                        dtype,
+                        device,
+                        seed=2153 + rank + 77 * step,
+                    )
+                    torch.manual_seed(2154 + rank + 77 * step)
+                    dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+                    expected = torch_moe_fwd_golden(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        num_experts,
+                        ep_group,
+                    )
+                    with torch.no_grad():
+                        produced, native_saved = op.forward(
+                            hs,
+                            expert_indices,
+                            packed_w1,
+                            w2,
+                            routing_weights,
+                            return_saved=True,
+                        )
+                    assert_close(
+                        produced, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                    )
+                    epoch_sequence.append(op._replica_weight_epoch)
+                    transport = op.lend_replica_weight_tables_for_grad()
+                    with torch.no_grad():
+                        _, home_saved = moe_forward(
+                            hs,
+                            routing_weights,
+                            expert_indices,
+                            w_gate,
+                            w_up,
+                            w2,
+                            ep_group,
+                            topk,
+                            return_saved=True,
+                        )
+                        torch_result = backward_torch_baseline(home_saved, dy)
+                        triton_result = moe_backward_triton(
+                            native_saved,
+                            dy,
+                            peer_mem,
+                            grad_transport=transport,
+                            hidden_states=hs,
+                        )
+                    _assert_gradients_match_golden(
+                        rank,
+                        triton_result,
+                        torch_result,
+                        ep_group,
+                        f"{label}-L{layer}-s{step}",
+                    )
+                    accumulated = _assert_symmetric_transport_stages(
+                        rank,
+                        transport,
+                        {},
+                        triton_result,
+                        ep_group,
+                        f"{label}-L{layer}-s{step}",
+                    )
+                    contributions = torch.tensor(
+                        [accumulated], dtype=torch.int64, device=device
+                    )
+                    dist.all_reduce(
+                        contributions, op=dist.ReduceOp.SUM, group=ep_group
+                    )
+                    if int(contributions.item()) <= 0:
+                        raise AssertionError(
+                            "no owner pulled a replica weight gradient back"
+                        )
+
+            if any(
+                later <= earlier
+                for earlier, later in zip(epoch_sequence, epoch_sequence[1:])
+            ):
+                raise AssertionError(
+                    f"pooled replica epochs must strictly increase across "
+                    f"layers/steps, got {epoch_sequence}"
+                )
+            snapshot = replica_pool_snapshot()
+            if len(snapshot) != 1 or list(snapshot.values()) != [num_layers]:
+                raise AssertionError(
+                    "all same-shape layers must pool into one entry with "
+                    f"refcount {num_layers}, got {snapshot}"
+                )
+            if len({id(op._replica_weight_buffers) for op in ops}) != 1:
+                raise AssertionError(
+                    "pooled layers did not resolve to one buffers object"
+                )
+        finally:
+            for op in ops:
+                op.finalize()
+        snapshot = replica_pool_snapshot()
+        if snapshot:
+            raise AssertionError(
+                f"finalize must drain the replica pool, got {snapshot}"
+            )
+        kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 def _megamoe_function_grads(leaves, ffn_dim):
     """Map the Function's autograd grads onto the five canonical check keys.
 
@@ -5178,6 +5447,18 @@ def test_moonep_native_saved_hot_expert(dist_test, world_size):
 def test_moonep_native_backward_symmetric_hot_expert(dist_test, world_size):
     dist_test(
         run_moonep_native_backward_symmetric_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_multilayer_pool_epoch(dist_test, world_size):
+    if os.environ.get("MEGAMOE_REPLICA_POOL") != "1":
+        pytest.skip("the pooled-table epoch case requires MEGAMOE_REPLICA_POOL=1")
+    dist_test(
+        run_moonep_multilayer_pool_epoch_case,
         world_size=world_size,
     )
 

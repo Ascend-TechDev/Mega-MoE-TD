@@ -18,6 +18,28 @@ import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
 import triton.language.extra.cann.extension as al
+
+
+@triton.jit
+def _wait_bounded_report(sig_ptr, want, site, slot_id, expert_id, pid,
+                         dbg_ptr):
+    """Bounded signal spin with a timeout report (MOE_MEGA_WAIT_DEBUG=1):
+    spins until the slot reaches `want` (monotonic epochs); on ~1M
+    iterations writes [site, slot, want, observed, expert, spins] into
+    dbg_ptr[pid*8..] and CONTINUES (the subsequent compute will be wrong —
+    that is the point: deadlock -> diagnosable numeric failure)."""
+    cur = tl.load(sig_ptr)
+    spins = 0
+    while (cur < want) & (spins < 1000000):
+        cur = tl.load(sig_ptr)
+        spins += 1
+    if cur < want:
+        tl.store(dbg_ptr + pid * 8 + 0, site)
+        tl.store(dbg_ptr + pid * 8 + 1, slot_id)
+        tl.store(dbg_ptr + pid * 8 + 2, want)
+        tl.store(dbg_ptr + pid * 8 + 3, cur)
+        tl.store(dbg_ptr + pid * 8 + 4, expert_id)
+        tl.store(dbg_ptr + pid * 8 + 5, spins)
 from triton.language.extra.cann.extension import sub_vec_id
 
 from .common import ncore, all_gather_list, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
@@ -252,12 +274,13 @@ def _dispatch_grad_source_tiles(
     BLOCK_M: tl.constexpr,
     BLOCK_H_PUSH: tl.constexpr,
 ):
-    """Per-(dst,expert,tile) putmem + fence + signal_op SET. Adapted from forward
-    _dispatch_one_source_tile_task (dispatch_fc1.py:710-762): the staging buffer
-    (gco) is already expert-major contiguous, so each BLOCK_M tile is one bulk
-    putmem (no per-token gather). Expert-major work order so every dst receives
-    early expert tiles concurrently. slot = (LOCAL_RANK*EPR+expert)*MAX_BWD_TILES
-    +source_tile; the consumer waits the same slot keyed by source_id == LOCAL_RANK."""
+    """Per-(dst,expert,tile) direct remote store + fence + signal_op SET.
+    2026-09-20: putmem -> put_store (the forward dispatch's direct-store
+    idiom): NO engine on the dispatch path at all — engine-delivered putmem
+    on this backend faults/hangs under engine coexistence (MTE x UDMA put
+    507015) and its CQ is a wedge surface; direct stores have no CQ.  B-arm
+    layer gate measured 40s -> 22.7s (w2/w4, 2026-09-20).  Self delivery is
+    just a local store (UDMA self faults, MTE-to-self is gone too)."""
     num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
     for work_id in range(pid, num_tasks, num_cores):
         dst_rank = work_id % WORLD_SIZE
@@ -270,10 +293,16 @@ def _dispatch_grad_source_tiles(
         for source_tile in range(num_source_tiles):
             tile_start = source_tile * BLOCK_M
             tile_count = tl.minimum(BLOCK_M, task_count - tile_start)
-            libshmem_device.putmem(
-                peer_mem_ptr + (task_dst_start + tile_start) * H,
-                gco_ptr + (task_start + tile_start) * stride_gm,
-                tile_count * H * 2, dst_rank)
+            # direct remote store (put_store): engine-free
+            remote_tile = dl.symm_at(
+                peer_mem_ptr + (task_dst_start + tile_start) * H, dst_rank)
+            for cb in range(0, tile_count * H, 8192):
+                offs = cb + tl.arange(0, 8192)
+                m = offs < tile_count * H
+                v = tl.load(
+                    gco_ptr + (task_start + tile_start) * stride_gm + offs,
+                    mask=m, other=0.0)
+                tl.store(remote_tile + offs, v, mask=m)
             libshmem_device.fence()
             signal_slot = (
                 (LOCAL_RANK * EXPERTS_PER_RANK + expert_id) * MAX_BWD_TILES
@@ -286,7 +315,8 @@ def _dispatch_grad_source_tiles(
                 dst_rank)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["FIRST_EXPERT", "LAST_EXPERT",
+                                  "WEIGHT_EXPERT_BASE"])
 def _fc2_bwd_gemm_merged_tiles_wait(
     pid, ncore,
     peer_mem_ptr, signal_mem_ptr, fc2_ptr, output_ptr,
@@ -297,8 +327,12 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     TILE_M: tl.constexpr,
     WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
-    FIRST_EXPERT: tl.constexpr, LAST_EXPERT: tl.constexpr,
-    WEIGHT_EXPERT_BASE: tl.constexpr,
+    # 2026-09-20 candidate (a): RUNTIME scalars (do_not_specialize) — home
+    # and replica sweeps become one structural instantiation, taking the
+    # w4 binary to the (green) w2 shape instead of a per-world-size
+    # constexpr roll of the whole-kernel miscompile dice (mega_bwd.py:147).
+    FIRST_EXPERT, LAST_EXPERT,
+    WEIGHT_EXPERT_BASE,
     MAX_BWD_TILES: tl.constexpr, dtype: tl.constexpr,
     b1_signal_ptr, b1_epoch,
     SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
@@ -307,6 +341,17 @@ def _fc2_bwd_gemm_merged_tiles_wait(
     # splitting P1 into "stalled on dispatch" vs "GEMM".  Default-off keeps the
     # standalone step-1 kernel's binary untouched (dead-arg pattern).
     wait_acc_ptr=None, WAIT_ACC: tl.constexpr = 0,
+    # MOE_MEGA_REPREFETCH=1 only (mega backward, pooled tables): wait this
+    # sweep's replica WEIGHT slots before first dereference — the forward
+    # dispatch_fc1 WAIT_REPLICA_WEIGHTS pattern mirrored.  The re-push rides
+    # the same launch's P1 vector subcore, so the wait pairs pushes and
+    # reads of ONE kernel.  Default-off keeps the standalone binary intact.
+    replica_weight_ready_ptr=None, replica_weight_epoch=0,
+    WAIT_REPLICA_WEIGHTS: tl.constexpr = 0,
+    # MOE_MEGA_WAIT_DEBUG=1 (2026-09-20): bounded spins + timeout reports
+    # instead of unbounded dl.wait — converts the w4 deadlock into a
+    # numeric failure naming the stuck (site, slot, want, observed).
+    wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0,
 ):
     """Consume merged expert M windows as their source tiles become ready. Adapted
     from forward _triton_grouped_gemm_expert_n_merged_tiles_wait
@@ -354,6 +399,29 @@ def _fc2_bwd_gemm_merged_tiles_wait(
         expert_size = tl.load(recv_per_expert_ptr + expert_id)
         expert_off = tl.load(recv_expert_offs_ptr + expert_id)
         if expert_size > 0:
+            if WAIT_REPLICA_WEIGHTS:
+                # Pooled-table re-prefetch: this expert's replica weight
+                # slot must hold THIS layer's push (table-level epoch) —
+                # slot ids are table-local, base WEIGHT_EXPERT_BASE into
+                # the replica table (the forward's consumer shape).
+                # Post-R1 (2026-09-21): compiled out everywhere — the
+                # mega wrapper never sets REPREFETCH_WAIT any more (the
+                # publication edge is the pre-launch collective barrier,
+                # mega_bwd.py R1 note); kept for signature stability.
+                replica_slot = expert_id - WEIGHT_EXPERT_BASE
+                if WAIT_DEBUG:
+                    _wait_bounded_report(
+                        replica_weight_ready_ptr + replica_slot * 16,
+                        replica_weight_epoch, 1, replica_slot, expert_id,
+                        pid, wait_dbg_ptr)
+                else:
+                    dl.wait(
+                        replica_weight_ready_ptr + replica_slot * 16,
+                        1, "gpu", "acquire",
+                        waitValue=replica_weight_epoch)
+                sweep_weight_ptr = fc2_ptr
+            else:
+                sweep_weight_ptr = fc2_ptr
             num_m_windows = tl.cdiv(expert_size, BLOCK_M)
             for m_window in range(num_m_windows):
                 window_start = m_window * BLOCK_M
@@ -388,10 +456,17 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                                 * MAX_BWD_TILES
                                 + source_tile
                             )
-                            token = dl.wait(
-                                signal_mem_ptr + signal_slot * 16,
-                                1, "gpu", "acquire",
-                                waitValue=signal_epoch)
+                            if WAIT_DEBUG:
+                                _wait_bounded_report(
+                                    signal_mem_ptr + signal_slot * 16,
+                                    signal_epoch, 2, signal_slot, expert_id,
+                                    pid, wait_dbg_ptr)
+                                token = 0
+                            else:
+                                token = dl.wait(
+                                    signal_mem_ptr + signal_slot * 16,
+                                    1, "gpu", "acquire",
+                                    waitValue=signal_epoch)
                             ready_token += token
                     source_start = source_end
                 if WAIT_ACC:
@@ -399,7 +474,7 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                     wait_ticks += _w1 - _w0
                 ready_input_ptr = dl.consume_token(peer_mem_ptr, ready_token)
                 _fc2_bwd_gemm_one_mn_tile(
-                    ready_input_ptr, fc2_ptr, output_ptr,
+                    ready_input_ptr, sweep_weight_ptr, output_ptr,
                     expert_id, expert_off + window_start, window_size, n_tile, N, K,
                     stride_im, stride_ik, stride_we, stride_wk, stride_wn, stride_om, stride_on,
                     BLOCK_M, BLOCK_N, BLOCK_K, WEIGHT_EXPERT_BASE, dtype)
