@@ -17,10 +17,12 @@ _MAX_FC2_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
 # Supported post-FC1 gated activations.  swiglu is silu(gate) * up;
 # situglu is beta * tanh(gate / beta) * sigmoid(gate) * up (with an
-# optional linear_beta * tanh(up / linear_beta) transform on up).
+# optional linear_beta * tanh(up / linear_beta) transform on up);
+# clamp_swiglu clamps gate to [-, L] and up to [-L, L] before silu (L=clamp_limit).
 _ACTIVATIONS = (
     "swiglu",
     "situglu",
+    "clamp_swiglu",
 )
 
 _MAX_REPLICA_PREFETCH_CHUNK_BYTES = (1 << 32) - 1
@@ -122,10 +124,14 @@ class MoEForwardConfig:
     fc2_gemm_block_size_k: int = 128
 
     # Post-FC1 gated activation.  swiglu (default) preserves the original
-    # silu(gate) * up path; situglu selects SiTU-GLU.
+    # silu(gate) * up path; situglu selects SiTU-GLU; clamp_swiglu clamps
+    # gate to max=L and up to [-L, L] before silu.
     activation: str = "swiglu"
     situ_beta: float = 1.0
     situ_linear_beta: Optional[float] = None
+    # ClampSwiGLU limit L (ignored for swiglu/situglu); gate.clamp(max=L) and
+    # up.clamp(min=-L, max=L).  MoE fc1 activation target uses L=7.0.
+    clamp_limit: float = 7.0
     # Appended to preserve positional construction of the older config fields.
     fc1_gemm_block_size_m: int = 256
     # MoonEP load balancing is opt-in while the weight-prefetch path is being
@@ -265,6 +271,10 @@ class MoEForwardConfig:
                 raise TypeError("situ_linear_beta must be a float or None")
             if float(self.situ_linear_beta) <= 0.0:
                 raise ValueError("situ_linear_beta must be positive when set")
+        if not (type(self.clamp_limit) is float or type(self.clamp_limit) is int):
+            raise TypeError("clamp_limit must be a float")
+        if float(self.clamp_limit) <= 0.0:
+            raise ValueError("clamp_limit must be positive")
         if type(self.enable_moonep) is not bool:
             raise TypeError("enable_moonep must be a bool")
         if type(self.enable_single_kernel_forward) is not bool:

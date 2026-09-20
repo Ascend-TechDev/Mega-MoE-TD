@@ -163,13 +163,17 @@ def test_pack_gate_up_weights_returns_contiguous_kn_layout():
     torch.testing.assert_close(packed[:, :, 3:], up.transpose(1, 2))
 
 
-def _situglu_torch_ref(fc1, routing_weights, activation, beta, linear_beta):
+def _situglu_torch_ref(fc1, routing_weights, activation, beta, linear_beta,
+                       clamp_limit=7.0):
     """Independent FP32 reference for the target activation extension."""
     ffn_dim = fc1.shape[-1] // 2
     gate = fc1[..., :ffn_dim].float()
     up = fc1[..., ffn_dim:].float()
     if activation == "swiglu":
         activated = torch.nn.functional.silu(gate) * up
+    elif activation == "clamp_swiglu":
+        activated = torch.nn.functional.silu(
+            gate.clamp(max=clamp_limit)) * up.clamp(min=-clamp_limit, max=clamp_limit)
     else:
         activated = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
         if linear_beta is not None:
@@ -205,11 +209,12 @@ def test_weighted_activation_expert_groups_cover_empty_and_tail_ranges():
     ).contiguous()
     num_vector_programs = NPUUtils().get_aivector_core_num()
     cases = (
-        ("swiglu", 0, 1.0, None),
-        ("situglu", 1, 2.0, 1.0),
+        ("swiglu", 0, 1.0, None, 7.0),
+        ("situglu", 1, 2.0, 1.0, 7.0),
+        ("clamp_swiglu", 2, 1.0, None, 7.0),
     )
 
-    for activation, activation_id, beta, linear_beta in cases:
+    for activation, activation_id, beta, linear_beta, clamp_limit in cases:
         actual = torch.empty(
             (rows, ffn_dim), dtype=torch.bfloat16, device=device
         )
@@ -223,6 +228,7 @@ def test_weighted_activation_expert_groups_cover_empty_and_tail_ranges():
                 ffn_dim,
                 beta,
                 float(linear_beta) if linear_beta is not None else 0.0,
+                clamp_limit,
                 BLOCK_M=_WEIGHTED_BLOCK_M,
                 BLOCK_N=_WEIGHTED_BLOCK_N,
                 ACTIVATION=activation_id,
@@ -236,6 +242,7 @@ def test_weighted_activation_expert_groups_cover_empty_and_tail_ranges():
             activation,
             beta,
             linear_beta,
+            clamp_limit,
         )
         torch.testing.assert_close(
             actual.float(),

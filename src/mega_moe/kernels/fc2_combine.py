@@ -246,6 +246,7 @@ def _kernel_fc2_combine_v0_mix(
     HAS_LINEAR_BETA: tl.constexpr,
     SITU_BETA: tl.constexpr,
     SITU_LINEAR_BETA: tl.constexpr,
+    CLAMP_LIMIT: tl.constexpr,
 ):
     """Single-launch per-item pipelined CV mix (AIV0 -> AIC -> AIV1).
 
@@ -302,6 +303,10 @@ def _kernel_fc2_combine_v0_mix(
                             mask=m, other=0.0,
                         ).to(tl.float32)
                         if ACTIVATION == 0:
+                            activated = gate * tl.sigmoid(gate) * up
+                        elif ACTIVATION == 2:
+                            gate = tl.minimum(gate, CLAMP_LIMIT)
+                            up = tl.minimum(tl.maximum(up, -CLAMP_LIMIT), CLAMP_LIMIT)
                             activated = gate * tl.sigmoid(gate) * up
                         else:
                             situ_a = (
@@ -772,6 +777,7 @@ def _launch_fc2_combine_v0_kernel(
     activation_situ_beta: float,
     activation_situ_linear_beta: float,
     activation_has_linear_beta: bool,
+    activation_clamp_limit: float = 7.0,
 ) -> None:
     """Launch the single CV activation/FC2/transport kernel."""
     K = weighted_activation.shape[1]
@@ -829,6 +835,7 @@ def _launch_fc2_combine_v0_kernel(
         HAS_LINEAR_BETA=activation_has_linear_beta,
         SITU_BETA=activation_situ_beta,
         SITU_LINEAR_BETA=activation_situ_linear_beta,
+        CLAMP_LIMIT=activation_clamp_limit,
         disable_auto_inject_block_sync=True,
         limit_auto_multi_buffer_buffer="no-limit",
         **launch_options,
@@ -991,8 +998,11 @@ def _launch_fc2_combine(
         or not activation_routing_weights.is_contiguous()
     ):
         raise ValueError("shadow activation tensors must be contiguous")
-    if activation_id not in (0, 1):
-        raise ValueError("activation_id must select SwiGLU (0) or SiTU-GLU (1)")
+    if activation_id not in (0, 1, 2):
+        raise ValueError(
+            "activation_id must select SwiGLU (0), SiTU-GLU (1) or "
+            "ClampSwiGLU (2)"
+        )
     if activation_situ_beta <= 0.0:
         raise ValueError("activation_situ_beta must be positive")
     if activation_has_linear_beta and activation_situ_linear_beta <= 0.0:

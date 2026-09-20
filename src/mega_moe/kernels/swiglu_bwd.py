@@ -22,8 +22,9 @@ def kernel_swiglu_bwd(
     dscale_ptr,               # grad_gate [M] out
     n_rows,
     situ_beta, situ_linear_beta,   # SiTU params (ignored when ACTIVATION == 0)
+    clamp_limit,                    # ClampSwiGLU limit L (ignored otherwise)
     BLOCK_SIZE: tl.constexpr,
-    ACTIVATION: tl.constexpr,      # 0 = swiglu, 1 = situglu
+    ACTIVATION: tl.constexpr,      # 0 = swiglu, 1 = situglu, 2 = clamp_swiglu
     HAS_LINEAR_BETA: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -43,6 +44,10 @@ def kernel_swiglu_bwd(
         #   situglu: act_a = beta*tanh(g/beta)*s   dact_a = (1-t^2)*s
         #                                            + beta*t*s*(1-s)        v = lb*tanh(up/lb)
         #                                                                    dv = 1 - tanh^2(up/lb)
+        #   clamp_swiglu: act_a = silu(clamp(a,L)) dact_a = silu'(gc)*(a<=L) v = clamp(b,±L)
+        #                                                                    dv = (|b|<=L)
+        #     (clamp flat region has zero slope; INCLUSIVE <= so x==L keeps grad 1,
+        #      matching torch.clamp autograd)
         # (tanh via the 2*sigmoid(2x)-1 rewrite, same as the host reference)
         if ACTIVATION == 0:
             sigmoid_a = tl.sigmoid(a)
@@ -50,6 +55,14 @@ def kernel_swiglu_bwd(
             dact_a = act_a * (1 - sigmoid_a) + sigmoid_a
             v = b
             dv = 1.0
+        elif ACTIVATION == 2:
+            gc = tl.minimum(a, clamp_limit)
+            uc = tl.minimum(tl.maximum(b, -clamp_limit), clamp_limit)
+            sig = tl.sigmoid(gc)
+            act_a = gc * sig
+            dact_a = (sig + gc * sig * (1.0 - sig)) * (a <= clamp_limit).to(tl.float32)
+            v = uc
+            dv = (tl.abs(b) <= clamp_limit).to(tl.float32)
         else:
             t = 2.0 * tl.sigmoid(2.0 * a / situ_beta) - 1.0
             s = tl.sigmoid(a)
@@ -71,31 +84,39 @@ def kernel_swiglu_bwd(
 
 
 def swiglu_bwd_triton(grad_swiglu, fc1_output, recv_weights_sorted, *,
-                      activation="swiglu", situ_beta=None, situ_linear_beta=None):
+                      activation="swiglu", situ_beta=None, situ_linear_beta=None,
+                      clamp_limit=None):
     """Step 2: returns (grad_fc1_output [M,2ffn], grad_gate [M]).
 
-    ``activation`` selects the derivative: "swiglu" (default, silu'(gate)) or
+    ``activation`` selects the derivative: "swiglu" (default, silu'(gate)),
     "situglu" (Kimi SiTU-GLU with ``situ_beta``/``situ_linear_beta``; the
-    latter may be None for the untransformed-up variant)."""
+    latter may be None for the untransformed-up variant) or "clamp_swiglu"
+    (ClampSwiGLU with ``clamp_limit`` L, silu'(clamp(gate,L))*(gate<=L) and
+    clamp(up,±L) with inclusive <= boundary matching torch.clamp autograd)."""
     M, two_ffn = fc1_output.shape
     ffn = two_ffn // 2
     dAB = torch.empty_like(fc1_output)
     dscale = torch.empty(M, dtype=fc1_output.dtype, device=fc1_output.device)
     BLOCK_SIZE = triton.next_power_of_2(ffn)
     if activation in (None, "swiglu"):
-        act, beta, lbeta, has_lb = 0, 1.0, 1.0, False
+        act, beta, lbeta, has_lb, clamp_lim = 0, 1.0, 1.0, False, 7.0
     elif activation == "situglu":
         act = 1
         beta = 1.0 if situ_beta is None else float(situ_beta)
         lbeta = 1.0 if situ_linear_beta is None else float(situ_linear_beta)
         has_lb = situ_linear_beta is not None
+        clamp_lim = 7.0
+    elif activation == "clamp_swiglu":
+        act = 2
+        beta, lbeta, has_lb = 1.0, 1.0, False
+        clamp_lim = 7.0 if clamp_limit is None else float(clamp_limit)
     else:
         raise ValueError(f"unknown activation for the backward: {activation!r}")
     # Pure-vector elementwise kernel: launch on nvec() (48) not ncore() (24) to
     # use both vector lanes per AI core — 2x the vector-core parallelism.
     kernel_swiglu_bwd[(nvec(), 1, 1)](
         grad_swiglu, grad_swiglu.stride(0), fc1_output, fc1_output.stride(0),
-        ffn, recv_weights_sorted, dAB, dscale, M, beta, lbeta,
+        ffn, recv_weights_sorted, dAB, dscale, M, beta, lbeta, clamp_lim,
         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=act, HAS_LINEAR_BETA=has_lb,
         num_warps=8)
     return dAB, dscale

@@ -236,6 +236,7 @@ def build_physical_saved_from_plan(
     activation="swiglu",
     situ_beta=1.0,
     situ_linear_beta=None,
+    clamp_limit=7.0,
 ):
     """Replay one MoonEP routing plan in torch and materialize ``saved_phys``.
 
@@ -346,7 +347,7 @@ def build_physical_saved_from_plan(
         transpose=False,
     )
     gate, up = fc1_out.chunk(2, dim=-1)
-    swiglu_out = _gated_activation(gate, up, activation, situ_beta, situ_linear_beta)
+    swiglu_out = _gated_activation(gate, up, activation, situ_beta, situ_linear_beta, clamp_limit)
     swiglu_out_weighted = (
         swiglu_out * recv_weights_sorted.float().unsqueeze(-1)
     ).to(dtype)
@@ -393,6 +394,9 @@ def build_physical_saved_from_plan(
         recv_hidden_sorted=recv_hidden_sorted, fc1_output=fc1_out,
         gate=gate, up=up, swiglu_out_weighted=swiglu_out_weighted,
         recv_weights_sorted=recv_weights_sorted, fc2_out=fc2_out,
+        # activation (so moe_backward_triton can select the clamp derivative)
+        activation=activation, situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta, clamp_limit=clamp_limit,
         # home-segment weights in the legacy saved layouts
         fc1_1=fc1_1, fc1_2=fc1_2, fc2=home_down_weight, fc1_combined=fc1_combined,
         selected_experts=plan.selected_experts,

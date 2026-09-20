@@ -25,6 +25,7 @@ def _weighted_activation_rows(
     ffn_dim,
     situ_beta,
     situ_linear_beta,
+    clamp_limit,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -60,6 +61,11 @@ def _weighted_activation_rows(
         )
         if ACTIVATION == 0:
             activated = gate * tl.sigmoid(gate) * up
+        elif ACTIVATION == 2:
+            # ClampSwiGLU: silu(clamp(gate, max=L)) * clamp(up, -L, L)
+            gate = tl.minimum(gate, clamp_limit)
+            up = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
+            activated = gate * tl.sigmoid(gate) * up
         else:
             situ_a = situ_beta * tl.math.tanh(gate / situ_beta) * tl.sigmoid(gate)
             if HAS_LINEAR_BETA:
@@ -84,6 +90,7 @@ def _weighted_activation_expert_group_kernel(
     ffn_dim,
     situ_beta,
     situ_linear_beta,
+    clamp_limit,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -105,6 +112,7 @@ def _weighted_activation_expert_group_kernel(
         ffn_dim,
         situ_beta,
         situ_linear_beta,
+        clamp_limit,
         BLOCK_M,
         BLOCK_N,
         ACTIVATION,

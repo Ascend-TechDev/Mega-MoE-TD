@@ -324,7 +324,7 @@ def _wait_fc1_vector_ack(SLOT: tl.constexpr):
 @triton.jit
 def _partition_pipeline_fc1_activation_group_ub(
         pid, input_ptr, signal_mem_ptr, weight_ptr, routing_weight_ptr, output_ptr,
-        fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr, recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+        fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr, recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
         stride_input_m, stride_input_k, stride_weight_e, stride_weight_n, stride_weight_k,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -568,6 +568,10 @@ def _partition_pipeline_fc1_activation_group_ub(
                     gate = gate_raw.to(tl.float32)
                     up = up_raw.to(tl.float32)
                     if ACTIVATION == 0:
+                        activated = gate * tl.sigmoid(gate) * up
+                    elif ACTIVATION == 2:
+                        gate = tl.minimum(gate, clamp_limit)
+                        up = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
                         activated = gate * tl.sigmoid(gate) * up
                     else:
                         situ_a = situ_beta * tl.math.tanh(
@@ -924,7 +928,7 @@ def _run_dynamic_wave_pipeline(
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
-        situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
+        situ_beta, situ_linear_beta, clamp_limit, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
         NUM_CORES: tl.constexpr, LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, HIDDEN: tl.constexpr, FFN: tl.constexpr, TOPK: tl.constexpr,
@@ -990,7 +994,7 @@ def _run_dynamic_wave_pipeline(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
                                     routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
-                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
@@ -1002,7 +1006,7 @@ def _run_dynamic_wave_pipeline(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
                                     routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
-                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta, clamp_limit,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
@@ -1055,7 +1059,7 @@ def _kernel_fused_forward(
         experts_to_copy_ptr, inverse_ptr, replica_counts_ptr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         gate_notify_ptr, down_notify_ptr,
-        num_routes, signal_epoch, situ_beta, situ_linear_beta, stride_hidden_m: tl.constexpr,
+        num_routes, signal_epoch, situ_beta, situ_linear_beta, clamp_limit, stride_hidden_m: tl.constexpr,
         stride_hidden_k: tl.constexpr, stride_gate_up_e: tl.constexpr,
         stride_gate_up_n: tl.constexpr, stride_gate_up_k: tl.constexpr, stride_down_e: tl.constexpr,
         stride_down_n: tl.constexpr, stride_down_k: tl.constexpr, NUM_PROGRAM_CORES: tl.constexpr,
@@ -1199,7 +1203,7 @@ def _kernel_fused_forward(
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
-        situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
+        situ_beta, situ_linear_beta, clamp_limit, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
         NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
         MAX_SOURCE_TILES, MAX_PIPELINE_GROUPS, DISPATCH_BLOCK_M, FC1_BLOCK_M, FC1_BLOCK_N,

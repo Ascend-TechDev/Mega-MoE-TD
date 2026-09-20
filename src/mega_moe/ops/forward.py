@@ -146,6 +146,7 @@ class FusedMoEForward(torch.nn.Module):
         self.activation = self.config.activation
         self.situ_beta = self.config.situ_beta
         self.situ_linear_beta = self.config.situ_linear_beta
+        self.clamp_limit = self.config.clamp_limit
 
         # Tile SET slots publish per-source-tile readiness for the Cube consumer.
         self._tile_signal_epoch = 1
@@ -1406,7 +1407,7 @@ class FusedMoEForward(torch.nn.Module):
             pipeline_activation_events=self._combine_pipeline_activation_events,
             activation_fc1_output=dispatch_result.fc1_output,
             activation_routing_weights=dispatch_result.received_routing_weights,
-            activation_id=0 if self.activation == "swiglu" else 1,
+            activation_id={"swiglu": 0, "situglu": 1, "clamp_swiglu": 2}[self.activation],
             activation_situ_beta=float(self.situ_beta),
             activation_situ_linear_beta=(
                 float(self.situ_linear_beta)
@@ -1414,6 +1415,7 @@ class FusedMoEForward(torch.nn.Module):
                 else 0.0
             ),
             activation_has_linear_beta=self.situ_linear_beta is not None,
+            activation_clamp_limit=float(self.clamp_limit),
         )
         if self._replica_prefetch_pending:
             # This flag also records that both symmetric tables hold a valid
@@ -1558,6 +1560,7 @@ class FusedMoEForward(torch.nn.Module):
                 if self.situ_linear_beta is not None
                 else 0.0
             ),
+            float(self.clamp_limit),
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_for_gemm.stride(0),
@@ -1584,7 +1587,7 @@ class FusedMoEForward(torch.nn.Module):
             FC1_BLOCK_K=self.config.fc1_gemm_block_size_k,
             FC2_BLOCK_N=self.config.fc2_gemm_block_size_n,
             FC2_BLOCK_K=self.config.fc2_gemm_block_size_k,
-            ACTIVATION=0 if self.activation == "swiglu" else 1,
+            ACTIVATION={"swiglu": 0, "situglu": 1, "clamp_swiglu": 2}[self.activation],
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
             SAVE_FC1=return_saved,
             FC1_FP8=self._fc1_save_fp8,

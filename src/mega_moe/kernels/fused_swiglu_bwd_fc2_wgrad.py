@@ -48,6 +48,7 @@ def kernel_fused_swiglu_bwd_fc2_wgrad(
     dscale_ptr,               # grad_gate out [M]
     n_rows,
     situ_beta, situ_linear_beta,   # SiTU params (ignored when ACTIVATION == 0)
+    clamp_limit,                   # ClampSwiGLU limit L (ignored otherwise)
     # ---- cube: fc2 weight-grad grouped GEMM ----
     grad_out_ptr,             # [M, N] contiguous (grad_fc2_out_sorted, NO host transpose)
     orig_in_ptr,              # [M, K] contiguous (swiglu_out_weighted.contiguous())
@@ -61,7 +62,7 @@ def kernel_fused_swiglu_bwd_fc2_wgrad(
     # ---- constexpr tile sizes ----
     BLOCK_SIZE: tl.constexpr,           # swiglu row tile = next_power_of_2(ffn)
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ACTIVATION: tl.constexpr,           # 0 = swiglu, 1 = situglu (vector scope)
+    ACTIVATION: tl.constexpr,           # 0 = swiglu, 1 = situglu, 2 = clamp_swiglu (vector scope)
     HAS_LINEAR_BETA: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -87,6 +88,14 @@ def kernel_fused_swiglu_bwd_fc2_wgrad(
                 dact_a = act_a * (1 - sigmoid_a) + sigmoid_a
                 v = b
                 dv = 1.0
+            elif ACTIVATION == 2:
+                gc = tl.minimum(a, clamp_limit)
+                uc = tl.minimum(tl.maximum(b, -clamp_limit), clamp_limit)
+                sig = tl.sigmoid(gc)
+                act_a = gc * sig
+                dact_a = (sig + gc * sig * (1.0 - sig)) * (a <= clamp_limit).to(tl.float32)
+                v = uc
+                dv = (tl.abs(b) <= clamp_limit).to(tl.float32)
             else:
                 t = 2.0 * tl.sigmoid(2.0 * a / situ_beta) - 1.0
                 s = tl.sigmoid(a)
@@ -151,7 +160,7 @@ def fused_swiglu_bwd_fc2_wgrad(grad_swiglu, fc1_output, recv_weights_sorted,
                                grad_fc2_out_sorted, swiglu_out_weighted,
                                expert_counts, split_size_cum_per_expert, *,
                                activation="swiglu", situ_beta=None,
-                               situ_linear_beta=None):
+                               situ_linear_beta=None, clamp_limit=None):
     """Fused step2 (SwiGLU/SiTU bwd) + step3 (fc2 wgrad): returns
     (grad_fc1_output [M,2ffn], grad_gate [M], grad_fc2 [E,N,K]).
 
@@ -168,12 +177,17 @@ def fused_swiglu_bwd_fc2_wgrad(grad_swiglu, fc1_output, recv_weights_sorted,
     dev = fc1_output.device
 
     if activation in (None, "swiglu"):
-        act, beta, lbeta, has_lb = 0, 1.0, 1.0, False
+        act, beta, lbeta, has_lb, clamp_lim = 0, 1.0, 1.0, False, 7.0
     elif activation == "situglu":
         act = 1
         beta = 1.0 if situ_beta is None else float(situ_beta)
         lbeta = 1.0 if situ_linear_beta is None else float(situ_linear_beta)
         has_lb = situ_linear_beta is not None
+        clamp_lim = 7.0
+    elif activation == "clamp_swiglu":
+        act = 2
+        beta, lbeta, has_lb = 1.0, 1.0, False
+        clamp_lim = 7.0 if clamp_limit is None else float(clamp_limit)
     else:
         raise ValueError(f"unknown activation for the backward: {activation!r}")
 
@@ -193,7 +207,7 @@ def fused_swiglu_bwd_fc2_wgrad(grad_swiglu, fc1_output, recv_weights_sorted,
     kernel_fused_swiglu_bwd_fc2_wgrad[(ncore(), 1, 1)](
         grad_swiglu, grad_swiglu.stride(0),
         fc1_output, fc1_output.stride(0),
-        ffn, recv_weights_sorted, dAB, dscale, M, beta, lbeta,
+        ffn, recv_weights_sorted, dAB, dscale, M, beta, lbeta, clamp_lim,
         grad_fc2_out_sorted, orig_in_c, grad_w,
         split_size_cum_per_expert, expert_counts,
         N, K, E, num_tn, num_tk,

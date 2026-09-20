@@ -425,6 +425,7 @@ def assemble_native_saved(
     # the same one (op lifts the fields in __init__).
     _situ_beta = getattr(op, "situ_beta", None)
     _situ_linear_beta = getattr(op, "situ_linear_beta", None)
+    _clamp_limit = getattr(op, "clamp_limit", None)
     saved.update(
         batch_size=int(hidden_states.shape[0]),
         hidden_dim=int(hidden_states.shape[1]),
@@ -440,6 +441,7 @@ def assemble_native_saved(
         situ_linear_beta=(
             None if _situ_linear_beta is None else float(_situ_linear_beta)
         ),
+        clamp_limit=7.0 if _clamp_limit is None else float(_clamp_limit),
         _routing_generation=int(plan.generation),
         _owner_token=id(op._routing_owner_token),
     )

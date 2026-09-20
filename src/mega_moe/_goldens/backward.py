@@ -96,18 +96,34 @@ def swiglu_bwd(grad_swiglu, saved):
       dGate = grad_swiglu * silu'(gate) * up * scale
       dUp   = grad_swiglu * silu(gate)  * scale
       dScale = sum(silu(gate)*up*grad_swiglu)  (per row)  => grad of recv_weights_sorted
+    For "clamp_swiglu", clamped gate/up replace the raw values and the INCLUSIVE
+    <= boundary zeroes the saturated region's derivative (matching torch.clamp
+    autograd and the triton kernel): deriv of silu(clamp(gate,L)) carries a
+    (gate<=L) mask, and the up derivative options |up|<=L (the only place it
+    differs from plain up) — so clamping only gates the raw inputs here.
     Returns grad_fc1_output [M,2*ffn] (=cat[dGate,dUp]), grad_gate [M]."""
     gate = saved["gate"].float()
     up = saved["up"].float()
     scale = saved["recv_weights_sorted"].float().unsqueeze(-1)
     g = grad_swiglu.float()
-    sigmoid_g = torch.sigmoid(gate)
-    silu_g = gate * sigmoid_g
-    silu_prime = silu_g * (1 - sigmoid_g) + sigmoid_g          # d/dgate silu(gate)
-    dGate = g * silu_prime * up * scale
-    dUp = g * silu_g * scale
+    if saved.get("activation") == "clamp_swiglu":
+        L = float(saved.get("clamp_limit", 7.0))
+        gc = torch.clamp(gate, max=L)                      # silu input (gate saturated at L)
+        uc = torch.clamp(up, min=-L, max=L)                # up saturated at ±L
+        sigmoid_g = torch.sigmoid(gc)
+        silu_g = gc * sigmoid_g
+        silu_prime = (silu_g * (1 - sigmoid_g) + sigmoid_g) * (gate <= L).float()
+        dGate = g * silu_prime * uc * scale
+        dUp = g * silu_g * (up.abs() <= L).float() * scale
+    else:
+        sigmoid_g = torch.sigmoid(gate)
+        silu_g = gate * sigmoid_g
+        silu_prime = silu_g * (1 - sigmoid_g) + sigmoid_g  # d/dgate silu(gate)
+        uc = up
+        dGate = g * silu_prime * up * scale
+        dUp = g * silu_g * scale
     grad_fc1_output = torch.cat([dGate, dUp], dim=-1).to(grad_swiglu.dtype)
-    grad_gate = (silu_g * up * g).sum(dim=-1).to(grad_swiglu.dtype)   # dscale, [M]
+    grad_gate = (silu_g * uc * g).sum(dim=-1).to(grad_swiglu.dtype)   # dscale, [M]
     return grad_fc1_output, grad_gate
 
 

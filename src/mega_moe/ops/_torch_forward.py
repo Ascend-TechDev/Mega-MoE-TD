@@ -174,12 +174,15 @@ def _a2a(input, output_split_sizes, input_split_sizes, group):
 # Gated activation (SwiGLU / SiTU-GLU), differentiable Torch implementation
 # ----------------------------------------------------------------------------
 
-def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta):
+def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta,
+                      clamp_limit=7.0):
     """Gated activation in FP32, mirroring the triton ``weighted_swiglu`` kernel.
 
     ``swiglu``  : ``silu(gate) * up``  = ``gate * sigmoid(gate) * up``
     ``situglu`` : ``beta * tanh(gate / beta) * sigmoid(gate) * up``, with an
                   optional ``linear_beta * tanh(up / linear_beta)`` on ``up``.
+    ``clamp_swiglu`` : ``silu(clamp(gate, max=L)) * clamp(up, -L, L)`` with
+                  ``L = clamp_limit`` (clamp before silu).
 
     ``gate`` and ``up`` are promoted to FP32; the caller casts the result back.
     """
@@ -187,12 +190,19 @@ def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta):
     up = up.float()
     if activation == "swiglu":
         return torch.nn.functional.silu(gate) * up
+    if activation == "clamp_swiglu":
+        return (
+            torch.nn.functional.silu(gate.clamp(max=clamp_limit))
+            * up.clamp(min=-clamp_limit, max=clamp_limit)
+        )
     if activation == "situglu":
         situ_a = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
         if situ_linear_beta is not None:
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
         return situ_a * up
-    raise ValueError(f"activation must be 'swiglu' or 'situglu', got {activation!r}")
+    raise ValueError(
+        f"activation must be 'swiglu', 'clamp_swiglu' or 'situglu', got {activation!r}"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -201,7 +211,8 @@ def _gated_activation(gate, up, activation, situ_beta, situ_linear_beta):
 
 def moe_forward(hidden_states, routing_weights, selected_experts,
                 fc1_1, fc1_2, fc2, ep_group, topk, return_saved=False,
-                activation="swiglu", situ_beta=1.0, situ_linear_beta=None):
+                activation="swiglu", situ_beta=1.0, situ_linear_beta=None,
+                clamp_limit=7.0):
     """EP-MoE forward. routing_weights [B,topk], selected_experts [B,topk] (global ids).
 
     Mirrors GPU torch_moe_fwd / 06 build_moe_fwd_inputs. No token dropping.
@@ -265,7 +276,7 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
     fc1_combined = torch.cat([fc1_1, fc1_2], dim=1)                      # [E, 2*ffn, H]
     fc1_out = grouped_matmul(recv_hidden_sorted, fc1_combined, expert_counts, transpose=True)
     gate, up = fc1_out.chunk(2, dim=-1)                                  # each [M, ffn]
-    swiglu_out = _gated_activation(gate, up, activation, situ_beta, situ_linear_beta)
+    swiglu_out = _gated_activation(gate, up, activation, situ_beta, situ_linear_beta, clamp_limit)
     swiglu_out_weighted = (swiglu_out * recv_weights_sorted.float().unsqueeze(-1)).to(dtype)
     fc2_out = grouped_matmul(swiglu_out_weighted, fc2, expert_counts, transpose=True)  # [M, H]
 
@@ -300,6 +311,9 @@ def moe_forward(hidden_states, routing_weights, selected_experts,
         recv_hidden_sorted=recv_hidden_sorted, fc1_output=fc1_out,
         gate=gate, up=up, swiglu_out_weighted=swiglu_out_weighted,
         recv_weights_sorted=recv_weights_sorted, fc2_out=fc2_out,
+        # activation (so moe_backward_triton can select the clamp derivative)
+        activation=activation, situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta, clamp_limit=clamp_limit,
         # weights
         fc1_1=fc1_1, fc1_2=fc1_2, fc2=fc2, fc1_combined=fc1_combined,
         selected_experts=selected_experts,
