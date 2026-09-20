@@ -163,6 +163,23 @@ Mega-MoE-TD 的主要阶段 median 耗时 如下：
 
 ### Backward
 
+| 模块 | `kernel_moe_backward_mega` | `kernel_moe_backward_mega_recompute` |
+  |---|:---:|:---:|
+  | (env) | `MOE_SAVED_RECOMPUTE=0` | `MOE_SAVED_RECOMPUTE=1` |
+  | dispatch A2A(P1) | √ | √ |
+  | fc2 dgrad(P1) | √ | √ |
+  | swiglu bwd(P2) | √ | √ |
+  | fc2 wgrad(P3) | √ | √ |
+  | fc1 dgrad(P4a) | √ | √ |
+  | reverse A2A push(P4b) | √ | √ |
+  | fc1 wgrad(P5a/P5b) | √ | √ |
+  | topk reduce(P4c) | √ | √ |
+  | MoonEP replica | √ | √ |
+  | act 行重算 | — | √ |
+  | re-dispatch 重发 | — | √ |
+  | re-prefetch | — | √ |
+  | 读 saved fc1_output | √ | √ |
+
 #### Kimi-K3（八卡）
 
 完整*八卡A3*后向`torch(ms) / triton(ms)`：
