@@ -6,6 +6,7 @@ import triton.language as tl
 from triton_dist.language.extra import libshmem_device
 
 from .moonep_planning import _kernel_moonep_b0_b1
+from .dispatch_fc2_bwd import _sys_cnt_tick
 
 # Older Triton hashes dependencies even in constexpr-dead branches. Bind
 # optional APIs without attribute lookups in JIT bodies so MoonEP-off remains
@@ -88,22 +89,88 @@ def _single_moonep_scatter(
             cursors += tl.sum(matches, 1)
 
 
+# MOE_FWD_TIMING=1 instrumentation for the UDMA owner-push issue phase
+# (2026-09-17, the SIMT issue-overhead question).  Stamps read SYS_CNT on
+# the ISSUING (scalar) stream — same caveat as mega_bwd's _mega_stamp: a
+# stamp measures instruction-issue completion, never engine drain.  That is
+# exactly the quantity wanted here: how long the serial WQE-issue phase
+# (put_nbi/quiet/put_signal_nbi register writes inside the SIMT loop) takes
+# from first instruction to last.  Per-program row of ts (int64, 32 wide,
+# row = the pid that owns the peer's QP):
+#   [0] push loop entered (first panel's first instruction about to issue)
+#   [1] last panel's tail-signal instruction issued (push issue phase done)
+#   [2] panel issue start   (overwritten per matching slot within a sweep;
+#   [3] panel issue end      the LAST matching slot's pair survives)
+#   [4]/[5], [6]/[7] same pair per panel id (1-based down panels)
+#   [8:32) FINE ring: one stamp after every put/signal instruction and on
+#   BOTH sides of each quiet, in issue order (TS_FINE=1 only; host splits
+#   it into panels by the per-panel CHUNKS counts).  quiet BLOCKS the
+#   issuing stream until the engine drains, so pre->post-quiet deltas are
+#   engine drain, not issue.  TS_FINE adds a store per WQE and DOES
+#   perturb the issue phase it measures — report COARSE numbers as the
+#   truth, FINE only for per-WQE cadence.
+FWD_TS_SLOTS = 32
+
+
+@triton.jit
+def _fwd_ts(ts_ptr, pid, slot: tl.constexpr, TS_SLOTS: tl.constexpr):
+    dummy = tl.arange(0, 1)
+    tl.store(ts_ptr + pid * TS_SLOTS + slot + dummy,
+             _sys_cnt_tick(dummy))
+
+
 @triton.jit
 def _udma_panel(destination, source, ready, epoch, peer,
-                ELEMENTS: tl.constexpr, CHUNK_ELEMENTS: tl.constexpr):
+                ELEMENTS: tl.constexpr, CHUNK_ELEMENTS: tl.constexpr,
+                ts_ptr, pid, s_start: tl.constexpr, s_end: tl.constexpr,
+                fine_i, TIMING: tl.constexpr,
+                TS_FINE: tl.constexpr):
     CHUNKS: tl.constexpr = triton.cdiv(ELEMENTS, CHUNK_ELEMENTS)
+    if TIMING:
+        _fwd_ts(ts_ptr, pid, s_start, 32)
     for chunk in range(CHUNKS - 1):
         offset = chunk * CHUNK_ELEMENTS
         _udma_put_nbi(destination + offset, source + offset,
                                      CHUNK_ELEMENTS, peer)
+        if TS_FINE:
+            if fine_i < 24:      # ring guard: 24 slots per pid row
+                dummy = tl.arange(0, 1)
+                tl.store(ts_ptr + pid * 32 + 8 + fine_i + dummy,
+                         _sys_cnt_tick(dummy))
+            fine_i += 1
     if CHUNKS > 1:
         # WQEs have NO ordering, even on one QP. A final-chunk notification
         # proves panel readiness only after all prefix chunks have completed.
+        if TS_FINE:
+            # Pre-quiet stamp closes the PURE put-chain issue bracket.  The
+            # quiet itself BLOCKS the issuing stream until the engine drains
+            # every outstanding WQE, so the pre->post-quiet delta is engine
+            # drain time, not instruction issue time.
+            if fine_i < 24:
+                dummy = tl.arange(0, 1)
+                tl.store(ts_ptr + pid * 32 + 8 + fine_i + dummy,
+                         _sys_cnt_tick(dummy))
+            fine_i += 1
         _udma_quiet(peer)
+        if TS_FINE:
+            if fine_i < 24:
+                dummy = tl.arange(0, 1)
+                tl.store(ts_ptr + pid * 32 + 8 + fine_i + dummy,
+                         _sys_cnt_tick(dummy))
+            fine_i += 1
     tail_offset: tl.constexpr = (CHUNKS - 1) * CHUNK_ELEMENTS
     _udma_put_signal_nbi(
         destination + tail_offset, source + tail_offset, ELEMENTS - tail_offset,
         ready, epoch.to(tl.uint64), peer)
+    if TS_FINE:
+        if fine_i < 24:
+            dummy = tl.arange(0, 1)
+            tl.store(ts_ptr + pid * 32 + 8 + fine_i + dummy,
+                     _sys_cnt_tick(dummy))
+        fine_i += 1
+    if TIMING:
+        _fwd_ts(ts_ptr, pid, s_end, 32)
+    return fine_i
 
 
 @triton.jit
@@ -111,9 +178,14 @@ def _single_moonep_push(
         peer, gate_up_ptr, down_ptr, replica_gate_ptr, replica_down_ptr,
         gate_ready_ptr, down_ready_ptr, experts_to_copy_ptr, signal_epoch,
         LOCAL_RANK: tl.constexpr, EPN: tl.constexpr, HIDDEN: tl.constexpr,
-        FFN: tl.constexpr, CHUNK_ELEMENTS: tl.constexpr):
+        FFN: tl.constexpr, CHUNK_ELEMENTS: tl.constexpr,
+        ts_ptr, TIMING: tl.constexpr, TS_FINE: tl.constexpr):
     # Exactly one Vector owns each peer's QP. PIPE_S submission leaves both
     # Vector subcores available for the existing UB activation pipeline.
+    pid = peer
+    fine_i = 0
+    if TIMING:
+        _fwd_ts(ts_ptr, pid, 0, 32)
     for panel in tl.static_range(3):
         for slot in range(EPN):
             expert = tl.load(experts_to_copy_ptr + peer * EPN + slot)
@@ -121,13 +193,21 @@ def _single_moonep_push(
                 local = expert % EPN
                 if panel == 0:
                     elements: tl.constexpr = 2 * HIDDEN * FFN
-                    _udma_panel(replica_gate_ptr + slot * elements,
+                    fine_i = _udma_panel(
+                                replica_gate_ptr + slot * elements,
                                 gate_up_ptr + local * elements,
                                 gate_ready_ptr + slot * 8, signal_epoch,
-                                peer, elements, CHUNK_ELEMENTS)
+                                peer, elements, CHUNK_ELEMENTS,
+                                ts_ptr, pid, 2, 3,
+                                fine_i, TIMING, TS_FINE)
                 else:
                     elements: tl.constexpr = HIDDEN * FFN // 2
-                    _udma_panel(replica_down_ptr + (2 * slot + panel - 1) * elements,
+                    fine_i = _udma_panel(
+                                replica_down_ptr + (2 * slot + panel - 1) * elements,
                                 down_ptr + (2 * local + panel - 1) * elements,
                                 down_ready_ptr + (2 * slot + panel - 1) * 8,
-                                signal_epoch, peer, elements, CHUNK_ELEMENTS)
+                                signal_epoch, peer, elements, CHUNK_ELEMENTS,
+                                ts_ptr, pid, 2 + 2 * panel, 3 + 2 * panel,
+                                fine_i, TIMING, TS_FINE)
+    if TIMING:
+        _fwd_ts(ts_ptr, pid, 1, 32)

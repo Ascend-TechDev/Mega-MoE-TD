@@ -1067,7 +1067,10 @@ def _kernel_fused_forward(
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
         FC2_BLOCK_K: tl.constexpr, ACTIVATION: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
         SAVE_FC1: tl.constexpr, FC1_FP8: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
-        RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr):
+        RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
+        # ---- MOE_FWD_TIMING: UDMA owner-push issue-phase stamps (dead args
+        # when TIMING=0 — fused_moonep.FWD_TS_SLOTS row layout) ----
+        ts_ptr, TIMING: tl.constexpr, TS_FINE: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
     physical_experts: tl.constexpr = EXPERTS_PER_RANK * (2 if MOONEP else 1)
@@ -1142,7 +1145,8 @@ def _kernel_fused_forward(
                         pid, gate_up_weight_ptr, down_weight_ptr, replica_gate_ptr,
                         replica_down_ptr, gate_notify_ptr, down_notify_ptr,
                         experts_to_copy_ptr, signal_epoch, LOCAL_RANK,
-                        EXPERTS_PER_RANK, HIDDEN, FFN, UDMA_CHUNK_ELEMENTS)
+                        EXPERTS_PER_RANK, HIDDEN, FFN, UDMA_CHUNK_ELEMENTS,
+                        ts_ptr, TIMING, TS_FINE)
             libshmem_device.fence()
         al.sync_block_all('all', 15)
     with al.scope(core_mode='vector', disable_auto_sync=True):

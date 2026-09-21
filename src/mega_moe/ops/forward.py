@@ -1513,6 +1513,20 @@ class FusedMoEForward(torch.nn.Module):
         signal_epoch = self._tile_signal_epoch
         if signal_epoch >= torch.iinfo(torch.int32).max:
             raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
+        # MOE_FWD_TIMING=1/2: UDMA owner-push issue-phase SYS_CNT stamps
+        # (fused_moonep._single_moonep_push / _udma_panel; row per peer-QP
+        # program, FWD_TS_SLOTS layout).  =2 adds the per-WQE FINE ring.
+        fwd_timing = int(os.environ.get("MOE_FWD_TIMING", "0"))
+        if self.enable_moonep and fwd_timing:
+            ts_fine = fwd_timing >= 2
+            fwd_ts = torch.zeros(
+                self.world_size, 32, dtype=torch.int64,
+                device=hidden_states.device)
+        else:
+            ts_fine = False
+            fwd_timing = 0
+            # dead arg (TIMING=0 compiles every stamp out)
+            fwd_ts = self.context.routing_weight_mem
         # FC1 holds two (M, N/2) accumulators with the same total L0C footprint.
         launch_options = (
             {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
@@ -1617,9 +1631,51 @@ class FusedMoEForward(torch.nn.Module):
             MOONEP=self.enable_moonep,
             RAW_NUM_BINS=self.context.planning_num_bins,
             UDMA_CHUNK_ELEMENTS=self.config.moonep_udma_chunk_bytes // 2,
+            ts_ptr=fwd_ts, TIMING=bool(fwd_timing), TS_FINE=ts_fine,
             **launch_options,
         )
         self._tile_signal_epoch += 1
+        if fwd_timing:
+            # Stamps ride the issue stream; drain the launch, then report.
+            # SYS_CNT ~20 MHz on this part (see _sys_cnt_tick) -> 50 ns/tick;
+            # calibrate against a known-duration launch before trusting
+            # absolute values — deltas within one launch are consistent.
+            torch.npu.synchronize()
+            tick_ns = 50.0
+            chunk_elems = self.config.moonep_udma_chunk_bytes // 2
+            gu_chunks = -(-(2 * self.hidden_size * ffn_size) // chunk_elems)
+            dn_chunks = -(-(self.hidden_size * ffn_size // 2) // chunk_elems)
+            ts = fwd_ts.cpu()
+            for peer in range(self.world_size):
+                if peer == self.rank:
+                    continue
+                row = ts[peer]
+                if int(row[0]) == 0 and int(row[1]) == 0:
+                    continue  # no owned replica pushed to this peer
+                total = int(row[1] - row[0])
+                parts = []
+                for p in range(3):
+                    s, e = 2 + 2 * p, 3 + 2 * p
+                    if int(row[e]) or int(row[s]):
+                        parts.append(
+                            f"p{p}={int(row[e]) - int(row[s])}t")
+                msg = (
+                    f"[fwd-ts r{self.rank}->p{peer}] "
+                    f"issue_total={total}t ({total * tick_ns / 1e3:.2f}us) "
+                    f"panels({' '.join(parts) or 'none'}) "
+                    f"gu_chunks={gu_chunks} dn_chunks={dn_chunks} "
+                    f"raw={list(int(v) for v in row[:8])}"
+                )
+                if ts_fine:
+                    ring = [int(v) for v in row[8:32] if int(v)]
+                    if len(ring) > 1:
+                        d = [b - a for a, b in zip(ring, ring[1:])]
+                        msg += (
+                            f" FINE(first24): n={len(d)} min={min(d)}"
+                            f" med={sorted(d)[len(d) // 2]} max={max(d)}"
+                            f" ticks/WQE d_seq={d}"
+                        )
+                print(msg, flush=True)
         # Every call rewrites the shared metadata workspaces and the fc1
         # buffer in place; the generation bump lets a consumer reject a saved
         # dict superseded by any later forward on this operator.
