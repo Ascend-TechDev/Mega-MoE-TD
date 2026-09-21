@@ -111,8 +111,8 @@
 #  orchestrator knobs are inert (the early return in ops/backward.py skips
 #  them). MOE_DISPATCH_GEMM_* / MOE_COMBINE_GEMM_* / MOE_COMBINE_PUSH_BN /
 #  MOE_FUSED_WGRAD_BLOCK_M tiles still apply (the kernel reuses those
-#  getters), plus the mega-local MOE_MEGA_WGRAD_BN / MOE_MEGA_WGRAD_BK /
-#  MOE_MEGA_WGRAD_NS wgrad tile knobs, MOE_MEGA_TILE_B3=1 (replace the
+#  getters), plus the mega-local MOE_MEGA_WGRAD_BK / MOE_MEGA_WGRAD_NS
+#  wgrad tile knobs, MOE_MEGA_TILE_B3=1 (replace the
 #  B3 barrier with per-(tile,n) readiness signals; the local cube->vector
 #  fence/signal/dl.wait chain it rests on is proven by probes 3/4,
 #  w8 910B1) and MOE_MEGA_FUSE_P4=1 (the P4a+P4b self-produce-self-push
@@ -2707,11 +2707,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # showed the cube MTE2 (GM->L1 feed) pipe ~93% busy on kimi t4k — wider
     # N/K tiles amortize the transposed feed (L0C=256KB bounds BN*BK*4B).
     wbm = int(os.environ.get("MOE_FUSED_WGRAD_BLOCK_M", str(FUSED_WBM)))
-    # WGRAD_BN default 256 (was the fused 128): the 2026-09-21 knob bisect's
+    # WGRAD_BN fixed at 256 (was the fused 128): the 2026-09-21 knob bisect's
     # it13 winner (balanced 14.55ms / skew 22.08ms, w2 value oracle green) —
-    # wider N amortizes the transposed GM->L1 feed; env override kept for
-    # future sweeps.
-    wbn = int(os.environ.get("MOE_MEGA_WGRAD_BN", "256"))
+    # wider N amortizes the transposed GM->L1 feed.  Hardcoded per user
+    # instruction: no env override, this is simply how the kernel runs.
+    wbn = 256
     wbk = int(os.environ.get("MOE_MEGA_WGRAD_BK", str(FUSED_WBK)))
     wns = int(os.environ.get("MOE_MEGA_WGRAD_NS", "2"))
     dbm, dbn, dbk = _dispatch_gemm_tile()
@@ -3304,25 +3304,22 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
     if saved_recompute:
-        # 2026-09-21 bisect resolution: the it13 winners are now the DEFAULTS
-        # (P2_DUALVEC + REDUCE_DUALVEC below, WGRAD_BN=256 above); the
-        # placement/shape experiment knobs of the masking-iteration round
-        # (ACTREC_MOVE/BM/BN, REDIS_SPLIT/EARLY_FRAC/DUALVEC, SLAB_PREFETCH/
-        # PF_ROWS, W5_SPLIT_FRAC/SWAP, PUSH/GCO_DUALVEC) were deleted — the
-        # three remote-store DUALVEC variants were convicted by the w2 value
-        # oracle (subcore-1 remote stores escape barrier_all's fence), the
-        # rest never beat the baseline cleanly.  P2/REDUCE_DUALVEC keep their
-        # env vars (=0 escape hatch) but default ON.
+        # 2026-09-21 bisect resolution: the it13 winners are baked in with no
+        # switches (P2_DUALVEC + REDUCE_DUALVEC below, WGRAD_BN=256 above) —
+        # this is simply how the kernel runs.  The placement/shape experiment
+        # knobs of the masking-iteration round (ACTREC_MOVE/BM/BN, REDIS_
+        # SPLIT/EARLY_FRAC/DUALVEC, SLAB_PREFETCH/PF_ROWS, W5_SPLIT_FRAC/
+        # SWAP, PUSH/GCO_DUALVEC) were deleted — the three remote-store
+        # DUALVEC variants were convicted by the w2 value oracle (subcore-1
+        # remote stores escape barrier_all's fence), the rest never beat the
+        # baseline cleanly.
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
             send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
             SAVED_RECOMPUTE=True,
             REDIS_BM=64, REDIS_BN=1024,
-            P2_DUALVEC=os.environ.get(
-                "MOE_MEGA_P2_DUALVEC", "1") == "1",
-            REDUCE_DUALVEC=os.environ.get(
-                "MOE_MEGA_REDUCE_DUALVEC", "1") == "1",
+            P2_DUALVEC=True, REDUCE_DUALVEC=True,
             num_warps=8, **launch_options)
     else:
         # the ORIGINAL kernel (kept verbatim above): the non-recompute
