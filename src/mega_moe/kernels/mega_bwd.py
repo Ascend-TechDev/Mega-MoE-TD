@@ -1104,12 +1104,8 @@ def _redispatch_hidden_direct(
     comment)."""
     rows = tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_N)
-    # runtime [task_begin, task_end) carve (REDIS_SPLIT: the early half of
-    # the buckets rides the P23 window; runtime-arg trip counts are the
-    # proven-safe shape here)
     for work_id in range(task_begin + pid, task_end, nprogs):
-        # i32 for dl.symm_at's rank operand — the DUALVEC caller hands this
-        # helper a pid + sub_vec_id()*nprogs sum that lands as i64
+        # i32 for dl.symm_at's rank operand
         dst_rank = (work_id % WORLD_SIZE).to(tl.int32)
         expert_id = work_id // WORLD_SIZE
         task_id = dst_rank * EXPERTS_PER_RANK + expert_id
@@ -1133,92 +1129,6 @@ def _redispatch_hidden_direct(
                 tl.store(
                     remote + dst_rows[:, None] * H + cc[None, :], values,
                     mask=row_mask[:, None] & col_mask[None, :])
-
-
-@triton.jit
-def _recompute_act_rows_tiled(
-    pid, nprogs,
-    fc1_out_ptr, stride_om,
-    scale_ptr,
-    actw_ptr, stride_am,
-    ffn, n_rows,
-    situ_beta, situ_linear_beta,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    HAS_LINEAR_BETA: tl.constexpr,
-    fc1_scale_ptr,
-    FC1_FP8: tl.constexpr, FC1_GROUP_N: tl.constexpr,
-):
-    """The per-row _recompute_act_rows formula over BLOCK_M x BLOCK_N tiles
-    (2026-09-20 masking-iteration variant): the per-row loop's
-    one-row-per-iteration MTE shape (~620GB/s at kimi t4k w4) leaves vector
-    bandwidth on the table; the 2D tile amortizes the row-loop overhead
-    across BLOCK_M rows per load pair.  Same idempotent pure-function-store
-    discipline (pid-strided row blocks, safe on both vec subcores)."""
-    rm = tl.arange(0, BLOCK_M)
-    cm = tl.arange(0, BLOCK_N)
-    for r0 in range(pid * BLOCK_M, n_rows, nprogs * BLOCK_M):
-        rows = r0 + rm
-        rmask = rows < n_rows
-        r64 = rows.to(tl.int64)
-        sc = tl.load(scale_ptr + r64, mask=rmask, other=0.0).to(tl.float32)
-        for c0 in range(0, ffn, BLOCK_N):
-            cols = c0 + cm
-            m2 = rmask[:, None] & (cols[None, :] < ffn)
-            gate = tl.load(
-                fc1_out_ptr + r64[:, None] * stride_om + cols[None, :],
-                mask=m2, other=0.0).to(tl.float32)
-            up = tl.load(
-                fc1_out_ptr + r64[:, None] * stride_om + ffn + cols[None, :],
-                mask=m2, other=0.0).to(tl.float32)
-            if FC1_FP8:
-                gate = gate * tl.load(
-                    fc1_scale_ptr + r64[:, None] * ((2 * ffn) // FC1_GROUP_N)
-                    + cols[None, :] // FC1_GROUP_N, mask=m2, other=0.0)
-                up = up * tl.load(
-                    fc1_scale_ptr + r64[:, None] * ((2 * ffn) // FC1_GROUP_N)
-                    + (ffn + cols[None, :]) // FC1_GROUP_N, mask=m2, other=0.0)
-            if ACTIVATION == 0:
-                act = gate * tl.sigmoid(gate) * up
-            else:
-                situ_a = situ_beta * tl.math.tanh(gate / situ_beta) * tl.sigmoid(gate)
-                if HAS_LINEAR_BETA:
-                    up = situ_linear_beta * tl.math.tanh(up / situ_linear_beta)
-                act = situ_a * up
-            act = act * sc[:, None]
-            tl.store(actw_ptr + r64[:, None] * stride_am + cols[None, :],
-                     act.to(actw_ptr.dtype.element_ty), mask=m2)
-
-
-@triton.jit
-def _slab_prefetch_sweep(
-    pid, nprogs,
-    slab_ptr, rows, H: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    sink_ptr,
-):
-    """Warm the first `rows` rows of the re-dispatch slab into L2 (2026-09-20
-    masking-iteration experiment): P5a's transposed B reads stall on
-    cold/just-remote-written pages (+4.5ms over a contiguous copy in the
-    fused kernel); this masked-load sweep rides the P4b push window (vector
-    engine, mostly idle) so P5a's earliest wgrad tiles hit warm L2.  The
-    loaded values are reduced to one scalar per program and parked in
-    sink_ptr (= wait1_ptr, timing-only) to keep the loads alive — pollutes
-    P1wait_tk when TIMING=1, a known harmless interaction."""
-    rm = tl.arange(0, BLOCK_M)
-    cm = tl.arange(0, BLOCK_N)
-    acc = 0.0
-    for r0 in range(pid * BLOCK_M, rows, nprogs * BLOCK_M):
-        rows_ = r0 + rm
-        rmask = rows_ < rows
-        r64 = rows_.to(tl.int64)
-        for c0 in range(0, H, BLOCK_N):
-            cols = c0 + cm
-            v = tl.load(
-                slab_ptr + r64[:, None] * H + cols[None, :],
-                mask=rmask[:, None] & (cols[None, :] < H), other=0.0)
-            acc += tl.max(v.to(tl.float32))
-    tl.store(sink_ptr + pid, acc.to(tl.int64))
 
 
 @triton.jit
@@ -1853,8 +1763,6 @@ def kernel_moe_backward_mega(
     "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
     "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
     "w5_split", "w5_total",                      # P5 wgrad split geometry
-    "pf_rows6",                                  # slab-prefetch warm rows
-    "redis_early",                               # REDIS_SPLIT bucket cut
 ])
 def kernel_moe_backward_mega_recompute(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
@@ -1978,48 +1886,18 @@ def kernel_moe_backward_mega_recompute(
     redis_src_ptr, stride_rm,              # pre-dispatch token copy [B, H]
     send_src_idx_ptr,                      # send slot -> source row (sort//topk)
     redis_buf_ptr,                         # symmetric slab [rows, H] = P5's B
-    pf_rows6,                              # SLAB_PREFETCH warm-row count
-    redis_early,                           # REDIS_SPLIT early-bucket count
     SAVED_RECOMPUTE: tl.constexpr,
     REDIS_BM: tl.constexpr, REDIS_BN: tl.constexpr,
-    # ---- recompute perf knobs (2026-09-20 masking-iteration round; env-gated
-    # in the wrapper, defaults = the original placement/shape) ----
-    ACTREC_MOVE: tl.constexpr,   # act recompute as its own vec scope AFTER the
-                                 # P1 cube dgrad (overlaps its MTE drain) at
-                                 # the P1gemm>B1 span, instead of inside the
-                                 # gco putmem scope delaying the dgrad start
-    ACTREC_BM: tl.constexpr, ACTREC_BN: tl.constexpr,  # 0/0 = per-row loop;
-                                 # >0 = 2D-tiled act recompute (row-block x
-                                 # col-block, better MTE shape than per-row)
-    REDIS_DUALVEC: tl.constexpr,  # re-dispatch stores on BOTH vec subcores
-                                 # (pid+sv*nprogs strided) instead of sub_vec0
-                                 # only — 2x store issue concurrency
-    SLAB_PREFETCH: tl.constexpr,  # P4b window warms the re-dispatch slab rows
-                                 # (masked loads, checksum parked in wait1_ptr)
-                                 # so P5a's B-matrix reads hit warm L2
-    W5_SWAP: tl.constexpr,        # P5a sweeps the task-range TAIL
-                                 # ([total-split, total)) instead of the head —
-                                 # tests whether the freshest-written slab
-                                 # rows are the slowest first reads
-    PUSH_DUALVEC: tl.constexpr,   # P4b push partitioned across BOTH vec
-                                 # subcores (pid+sv*nprogs strided) instead
-                                 # of sub_vec0 only — under balanced routing
-                                 # the vec path redis+push (~9.2ms) is the
-                                 # B2>B4 window's binding constraint
-    GCO_DUALVEC: tl.constexpr,    # P1's gco putmem sweep partitioned across
-                                 # BOTH subcores (disjoint tiles, one signal
-                                 # each) — C1 was the P1 window's vec bound
-    P2_DUALVEC: tl.constexpr,     # P2 swiglu-bwd rows partitioned across
-                                 # BOTH subcores (the ungated form DUPLICATES
-                                 # the full sweep per subcore)
-    REDUCE_DUALVEC: tl.constexpr, # P4c topk-reduce partitioned the same way
-    REDIS_SPLIT: tl.constexpr,    # re-dispatch split into two dual-partitioned
-                                 # scopes: the first `redis_early` buckets
-                                 # ride the P23 window (the link sits idle
-                                 # there — P2/P3 are local), the remainder
-                                 # stay in the B2->B3 window.  The early
-                                 # stores are cross-rank published by B2
-                                 # (consumer P5a reads behind B3 — safe)
+    # ---- local-phase DUALVEC partitioning (2026-09-21 bisect winners, now the
+    # defaults): P2 swiglu-bwd rows and P4c topk-reduce tokens partitioned
+    # across BOTH vec subcores (virtual pid = pid + sv*nprogs, stride 2*nprogs
+    # — each row/token handled exactly once).  SAFE because both phases are
+    # pure-local reads/writes with disjoint outputs; remote-store phases (P1
+    # gco / P4b push / re-dispatch) must NEVER be dual-partitioned — subcore-1
+    # remote symm_at stores are not fenced by barrier_all (w2 oracle bisect
+    # 2026-09-21 convicted REDIS/PUSH_DUALVEC, GCO same family). ----
+    P2_DUALVEC: tl.constexpr,
+    REDUCE_DUALVEC: tl.constexpr,
 ):
     """One launch for the whole non-MoonEP MoE backward — see the module
     docstring for the phase/barrier map and the M0 probe evidence.  Grid MUST
@@ -2042,27 +1920,7 @@ def kernel_moe_backward_mega_recompute(
     # waiters, the critical path.)
     if P1_ON:
         with al.scope(core_mode="vector", disable_auto_sync=True):
-            if GCO_DUALVEC:
-                # ⚠ UNVERIFIED VALUES, suspect class (2026-09-21): this is a
-                # REMOTE putmem sweep run from both vec subcores — the same
-                # shape that breaks REDIS/PUSH_DUALVEC (remote stores from
-                # subcore 1 not published by the closing barrier).  Timed in
-                # it8/it21 with no value oracle; w2 bisect convicted the
-                # other two remote-store DUAL knobs.  Default off; do not
-                # enable without re-running the w2 oracle.
-                # masking-iteration knob: tiles partitioned across BOTH vec
-                # subcores — disjoint (task, tile) sets, every signal still
-                # SET exactly once; consumers wait slots, not programs
-                _dispatch_grad_source_tiles(
-                    (pid + sub_vec_id() * num_cores).to(tl.int32),
-                    2 * num_cores,
-                    gco_ptr, peer_mem_ptr, signal_mem_ptr,
-                    send_bucket_starts_ptr, send_counts_re_ptr,
-                    send_bucket_dst_starts_ptr,
-                    signal_epoch, H, stride_gm,
-                    LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
-                    MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
-            elif sub_vec_id() == 0:
+            if sub_vec_id() == 0:
                 _dispatch_grad_source_tiles(
                     pid, num_cores,
                     gco_ptr, peer_mem_ptr, signal_mem_ptr,
@@ -2072,29 +1930,14 @@ def kernel_moe_backward_mega_recompute(
                     LOCAL_RANK, WORLD_SIZE, EXPERTS_PER_RANK,
                     MAX_BWD_TILES, PUSH_BLOCK_M, BLOCK_H_PUSH)
             if SAVED_RECOMPUTE:
-                # masking-iteration knobs: ACTREC_BM>0 swaps in the 2D-tiled
-                # row sweep PARTITIONED ACROSS BOTH VEC SUBCORES (the
-                # ungated-duplicate per-row form runs the same rows twice);
-                # ACTREC_MOVE takes the recompute OUT of this scope entirely
-                # (it re-issues after the P1 cube dgrad below)
-                if ACTREC_BM > 0:
-                    _recompute_act_rows_tiled(
-                        pid + sub_vec_id() * num_cores, 2 * num_cores,
-                        AB_ptr, K4,
-                        scale_ptr,
-                        orig_in3_ptr, stride_om3,
-                        ffn, n_rows, situ_beta, situ_linear_beta,
-                        ACTREC_BM, ACTREC_BN, ACTIVATION, HAS_LINEAR_BETA,
-                        fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
-                elif not ACTREC_MOVE:
-                    _recompute_act_rows(
-                        pid, num_cores,
-                        AB_ptr, K4,
-                        scale_ptr,
-                        orig_in3_ptr, stride_om3,
-                        ffn, n_rows, situ_beta, situ_linear_beta,
-                        BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
-                        fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
+                _recompute_act_rows(
+                    pid, num_cores,
+                    AB_ptr, K4,
+                    scale_ptr,
+                    orig_in3_ptr, stride_om3,
+                    ffn, n_rows, situ_beta, situ_linear_beta,
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         if TIMING:
             _phase_stamp(ts_ptr, 1, pid, TS_SLOTS)   # P1 vec dispatch issued
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -2142,33 +1985,6 @@ def kernel_moe_backward_mega_recompute(
                     wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         if TIMING:
             _phase_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
-    # masking-iteration knob (ACTREC_MOVE, SAVED_RECOMPUTE only): the act-row
-    # recompute re-issued as its OWN vec scope after the P1 cube dgrad — the
-    # dgrad's MTE drain overlaps this scope's vector execution (the
-    # adjacent-scope engine recipe), where inside the gco scope above it sat
-    # BEFORE the dgrad and pushed the P1 window's critical path out by its
-    # full duration (fused split 2026-09-20: P1vec 1.29->2.82).  B1 (next)
-    # still publishes the act rows to P3 — publication timing is unchanged.
-    if SAVED_RECOMPUTE and ACTREC_MOVE:
-        with al.scope(core_mode="vector", disable_auto_sync=True):
-            if ACTREC_BM > 0:
-                _recompute_act_rows_tiled(
-                    pid + sub_vec_id() * num_cores, 2 * num_cores,
-                    AB_ptr, K4,
-                    scale_ptr,
-                    orig_in3_ptr, stride_om3,
-                    ffn, n_rows, situ_beta, situ_linear_beta,
-                    ACTREC_BM, ACTREC_BN, ACTIVATION, HAS_LINEAR_BETA,
-                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
-            else:
-                _recompute_act_rows(
-                    pid, num_cores,
-                    AB_ptr, K4,
-                    scale_ptr,
-                    orig_in3_ptr, stride_om3,
-                    ffn, n_rows, situ_beta, situ_linear_beta,
-                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
-                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
     # TILE_B1 replaces the barrier: P1's cube GEMM SETs a local slot per
     # (expert, n_tile, m_window) grad_swiglu tile, the P2 windowed consumer
@@ -2202,8 +2018,9 @@ def kernel_moe_backward_mega_recompute(
                         fc1_scale_ptr=fc1_scale_ptr,
                         FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
             elif P2_DUALVEC:
-                # masking-iteration knob: rows partitioned across BOTH subcores
-                # (the ungated form duplicated the full sweep per subcore)
+                # default path (2026-09-21 bisect winner): rows partitioned
+                # across BOTH subcores — the ungated form duplicated the full
+                # sweep per subcore instead of splitting it
                 _mega_swiglu_bwd(
                     (pid + sub_vec_id() * num_cores).to(tl.int32),
                     2 * num_cores,
@@ -2222,25 +2039,6 @@ def kernel_moe_backward_mega_recompute(
                     situ_beta, situ_linear_beta,
                     BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                     fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
-        if SAVED_RECOMPUTE and REDIS_SPLIT:
-            # masking-iteration knob: the FIRST redis_early buckets of the
-            # re-dispatch ride THIS window — the link sits idle here (P2/P3
-            # are local-only) while the B2->B3 window is link-bound (the
-            # it2 null result: push subcore partitioning alone bought
-            # nothing, the remote path itself is the constraint).  Stores
-            # are published cross-rank by the window's closing B2; the only
-            # consumer (P5a) reads behind B3.
-            with al.scope(core_mode="vector", disable_auto_sync=True):
-                _redispatch_hidden_direct(
-                    (pid + sub_vec_id() * num_cores).to(tl.int32),
-                    2 * num_cores,
-                    redis_src_ptr, stride_rm,
-                    send_src_idx_ptr, redis_buf_ptr,
-                    send_bucket_starts_ptr, send_counts_re_ptr,
-                    send_bucket_dst_starts_ptr,
-                    0, redis_early,
-                    H, WORLD_SIZE, EXPERTS_PER_RANK,
-                    REDIS_BM, REDIS_BN)
         with al.scope(core_mode="cube", disable_auto_sync=True):
             # grad_fc2_out_sorted IS peer_mem's first [M, H] rows (stride H).
             _mega_wgrad_sweep(
@@ -2286,42 +2084,12 @@ def kernel_moe_backward_mega_recompute(
     # and the only consumer is the B5->B6 owner-pull — no new barrier needed.
     if SAVED_RECOMPUTE:
         with al.scope(core_mode="vector", disable_auto_sync=True):
-            if REDIS_SPLIT:
-                # remainder buckets (dual-partitioned like the early half
-                # riding the P23 window)
-                _redispatch_hidden_direct(
-                    (pid + sub_vec_id() * num_cores).to(tl.int32),
-                    2 * num_cores,
-                    redis_src_ptr, stride_rm,
-                    send_src_idx_ptr, redis_buf_ptr,
-                    send_bucket_starts_ptr, send_counts_re_ptr,
-                    send_bucket_dst_starts_ptr,
-                    redis_early, WORLD_SIZE * EXPERTS_PER_RANK,
-                    H, WORLD_SIZE, EXPERTS_PER_RANK,
-                    REDIS_BM, REDIS_BN)
-            elif REDIS_DUALVEC:
-                # ⚠ BROKEN (w2 oracle bisect 2026-09-21): remote symm_at
-                # stores issued from vec subcore 1 are NOT fenced/published
-                # by the closing barrier_all — P5a reads a stale slab and
-                # every consumer grad goes garbage (all-5 relative ~1.0 on
-                # the interleave oracle).  Remote-store helpers must stay
-                # behind the sub_vec_id()==0 gate (see _mega_push_rows'
-                # docstring contract).  Default off; do not enable.
-                # masking-iteration knob: stores from BOTH vec subcores
-                # (pid + sv*nprogs offset, 2*nprogs stride covers the same
-                # task set) — the sub_vec0-only form leaves half the vector
-                # store issue concurrency idle at ~40GB/s effective remote
-                _redispatch_hidden_direct(
-                    (pid + sub_vec_id() * num_cores).to(tl.int32),
-                    2 * num_cores,
-                    redis_src_ptr, stride_rm,
-                    send_src_idx_ptr, redis_buf_ptr,
-                    send_bucket_starts_ptr, send_counts_re_ptr,
-                    send_bucket_dst_starts_ptr,
-                    0, WORLD_SIZE * EXPERTS_PER_RANK,
-                    H, WORLD_SIZE, EXPERTS_PER_RANK,
-                    REDIS_BM, REDIS_BN)
-            elif sub_vec_id() == 0:
+            # sub_vec0-gated on purpose: remote symm_at stores from vec
+            # subcore 1 are NOT fenced/published by the closing barrier_all
+            # (w2 oracle bisect 2026-09-21 convicted the dual-partitioned
+            # variant — P5a read a stale slab; see _mega_push_rows'
+            # docstring contract).
+            if sub_vec_id() == 0:
                 _redispatch_hidden_direct(
                     pid, num_cores,
                     redis_src_ptr, stride_rm,
@@ -2480,24 +2248,10 @@ def kernel_moe_backward_mega_recompute(
                             num_tiles_m4, num_tiles_n4,
                             H, M4,
                             BLOCK_N_PUSH, GATE_PAD_C)
-                elif PUSH_DUALVEC:
-                    # ⚠ BROKEN (w2 oracle bisect 2026-09-21): same
-                    # remote-store-from-subcore-1 defect as REDIS_DUALVEC —
-                    # deadlocks the B4 barrier at w2 (dist workers hang) and
-                    # partially corrupts grad_fc1_* where it doesn't.
-                    # Violates _mega_push_rows' sub_vec0 gate contract.
-                    # Default off; do not enable.
-                    # masking-iteration knob: rows partitioned across BOTH
-                    # vec subcores (disjoint, idempotent per row) — halves
-                    # the B2>B4 window's vec-path serial time
-                    _mega_push_rows(
-                        pid + sub_vec_id() * num_cores, 2 * num_cores,
-                        hidden_buf_ptr,
-                        write_rank_by_src_ptr, write_off_by_src_ptr,
-                        combine_buf_ptr, dscale_ptr,
-                        H, M4,
-                        BLOCK_N_PUSH, GATE_PAD_C)
                 else:
+                    # sub_vec0-gated on purpose: remote symm_at stores from
+                    # vec subcore 1 are not fenced by barrier_all (w2 oracle
+                    # bisect 2026-09-21 — see _mega_push_rows' docstring).
                     if sub_vec_id() == 0:
                         _mega_push_rows(
                             pid, num_cores,
@@ -2506,15 +2260,6 @@ def kernel_moe_backward_mega_recompute(
                             combine_buf_ptr, dscale_ptr,
                             H, M4,
                             BLOCK_N_PUSH, GATE_PAD_C)
-
-                if SAVED_RECOMPUTE and SLAB_PREFETCH:
-                    # masking-iteration knob: warm the re-dispatch slab rows
-                    # (P5a's B matrix) beside the push — P5a's slab reads
-                    # otherwise pay the cold/just-written-page amplification
-                    _slab_prefetch_sweep(
-                        pid, num_cores,
-                        redis_buf_ptr, pf_rows6, H,
-                        REDIS_BM, REDIS_BN, wait1_ptr)
 
     # P5a (cube wgrad, first half of tasks): with FUSE_P4 it follows the
     # fused loop, overlapping only the per-program tail pushes (adjacent
@@ -2530,8 +2275,7 @@ def kernel_moe_backward_mega_recompute(
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
                 N5, K5, num_tn5, num_tk5,
-                (w5_total - w5_split) if W5_SWAP else 0,
-                w5_total if W5_SWAP else w5_split, max_rows_w,
+                0, w5_split, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -2553,8 +2297,9 @@ def kernel_moe_backward_mega_recompute(
     if P4_ON:
         with al.scope(core_mode="vector", disable_auto_sync=True):
             if REDUCE_DUALVEC:
-                # masking-iteration knob: token rows partitioned across BOTH
-                # subcores (the ungated form duplicated the sweep)
+                # default path (2026-09-21 bisect winner): token rows
+                # partitioned across BOTH subcores — the ungated form
+                # duplicated the sweep
                 _mega_reduce(
                     (pid + sub_vec_id() * num_cores).to(tl.int32),
                     2 * num_cores,
@@ -2580,8 +2325,7 @@ def kernel_moe_backward_mega_recompute(
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
                 N5, K5, num_tn5, num_tk5,
-                0 if W5_SWAP else w5_split,
-                (w5_total - w5_split) if W5_SWAP else w5_total, max_rows_w,
+                w5_split, w5_total, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -2963,7 +2707,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # showed the cube MTE2 (GM->L1 feed) pipe ~93% busy on kimi t4k — wider
     # N/K tiles amortize the transposed feed (L0C=256KB bounds BN*BK*4B).
     wbm = int(os.environ.get("MOE_FUSED_WGRAD_BLOCK_M", str(FUSED_WBM)))
-    wbn = int(os.environ.get("MOE_MEGA_WGRAD_BN", str(FUSED_WBN)))
+    # WGRAD_BN default 256 (was the fused 128): the 2026-09-21 knob bisect's
+    # it13 winner (balanced 14.55ms / skew 22.08ms, w2 value oracle green) —
+    # wider N amortizes the transposed GM->L1 feed; env override kept for
+    # future sweeps.
+    wbn = int(os.environ.get("MOE_MEGA_WGRAD_BN", "256"))
     wbk = int(os.environ.get("MOE_MEGA_WGRAD_BK", str(FUSED_WBK)))
     wns = int(os.environ.get("MOE_MEGA_WGRAD_NS", "2"))
     dbm, dbn, dbk = _dispatch_gemm_tile()
@@ -2994,12 +2742,6 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # satisfies both at the measured t4k rank0 numbers, push 4.91ms vs
     # W/2 4.95ms).
     w5_split = w5_total // 2
-    if saved_recompute:
-        # masking-iteration knob: env-tunable split point (default = the
-        # canonical 50/50).  w5_split is do_not_specialize'd — sweeps move
-        # the runtime arg without minting a new binary.
-        w5_split = int(w5_total * float(
-            os.environ.get("MOE_MEGA_W5_SPLIT_FRAC", "0.5")))
 
     # step-2 activation derivative selection (ops/backward.py semantics)
     activation = saved.get("activation", "swiglu")
@@ -3562,43 +3304,25 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
     if saved_recompute:
-        # masking-iteration knobs (2026-09-20): env-gated placement/shape
-        # overrides for the two recompute riders, defaults = the original
-        # placement (act rows in the P1 gco scope, per-row loop; re-dispatch
-        # sub_vec0-only at 64x1024; no slab prefetch; P5a sweeps the
-        # task-range head).  See the kernel signature's knob paragraph.
-        pf_rows6 = min(
-            M, max(0, int(os.environ.get("MOE_MEGA_PF_ROWS", "8192"))))
-        # REDIS_SPLIT early-bucket count (runtime arg — the frac sweeps
-        # without a recompile)
-        redis_early = int(float(os.environ.get(
-            "MOE_MEGA_REDIS_EARLY_FRAC", "0.5")) * W * EPR)
+        # 2026-09-21 bisect resolution: the it13 winners are now the DEFAULTS
+        # (P2_DUALVEC + REDUCE_DUALVEC below, WGRAD_BN=256 above); the
+        # placement/shape experiment knobs of the masking-iteration round
+        # (ACTREC_MOVE/BM/BN, REDIS_SPLIT/EARLY_FRAC/DUALVEC, SLAB_PREFETCH/
+        # PF_ROWS, W5_SPLIT_FRAC/SWAP, PUSH/GCO_DUALVEC) were deleted — the
+        # three remote-store DUALVEC variants were convicted by the w2 value
+        # oracle (subcore-1 remote stores escape barrier_all's fence), the
+        # rest never beat the baseline cleanly.  P2/REDUCE_DUALVEC keep their
+        # env vars (=0 escape hatch) but default ON.
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
             send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
-            pf_rows6=pf_rows6, redis_early=redis_early,
             SAVED_RECOMPUTE=True,
-            REDIS_BM=int(os.environ.get("MOE_MEGA_REDIS_BM", "64")),
-            REDIS_BN=int(os.environ.get("MOE_MEGA_REDIS_BN", "1024")),
-            ACTREC_MOVE=os.environ.get("MOE_MEGA_ACTREC_MOVE", "0") == "1",
-            ACTREC_BM=int(os.environ.get("MOE_MEGA_ACTREC_BM", "0")),
-            ACTREC_BN=int(os.environ.get("MOE_MEGA_ACTREC_BN", "0")),
-            REDIS_DUALVEC=os.environ.get(
-                "MOE_MEGA_REDIS_DUALVEC", "0") == "1",
-            SLAB_PREFETCH=os.environ.get(
-                "MOE_MEGA_SLAB_PREFETCH", "0") == "1",
-            W5_SWAP=os.environ.get("MOE_MEGA_W5_SWAP", "0") == "1",
-            PUSH_DUALVEC=os.environ.get(
-                "MOE_MEGA_PUSH_DUALVEC", "0") == "1",
-            GCO_DUALVEC=os.environ.get(
-                "MOE_MEGA_GCO_DUALVEC", "0") == "1",
+            REDIS_BM=64, REDIS_BN=1024,
             P2_DUALVEC=os.environ.get(
-                "MOE_MEGA_P2_DUALVEC", "0") == "1",
+                "MOE_MEGA_P2_DUALVEC", "1") == "1",
             REDUCE_DUALVEC=os.environ.get(
-                "MOE_MEGA_REDUCE_DUALVEC", "0") == "1",
-            REDIS_SPLIT=os.environ.get(
-                "MOE_MEGA_REDIS_SPLIT", "0") == "1",
+                "MOE_MEGA_REDUCE_DUALVEC", "1") == "1",
             num_warps=8, **launch_options)
     else:
         # the ORIGINAL kernel (kept verbatim above): the non-recompute
