@@ -15,7 +15,12 @@ import torch.distributed
 
 from ..config import MoEForwardConfig
 from ..kernels.dispatch_fc1 import _kernel_dispatch_fc1
-from ..kernels.fused_forward import _kernel_fused_forward
+from ..kernels.fused_forward import (
+    FWD_ACC_SLOTS,
+    FWD_TS_SLOTS,
+    _kernel_fused_forward,
+    fwd_ring_slots,
+)
 from ..kernels.replica_weight_prefetch import (
     _kernel_compact_local_replica_descriptors,
 )
@@ -131,9 +136,10 @@ class FusedMoEForward(torch.nn.Module):
         )
         self.num_aicore_programs = self.config.num_aicore_programs
         self.num_aivector_programs = self.config.num_aivector_programs
-        # Saved-forward FC1 format switch (see MoEForwardConfig.fc1_save_fp8):
-        # fixes the workspace dtype for this operator's lifetime.
-        self._fc1_save_fp8 = self.config.fc1_save_fp8
+        # Saved-forward FC1 format switch (see
+        # MoEForwardConfig.save_fc1_dtype): fixes the workspace dtype for
+        # this operator's lifetime.
+        self._save_fc1_dtype = self.config.save_fc1_dtype
         if (
             self.enable_single_kernel_forward
             and self.world_size > self.num_aicore_programs
@@ -197,6 +203,14 @@ class FusedMoEForward(torch.nn.Module):
         self._single_send_token_indices = None
         self._single_send_route_indices = None
         self._single_wave_expert_offsets = None
+        # MOE_FWD_TIMING=1 single-kernel phase stamps (dead-arg buffers,
+        # allocated with the single-kernel workspaces).
+        self._fwd_ts_buf = None
+        self._fwd_acc_buf = None
+        self._fwd_ring_buf = None
+        self._fwd_fc2w_buf = None
+        self._fwd_ring_slots = 0
+        self._fwd_timing_last = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
         # True when _replica_weight_buffers came from the session pool
@@ -342,6 +356,12 @@ class FusedMoEForward(torch.nn.Module):
         self._single_send_token_indices = None
         self._single_send_route_indices = None
         self._single_wave_expert_offsets = None
+        self._fwd_ts_buf = None
+        self._fwd_acc_buf = None
+        self._fwd_ring_buf = None
+        self._fwd_fc2w_buf = None
+        self._fwd_ring_slots = 0
+        self._fwd_timing_last = None
         self.context.finalize()
 
     def _ensure_replica_weight_buffers(
@@ -584,19 +604,26 @@ class FusedMoEForward(torch.nn.Module):
             )
             # Raw pre-activation gate/up GEMM results for the saved forward
             # (same [receive rows, gate F | up F] layout as the staged path's
-            # fc1_output workspace).  fc1_save_fp8=True quantizes to FP8 E4M3
-            # plus the per-row/per-group FP32 scales — roughly half the BF16
-            # memory; the default keeps the raw BF16 tiles (the quantize leg
-            # overflows UB on some tile shapes, see the config field).
+            # fc1_output workspace).  save_fc1_dtype selects the format:
+            # "fp8" quantizes to FP8 E4M3 plus the per-row/per-group FP32
+            # scales — roughly half the BF16 memory (the quantize leg
+            # overflows UB on some tile shapes, see the config field);
+            # "fp16" is a plain FP16 copy of the raw values (the A/B
+            # experiment branch — no scale table, 2x the save traffic, no
+            # quantize work); the default keeps the raw BF16 tiles.
+            save_fc1 = self.config.save_fc1_dtype
             self._single_fc1_output = torch.empty(
                 expected_fc1_output,
                 dtype=(
-                    torch.float8_e4m3fn
-                    if self._fc1_save_fp8
+                    torch.float8_e4m3fn if save_fc1 == "fp8"
+                    else torch.float16 if save_fc1 == "fp16"
                     else self.activation_dtype
                 ),
                 device=device,
             )
+            # The non-FP8 variants store raw values directly; the scale
+            # workspace stays allocated anyway (dead arg — the kernel only
+            # reads it on the FP8 path).
             self._single_fc1_scale = torch.empty(
                 expected_fc1_scale,
                 dtype=torch.float32,
@@ -640,6 +667,37 @@ class FusedMoEForward(torch.nn.Module):
                 device_id=self.rank,
             )
             self._single_pipeline_signal_storage.zero_()
+            # MOE_FWD_TIMING dead-arg buffers: the launch always receives
+            # valid pointers; TIMING=0 compiles every stamp/store out.
+            self._fwd_ring_slots = fwd_ring_slots(
+                self._single_pipeline_max_groups,
+                self.physical_experts_per_rank,
+            )
+            self._fwd_ts_buf = torch.zeros(
+                (self.num_aicore_programs, FWD_TS_SLOTS),
+                dtype=torch.int64,
+                device=device,
+            )
+            # One acc row per part (vec lane 0 / lane 1 / cube), like the
+            # ring: each part stores its whole accumulator vector.
+            self._fwd_acc_buf = torch.zeros(
+                (self.num_aicore_programs * 3, FWD_ACC_SLOTS),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._fwd_ring_buf = torch.zeros(
+                (self.num_aicore_programs * 3, self._fwd_ring_slots, 4),
+                dtype=torch.int64,
+                device=device,
+            )
+            # Per-core FC2 per-wave walls (lane-0 single writer); the wave
+            # bound is the pipeline group bound.
+            self._fwd_fc2w_buf = torch.zeros(
+                (self.num_aicore_programs,
+                 self._single_pipeline_max_groups),
+                dtype=torch.int64,
+                device=device,
+            )
         elif (
             tuple(self._single_weighted_activation.shape) != expected_activation
             or tuple(self._single_fc1_output.shape) != expected_fc1_output
@@ -1450,6 +1508,23 @@ class FusedMoEForward(torch.nn.Module):
             return output, weighted_activation
         return output
 
+    def read_last_forward_phase_timing(self):
+        """Return the last single-kernel launch's SYS_CNT phase products.
+
+        Meaningful only under ``MOE_FWD_TIMING=1`` — otherwise the stamp and
+        accumulator stores are compiled out and the buffers stay zero.  The
+        returned device tensors are ``{"ts": [cores, 10],
+        "acc": [cores*3, 8], "ring": [cores*3, ring_slots, 3]}`` (raw SYS_CNT
+        ticks; see ``benchmark/layer/_fwd_phase_timing.py`` for the slot
+        tables and the reduction).  The caller owns synchronization: copy to
+        host only after the launch drained (the saved-forward path's host
+        reads already do).
+        """
+        if self._fwd_timing_last is None:
+            raise RuntimeError("no single-kernel forward has run on this operator")
+        ts, acc, ring, fc2w = self._fwd_timing_last
+        return {"ts": ts, "acc": acc, "ring": ring, "fc2w": fc2w}
+
     def _forward_single_kernel(
         self,
         hidden_states: torch.Tensor,
@@ -1513,20 +1588,6 @@ class FusedMoEForward(torch.nn.Module):
         signal_epoch = self._tile_signal_epoch
         if signal_epoch >= torch.iinfo(torch.int32).max:
             raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
-        # MOE_FWD_TIMING=1/2: UDMA owner-push issue-phase SYS_CNT stamps
-        # (fused_moonep._single_moonep_push / _udma_panel; row per peer-QP
-        # program, FWD_TS_SLOTS layout).  =2 adds the per-WQE FINE ring.
-        fwd_timing = int(os.environ.get("MOE_FWD_TIMING", "0"))
-        if self.enable_moonep and fwd_timing:
-            ts_fine = fwd_timing >= 2
-            fwd_ts = torch.zeros(
-                self.world_size, 32, dtype=torch.int64,
-                device=hidden_states.device)
-        else:
-            ts_fine = False
-            fwd_timing = 0
-            # dead arg (TIMING=0 compiles every stamp out)
-            fwd_ts = self.context.routing_weight_mem
         # FC1 holds two (M, N/2) accumulators with the same total L0C footprint.
         launch_options = (
             {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
@@ -1546,6 +1607,16 @@ class FusedMoEForward(torch.nn.Module):
             enable_dynamic_cv_pipeline=False, enable_mixed_cv=True,
             disable_auto_inject_block_sync=True, set_workspace_multibuffer=0,
             limit_auto_multi_buffer_buffer="only-cube")
+        # MOE_FWD_TIMING=1: SYS_CNT phase stamps ride the same launch.  The
+        # per-launch reset matters for the ring/acc: slots a program never
+        # stores (skipped experts, idle lanes) must read zero, not the
+        # previous call's ticks.
+        timing_on = os.environ.get("MOE_FWD_TIMING", "0") == "1"
+        if timing_on:
+            self._fwd_ts_buf.zero_()
+            self._fwd_acc_buf.zero_()
+            self._fwd_ring_buf.zero_()
+            self._fwd_fc2w_buf.zero_()
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
             selected_experts,
@@ -1597,6 +1668,10 @@ class FusedMoEForward(torch.nn.Module):
                 if self.situ_linear_beta is not None
                 else 0.0
             ),
+            self._fwd_ts_buf,
+            self._fwd_acc_buf,
+            self._fwd_ring_buf,
+            self._fwd_fc2w_buf,
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_for_gemm.stride(0),
@@ -1626,56 +1701,23 @@ class FusedMoEForward(torch.nn.Module):
             ACTIVATION=0 if self.activation == "swiglu" else 1,
             HAS_LINEAR_BETA=self.situ_linear_beta is not None,
             SAVE_FC1=return_saved,
-            FC1_FP8=self._fc1_save_fp8,
+            FC1_FP8=self._save_fc1_dtype == "fp8",
+            FC1_SAVE_FP16=self._save_fc1_dtype == "fp16",
             PIPELINE_GROUP_WINDOWS=self.config.single_kernel_group_windows,
             MOONEP=self.enable_moonep,
             RAW_NUM_BINS=self.context.planning_num_bins,
             UDMA_CHUNK_ELEMENTS=self.config.moonep_udma_chunk_bytes // 2,
-            ts_ptr=fwd_ts, TIMING=bool(fwd_timing), TS_FINE=ts_fine,
+            TS_SLOTS=FWD_TS_SLOTS,
+            ACC_SLOTS=FWD_ACC_SLOTS,
+            RING_SLOTS=self._fwd_ring_slots,
+            TIMING=timing_on,
             **launch_options,
         )
         self._tile_signal_epoch += 1
-        if fwd_timing:
-            # Stamps ride the issue stream; drain the launch, then report.
-            # SYS_CNT ~20 MHz on this part (see _sys_cnt_tick) -> 50 ns/tick;
-            # calibrate against a known-duration launch before trusting
-            # absolute values — deltas within one launch are consistent.
-            torch.npu.synchronize()
-            tick_ns = 50.0
-            chunk_elems = self.config.moonep_udma_chunk_bytes // 2
-            gu_chunks = -(-(2 * self.hidden_size * ffn_size) // chunk_elems)
-            dn_chunks = -(-(self.hidden_size * ffn_size // 2) // chunk_elems)
-            ts = fwd_ts.cpu()
-            for peer in range(self.world_size):
-                if peer == self.rank:
-                    continue
-                row = ts[peer]
-                if int(row[0]) == 0 and int(row[1]) == 0:
-                    continue  # no owned replica pushed to this peer
-                total = int(row[1] - row[0])
-                parts = []
-                for p in range(3):
-                    s, e = 2 + 2 * p, 3 + 2 * p
-                    if int(row[e]) or int(row[s]):
-                        parts.append(
-                            f"p{p}={int(row[e]) - int(row[s])}t")
-                msg = (
-                    f"[fwd-ts r{self.rank}->p{peer}] "
-                    f"issue_total={total}t ({total * tick_ns / 1e3:.2f}us) "
-                    f"panels({' '.join(parts) or 'none'}) "
-                    f"gu_chunks={gu_chunks} dn_chunks={dn_chunks} "
-                    f"raw={list(int(v) for v in row[:8])}"
-                )
-                if ts_fine:
-                    ring = [int(v) for v in row[8:32] if int(v)]
-                    if len(ring) > 1:
-                        d = [b - a for a, b in zip(ring, ring[1:])]
-                        msg += (
-                            f" FINE(first24): n={len(d)} min={min(d)}"
-                            f" med={sorted(d)[len(d) // 2]} max={max(d)}"
-                            f" ticks/WQE d_seq={d}"
-                        )
-                print(msg, flush=True)
+        if timing_on:
+            self._fwd_timing_last = (
+                self._fwd_ts_buf, self._fwd_acc_buf, self._fwd_ring_buf,
+                self._fwd_fc2w_buf)
         # Every call rewrites the shared metadata workspaces and the fc1
         # buffer in place; the generation bump lets a consumer reject a saved
         # dict superseded by any later forward on this operator.
@@ -1708,12 +1750,13 @@ class FusedMoEForward(torch.nn.Module):
         saved = {
             # Raw pre-activation gate/up GEMM results, expert-major receive
             # rows, [rows, gate F | up F] — one of the two intermediates the
-            # redesigned backward keeps.  With fc1_save_fp8=True this tensor
-            # is FP8 E4M3 and the companion FP32 scale pair below carries one
-            # value per row and per fc1_scale_group_size-wide column group
-            # (dequant: fc1_output.float() * scale[:, group]), together about
-            # half the BF16 save; the default keeps the raw BF16 tiles and
-            # omits the scale keys.  Either way it is materialized as a copy:
+            # redesigned backward keeps.  Format follows save_fc1_dtype:
+            # "fp8" stores E4M3 and the companion FP32 scale pair below
+            # carries one value per row and per fc1_scale_group_size-wide
+            # column group (dequant: fc1_output.float() * scale[:, group]),
+            # together about half the BF16 save; "fp16" keeps a plain FP16
+            # copy and the default keeps the raw BF16 tiles — both omit the
+            # scale keys.  Either way it is materialized as a copy:
             # the source is a fixed-address workspace rewritten by every
             # call, and framework hosts share one operator across same-shape
             # MoE layers, so the NEXT layer's forward would clobber the view
@@ -1765,7 +1808,7 @@ class FusedMoEForward(torch.nn.Module):
             "_routing_generation": self._routing_generation,
             "_owner_token": id(self._routing_owner_token),
         }
-        if self._fc1_save_fp8:
+        if self._save_fc1_dtype == "fp8":
             saved["fc1_output_scale"] = self._single_fc1_scale[
                 :num_received_routes
             ].clone()
@@ -1798,10 +1841,10 @@ class FusedMoEForward(torch.nn.Module):
           launch saves the raw FC1 gate/up GEMM result into a fixed-address
           buffer, and ``saved`` holds that ``fc1_output`` tensor
           (expert-major receive rows, ``[rows, gate F | up F]``).  With
-          ``config.fc1_save_fp8=True`` it is quantized to FP8 E4M3 with
-          per-row/per-column-group FP32 ``fc1_output_scale`` (about half the
-          BF16 memory); the default keeps raw BF16.  Plus the dispatch in
-          pre-dispatch form —
+          ``config.save_fc1_dtype="fp8"`` it is quantized to FP8 E4M3 with
+          per-row/per-column-group FP32 ``fc1_output_scale`` (about half
+          the BF16 memory); ``"fp16"`` keeps a plain FP16 copy; the
+          default keeps raw BF16.  Plus the dispatch in pre-dispatch form —
           receive-layout tables and references to the forward's own inputs,
           letting the backward re-gather dispatched rows from
           ``hidden_states`` instead of a materialized

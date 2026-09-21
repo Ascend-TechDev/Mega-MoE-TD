@@ -18,7 +18,12 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 from config import resolve_case
-from mega_moe.kernels.fused_forward import _kernel_fused_forward
+from mega_moe.kernels.fused_forward import (
+    FWD_ACC_SLOTS,
+    FWD_TS_SLOTS,
+    _kernel_fused_forward,
+    fwd_ring_slots,
+)
 
 
 def main():
@@ -31,6 +36,14 @@ def main():
     parser.add_argument("--save-fc1", action="store_true",
                         help="compile the return_saved variant that mirrors "
                              "the raw FC1 GEMM results")
+    parser.add_argument("--save-dtype", choices=("bf16", "fp8", "fp16"),
+                        default="bf16",
+                        help="saved-FC1 format with --save-fc1: raw BF16 "
+                             "(bf16, default), E4M3 + scales (fp8), or a "
+                             "plain FP16 copy")
+    parser.add_argument("--timing", action="store_true",
+                        help="compile the MOE_FWD_TIMING variant with the "
+                             "SYS_CNT phase stamps/ring enabled")
     parser.add_argument("--wave-windows", type=int,
                         help="M tiles per compute wave (default: 32 with MoonEP, otherwise 16)")
     parser.add_argument("--dump-sync-ir", action="store_true")
@@ -63,6 +76,9 @@ def main():
     if h % fc1_k or f % fc2_k or h % fc2_n or (2 * f) % fc1_n:
         parser.error("GEMM N/K tiles must divide the weight dimensions")
     max_recv = math.ceil(case.tokens * case.topk * case.capacity_factor)
+    physical_experts = case.experts_per_rank * (2 if args.moonep else 1)
+    max_pipeline_groups = triton.cdiv(
+        max_recv + physical_experts * (fc1_m - 1), windows * fc1_m)
     constants = dict(
         stride_hidden_m=h, stride_hidden_k=1,
         stride_gate_up_e=h * 2 * f, stride_gate_up_n=1, stride_gate_up_k=2 * f,
@@ -73,14 +89,18 @@ def main():
         HIDDEN=h, FFN=f, MAX_RECEIVED_ROUTES=max_recv,
         NUM_BINS_PAD=triton.next_power_of_2(case.num_experts * (2 if args.moonep else 1)),
         MAX_SOURCE_TILES=triton.cdiv(case.tokens * case.topk, 128),
-        MAX_PIPELINE_GROUPS=triton.cdiv(
-            max_recv + case.experts_per_rank * (2 if args.moonep else 1) * (fc1_m - 1), windows * fc1_m),
+        MAX_PIPELINE_GROUPS=max_pipeline_groups,
         DISPATCH_BLOCK_M=128, FC1_BLOCK_M=fc1_m, FC1_BLOCK_N=fc1_n,
         FC1_BLOCK_K=fc1_k, FC2_BLOCK_N=fc2_n, FC2_BLOCK_K=fc2_k,
         ACTIVATION=0, HAS_LINEAR_BETA=False, SAVE_FC1=args.save_fc1,
+        FC1_SAVE_FP16=args.save_fc1 and args.save_dtype == "fp16",
+        FC1_FP8=args.save_fc1 and args.save_dtype == "fp8",
         PIPELINE_GROUP_WINDOWS=windows,
         MOONEP=args.moonep, RAW_NUM_BINS=triton.next_power_of_2(case.num_experts + 1),
         UDMA_CHUNK_ELEMENTS=32 * 1024 * 1024,
+        TS_SLOTS=FWD_TS_SLOTS, ACC_SLOTS=FWD_ACC_SLOTS,
+        RING_SLOTS=fwd_ring_slots(max_pipeline_groups, physical_experts),
+        TIMING=args.timing,
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",
@@ -88,8 +108,8 @@ def main():
         "weighted_activation_ptr", "output_ptr",
         "replica_gate_ptr", "replica_down_ptr",
     }
-    # The saved FC1 mirror stores E4M3-quantized gate/up results.
-    fp8_inputs = {"fc1_output_ptr"}
+    # The saved FC1 mirror's dtype rides --save-dtype (raw BF16, E4M3, FP16).
+    save_inputs = {"fc1_output_ptr"}
     fp32_inputs = {
         "routing_weights_ptr", "routing_weight_recv_ptr", "fc1_scale_ptr",
     }
@@ -99,13 +119,16 @@ def main():
             signature[name] = "constexpr"
         elif name in bf16_inputs:
             signature[name] = "*bf16"
-        elif name in fp8_inputs:
-            signature[name] = "*fp8e4nv"
+        elif name in save_inputs:
+            signature[name] = {
+                "bf16": "*bf16", "fp8": "*fp8e4nv", "fp16": "*fp16",
+            }[args.save_dtype]
         elif name in fp32_inputs:
             signature[name] = "*fp32"
         elif name in ("gate_notify_ptr", "down_notify_ptr"):
             signature[name] = "*u64"
-        elif name in ("expert_count_ptr", "transfers_ptr", "allocation_ptr"):
+        elif name in ("expert_count_ptr", "transfers_ptr", "allocation_ptr",
+                      "ts_ptr", "acc_ptr", "ring_ptr", "fc2w_ptr"):
             signature[name] = "*i64"
         elif name.endswith("_ptr"):
             signature[name] = "*i32"

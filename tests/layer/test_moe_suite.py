@@ -32,11 +32,14 @@ from mega_moe.ops._moonep_torch_forward import (
 from mega_moe.ops._torch_forward import moe_forward
 from mega_moe.kernels.common import all_gather_list
 import mega_moe.kernels.fc2_combine as fc2_combine_module
+import mega_moe.kernels.fused_forward as fused_forward_module
+from benchmark.layer import _fwd_phase_timing as fwd_timing_table
 from mega_moe.kernels.moonep_planning import launch_moonep_b0_b3
 from mega_moe.runtime.moonep_planning import (
     build_inverse_experts_to_copy,
     plan_moonep_b0_b3,
 )
+from mega_moe.runtime.replica_weight_prefetch import replica_pool_snapshot
 from benchmark.layer import bench_moe_suite as bench_module
 from mega_moe.kernels.weighted_swiglu import (
     _BLOCK_M as _WEIGHTED_BLOCK_M,
@@ -359,9 +362,14 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
 
 def run_single_kernel_forward_case(
     rank: int, world_size: int, fc1_block_m: int = 256, tokens: int = 64,
-    num_experts: int = 8,
+    num_experts: int = 8, save_fc1_dtype: str = "bf16",
 ) -> None:
-    """Exercise the one-launch home-expert path against the Torch oracle."""
+    """Exercise the one-launch home-expert path against the Torch oracle.
+
+    ``save_fc1_dtype`` selects the saved-FC1 format asserted in the
+    return_saved sub-case (the "bf16" raw default, "fp8" E4M3 + scales, or
+    the "fp16" plain-copy A/B branch); the fp8 opt-in is additionally
+    exercised with a halved M tile through its own operator below."""
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("single-kernel forward requires NPU and ACLSHMEM")
 
@@ -385,6 +393,7 @@ def run_single_kernel_forward_case(
             config=MoEForwardConfig(
                 receive_capacity_factor=float(world_size),
                 enable_single_kernel_forward=True,
+                save_fc1_dtype=save_fc1_dtype,
                 fc1_gemm_block_size_m=fc1_block_m,
                 fc2_combine_block_size_m=fc1_block_m,
             ),
@@ -553,7 +562,11 @@ def run_single_kernel_forward_case(
                 "_routing_generation",
                 "_owner_token",
             }
+            if save_fc1_dtype == "fp8":
+                saved_keys |= {"fc1_output_scale", "fc1_scale_group_size"}
             experts_per_rank = num_experts // world_size
+            group_n = op.config.fc1_gemm_block_size_n // 2
+            num_groups = (2 * ffn) // group_n
             send_tables_ok = (
                 saved["send_token_indices"].shape
                 == saved["send_route_indices"].shape
@@ -591,17 +604,90 @@ def run_single_kernel_forward_case(
                 and recv_layout_ok
                 and tuple(saved["fc1_output"].shape)
                 == tuple(replay_saved["fc1_output"].shape)
-                # Default format: raw BF16 gate/up tiles, no scale keys.
-                and saved["fc1_output"].dtype == torch.bfloat16
             )
+            if save_fc1_dtype == "fp8":
+                saved_ok &= (
+                    # FP8 E4M3 payload + per-row/per-group FP32 scales.
+                    saved["fc1_output"].dtype == torch.float8_e4m3fn
+                    and saved["fc1_output_scale"].dtype == torch.float32
+                    and int(saved["fc1_scale_group_size"]) == group_n
+                    and tuple(saved["fc1_output_scale"].shape)
+                    == (int(saved["total_recv"]), num_groups)
+                )
+            elif save_fc1_dtype == "fp16":
+                # Plain FP16 copy of the raw gate/up values.
+                saved_ok &= saved["fc1_output"].dtype == torch.float16
+            else:
+                # Default format: raw BF16 gate/up tiles, no scale keys.
+                saved_ok &= saved["fc1_output"].dtype == torch.bfloat16
             if saved_ok:
                 try:
-                    assert_close(
-                        saved["fc1_output"].float(),
-                        replay_saved["fc1_output"].float(),
-                        rtol=NATIVE_SAVED_H2_RTOL,
-                        atol=NATIVE_SAVED_H2_ATOL,
-                    )
+                    ref = replay_saved["fc1_output"].float()
+                    if save_fc1_dtype == "fp8":
+                        # Grouped error bound for the E4M3 quantized save:
+                        # dequantize with the saved scales and compare
+                        # against the replay oracle per column group.  E4M3
+                        # round-to-nearest is bounded by 1/16 of the value
+                        # (a truncating backend doubles that to 1/8), and
+                        # the two GEMM implementations themselves differ by
+                        # ~2e-2, so a 0.15 x group-amax bound covers both
+                        # with margin.
+                        deq = (
+                            saved["fc1_output"].float()
+                            .view(int(saved["total_recv"]), num_groups,
+                                  group_n)
+                            * saved["fc1_output_scale"][:, :, None]
+                        ).view(ref.shape)
+                        group_amax = (
+                            ref.view(ref.shape[0], num_groups, group_n)
+                            .abs()
+                            .amax(dim=-1)
+                        )
+                        err = (deq - ref).abs().view(
+                            ref.shape[0], num_groups, group_n
+                        )
+                        if not bool((err <= 0.15 * group_amax + 1e-3).all()):
+                            raise AssertionError(
+                                "dequantized fc1 exceeds the grouped error "
+                                f"bound (max {float(err.max().item()):.4f})"
+                            )
+                        # The scale must be the group amax / 448 (E4M3 max);
+                        # near-zero groups keep the kernel's 1/448 sentinel,
+                        # and the relative GEMM difference between the two
+                        # sides inflates small amaxes, so the bound stays
+                        # loose — its job is catching a misaligned scale
+                        # table, which would explode the error bound above,
+                        # not re-measuring fp8.
+                        expected_scale = torch.where(
+                            group_amax > 1e-3, group_amax,
+                            torch.ones_like(group_amax),
+                        ) / 448.0
+                        assert_close(
+                            saved["fc1_output_scale"],
+                            expected_scale,
+                            rtol=1e-1,
+                            atol=1e-3,
+                        )
+                    elif save_fc1_dtype == "fp16":
+                        # The FP16 copy keeps the raw GEMM values: only the
+                        # two implementations' ~2e-2 difference plus fp16
+                        # rounding show up.
+                        err = (saved["fc1_output"].float() - ref).abs()
+                        if not bool(
+                            (err <= 0.15 * ref.abs() + 1e-3).all()
+                        ):
+                            raise AssertionError(
+                                "fp16 fc1 exceeds the grouped error bound "
+                                f"(max {float(err.max().item()):.4f})"
+                            )
+                    else:
+                        # Default BF16: the raw values — only the two GEMM
+                        # implementations' ~2e-2 difference shows up.
+                        assert_close(
+                            saved["fc1_output"].float(), ref,
+                            rtol=NATIVE_SAVED_H2_RTOL,
+                            atol=NATIVE_SAVED_H2_ATOL,
+                        )
                 except AssertionError:
                     saved_ok = False
             if not saved_ok:
@@ -613,8 +699,8 @@ def run_single_kernel_forward_case(
                 )
             all_passed &= saved_ok
 
-            # fc1_save_fp8=True opt-in (!59 contract): FP8 E4M3 payload plus
-            # per-row/per-group FP32 scales.  The in-kernel quantize leg
+            # save_fc1_dtype="fp8" opt-in (!59 contract): FP8 E4M3 payload
+            # plus per-row/per-group FP32 scales.  The in-kernel quantize leg
             # raises the fused launch's Unified Buffer demand, so this op
             # halves the M tile to stay under budget at this suite shape.
             fp8_op = FusedMoEForward(
@@ -628,7 +714,7 @@ def run_single_kernel_forward_case(
                     enable_single_kernel_forward=True,
                     fc1_gemm_block_size_m=min(fc1_block_m, 128),
                     fc2_combine_block_size_m=min(fc1_block_m, 128),
-                    fc1_save_fp8=True,
+                    save_fc1_dtype="fp8",
                 ),
             )
             try:
@@ -719,6 +805,71 @@ def run_single_kernel_forward_case(
                 all_passed &= fp8_ok
             finally:
                 fp8_op.finalize()
+
+            # MOE_FWD_TIMING=1 smoke: the same launch carries the SYS_CNT
+            # phase stamps.  The unsaved run must leave the ring's save
+            # column zero (SAVE_FC1=0 compiles the block out); the saved
+            # run stamps every checkpoint on a monotone per-program clock.
+            previous_timing_env = os.environ.get("MOE_FWD_TIMING")
+            os.environ["MOE_FWD_TIMING"] = "1"
+            try:
+                with torch.no_grad():
+                    op.forward(
+                        hs, expert_indices, packed_w1, w2, routing_weights)
+                torch.npu.synchronize(device)
+                plain_timing = op.read_last_forward_phase_timing()
+                with torch.no_grad():
+                    _, timing_saved = op.forward(
+                        saved_hs, saved_experts, packed_w1, w2, saved_weights,
+                        return_saved=True,
+                    )
+                torch.npu.synchronize(device)
+                saved_timing = op.read_last_forward_phase_timing()
+
+                timing_ok = (
+                    fused_forward_module.FWD_TS_SLOTS
+                    == fwd_timing_table.FWD_TS_SLOTS
+                    and fused_forward_module.FWD_ACC_SLOTS
+                    == fwd_timing_table.FWD_ACC_SLOTS
+                    and int(fused_forward_module.FWD_RING_COLS)
+                    == fwd_timing_table.FWD_RING_COLS
+                    and fused_forward_module.fwd_ring_slots(5, 16)
+                    == fwd_timing_table.fwd_ring_slots(5, 16)
+                )
+                for products in (plain_timing, saved_timing):
+                    ts = products["ts"]
+                    timing_ok &= tuple(ts.shape) == (
+                        op.num_aicore_programs, fwd_timing_table.FWD_TS_SLOTS)
+                    timing_ok &= bool((ts > 0).all())
+                    timing_ok &= bool((ts[:, 1:] >= ts[:, :-1]).all())
+                    timing_ok &= tuple(products["acc"].shape) == (
+                        op.num_aicore_programs * 3,
+                        fwd_timing_table.FWD_ACC_SLOTS)
+                    timing_ok &= bool((products["acc"] >= 0).all())
+                    timing_ok &= tuple(products["ring"].shape) == (
+                        op.num_aicore_programs * 3, op._fwd_ring_slots,
+                        fwd_timing_table.FWD_RING_COLS,
+                    )
+                save_column = int(fused_forward_module.FWD_RING_SAVE)
+                timing_ok &= int(
+                    plain_timing["ring"][:, :, save_column].abs().sum().item()
+                ) == 0
+                if int(timing_saved["total_recv"]) > 0:
+                    timing_ok &= int(
+                        saved_timing["ring"][:, :, save_column].sum().item()
+                    ) > 0
+                if not timing_ok:
+                    print(
+                        f"[rank {rank}] single-kernel-forward-w{world_size}: "
+                        "MOE_FWD_TIMING products violated the stamp contract",
+                        flush=True,
+                    )
+                all_passed &= timing_ok
+            finally:
+                if previous_timing_env is None:
+                    os.environ.pop("MOE_FWD_TIMING", None)
+                else:
+                    os.environ["MOE_FWD_TIMING"] = previous_timing_env
         finally:
             op.finalize()
 
@@ -1795,6 +1946,12 @@ def _assert_gradients_match_golden(
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ep_group)
     if rank == 0 and not bool(flag.item()):
         print(f"{label} gradient details: {details}", flush=True)
+    # research instrumentation (2026-09-18): the collective MIN reduce means
+    # the failing rank's details never print when rank0 is fine — always
+    # print on the locally-failing rank.
+    if not all_ok:
+        print(f"{label} rank{rank} LOCAL-FAIL gradient details: {details}",
+              flush=True)
     if not bool(flag.item()):
         raise AssertionError(
             f"{label} physical backward mismatched the logical golden"
@@ -2720,6 +2877,14 @@ def run_moonep_backward_symmetric_moderate_wide_case(
                     op._replica_weight_buffers.down,
                     ep_group=ep_group,
                 )
+                # Pooling-era contract keys (MOE_MEGA_REPREFETCH=1): the
+                # oracle-built saved predates pooling, so mirror the three
+                # entries _native_saved._attach_moonep_plan_sections adds.
+                saved_phys.update(
+                    replica_buffers=op._replica_weight_buffers,
+                    replica_gate_ready=op.context.replica_gate_ready,
+                    replica_down_ready=op.context.replica_down_ready,
+                )
                 _assert_physical_saved_layout(saved_phys, tokens, topk)
                 assert_close(
                     output, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
@@ -2918,11 +3083,11 @@ NATIVE_SAVED_H2_FLOAT_KEYS = (
 NATIVE_SAVED_H2_RTOL = 2e-2
 NATIVE_SAVED_H2_ATOL = 2e-2
 
-# Zero-copy weight references (§3.1 F).  The native side saves views of the
-# forward inputs — ``fc1_combined`` is ``gate_up_weight.transpose(1, 2)`` as a
-# stride view, ``fc1_1``/``fc1_2`` are slice-transpose views, ``fc2`` is the
-# down weight itself — while the replay side rebuilds its twins from the
-# unpacked weights (its ``fc1_combined`` is the contiguous ``cat`` product).
+# Zero-copy weight references (§3.1 F).  Both sides save ``fc1_combined`` as
+# ``gate_up_weight.transpose(1, 2)`` stride views of the packed table (the
+# replay side matches the production layout since the MOE_MEGA_REPREFETCH
+# flat RMA push reads its natural storage order), ``fc1_1``/``fc1_2`` are
+# slice-transpose views, ``fc2`` is the down weight itself.
 # ``pack_gate_up_weights`` is the exact inverse of those views and both sides
 # of this harness are built from the same ``w_gate``/``w_up``/``w2`` tensors,
 # so values, dtype, and shape must agree bit-for-bit.  Aliasing the forward
@@ -4147,6 +4312,239 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
             kit.ash.aclshmem_free_tensor(peer_mem)
 
 
+def _perturb_weights_layer_local(
+    w_local, layer, rank, world_size, num_experts, amp=0.05,
+):
+    """Add layer-only, rank-sliced full-table ±amp noise to local weights.
+
+    The session pool hands every same-shape layer the same symmetric replica
+    table, and the stock weight makers use fixed seeds — every layer would
+    own identical weights and a stale-table read would be invisible.  The
+    noise comes from a FULL ``[num_experts, ...]`` table seeded only by the
+    layer, sliced to this rank's experts, so every rank agrees on every
+    expert's true weight while each layer differs measurably.
+    """
+    epr = num_experts // world_size
+    g = torch.Generator(device="cpu").manual_seed(9100 + 13 * layer)
+    full = (
+        torch.rand((num_experts,) + tuple(w_local.shape[1:]), generator=g) * 2
+        - 1
+    ) * amp
+    return (
+        w_local
+        + full[rank * epr:(rank + 1) * epr].to(
+            dtype=w_local.dtype, device=w_local.device
+        )
+    ).contiguous()
+
+
+def run_moonep_multilayer_pool_epoch_case(rank: int, world_size: int) -> None:
+    """Cross-layer staleness regression for the pooled replica tables.
+
+    L same-shape operators (one per MoE layer) share the session-level
+    replica-table pool.  Every layer runs forward -> native backward +
+    symmetric grad transport in order, twice: step 2 reseeds the inputs, so a
+    layer consuming a stale pooled table — another layer's weights, its own
+    step-1 weights, or gradients/zeroes left by a previous transport — fails
+    the gradient oracle.  The pooled epochs must also advance strictly across
+    the whole (layer, step) sequence, all layers must resolve to one buffers
+    object with pool refcount L, and finalize must drain the pool.
+    """
+    if world_size not in (2, 4):
+        raise ValueError(
+            "the multi-layer pool epoch case requires two or four ranks"
+        )
+    if os.environ.get("MEGAMOE_REPLICA_POOL") != "1":
+        raise RuntimeError(
+            "the multi-layer pool epoch case requires MEGAMOE_REPLICA_POOL=1"
+        )
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError(
+            "the multi-layer pool epoch case requires NPU and ACLSHMEM"
+        )
+
+    tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
+    num_layers = 3
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = "moonep-multilayer-pool-epoch"
+
+    with kit.aclshmem_session(
+        rank, world_size, kit.get_ash_size_bytes(default_gb=2)
+    ):
+        # Backward scratch, reused layer by layer (the session's first
+        # symmetric allocation keeps the dl.symm_at offset-0 contract).
+        peer_mem = kit.make_moonep_backward_peer_mem(
+            tokens * topk, tokens * topk, hidden, dtype, rank, ep_group
+        )
+        ops = []
+        layer_weights = []
+        try:
+            for layer in range(num_layers):
+                op = FusedMoEForward(
+                    ep_group,
+                    max_tokens_per_rank=tokens,
+                    hidden_size=hidden,
+                    top_k=topk,
+                    num_experts=num_experts,
+                    config=MoEForwardConfig(
+                        receive_capacity_factor=1.0,
+                        enable_moonep=True,
+                    ),
+                )
+                w_gate, w_up = make_gate_up_weights(
+                    num_experts, hidden, ffn, world_size, rank, dtype, device
+                )
+                w_gate = _perturb_weights_layer_local(
+                    w_gate, layer, rank, world_size, num_experts
+                )
+                w_up = _perturb_weights_layer_local(
+                    w_up, layer, rank, world_size, num_experts
+                )
+                packed_w1 = pack_gate_up_weights(w_gate, w_up)
+                w2 = _perturb_weights_layer_local(
+                    make_down_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype, device
+                    ),
+                    layer, rank, world_size, num_experts,
+                )
+                ops.append(op)
+                layer_weights.append((packed_w1, w2, w_gate, w_up))
+
+            if os.environ.get("MOONEP_TEST_BALANCED") == "1":
+                # M1 discriminator (2026-09-20): near-uniform round-robin
+                # routing — the documented concentrated-routing whole-kernel
+                # miscompile (mega_bwd.py:147-164) must not fire here.
+                expert_indices = (
+                    torch.arange(tokens * topk, dtype=torch.int32)
+                    .view(tokens, topk) % num_experts
+                ).to(device)
+            else:
+                expert_indices = torch.zeros(
+                    (tokens, topk), dtype=torch.int32, device=device
+                )
+            routing_weights = torch.empty(
+                (tokens, topk), dtype=torch.float32, device=device
+            )
+            routing_weights[:, 0] = 0.25
+            routing_weights[:, 1] = 0.75
+
+            epoch_sequence = []
+            for step in (0, 1):
+                for layer, (op, (packed_w1, w2, w_gate, w_up)) in enumerate(
+                    zip(ops, layer_weights)
+                ):
+                    hs, _ = prepare_inputs(
+                        tokens,
+                        hidden,
+                        num_experts,
+                        topk,
+                        dtype,
+                        device,
+                        seed=2153 + rank + 77 * step,
+                    )
+                    torch.manual_seed(2154 + rank + 77 * step)
+                    dy = torch.randn(tokens, hidden, dtype=dtype, device=device)
+                    expected = torch_moe_fwd_golden(
+                        hs,
+                        routing_weights,
+                        expert_indices,
+                        w_gate,
+                        w_up,
+                        w2,
+                        num_experts,
+                        ep_group,
+                    )
+                    with torch.no_grad():
+                        produced, native_saved = op.forward(
+                            hs,
+                            expert_indices,
+                            packed_w1,
+                            w2,
+                            routing_weights,
+                            return_saved=True,
+                        )
+                    assert_close(
+                        produced, expected, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+                    )
+                    epoch_sequence.append(op._replica_weight_epoch)
+                    transport = op.lend_replica_weight_tables_for_grad()
+                    with torch.no_grad():
+                        _, home_saved = moe_forward(
+                            hs,
+                            routing_weights,
+                            expert_indices,
+                            w_gate,
+                            w_up,
+                            w2,
+                            ep_group,
+                            topk,
+                            return_saved=True,
+                        )
+                        torch_result = backward_torch_baseline(home_saved, dy)
+                        triton_result = moe_backward_triton(
+                            native_saved,
+                            dy,
+                            peer_mem,
+                            grad_transport=transport,
+                            hidden_states=hs,
+                        )
+                    _assert_gradients_match_golden(
+                        rank,
+                        triton_result,
+                        torch_result,
+                        ep_group,
+                        f"{label}-L{layer}-s{step}",
+                    )
+                    accumulated = _assert_symmetric_transport_stages(
+                        rank,
+                        transport,
+                        {},
+                        triton_result,
+                        ep_group,
+                        f"{label}-L{layer}-s{step}",
+                    )
+                    contributions = torch.tensor(
+                        [accumulated], dtype=torch.int64, device=device
+                    )
+                    dist.all_reduce(
+                        contributions, op=dist.ReduceOp.SUM, group=ep_group
+                    )
+                    if int(contributions.item()) <= 0:
+                        raise AssertionError(
+                            "no owner pulled a replica weight gradient back"
+                        )
+
+            if any(
+                later <= earlier
+                for earlier, later in zip(epoch_sequence, epoch_sequence[1:])
+            ):
+                raise AssertionError(
+                    f"pooled replica epochs must strictly increase across "
+                    f"layers/steps, got {epoch_sequence}"
+                )
+            snapshot = replica_pool_snapshot()
+            if len(snapshot) != 1 or list(snapshot.values()) != [num_layers]:
+                raise AssertionError(
+                    "all same-shape layers must pool into one entry with "
+                    f"refcount {num_layers}, got {snapshot}"
+                )
+            if len({id(op._replica_weight_buffers) for op in ops}) != 1:
+                raise AssertionError(
+                    "pooled layers did not resolve to one buffers object"
+                )
+        finally:
+            for op in ops:
+                op.finalize()
+        snapshot = replica_pool_snapshot()
+        if snapshot:
+            raise AssertionError(
+                f"finalize must drain the replica pool, got {snapshot}"
+            )
+        kit.ash.aclshmem_free_tensor(peer_mem)
+
+
 def _megamoe_function_grads(leaves, ffn_dim):
     """Map the Function's autograd grads onto the five canonical check keys.
 
@@ -5023,6 +5421,14 @@ def test_single_kernel_forward_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
+def test_single_kernel_forward_fp16_saved_w2(dist_test):
+    dist_test(
+        run_single_kernel_forward_case, world_size=2, args=(256, 64, 8, "fp16")
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 @pytest.mark.parametrize(
     "tokens,block_m", [(3, 256), (4097, 256), (4097, 128)],
     ids=("tiny-tail", "m256-multi-wave", "m128-multi-wave"),
@@ -5198,6 +5604,18 @@ def test_moonep_native_saved_hot_expert(dist_test, world_size):
 def test_moonep_native_backward_symmetric_hot_expert(dist_test, world_size):
     dist_test(
         run_moonep_native_backward_symmetric_hot_expert_case,
+        world_size=world_size,
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("world_size", (2, 4))
+def test_moonep_multilayer_pool_epoch(dist_test, world_size):
+    if os.environ.get("MEGAMOE_REPLICA_POOL") != "1":
+        pytest.skip("the pooled-table epoch case requires MEGAMOE_REPLICA_POOL=1")
+    dist_test(
+        run_moonep_multilayer_pool_epoch_case,
         world_size=world_size,
     )
 
