@@ -17,11 +17,12 @@ from .common import _sys_cnt_tick
 from .dispatch_fc1 import _dispatch_one_source_tile_task
 from .fc2_combine import _fc2_gemm_one_mn_tile
 from .moonep_planning import (
-    _kernel_moonep_b2, _kernel_moonep_alloc_cumsum, _kernel_moonep_b3,
+    _moonep_b2_home, _kernel_moonep_alloc_cumsum, _moonep_b3_destination,
 )
-from .balanced_routing import _kernel_build_balanced_count_cube
+from .balanced_routing import _balanced_count_cube_destination
 from .fused_moonep import (
-    _single_moonep_b0, _single_moonep_scatter, _single_moonep_push, _udma_quiet,
+    _single_moonep_b0, _single_moonep_scatter, _single_moonep_push,
+    _single_moonep_source_prefix, _udma_quiet,
 )
 
 _ROUTE_BLOCK = tl.constexpr(256)
@@ -191,7 +192,7 @@ def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
 def _publish_count_row(
     core_bucket_cursor_ptr,
     counts_mem_ptr,
-    LOCAL_RANK: tl.constexpr,
+    LOCAL_RANK,
     WORLD_SIZE: tl.constexpr,
     NUM_PROGRAM_CORES: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
@@ -239,7 +240,7 @@ def _publish_count_row(
 def _build_destination_metadata(
         dst_rank, counts_mem_ptr, send_bucket_starts_ptr,
         send_bucket_dst_starts_ptr, recv_counts_re_ptr, recv_per_expert_ptr,
-        recv_expert_offs_ptr, stats_ptr, LOCAL_RANK: tl.constexpr,
+        recv_expert_offs_ptr, stats_ptr, LOCAL_RANK,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
         NUM_BINS_PAD: tl.constexpr):
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
@@ -309,7 +310,7 @@ def _build_pull_destination_starts(
     source_rank,
     counts_mem_ptr,
     pull_tile_dst_start_ptr,
-    LOCAL_RANK: tl.constexpr,
+    LOCAL_RANK,
     WORLD_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
@@ -390,27 +391,89 @@ def _scatter_stable_routes(pid, selected_experts_ptr, core_bucket_cursor_ptr,
 
 
 @triton.jit
+def _build_recv_segment_starts(
+        pid, recv_counts_re_ptr, recv_seg_starts_ptr, NUM_CORES: tl.constexpr,
+        EXPERTS_PER_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
+        BLOCK_W: tl.constexpr):
+    """Per-expert source segment starts, layout [EPR, W + 1] with sentinel.
+
+    The [W] sentinel holds the expert's total received rows.  The wait and
+    return paths binary-search this table instead of scanning every source,
+    which dominated the FC1 critical path at wide worlds.
+    """
+    lanes = tl.arange(0, BLOCK_W)
+    # Masked lanes still form their physical address on this backend; clamp
+    # the padded lanes into the table before they reach a pointer (non
+    # power-of-two worlds pad BLOCK_W past WORLD_SIZE).
+    safe_lanes = tl.minimum(lanes, WORLD_SIZE - 1)
+    for expert in range(pid, EXPERTS_PER_RANK, NUM_CORES):
+        counts = tl.load(
+            recv_counts_re_ptr + safe_lanes * EXPERTS_PER_RANK + expert,
+            mask=lanes < WORLD_SIZE,
+            other=0,
+        )
+        tl.store(
+            recv_seg_starts_ptr + expert * (WORLD_SIZE + 1) + safe_lanes,
+            tl.cumsum(counts, 0) - counts,
+            mask=lanes < WORLD_SIZE,
+        )
+        tl.store(
+            recv_seg_starts_ptr + expert * (WORLD_SIZE + 1) + WORLD_SIZE,
+            tl.sum(counts, 0),
+        )
+
+
+@triton.jit
 def _wait_dispatch_row_range(
-        signal_mem_ptr, recv_counts_re_ptr, expert_id, row_start, row_end,
+        signal_mem_ptr, recv_seg_starts_ptr, expert_id, row_start, row_end,
         signal_epoch, WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
-        MAX_SOURCE_TILES: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr):
-    source_start = 0
+        MAX_SOURCE_TILES: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr):
+    """Wait for every source tile overlapping [row_start, row_end) of an expert.
+
+    Two W.bit_length()-step binary searches over the segment-start table
+    bracket the overlapping sources; the walk then visits exactly those.
+    The old O(W) linear scan sat on the FC1 Cube critical path.
+    """
+    seg_row = recv_seg_starts_ptr + expert_id * (WORLD_SIZE + 1)
+    # Bracket the overlapping sources with two interleaved binary searches:
+    # the first source whose segment ends after row_start, and the first
+    # whose segment starts at or past row_end.  Interleaving halves the
+    # serial dependent steps on the FC1 critical path.
+    lo_a = 0
+    hi_a = WORLD_SIZE
+    lo_b = 0
+    hi_b = WORLD_SIZE
+    for _ in range(SEARCH_STEPS):
+        active_a = lo_a < hi_a
+        mid_a = tl.where(active_a, (lo_a + hi_a) // 2, 0)
+        safe_a = tl.minimum(mid_a, WORLD_SIZE - 1)
+        seg_end = tl.load(seg_row + safe_a + 1)
+        take_a = active_a & (seg_end <= row_start)
+        lo_a = tl.where(take_a, mid_a + 1, lo_a)
+        hi_a = tl.where(take_a, hi_a, tl.where(active_a, mid_a, hi_a))
+        active_b = lo_b < hi_b
+        mid_b = tl.where(active_b, (lo_b + hi_b) // 2, 0)
+        safe_b = tl.minimum(mid_b, WORLD_SIZE - 1)
+        seg_begin = tl.load(seg_row + safe_b)
+        take_b = active_b & (seg_begin < row_end)
+        lo_b = tl.where(take_b, mid_b + 1, lo_b)
+        hi_b = tl.where(take_b, hi_b, tl.where(active_b, mid_b, hi_b))
+    first_source = lo_a
+    last_source = lo_b
     ready_token = 0
-    for source_id in range(0, WORLD_SIZE):
-        source_size = tl.load(recv_counts_re_ptr +
-                              source_id * EXPERTS_PER_RANK + expert_id)
-        source_end = source_start + source_size
+    for source_id in range(first_source, last_source):
+        source_start = tl.load(seg_row + source_id)
+        source_end = tl.load(seg_row + source_id + 1)
         overlap_start = tl.maximum(row_start, source_start)
         overlap_end = tl.minimum(row_end, source_end)
-        if overlap_start < overlap_end:
-            first_tile = (overlap_start - source_start) // DISPATCH_BLOCK_M
-            last_tile = (overlap_end - source_start - 1) // DISPATCH_BLOCK_M
-            signal_slot = ((source_id * EXPERTS_PER_RANK + expert_id)
-                           * MAX_SOURCE_TILES + first_tile)
-            ready_token += dl.wait(
-                signal_mem_ptr + signal_slot * 16, last_tile - first_tile + 1,
-                'gpu', 'acquire', waitValue=signal_epoch)
-        source_start = source_end
+        first_tile = (overlap_start - source_start) // DISPATCH_BLOCK_M
+        last_tile = (overlap_end - source_start - 1) // DISPATCH_BLOCK_M
+        signal_slot = ((source_id * EXPERTS_PER_RANK + expert_id)
+                       * MAX_SOURCE_TILES + first_tile)
+        ready_token += dl.wait(
+            signal_mem_ptr + signal_slot * 16, last_tile - first_tile + 1,
+            'gpu', 'acquire', waitValue=signal_epoch)
     return ready_token
 
 
@@ -424,7 +487,7 @@ def _wait_fc1_vector_ack(SLOT: tl.constexpr):
 @triton.jit
 def _partition_pipeline_fc1_activation_group_ub(
         pid, input_ptr, signal_mem_ptr, weight_ptr, routing_weight_ptr, output_ptr,
-        fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr, recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+        fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr, recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
         stride_input_m, stride_input_k, stride_weight_e, stride_weight_n, stride_weight_k,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -433,7 +496,7 @@ def _partition_pipeline_fc1_activation_group_ub(
         FULL_GROUP: tl.constexpr, SAVE_FC1: tl.constexpr, wave_expert, wave_row_start, wave_rows,
         replica_ready_ptr, WEIGHT_EXPERT_BASE: tl.constexpr,
         WAIT_REPLICA: tl.constexpr, FC1_FP8: tl.constexpr,
-        FC1_SAVE_FP16: tl.constexpr,
+        FC1_SAVE_FP16: tl.constexpr, SEARCH_STEPS: tl.constexpr,
         # MOE_FWD_TIMING=1 only: this program's ring row base and the call's
         # ring slot (dead args when TIMING=0; stores clamp to RING_SLOTS).
         ring_base=None, ring_slot=0,
@@ -530,11 +593,11 @@ def _partition_pipeline_fc1_activation_group_ub(
                     first_sweep = pipeline_step < cube_group_row_parts // shared_factor
                 if first_sweep:
                     group_ready_token += _wait_dispatch_row_range(
-                        signal_mem_ptr, recv_counts_re_ptr, cube_expert_id,
+                        signal_mem_ptr, recv_seg_starts_ptr, cube_expert_id,
                         cube_group_start + local_row_start,
                         cube_group_start + local_row_start + row_count,
                         signal_epoch, WORLD_SIZE, EXPERTS_PER_RANK,
-                        MAX_SOURCE_TILES, DISPATCH_BLOCK_M)
+                        MAX_SOURCE_TILES, DISPATCH_BLOCK_M, SEARCH_STEPS)
                 # The Ascend consume-token ABI expects the allocation base;
                 # a subview's offset is not preserved by its pointer return.
                 ready_input_ptr = dl.consume_token(
@@ -938,43 +1001,50 @@ def _dispatch_dynamic_wave(
         send_route_indices_ptr, send_bucket_dst_starts_ptr,
         send_bucket_starts_ptr, local_counts_ptr, wave_expert_offsets_ptr,
         signal_epoch, stride_hidden_m,
-        NUM_CORES: tl.constexpr, LOCAL_RANK: tl.constexpr,
+        NUM_CORES: tl.constexpr, LOCAL_RANK,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
         HIDDEN: tl.constexpr, BLOCK_M: tl.constexpr,
         WAVE_WINDOWS: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
         DISPATCH_BLOCK_M: tl.constexpr):
-    destination = pid % WORLD_SIZE
-    lane = pid // WORLD_SIZE
-    lanes = tl.cdiv(NUM_CORES - destination, WORLD_SIZE)
-    for expert in range(EXPERTS_PER_RANK):
-        begin, end, expert_offset, _ = _dynamic_wave_expert_range(
-            wave_expert_offsets_ptr, destination, expert, wave,
-            EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
-        if begin < end:
-            bucket = destination * EXPERTS_PER_RANK + expert
-            source_begin = tl.load(send_bucket_dst_starts_ptr + bucket) - expert_offset
-            source_rows = tl.load(local_counts_ptr + bucket)
-            # A source tile belongs to the wave containing its first row.
-            # Copy the entire tile there; later waves reuse its ready signal.
-            first_tile = tl.cdiv(tl.maximum(begin - source_begin, 0), DISPATCH_BLOCK_M)
-            last_tile = tl.cdiv(tl.minimum(tl.maximum(end - source_begin, 0),
-                                          source_rows), DISPATCH_BLOCK_M)
-            if first_tile < last_tile:
-                _dispatch_one_source_tile_task(
-                    bucket, lane, lanes, hidden_states_ptr, peer_mem_ptr,
-                    routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
-                    send_token_indices_ptr, send_route_indices_ptr,
-                    send_bucket_dst_starts_ptr, send_bucket_starts_ptr,
-                    local_counts_ptr, signal_epoch, HIDDEN, stride_hidden_m,
-                    LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
-                    DISPATCH_BLOCK_M, True, first_tile, last_tile)
+    # Worlds wider than the core count stride one program across several
+    # destinations (TOTAL_UNITS > NUM_CORES); worlds that fit keep the
+    # historical single assignment (unit == pid, destination = pid %
+    # WORLD_SIZE) bit-for-bit, so the W <= cores dist suites validate the
+    # same mapping they always did.
+    TOTAL_UNITS: tl.constexpr = max(NUM_CORES, WORLD_SIZE)
+    for unit in range(pid, TOTAL_UNITS, NUM_CORES):
+        destination = unit % WORLD_SIZE
+        lane = unit // WORLD_SIZE
+        lanes = tl.cdiv(TOTAL_UNITS - destination, WORLD_SIZE)
+        for expert in range(EXPERTS_PER_RANK):
+            begin, end, expert_offset, _ = _dynamic_wave_expert_range(
+                wave_expert_offsets_ptr, destination, expert, wave,
+                EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+            if begin < end:
+                bucket = destination * EXPERTS_PER_RANK + expert
+                source_begin = tl.load(send_bucket_dst_starts_ptr + bucket) - expert_offset
+                source_rows = tl.load(local_counts_ptr + bucket)
+                # A source tile belongs to the wave containing its first row.
+                # Copy the entire tile there; later waves reuse its ready signal.
+                first_tile = tl.cdiv(tl.maximum(begin - source_begin, 0), DISPATCH_BLOCK_M)
+                last_tile = tl.cdiv(tl.minimum(tl.maximum(end - source_begin, 0),
+                                               source_rows), DISPATCH_BLOCK_M)
+                if first_tile < last_tile:
+                    _dispatch_one_source_tile_task(
+                        bucket, lane, lanes, hidden_states_ptr, peer_mem_ptr,
+                        routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
+                        send_token_indices_ptr, send_route_indices_ptr,
+                        send_bucket_dst_starts_ptr, send_bucket_starts_ptr,
+                        local_counts_ptr, signal_epoch, HIDDEN, stride_hidden_m,
+                        LOCAL_RANK, EXPERTS_PER_RANK, MAX_SOURCE_TILES,
+                        DISPATCH_BLOCK_M, True, first_tile, last_tile)
 
 
 @triton.jit
 def _fc2_dynamic_wave(
         pid, wave, input_ptr, weight_ptr, output_ptr, pipeline_signal_ptr, wave_expert_offsets_ptr,
         signal_epoch, stride_weight_e, stride_weight_n, stride_weight_k, NUM_CORES: tl.constexpr,
-        LOCAL_RANK: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
+        LOCAL_RANK, EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
         HIDDEN: tl.constexpr, FFN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
         replica_weight_ptr, replica_ready_ptr,
@@ -1025,9 +1095,9 @@ def _fc2_dynamic_wave(
 
 @triton.jit
 def _return_dynamic_wave(
-        worker, wave, combine_buf_ptr, fc2_output_ptr, recv_counts_re_ptr,
+        worker, wave, combine_buf_ptr, fc2_output_ptr, recv_seg_starts_ptr,
         pull_tile_dst_start_ptr, pipeline_signal_ptr, wave_expert_offsets_ptr, signal_epoch,
-        NUM_CORES: tl.constexpr, LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
+        NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr, HIDDEN: tl.constexpr,
         BLOCK_M: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
         # MOE_FWD_TIMING=1 only: this function's dl.wait is the FC2-wave
@@ -1038,9 +1108,11 @@ def _return_dynamic_wave(
     completion_base: tl.constexpr = MAX_WAVES * NUM_CORES
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
     worker = worker.to(tl.int32)
-    source = worker % WORLD_SIZE
-    lane = worker // WORLD_SIZE
-    lanes = tl.cdiv(2 * NUM_CORES - source, WORLD_SIZE)
+    # The 2*NUM_CORES vector workers cover max(2*NUM_CORES, WORLD_SIZE)
+    # return units; each unit owns one source segment and fires exactly one
+    # completion ADD on that source's slot.  Worlds that fit keep the
+    # historical single assignment (unit == worker) bit-for-bit.
+    TOTAL_RETURN_UNITS: tl.constexpr = max(2 * NUM_CORES, WORLD_SIZE)
     ready = dl.wait(
         pipeline_signal_ptr + (completion_base + wave * NUM_CORES) * 16,
         NUM_CORES, 'gpu', 'acquire', waitValue=signal_epoch)
@@ -1050,34 +1122,37 @@ def _return_dynamic_wave(
         # GEMM for this wave) is done.
         fc2_wave_end = _sys_cnt_tick(dummy)
     wave_fc2 = dl.consume_token(fc2_output_ptr, ready)
-    for expert in range(EXPERTS_PER_RANK):
-        begin, end, expert_offset, _ = _dynamic_wave_expert_range(
-            wave_expert_offsets_ptr, LOCAL_RANK, expert, wave,
-            EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
-        if begin < end:
-            source_begin = 0
-            for prior in range(WORLD_SIZE):
-                count = tl.load(recv_counts_re_ptr + prior * EXPERTS_PER_RANK + expert)
-                source_begin += tl.where(prior < source, count, 0)
-            source_rows = tl.load(recv_counts_re_ptr + source * EXPERTS_PER_RANK + expert)
-            overlap_begin = tl.maximum(begin, source_begin)
-            overlap_rows = tl.maximum(tl.minimum(end, source_begin + source_rows)
-                                      - overlap_begin, 0)
-            part_begin = overlap_rows * lane // lanes
-            part_end = overlap_rows * (lane + 1) // lanes
-            if part_begin < part_end:
-                destination_start = tl.load(
-                    pull_tile_dst_start_ptr + expert * WORLD_SIZE + source)
-                source_row = expert_offset.to(tl.int64) + overlap_begin + part_begin
-                destination_row = (destination_start.to(tl.int64) + overlap_begin
-                                   - source_begin + part_begin)
-                _return_rows_direct(
-                    combine_buf_ptr, wave_fc2, source_row, destination_row,
-                    part_end - part_begin, source, HIDDEN)
-    libshmem_device.fence()
-    libshmem_device.signal_op(
-        pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + LOCAL_RANK) * 16,
-        1, libshmem_device.ACLSHMEM_SIGNAL_ADD, source)
+    for unit in range(worker, TOTAL_RETURN_UNITS, 2 * NUM_CORES):
+        source = unit % WORLD_SIZE
+        lane = unit // WORLD_SIZE
+        lanes = tl.cdiv(TOTAL_RETURN_UNITS - source, WORLD_SIZE)
+        for expert in range(EXPERTS_PER_RANK):
+            begin, end, expert_offset, _ = _dynamic_wave_expert_range(
+                wave_expert_offsets_ptr, LOCAL_RANK, expert, wave,
+                EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+            if begin < end:
+                # Segment-start table replaces the O(W) prior-source scan.
+                seg_row = recv_seg_starts_ptr + expert * (WORLD_SIZE + 1)
+                source_begin = tl.load(seg_row + source)
+                source_end = tl.load(seg_row + source + 1)
+                overlap_begin = tl.maximum(begin, source_begin)
+                overlap_rows = tl.maximum(tl.minimum(end, source_end)
+                                          - overlap_begin, 0)
+                part_begin = overlap_rows * lane // lanes
+                part_end = overlap_rows * (lane + 1) // lanes
+                if part_begin < part_end:
+                    destination_start = tl.load(
+                        pull_tile_dst_start_ptr + expert * WORLD_SIZE + source)
+                    source_row = expert_offset.to(tl.int64) + overlap_begin + part_begin
+                    destination_row = (destination_start.to(tl.int64) + overlap_begin
+                                       - source_begin + part_begin)
+                    _return_rows_direct(
+                        combine_buf_ptr, wave_fc2, source_row, destination_row,
+                        part_end - part_begin, source, HIDDEN)
+        libshmem_device.fence()
+        libshmem_device.signal_op(
+            pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + LOCAL_RANK) * 16,
+            1, libshmem_device.ACLSHMEM_SIGNAL_ADD, source)
     if TIMING:
         return fc2_wave_end
 
@@ -1085,16 +1160,20 @@ def _return_dynamic_wave(
 @triton.jit
 def _wait_dynamic_wave_returns(
         wave_expert_offsets_ptr, pipeline_signal_ptr, NUM_CORES: tl.constexpr,
-        LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
+        LOCAL_RANK, WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
         MAX_WAVES: tl.constexpr, WAVE_WINDOWS: tl.constexpr):
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
+    # Mirrors TOTAL_RETURN_UNITS in _return_dynamic_wave: every return unit
+    # fires one ADD on its source's slot, so the waiter expects one ADD per
+    # unit assigned to its rank.
+    TOTAL_RETURN_UNITS: tl.constexpr = max(2 * NUM_CORES, WORLD_SIZE)
     ready = 0
     for destination in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
                          + (destination * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK) * 2)
         waves = tl.cdiv(blocks, WAVE_WINDOWS)
         for wave in range(waves):
-            expected = tl.cdiv(2 * NUM_CORES - LOCAL_RANK, WORLD_SIZE)
+            expected = tl.cdiv(TOTAL_RETURN_UNITS - LOCAL_RANK, WORLD_SIZE)
             ready += dl.wait(
                 pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + destination) * 16,
                 1, 'gpu', 'acquire', waitValue=expected)
@@ -1134,11 +1213,12 @@ def _run_dynamic_wave_pipeline(
         peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
         weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
-        send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+        send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr,
+        recv_seg_starts_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
         situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
-        NUM_CORES: tl.constexpr, LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
+        NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, HIDDEN: tl.constexpr, FFN: tl.constexpr, TOPK: tl.constexpr,
         MAX_SOURCE_TILES: tl.constexpr, MAX_WAVES: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr,
         BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr, FC1_BLOCK_K: tl.constexpr,
@@ -1147,6 +1227,7 @@ def _run_dynamic_wave_pipeline(
         FC1_FP8: tl.constexpr, FC1_SAVE_FP16: tl.constexpr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr,
         # MOE_FWD_TIMING=1 only (dead args when TIMING=0): per-program busy
         # accumulators and the per-call FC1 ring.
         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,
@@ -1258,7 +1339,7 @@ def _run_dynamic_wave_pipeline(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
                                     routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
-                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
@@ -1271,6 +1352,7 @@ def _run_dynamic_wave_pipeline(
                                     # geometry args again.
                                     FC1_FP8=FC1_FP8,
                                     FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                    SEARCH_STEPS=SEARCH_STEPS,
                                     ring_base=ring_base, ring_slot=ring_slot,
                                     TIMING=TIMING, RING_SLOTS=RING_SLOTS)
                             else:
@@ -1278,7 +1360,7 @@ def _run_dynamic_wave_pipeline(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
                                     routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
-                                    recv_counts_re_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                    recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
                                     HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
@@ -1287,6 +1369,7 @@ def _run_dynamic_wave_pipeline(
                                     HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
                                     FC1_FP8=FC1_FP8,
                                     FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                    SEARCH_STEPS=SEARCH_STEPS,
                                     ring_base=ring_base, ring_slot=ring_slot,
                                     TIMING=TIMING, RING_SLOTS=RING_SLOTS)
             with al.scope(core_mode='vector', disable_auto_sync=True):
@@ -1316,7 +1399,7 @@ def _run_dynamic_wave_pipeline(
                     _r0 = _sys_cnt_tick(dummy_ts)
                 _fc2_end = _return_dynamic_wave(
                     pid * 2 + sub_vec_id(), step - 2, combine_buf_ptr,
-                    fc2_output_ptr, recv_counts_re_ptr, pull_tile_dst_start_ptr, pipeline_signal_ptr,
+                    fc2_output_ptr, recv_seg_starts_ptr, pull_tile_dst_start_ptr, pipeline_signal_ptr,
                     wave_expert_offsets_ptr, signal_epoch, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                     EXPERTS_PER_RANK, MAX_WAVES, HIDDEN, BLOCK_M, WAVE_WINDOWS,
                     fc2_wave_start=_fc2_s2, TIMING=TIMING, dummy=dummy_ts)
@@ -1376,17 +1459,18 @@ def _run_dynamic_wave_pipeline(
                      busy)
 
 
-@triton.jit(do_not_specialize=['num_routes', 'signal_epoch'])
+@triton.jit(do_not_specialize=['num_routes', 'signal_epoch', 'LOCAL_RANK'])
 def _kernel_fused_forward(
         hidden_states_ptr, selected_experts_ptr, routing_weights_ptr, gate_up_weight_ptr,
         down_weight_ptr, peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
         combine_buf_ptr, fc2_output_ptr, weighted_activation_ptr, fc1_output_ptr,
         fc1_scale_ptr, output_ptr, counts_mem_ptr,
-        send_bucket_starts_ptr, send_bucket_dst_starts_ptr, recv_counts_re_ptr, recv_per_expert_ptr,
+        send_bucket_starts_ptr, send_bucket_dst_starts_ptr, recv_counts_re_ptr,
+        recv_seg_starts_ptr, recv_per_expert_ptr,
         recv_expert_offs_ptr, stats_ptr, core_bucket_cursor_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, pull_tile_dst_start_ptr, wave_expert_offsets_ptr,
         raw_counts_ptr, expert_count_ptr, transfers_ptr, allocation_ptr, alloc_cumsum_ptr,
-        experts_to_copy_ptr, inverse_ptr, replica_counts_ptr,
+        experts_to_copy_ptr, inverse_ptr, replica_counts_ptr, source_prefix_ptr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         gate_notify_ptr, down_notify_ptr,
         num_routes, signal_epoch, situ_beta, situ_linear_beta,
@@ -1395,7 +1479,7 @@ def _kernel_fused_forward(
         stride_hidden_k: tl.constexpr, stride_gate_up_e: tl.constexpr,
         stride_gate_up_n: tl.constexpr, stride_gate_up_k: tl.constexpr, stride_down_e: tl.constexpr,
         stride_down_n: tl.constexpr, stride_down_k: tl.constexpr, NUM_PROGRAM_CORES: tl.constexpr,
-        LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+        LOCAL_RANK, WORLD_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, TOPK: tl.constexpr, HIDDEN: tl.constexpr, FFN: tl.constexpr,
         MAX_RECEIVED_ROUTES: tl.constexpr, NUM_BINS_PAD: tl.constexpr,
         MAX_SOURCE_TILES: tl.constexpr, MAX_PIPELINE_GROUPS: tl.constexpr,
@@ -1406,7 +1490,8 @@ def _kernel_fused_forward(
         FC1_SAVE_FP16: tl.constexpr, PIPELINE_GROUP_WINDOWS: tl.constexpr, MOONEP: tl.constexpr,
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
         TS_SLOTS: tl.constexpr, ACC_SLOTS: tl.constexpr,
-        RING_SLOTS: tl.constexpr, TIMING: tl.constexpr):
+        RING_SLOTS: tl.constexpr, TIMING: tl.constexpr,
+        WORLD_SEARCH_STEPS: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
     # One shared dummy + one precomputed ts row for all ten stamps (the
@@ -1453,24 +1538,27 @@ def _kernel_fused_forward(
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if (sub_vec_id() == 0) & (pid == 0):
                 _single_moonep_b0(raw_counts_ptr, expert_count_ptr, transfers_ptr,
+                                  allocation_ptr,
                                   WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK,
                                   RAW_NUM_BINS, min(32, NUM_EXPERTS & -NUM_EXPERTS))
             libshmem_device.fence()
         al.sync_block_all('all', 15)
         with al.scope(core_mode='vector', disable_auto_sync=True):
-            if (sub_vec_id() == 0) & (pid < WORLD_SIZE):
-                _kernel_moonep_b2(expert_count_ptr, transfers_ptr, allocation_ptr,
-                                  WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK,
-                                  triton.next_power_of_2(EXPERTS_PER_RANK))
+            if sub_vec_id() == 0:
+                for home in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                    _moonep_b2_home(home, expert_count_ptr, transfers_ptr, allocation_ptr,
+                                    WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK,
+                                    triton.next_power_of_2(EXPERTS_PER_RANK))
             libshmem_device.fence()
         al.sync_block_all('all', 15)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             if sub_vec_id() == 0:
-                if pid < WORLD_SIZE:
-                    _kernel_moonep_b3(allocation_ptr, experts_to_copy_ptr, inverse_ptr,
-                                      replica_counts_ptr, WORLD_SIZE, NUM_EXPERTS,
-                                      triton.next_power_of_2(NUM_EXPERTS),
-                                      EXPERTS_PER_RANK, EXPERTS_PER_RANK)
+                for destination in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                    _moonep_b3_destination(destination, allocation_ptr, experts_to_copy_ptr,
+                                           inverse_ptr, replica_counts_ptr, WORLD_SIZE,
+                                           NUM_EXPERTS,
+                                           triton.next_power_of_2(NUM_EXPERTS),
+                                           EXPERTS_PER_RANK, EXPERTS_PER_RANK)
                 alloc_block: tl.constexpr = max(32, triton.next_power_of_2(
                     triton.cdiv(NUM_EXPERTS, NUM_PROGRAM_CORES)))
                 if pid < triton.cdiv(NUM_EXPERTS, alloc_block):
@@ -1479,33 +1567,40 @@ def _kernel_fused_forward(
             libshmem_device.fence()
         al.sync_block_all('all', 15)
         with al.scope(core_mode='vector', disable_auto_sync=True):
-            if pid < WORLD_SIZE:
-                if sub_vec_id() == 0:
-                    _kernel_build_balanced_count_cube(
-                        raw_counts_ptr, alloc_cumsum_ptr, experts_to_copy_ptr,
-                        counts_mem_ptr, expert_count_ptr, WORLD_SIZE, NUM_EXPERTS,
-                        EXPERTS_PER_RANK, LOCAL_RANK, RAW_NUM_BINS, NUM_BINS_PAD,
-                        32, triton.next_power_of_2(physical_experts), False)
-                elif pid != LOCAL_RANK:
-                    _single_moonep_push(
-                        pid, gate_up_weight_ptr, down_weight_ptr, replica_gate_ptr,
-                        replica_down_ptr, gate_notify_ptr, down_notify_ptr,
-                        experts_to_copy_ptr, signal_epoch, LOCAL_RANK,
-                        EXPERTS_PER_RANK, HIDDEN, FFN, UDMA_CHUNK_ELEMENTS)
+            if sub_vec_id() == 0:
+                for destination in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                    _balanced_count_cube_destination(
+                        destination, raw_counts_ptr, alloc_cumsum_ptr,
+                        experts_to_copy_ptr, counts_mem_ptr, expert_count_ptr,
+                        WORLD_SIZE, NUM_EXPERTS, EXPERTS_PER_RANK, LOCAL_RANK,
+                        RAW_NUM_BINS, NUM_BINS_PAD, 32,
+                        triton.next_power_of_2(physical_experts), False)
+            else:
+                # One Vector subcore owns every peer QP assigned to this
+                # program; wide worlds simply give it several peers.
+                for peer in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                    if peer != LOCAL_RANK:
+                        _single_moonep_push(
+                            peer, gate_up_weight_ptr, down_weight_ptr,
+                            replica_gate_ptr, replica_down_ptr, gate_notify_ptr,
+                            down_notify_ptr, experts_to_copy_ptr, signal_epoch,
+                            LOCAL_RANK, EXPERTS_PER_RANK, HIDDEN, FFN,
+                            UDMA_CHUNK_ELEMENTS)
             libshmem_device.fence()
         al.sync_block_all('all', 15)
     if TIMING:
         _fwd_stamp_lane0(ts_row, 3, ts_dummy)   # MoonEP planning done
     with al.scope(core_mode='vector', disable_auto_sync=True):
-        if (sub_vec_id() == 0) & (pid < WORLD_SIZE):
-            _build_destination_metadata(
-                pid, counts_mem_ptr, send_bucket_starts_ptr,
-                send_bucket_dst_starts_ptr, recv_counts_re_ptr,
-                recv_per_expert_ptr, recv_expert_offs_ptr, stats_ptr,
-                LOCAL_RANK, WORLD_SIZE, physical_experts, NUM_BINS_PAD)
-            _build_dynamic_wave_offsets(
-                pid, counts_mem_ptr, wave_expert_offsets_ptr, WORLD_SIZE,
-                physical_experts, NUM_BINS_PAD, FC1_BLOCK_M)
+        if sub_vec_id() == 0:
+            for dst_rank in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                _build_destination_metadata(
+                    dst_rank, counts_mem_ptr, send_bucket_starts_ptr,
+                    send_bucket_dst_starts_ptr, recv_counts_re_ptr,
+                    recv_per_expert_ptr, recv_expert_offs_ptr, stats_ptr,
+                    LOCAL_RANK, WORLD_SIZE, physical_experts, NUM_BINS_PAD)
+                _build_dynamic_wave_offsets(
+                    dst_rank, counts_mem_ptr, wave_expert_offsets_ptr, WORLD_SIZE,
+                    physical_experts, NUM_BINS_PAD, FC1_BLOCK_M)
     _mixed_forward_barrier()
     if TIMING:
         _fwd_stamp_lane0(ts_row, 4, ts_dummy)   # destination metadata done
@@ -1515,10 +1610,23 @@ def _kernel_fused_forward(
                                               send_bucket_starts_ptr,
                                               NUM_PROGRAM_CORES, NUM_EXPERTS,
                                               NUM_BINS_PAD, MOONEP)
-            if pid < WORLD_SIZE:
+            if MOONEP:
+                _single_moonep_source_prefix(
+                    pid, raw_counts_ptr, source_prefix_ptr, LOCAL_RANK,
+                    WORLD_SIZE, NUM_EXPERTS, RAW_NUM_BINS, NUM_PROGRAM_CORES,
+                    min(32, triton.next_power_of_2(NUM_EXPERTS)))
+            # recv_counts_re is complete after the destination-metadata
+            # barrier; publish the per-expert source segment starts the wave
+            # pipeline binary-searches.
+            _build_recv_segment_starts(
+                pid, recv_counts_re_ptr, recv_seg_starts_ptr, NUM_PROGRAM_CORES,
+                physical_experts, WORLD_SIZE,
+                triton.next_power_of_2(WORLD_SIZE))
+            for source_rank in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
                 _build_pull_destination_starts(
-                    pid, counts_mem_ptr, pull_tile_dst_start_ptr, LOCAL_RANK,
-                    WORLD_SIZE, physical_experts, WORLD_SIZE * physical_experts, NUM_BINS_PAD)
+                    source_rank, counts_mem_ptr, pull_tile_dst_start_ptr,
+                    LOCAL_RANK, WORLD_SIZE, physical_experts,
+                    WORLD_SIZE * physical_experts, NUM_BINS_PAD)
             if pid == 0:
                 max_received = 0
                 for dst_rank in range(0, WORLD_SIZE):
@@ -1532,11 +1640,13 @@ def _kernel_fused_forward(
         if MOONEP:
             if sub_vec_id() == 0:
                 _single_moonep_scatter(
-                    pid, selected_experts_ptr, core_bucket_cursor_ptr, raw_counts_ptr,
-                    alloc_cumsum_ptr, inverse_ptr, send_bucket_starts_ptr,
+                    pid, selected_experts_ptr, core_bucket_cursor_ptr,
+                    source_prefix_ptr, alloc_cumsum_ptr, inverse_ptr,
+                    send_bucket_starts_ptr,
                     send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
-                    num_routes, NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, NUM_EXPERTS,
-                    EXPERTS_PER_RANK, NUM_BINS_PAD, RAW_NUM_BINS, TOPK, _SCATTER_BLOCK)
+                    num_routes, NUM_PROGRAM_CORES, WORLD_SIZE, NUM_EXPERTS,
+                    EXPERTS_PER_RANK, NUM_BINS_PAD, TOPK,
+                    WORLD_SEARCH_STEPS, _SCATTER_BLOCK)
         else:
             # Both Vector subcores: _scatter_stable_routes splits its bin
             # blocks lane-interleaved (byte-identical output, half the wall).
@@ -1558,7 +1668,8 @@ def _kernel_fused_forward(
         peer_mem_ptr, routing_weight_recv_ptr, signal_mem_ptr, pipeline_signal_ptr,
         weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, fc2_output_ptr, combine_buf_ptr, output_ptr, local_counts_ptr,
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
-        send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr, recv_counts_re_ptr,
+        send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr,
+        recv_seg_starts_ptr,
         pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
         situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
@@ -1567,7 +1678,7 @@ def _kernel_fused_forward(
         FC1_BLOCK_K, FC2_BLOCK_N, FC2_BLOCK_K, PIPELINE_GROUP_WINDOWS, ACTIVATION, HAS_LINEAR_BETA,
         SAVE_FC1, FC1_FP8, FC1_SAVE_FP16,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
-        EXPERTS_PER_RANK, MOONEP,
+        EXPERTS_PER_RANK, MOONEP, WORLD_SEARCH_STEPS,
         acc_ptr=acc_ptr, ring_ptr=ring_ptr, fc2w_ptr=fc2w_ptr,
         TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS)
     if TIMING:
@@ -1575,9 +1686,12 @@ def _kernel_fused_forward(
     if MOONEP:
         # Drain outstanding WQEs before releasing source aliases. The next
         # call's initial rank barrier protects consumer slots from overwrite.
+        # Quiet every QP this program's second Vector subcore submitted.
         al.sync_block_all('all', 15)
         with al.scope(core_mode='vector', disable_auto_sync=True):
-            if (sub_vec_id() == 1) & (pid < WORLD_SIZE) & (pid != LOCAL_RANK):
-                _udma_quiet(pid)
+            if sub_vec_id() == 1:
+                for peer in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                    if peer != LOCAL_RANK:
+                        _udma_quiet(peer)
     if TIMING:
         _fwd_stamp_lane0(ts_row, 9, ts_dummy)   # exit

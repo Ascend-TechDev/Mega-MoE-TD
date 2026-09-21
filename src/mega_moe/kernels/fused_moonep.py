@@ -17,10 +17,12 @@ _udma_quiet = getattr(libshmem_device, "udma_quiet", None)
 
 @triton.jit
 def _single_moonep_b0(counts_ptr, expert_count_ptr, transfers_ptr,
+                      allocation_ptr,
                       R: tl.constexpr, E: tl.constexpr, EPN: tl.constexpr,
                       ROW_STRIDE: tl.constexpr, BLOCK_E: tl.constexpr):
     _kernel_moonep_b0_b1(counts_ptr, expert_count_ptr, transfers_ptr,
-                        R, E, EPN, ROW_STRIDE, BLOCK_E, False)
+                         allocation_ptr,
+                         R, E, EPN, ROW_STRIDE, BLOCK_E, False)
     # MoonEP assumes equal, dropless inputs. Other inputs retain home routing;
     # deciding from the replicated table gives every rank the same fallback.
     total = tl.load(counts_ptr + E)
@@ -35,18 +37,56 @@ def _single_moonep_b0(counts_ptr, expert_count_ptr, transfers_ptr,
         balanced_input &= (valid == declared) & (declared == total)
     if not balanced_input:
         r = tl.arange(0, R)
-        tl.store(transfers_ptr + r[:, None] * R + r[None, :],
-                 tl.zeros((R, R), tl.int64))
+        # Row-tiled like the b0_b1 zero pass: a one-shot (R, R) int64 value
+        # exceeds vector UB at wide worlds.  row_tile divides the power-of-two
+        # MoonEP world, so the row block needs no bound mask.
+        row_tile: tl.constexpr = min(32, triton.next_power_of_2(R))
+        for r0 in range(0, R, row_tile):
+            rows = r0 + tl.arange(0, row_tile)
+            tl.store(transfers_ptr + rows[:, None] * R + r[None, :],
+                     tl.zeros((row_tile, R), tl.int64))
+
+
+@triton.jit
+def _single_moonep_source_prefix(
+        pid, raw_counts_ptr, source_prefix_ptr, LOCAL_RANK,
+        R: tl.constexpr, E: tl.constexpr, RAW_STRIDE: tl.constexpr,
+        NUM_CORES: tl.constexpr, BLOCK_E: tl.constexpr):
+    """Summarize prior-source route counts per expert for the scatter.
+
+    The scatter used to rescan ``LOCAL_RANK`` raw-count rows per route block
+    as compile-time-unrolled scalar loads, which explodes at wide worlds and
+    specializes every rank's binary. One (R, BLOCK_E) masked gather here
+    replaces all of it; only the mask depends on the local rank.
+    """
+    experts = tl.arange(0, BLOCK_E)
+    source_lanes = tl.arange(0, triton.next_power_of_2(R))
+    # Masked lanes still form their physical address; clamp padded lanes
+    # into the table even though MoonEP worlds are powers of two.
+    safe_sources = tl.minimum(source_lanes, R - 1)
+    prior = source_lanes[:, None] < LOCAL_RANK
+    for e0 in range(pid * BLOCK_E, E, NUM_CORES * BLOCK_E):
+        expert = e0 + experts
+        valid = expert < E
+        safe_expert = tl.minimum(expert, E - 1)
+        counts = tl.load(
+            raw_counts_ptr
+            + safe_sources[:, None] * RAW_STRIDE
+            + safe_expert[None, :],
+            mask=prior & valid[None, :],
+            other=0,
+        )
+        tl.store(source_prefix_ptr + expert, tl.sum(counts, 0), mask=valid)
 
 
 @triton.jit
 def _single_moonep_scatter(
-        pid, selected_ptr, cursors_ptr, raw_counts_ptr, alloc_cumsum_ptr,
+        pid, selected_ptr, cursors_ptr, source_prefix_ptr, alloc_cumsum_ptr,
         inverse_ptr, send_starts_ptr, send_tokens_ptr, send_routes_ptr,
         route_to_send_ptr, num_routes, NUM_CORES: tl.constexpr,
-        LOCAL_RANK: tl.constexpr, R: tl.constexpr, E: tl.constexpr,
-        EPN: tl.constexpr, CURSOR_STRIDE: tl.constexpr,
-        RAW_STRIDE: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
+        R: tl.constexpr, E: tl.constexpr, EPN: tl.constexpr,
+        CURSOR_STRIDE: tl.constexpr, TOPK: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr, BLOCK: tl.constexpr):
     per_core = tl.cdiv(num_routes, NUM_CORES)
     begin = pid * per_core
     end = tl.minimum(begin + per_core, num_routes)
@@ -65,14 +105,25 @@ def _single_moonep_scatter(
             matches = ((expert[None, :] == bins[:, None]) & valid[None, :]).to(tl.int32)
             within = tl.cumsum(matches, 1) - matches
             ordinal = tl.sum((cursors[:, None] + within) * matches, 0)
-            source_lo = tl.full((BLOCK,), 0, tl.int32)
-            for source in tl.static_range(LOCAL_RANK):
-                source_lo += tl.load(raw_counts_ptr + source * RAW_STRIDE + safe_expert)
+            source_lo = tl.load(source_prefix_ptr + safe_expert)
             global_ordinal = ordinal + source_lo
-            destination = tl.full((BLOCK,), 0, tl.int32)
-            for rank in tl.static_range(R - 1):
-                hi = tl.load(alloc_cumsum_ptr + safe_expert * R + rank)
-                destination += (global_ordinal >= hi).to(tl.int32)
+            # Destination = count of alloc_cumsum[e][r] <= global_ordinal over
+            # the planner's non-decreasing row. log2(R) binary-search steps
+            # replace the old O(R) compile-time-unrolled scan; the planner
+            # invariant (ordinal < row[R-1] = expert total) keeps the result
+            # below R, and the clamp preserves the old count on degenerate
+            # rows as well.
+            lo = tl.zeros((BLOCK,), dtype=tl.int32)
+            hi = tl.full((BLOCK,), R, dtype=tl.int32)
+            for _ in range(SEARCH_STEPS):
+                active = lo < hi
+                mid = tl.where(active, (lo + hi) // 2, 0)
+                bound = tl.load(alloc_cumsum_ptr
+                                + safe_expert * R + tl.minimum(mid, R - 1))
+                take = active & (bound <= global_ordinal)
+                lo = tl.where(take, mid + 1, lo)
+                hi = tl.where(take, hi, tl.where(active, mid, hi))
+            destination = tl.minimum(lo, R - 1)
             previous = tl.maximum(destination - 1, 0)
             allocation_lo = tl.load(alloc_cumsum_ptr + safe_expert * R + previous)
             allocation_lo = tl.where(destination > 0, allocation_lo, 0)
@@ -110,7 +161,7 @@ def _udma_panel(destination, source, ready, epoch, peer,
 def _single_moonep_push(
         peer, gate_up_ptr, down_ptr, replica_gate_ptr, replica_down_ptr,
         gate_ready_ptr, down_ready_ptr, experts_to_copy_ptr, signal_epoch,
-        LOCAL_RANK: tl.constexpr, EPN: tl.constexpr, HIDDEN: tl.constexpr,
+        LOCAL_RANK, EPN: tl.constexpr, HIDDEN: tl.constexpr,
         FFN: tl.constexpr, CHUNK_ELEMENTS: tl.constexpr):
     # Exactly one Vector owns each peer's QP. PIPE_S submission leaves both
     # Vector subcores available for the existing UB activation pipeline.

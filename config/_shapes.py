@@ -255,6 +255,27 @@ _CASE_GROUPS = (
         capacity_factor=1.6875,
     ),
 
+    # Wide-EP Kimi forward: one EP group spanning 16 x 8-card servers (W=128,
+    # 896 / 128 = 7 home experts per rank).  Deliberately outside the
+    # "performance" tag so the 8-NPU suites never collect it; resolve it by
+    # case id for compile_single_kernel_forward.py validation and the
+    # 16-server bring-up.  capacity_factor must stay explicit here — the
+    # None default resolves to world_size and would budget peer_mem for the
+    # entire world's routes.
+    CaseGroup(
+        prefix="performance-fwd-kimi-k3-wide",
+        direction="forward",
+        model="KIMI-K3",
+        tokens=(64, 4096),
+        worlds=(128,),
+        hidden=3584,
+        ffn=3072,
+        topk=16,
+        num_experts=896,
+        tags=frozenset({"forward", "kimi", "wide-world", "compile"}),
+        capacity_factor=1.25,
+    ),
+
     # Backward performance has only validated profiles.  There is no DSV4
     # backward profile yet, so it is intentionally not synthesized here.
     CaseGroup(

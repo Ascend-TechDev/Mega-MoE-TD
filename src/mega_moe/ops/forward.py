@@ -140,14 +140,6 @@ class FusedMoEForward(torch.nn.Module):
         # MoEForwardConfig.save_fc1_dtype): fixes the workspace dtype for
         # this operator's lifetime.
         self._save_fc1_dtype = self.config.save_fc1_dtype
-        if (
-            self.enable_single_kernel_forward
-            and self.world_size > self.num_aicore_programs
-        ):
-            raise ValueError(
-                "single-kernel forward requires world_size no larger than "
-                "the physical AICore count"
-            )
         self._fc2_pipeline_group_experts = min(
             _FC2_PIPELINE_GROUP_EXPERTS, self.physical_experts_per_rank
         )
@@ -1665,6 +1657,7 @@ class FusedMoEForward(torch.nn.Module):
             self.context.metadata_send_bucket_starts,
             self.context.metadata_send_bucket_dst_starts,
             self.context.metadata_recv_counts_re,
+            self.context.metadata_recv_seg_starts,
             self.context.metadata_recv_per_expert,
             self.context.metadata_recv_expert_offs,
             self.context.metadata_stats,
@@ -1682,6 +1675,9 @@ class FusedMoEForward(torch.nn.Module):
             self.context.planning_experts_to_copy,
             self.context.planning_inverse_experts_to_copy,
             self.context.planning_replica_counts,
+            self.context.planning_source_prefix
+            if self.enable_moonep
+            else None,
             self._replica_weight_buffers.gate_up if self.enable_moonep else gate_up_for_gemm,
             self._replica_weight_buffers.down if self.enable_moonep else down_weight,
             self.context.replica_gate_ready if self.enable_moonep else self.context.signal_mem,
@@ -1739,6 +1735,12 @@ class FusedMoEForward(torch.nn.Module):
             ACC_SLOTS=FWD_ACC_SLOTS,
             RING_SLOTS=self._fwd_ring_slots,
             TIMING=timing_on,
+            # Guarded fixed-step binary searches over the closed rank
+            # interval [0, W] (scatter destination lookup and dispatch
+            # readiness) converge in exactly W.bit_length() steps; fewer
+            # leaves the worst case unconverged (host-modeled in
+            # tests/function/test_single_kernel_wide_world.py).
+            WORLD_SEARCH_STEPS=self.world_size.bit_length(),
             **launch_options,
         )
         self._tile_signal_epoch += 1
