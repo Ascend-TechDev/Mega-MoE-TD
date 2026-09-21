@@ -370,7 +370,12 @@ def build_physical_saved_from_plan(
     # Legacy-layout home weight views for the physical backward contract.
     fc1_1 = home_gate_up_weight[:, :, :ffn_dim].transpose(1, 2).contiguous()
     fc1_2 = home_gate_up_weight[:, :, ffn_dim:].transpose(1, 2).contiguous()
-    fc1_combined = torch.cat((fc1_1, fc1_2), dim=1)
+    # Match the production saved contract (_native_saved): fc1_combined is the
+    # transpose VIEW of the packed contiguous [E, H, 2F] table, not a fresh
+    # cat — the MOE_MEGA_REPREFETCH flat RMA push reads the base pointer's
+    # natural [E, H, 2F] order, and home_gate_up_weight is validated
+    # contiguous above.  Values are identical to cat(fc1_1, fc1_2, dim=1).
+    fc1_combined = home_gate_up_weight.transpose(1, 2)
 
     saved_phys = dict(
         output=output, dy=None,

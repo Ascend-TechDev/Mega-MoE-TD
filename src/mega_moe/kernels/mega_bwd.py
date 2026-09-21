@@ -192,6 +192,7 @@ from .dispatch_fc2_bwd import (
     _dispatch_gemm_tile,
     _ensure_bwd_signal_mem,
     _sys_cnt_tick,
+    _wait_bounded_report,
 )
 from .combine_fc1_bwd import (
     _combine_static_maps,
@@ -201,8 +202,21 @@ from .combine_fc1_bwd import (
     GATE_PAD,
 )
 from .fused_swiglu_bwd_fc2_wgrad import FUSED_WBM, FUSED_WBN, FUSED_WBK
+from .replica_weight_prefetch import (
+    _kernel_replica_repush_store,
+    _kernel_compact_local_replica_descriptors,
+    _push_compact_replica_weight_descriptors,
+    _push_compact_replica_weight_descriptors_mte,
+    _push_compact_replica_weight_descriptors_store,
+    _push_replica_weights_udma_peer,
+    _udma_put_nbi,
+    _udma_put_signal_nbi,
+    _udma_quiet,
+)
+from ..runtime.replica_weight_prefetch import replica_weight_push_geometry
 from .replica_grad_reduce import (
     build_owner_pull_descriptors_by_home,
+    launch_replica_grad_barrier,
     zero_consumed_replica_slots,
 )
 
@@ -486,6 +500,12 @@ def _mega_combine_gemm(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     SIGNAL_ON: tl.constexpr, LOCAL_RANK: tl.constexpr,
+    # MOE_MEGA_REPREFETCH=1 replica-call only: wait this m-tile's replica
+    # gate/up weight slot before first dereference (P1's in-launch re-push
+    # publishes it; deadline cushion = the whole P1 + P2||P3 windows).
+    replica_weight_ready_ptr=None, replica_weight_epoch=0,
+    WAIT_REPLICA_WEIGHTS: tl.constexpr = 0,
+    wait_dbg_ptr=None, WAIT_DEBUG: tl.constexpr = 0,
 ):
     """fc1 input-grad GEMM ``hidden_buf[m, :] = grad_fc1_output[m, :] @
     weight[e]`` over the M-TILE range [tile_m_begin, tile_m_end) against ONE
@@ -535,6 +555,22 @@ def _mega_combine_gemm(
         mm = om < rem
         mn = on_ < (N - n_start)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        if WAIT_REPLICA_WEIGHTS:
+            # slot ids are table-local: expert_base == home_base on the
+            # replica call, so (expert_id - expert_base) IS the replica slot
+            replica_slot = expert_id - expert_base
+            if WAIT_DEBUG:
+                _wait_bounded_report(
+                    replica_weight_ready_ptr + replica_slot * 16,
+                    replica_weight_epoch, 3, replica_slot, expert_id,
+                    pid, wait_dbg_ptr)
+            else:
+                dl.wait(
+                    replica_weight_ready_ptr + replica_slot * 16,
+                    1, "gpu", "acquire", waitValue=replica_weight_epoch)
+            sweep_weight_ptr = weight_ptr
+        else:
+            sweep_weight_ptr = weight_ptr
         wb = (expert_id.to(tl.int64) - expert_base) * stride_we
         row_base = row_start.to(tl.int64) + om.to(tl.int64)
         for ks in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
@@ -542,7 +578,7 @@ def _mega_combine_gemm(
             ao = row_base[:, None] * stride_im + (ks + ok[None, :]) * stride_ik
             a = tl.load(inp_ptr + ao, mask=mm[:, None] & mk[None, :], other=0.0)
             bo = wb + (ks + ok[:, None]) * stride_wk + (n_start + on_[None, :]) * stride_wn
-            b = tl.load(weight_ptr + bo, mask=mk[:, None] & mn[None, :], other=0.0)
+            b = tl.load(sweep_weight_ptr + bo, mask=mk[:, None] & mn[None, :], other=0.0)
             acc += tl.dot(a, b)
         co = row_base[:, None] * N + (n_start + on_[None, :])
         tl.store(hidden_buf_ptr + co, acc.to(hidden_buf_ptr.dtype.element_ty),
@@ -954,6 +990,9 @@ def _mega_grad_owner_pull(
                         acc_gate_up_ptr, src, home, cs, cnt, gu_elems,
                         ACC_BLK)
                 else:
+                    # BISECT arm2 (2026-09-21): back to getmem — the direct
+                    # remote LOAD is the w8 507014 suspect; getmem was the
+                    # 09-10/09-17-era w8-green form.
                     libshmem_device.getmem(gu_row, src, cnt * 2, peer)
                     _mega_grad_accum(
                         acc_gate_up_ptr, gu_row, home, cs, cnt, gu_elems,
@@ -976,6 +1015,7 @@ def _mega_grad_owner_pull(
                         acc_down_ptr, src, home, cs, cnt, dn_elems,
                         ACC_BLK)
                 else:
+                    # BISECT arm2 (2026-09-21): see the gate/up note.
                     libshmem_device.getmem(dn_row, src, cnt * 2, peer)
                     _mega_grad_accum(
                         acc_down_ptr, dn_row, home, cs, cnt, dn_elems,
@@ -1149,7 +1189,10 @@ def _recompute_act_rows(
 # compiles both bodies out and is equivalent to this kernel.  Keep the
 # shared phase bodies in sync when editing either copy.
 # ============================================================================
-@triton.jit(do_not_specialize=["signal_epoch", "b3_epoch", "b1_epoch"])
+@triton.jit(do_not_specialize=[
+    "signal_epoch", "b3_epoch", "b1_epoch",
+    "repref_epoch", "repref_desc_count",   # re-prefetch routing geometry
+])
 def kernel_moe_backward_mega(
     # ---- P1: dispatch + fc2 dgrad (verbatim step-1 operands) ----
     gco_ptr, peer_mem_ptr, signal_mem_ptr,
@@ -1237,6 +1280,30 @@ def kernel_moe_backward_mega(
     EPN6: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     TM6: tl.constexpr, TN6: tl.constexpr, BLK6: tl.constexpr,
+    # ---- MoonEP re-prefetch (MOE_MEGA_REPREFETCH=1, pooled tables) ----
+    # P1's idle second vector subcore re-pushes THIS layer's replica tables
+    # from the home weights (values are bit-exact at backward time — the
+    # optimizer has not stepped); the P1 replica sweep (down) and the P4a
+    # replica m-tiles (gate/up) dl.wait their slots.  Dead-arg pattern when
+    # off: pointers stay valid tensors, epochs 0, pushes compiled out.
+    # Post-R1 (2026-09-21) dead-arg group: repref_etc/desc_ids/desc_count,
+    # rref_gu/dn_src, *_u64_ptr, rref_rb_ptr and the RREF_* constexprs are
+    # unused in the body — the re-push moved to the standalone
+    # _kernel_replica_repush_store launch and the consumer wait to the
+    # pre-launch collective barrier (REPREFETCH_WAIT is always 0).  They
+    # stay in the signature ON PURPOSE: removing them changes the binary
+    # and re-rolls the 950DT whole-kernel miscompile dice on validated
+    # code (mega_bwd.py:147-164).
+    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+    repref_gate_ready_ptr, repref_down_ready_ptr, repref_epoch,
+    rref_gu_src_ptr, rref_dn_src_ptr,
+    repref_gate_ready_u64_ptr, repref_down_ready_u64_ptr,
+    wait_dbg_ptr, rref_rb_ptr,
+    REPREFETCH: tl.constexpr,
+    REPREFETCH_WAIT: tl.constexpr,
+    WAIT_DEBUG: tl.constexpr,
+    RREF_GU_ELEMS: tl.constexpr, RREF_GU_CHUNK: tl.constexpr, RREF_GU_NCHUNK: tl.constexpr,
+    RREF_DN_ELEMS: tl.constexpr, RREF_DN_CHUNK: tl.constexpr, RREF_DN_NCHUNK: tl.constexpr,
     # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
@@ -1302,7 +1369,11 @@ def kernel_moe_backward_mega(
                     MAX_BWD_TILES, tl.bfloat16,
                     b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
                     LOCAL_RANK=LOCAL_RANK,
-                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING,
+                    replica_weight_ready_ptr=repref_down_ready_ptr,
+                    replica_weight_epoch=repref_epoch,
+                    WAIT_REPLICA_WEIGHTS=REPREFETCH_WAIT,
+                    wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         if TIMING:
             _phase_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
@@ -1496,7 +1567,11 @@ def kernel_moe_backward_mega(
                         tile_home_bound4, num_tiles_m4,
                         b3_signal_ptr, b3_epoch,
                         C_BM, C_BN, C_BK, C_NS,
-                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK,
+                        replica_weight_ready_ptr=repref_gate_ready_ptr,
+                        replica_weight_epoch=repref_epoch,
+                        WAIT_REPLICA_WEIGHTS=REPREFETCH_WAIT,
+                        wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
         # barrier with per-(tile,n) readiness signals (uniform constexpr —
         # every program takes the same branch, so the barrier contract is
@@ -1652,6 +1727,14 @@ def kernel_moe_backward_mega(
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
                     PULL_GU=1, PULL_DN=0)
+        # barrier #2 (2026-09-20, zero-race fix): retire every rank's w3
+        # getmem readers BEFORE kernel exit — the host-side
+        # zero_consumed_replica_slots is stream-ordered only behind THIS
+        # rank's exit and was zeroing slots while peers still pulled them
+        # (owner grad_fc1 partial loss; down was covered by B6).
+        # (w8 bisect arm1 cleared it of hang causation: hangs persist
+        # without it, results/plan-a-20260918/w8-phase1_1789928339.)
+        libshmem_device.barrier_all()
 
 
 # ============================================================================
@@ -1675,6 +1758,7 @@ def kernel_moe_backward_mega(
 # ============================================================================
 @triton.jit(do_not_specialize=[
     "signal_epoch", "b3_epoch", "b1_epoch",
+    "repref_epoch", "repref_desc_count",         # re-prefetch routing geometry
     "n_rows", "max_rows_w", "w3_total",          # P2/P3 routing geometry
     "num_tiles_m4", "M4", "tile_home_bound4",    # P4 tile/split geometry
     "w5_split", "w5_total",                      # P5 wgrad split geometry
@@ -1766,6 +1850,30 @@ def kernel_moe_backward_mega_recompute(
     EPN6: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     TM6: tl.constexpr, TN6: tl.constexpr, BLK6: tl.constexpr,
+    # ---- MoonEP re-prefetch (MOE_MEGA_REPREFETCH=1, pooled tables) ----
+    # P1's idle second vector subcore re-pushes THIS layer's replica tables
+    # from the home weights (values are bit-exact at backward time — the
+    # optimizer has not stepped); the P1 replica sweep (down) and the P4a
+    # replica m-tiles (gate/up) dl.wait their slots.  Dead-arg pattern when
+    # off: pointers stay valid tensors, epochs 0, pushes compiled out.
+    # Post-R1 (2026-09-21) dead-arg group: repref_etc/desc_ids/desc_count,
+    # rref_gu/dn_src, *_u64_ptr, rref_rb_ptr and the RREF_* constexprs are
+    # unused in the body — the re-push moved to the standalone
+    # _kernel_replica_repush_store launch and the consumer wait to the
+    # pre-launch collective barrier (REPREFETCH_WAIT is always 0).  They
+    # stay in the signature ON PURPOSE: removing them changes the binary
+    # and re-rolls the 950DT whole-kernel miscompile dice on validated
+    # code (mega_bwd.py:147-164).
+    repref_etc_ptr, repref_desc_ids_ptr, repref_desc_count,
+    repref_gate_ready_ptr, repref_down_ready_ptr, repref_epoch,
+    rref_gu_src_ptr, rref_dn_src_ptr,
+    repref_gate_ready_u64_ptr, repref_down_ready_u64_ptr,
+    wait_dbg_ptr, rref_rb_ptr,
+    REPREFETCH: tl.constexpr,
+    REPREFETCH_WAIT: tl.constexpr,
+    WAIT_DEBUG: tl.constexpr,
+    RREF_GU_ELEMS: tl.constexpr, RREF_GU_CHUNK: tl.constexpr, RREF_GU_NCHUNK: tl.constexpr,
+    RREF_DN_ELEMS: tl.constexpr, RREF_DN_CHUNK: tl.constexpr, RREF_DN_NCHUNK: tl.constexpr,
     # ---- MOE_MEGA_TIMING=1: SYS_CNT stamps (dead-arg pattern when off) ----
     ts_ptr, wait1_ptr,
     TS_SLOTS: tl.constexpr, TIMING: tl.constexpr,
@@ -1859,7 +1967,11 @@ def kernel_moe_backward_mega_recompute(
                     MAX_BWD_TILES, tl.bfloat16,
                     b1_signal_ptr, b1_epoch, SIGNAL_ON=TILE_B1,
                     LOCAL_RANK=LOCAL_RANK,
-                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING)
+                    wait_acc_ptr=wait1_ptr, WAIT_ACC=TIMING,
+                    replica_weight_ready_ptr=repref_down_ready_ptr,
+                    replica_weight_epoch=repref_epoch,
+                    WAIT_REPLICA_WEIGHTS=REPREFETCH_WAIT,
+                    wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         if TIMING:
             _phase_stamp(ts_ptr, 2, pid, TS_SLOTS)   # P1 cube sweep done
     # B1: publish every rank's P1 remote puts; grad_swiglu GM-visible.
@@ -2074,7 +2186,11 @@ def kernel_moe_backward_mega_recompute(
                         tile_home_bound4, num_tiles_m4,
                         b3_signal_ptr, b3_epoch,
                         C_BM, C_BN, C_BK, C_NS,
-                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK)
+                        SIGNAL_ON=TILE_B3, LOCAL_RANK=LOCAL_RANK,
+                        replica_weight_ready_ptr=repref_gate_ready_ptr,
+                        replica_weight_epoch=repref_epoch,
+                        WAIT_REPLICA_WEIGHTS=REPREFETCH_WAIT,
+                        wait_dbg_ptr=wait_dbg_ptr, WAIT_DEBUG=WAIT_DEBUG)
         # B3: local cube->vector handoff of hidden_buf. TILE_B3 replaces the
         # barrier with per-(tile,n) readiness signals (uniform constexpr —
         # every program takes the same branch, so the barrier contract is
@@ -2230,6 +2346,9 @@ def kernel_moe_backward_mega_recompute(
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
                     PULL_GU=1, PULL_DN=0)
+        # barrier #2 (2026-09-20, zero-race fix): see the non-recompute
+        # kernel's note (w8 bisect arm1 cleared it of hang causation).
+        libshmem_device.barrier_all()
 
 
 # ============================================================================
@@ -2625,6 +2744,41 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # byte identically, so heap divergence is NOT that failure's cause (root
     # cause: the codegen limitation documented in the module docstring).
     m_bound = W * EPR * p1["max_bwd_tiles"] * 64
+    # MOE_MEGA_REPREFETCH=1 (pooled tables, the 2026-09-17 Plan A): re-push
+    # this layer's replica weights INSIDE the launch — P1's idle second
+    # vector subcore issues the owner pushes beside the gco dispatch
+    # (deadline-aware order: down first, its P1 replica-sweep consumers wait
+    # in-window; gate/up's consumers only run at P4a).  v1 is mutually
+    # exclusive with the P4-phase restructuring knobs below (their
+    # combinations reshape the P4a/B3/B4 phases this rides on), so it forces
+    # both off.  Default off = the status-quo semantics (the backward reads
+    # whatever the forward left in the tables; correct only with per-layer
+    # tables, i.e. pool OFF).
+    reprefetch = (use_moonep and active_e > home_e
+                  and os.environ.get("MOE_MEGA_REPREFETCH", "0") == "1")
+    # E6 research knob (2026-09-18, fault-domain split): push side still
+    # runs, consumer dl.wait compiled out. Values will be WRONG — numerics
+    # meaningless under this knob; pass/hang is the only signal.
+    reprefetch_nowait = (reprefetch and
+                         os.environ.get("MOE_MEGA_REPREFETCH_NOWAIT", "0") == "1")
+    # R1 (2026-09-21): the consumer dl.wait is ALWAYS compiled out — the
+    # wait's publication edge moved to a collective barrier launch queued
+    # between the standalone re-push kernel and the mega kernel (see the
+    # reprefetch block below), so the mega binary stays bit-identical to
+    # the REPREFETCH=0 one (the w8 8/8-green binary).  The in-kernel wait
+    # branch was one of the REPREFETCH=1 destabilizers of the w4/w8
+    # whole-kernel miscompile family (A+getmem 2/4, A+NOWAIT 2/4 hangs;
+    # results/plan-a-20260918/w8-phase1_1789930236/...884).
+    reprefetch_wait = False
+    if reprefetch and (
+        os.environ.get("MOE_MEGA_TILE_B3", "0") == "1"
+        or os.environ.get("MOE_MEGA_FUSE_P4", "0") == "1"
+    ):
+        print(f"[mega r{rank}] MOE_MEGA_REPREFETCH=1 forces "
+              f"MOE_MEGA_TILE_B3/FUSE_P4 off (v1 mutual exclusion)",
+              flush=True)
+        os.environ["MOE_MEGA_TILE_B3"] = "0"
+        os.environ["MOE_MEGA_FUSE_P4"] = "0"
     # SAVED_RECOMPUTE forces both B3-removing knobs off: the re-dispatch
     # sweep rides the B2->B3 window and its remote slab stores are published
     # cross-rank BY the B3 barrier — TILE_B3 (per-tile signals) and FUSE_P4
@@ -2730,6 +2884,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             f"redis_off={_off(orig_in5) if saved_recompute else '-'} "
             f"redis_n={orig_in5.numel() if saved_recompute else 0} "
             f"comb_off={_off(combine_buf)} comb_n={combine_buf.numel()} "
+            f"rfc2_off={_off(replica_fc2)} "
             f"ep={signal_epoch} b3e={b3_epoch} b1e={b1_epoch} "
             f"gr={int(grad_reduce)}",
             flush=True)
@@ -2806,6 +2961,190 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         gu6_elems = dn6_elems = 1
         gu_chunk6 = dn_chunk6 = 1
         tm6 = tn6 = blk6 = 1
+
+    # per-program readback scratch for the readback-gated SET (dead-arg
+    # when REPREFETCH is off)
+    rref_rb = saved.get("_mega_rref_rb")
+    if rref_rb is None or rref_rb.numel() < ncore() * 64:
+        rref_rb = torch.zeros(ncore() * 64, dtype=torch.bfloat16,
+                              device=device)
+        saved["_mega_rref_rb"] = rref_rb
+
+    # ---- MOE_MEGA_WAIT_DEBUG (2026-09-20): bounded-spin diagnostics ----
+    wait_debug = os.environ.get("MOE_MEGA_WAIT_DEBUG", "0") == "1"
+    if wait_debug:
+        wait_dbg = saved.get("_mega_wait_dbg")
+        if wait_dbg is None or wait_dbg.numel() < ncore() * 8:
+            wait_dbg = torch.zeros(ncore() * 8, dtype=torch.int32,
+                                   device=device)
+            saved["_mega_wait_dbg"] = wait_dbg
+        else:
+            wait_dbg.zero_()
+    else:
+        wait_dbg = signal_mem
+
+    # ---- MOE_MEGA_REPREFETCH operands (dead-arg pattern when off) ----
+    # Push geometry mirrors the forward config defaults (gate/up 16MB, down
+    # 4MB chunks), env-tunable for the RMA-contention sweep.
+    gu_elems = 2 * ffn * H
+    dn_elems = ffn * H
+    gu_chunk, gu_nchunk = replica_weight_push_geometry(
+        gu_elems,
+        chunk_bytes=int(os.environ.get(
+            "MOE_REPREF_GU_CHUNK_BYTES", str(16 * 1024 * 1024))),
+    )
+    dn_chunk, dn_nchunk = replica_weight_push_geometry(
+        dn_elems,
+        chunk_bytes=int(os.environ.get(
+            "MOE_REPREF_DN_CHUNK_BYTES", str(4 * 1024 * 1024))),
+    )
+    rref_gu_src = p4["weight"]
+    rref_dn_src = p1["fc2"]
+    if reprefetch:
+        try:
+            repref_buffers = saved["replica_buffers"]
+            repref_gate_ready = saved["replica_gate_ready"]
+            repref_down_ready = saved["replica_down_ready"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "MOE_MEGA_REPREFETCH=1 needs the pooling-era saved contract "
+                "(replica_buffers / replica_gate_ready / replica_down_ready); "
+                "re-run the forward on a current operator") from exc
+        # table-level monotonic mint: same sequence the forward pushes of
+        # EVERY pooled layer took — a waiter's epoch can only be satisfied
+        # by this launch's own pushes
+        repref_epoch = repref_buffers.next_push_epoch()
+        # the flat, layout-preserving RMA pushes need the HOME tables'
+        # natural contiguous storage: fc1_combined is a transpose stride
+        # view of the packed [E, H, 2F] table (its base pointer IS the
+        # natural layout), a non-contiguous home storage would scramble the
+        # element order into the [B, H, 2F] replica slots
+        if not saved["fc1_combined"].transpose(1, 2).is_contiguous():
+            raise ValueError(
+                "MOE_MEGA_REPREFETCH=1 requires a contiguous home gate/up "
+                "table (flat layout-preserving RMA push)")
+        repref_etc = saved["experts_to_copy"]
+        repref_etc_cpu = saved["experts_to_copy_cpu"]
+        lo = rank * home_e
+        owned = (repref_etc_cpu >= lo) & (repref_etc_cpu < lo + home_e)
+        repref_desc_count = int(
+            owned.sum().item() - owned[rank].sum().item())
+        # E7 research knob (2026-09-18, fault-domain split): zero the push
+        # traffic while keeping the sub_vec1 branch, compaction and quiet —
+        # NOPUSH+NOWAIT hanging would indict the branch's mere presence
+        # (lattice perturbation), green indicts the push traffic/addressing.
+        if os.environ.get("MOE_MEGA_REPREFETCH_NOPUSH", "0") == "1":
+            print(f"[mega r{rank}] MOE_MEGA_REPREFETCH_NOPUSH=1: descriptor "
+                  f"count {repref_desc_count} -> 0 (E7; pair with NOWAIT)",
+                  flush=True)
+            repref_desc_count = 0
+        if os.environ.get("MOE_MEGA_REPREFETCH_ZEROS", "0") == "1":
+            # E9 discriminator: push ZEROS instead of weights (host-side
+            # source swap; home_e * max(gu,dn) elems covers every home_slot
+            # base).  w2-diagnostic only (full-size alloc).
+            rref_gu_src = rref_dn_src = torch.zeros(
+                home_e * max(gu_elems, dn_elems), dtype=torch.bfloat16,
+                device=device)
+            print(f"[mega r{rank}] MOE_MEGA_REPREFETCH_ZEROS=1: E9 zeros "
+                  f"source ({home_e * max(gu_elems, dn_elems)} elems)",
+                  flush=True)
+        repref_gate_ready_u64 = repref_gate_ready.view(torch.uint64)
+        repref_down_ready_u64 = repref_down_ready.view(torch.uint64)
+        desc_ids = saved.get("_mega_repref_desc_ids")
+        if desc_ids is None or desc_ids.numel() < W * home_e:
+            desc_ids = torch.empty(
+                W * home_e, dtype=torch.int32, device=device)
+            saved["_mega_repref_desc_ids"] = desc_ids
+        # slot-major owner-local descriptor compaction on the device — the
+        # forward's exact pre-launch step (_begin_replica_prefetch),
+        # stream-ordered ahead of the mega launch with nothing consuming it
+        # in between: no exposure
+        _kernel_compact_local_replica_descriptors[1, 1, 1](
+            repref_etc, desc_ids,
+            LOCAL_RANK=rank, WORLD_SIZE=W, EXPERTS_PER_RANK=home_e)
+        # OUT-OF-KERNEL re-push (2026-09-20): run as a standalone launch
+        # before the mega kernel — the push code's mere presence in the
+        # mega binary trips the w4 whole-kernel miscompile family
+        # (A/AN/ANP all hang ~30-50% regardless of knobs/transports).
+        _kernel_replica_repush_store[(ncore(), 1, 1)](
+            rref_gu_src, rref_dn_src,
+            replica_w4, replica_fc2,
+            repref_gate_ready, repref_down_ready,
+            repref_etc, desc_ids, repref_desc_count,
+            repref_epoch,
+            LOCAL_RANK=rank, EPR=home_e,
+            GU_ELEMS=gu_elems, DN_ELEMS=dn_elems,
+            rb_ptr=rref_rb)
+        # R1 (2026-09-21): collective fence between the re-push and the mega
+        # kernel — every rank's re-push must complete (and be published)
+        # before any rank's mega reads its replica slots.  This replaces the
+        # in-kernel consumer dl.wait (REPREFETCH_WAIT is now always 0, mega
+        # binary ≡ REPREFETCH=0) with a stream-ordered publication edge over
+        # two small standalone kernels (transport-proven barrier).
+        launch_replica_grad_barrier(ncore())
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            # push-target addressing audit: every remote putmem/signal_op
+            # resolves the peer's address by SYMMETRIC OFFSET — these four
+            # offsets must be identical on every rank, else re-push writes
+            # land in the peer's wrong slab (clobbered signals -> barrier
+            # spin -> 507014).
+            _b = peer_mem.data_ptr()
+            print(
+                f"[mega-heap2 r{rank} t={time.time():.2f}] "
+                f"rfc2_off={replica_fc2.data_ptr() - _b} "
+                f"rw4_off={replica_w4.data_ptr() - _b} "
+                f"grdy_off={repref_gate_ready.data_ptr() - _b} "
+                f"drdy_off={repref_down_ready.data_ptr() - _b} "
+                f"epoch={repref_epoch} desc_n={repref_desc_count}",
+                flush=True)
+            # descriptor-compaction integrity audit: the compact kernel's
+            # masked data-dependent scatter store is a documented 910B1
+            # hazard (balanced_routing.py:51-59).  Rebuild the expected
+            # owner-local descriptor list on the host and diff — a drop
+            # here means some slot's push+SET never happens and vanilla
+            # (wait-on) consumers spin forever.
+            _flat = repref_etc_cpu.reshape(-1).tolist()
+            _want = sorted(
+                d for d in range(W * home_e)
+                if 0 <= _flat[d] < W * home_e
+                and _flat[d] // home_e == rank and d // home_e != rank
+            )
+            _got = sorted(
+                int(v) for v in desc_ids[:repref_desc_count].cpu())
+            print(
+                f"[mega-heap3 r{rank} t={time.time():.2f}] "
+                f"desc_match={_got == _want} want={len(_want)} "
+                f"got={len(_got)} "
+                f"missing={sorted(set(_want) - set(_got))[:8]}",
+                flush=True)
+            # consumer-demand vs push-coverage audit: every replica slot
+            # this rank's backward m-tiles will dl.wait on must be covered
+            # by a pushable ETC entry — an uncovered slot means the wait is
+            # unsatisfiable BY CONSTRUCTION (w4 multilayer deadlock
+            # candidate: all-core spin at dl.wait + B1).
+            _hb = home_base4
+            _demand = sorted({
+                int(e) - _hb
+                for e in tiles["tile_expert"].cpu().tolist()
+                if int(e) >= _hb
+            })
+            _row = repref_etc_cpu[rank].tolist()
+            _pushable = sorted(
+                s for s in range(home_e)
+                if 0 <= _row[s] < W * home_e and _row[s] // home_e != rank
+            )
+            print(
+                f"[mega-heap4 r{rank} t={time.time():.2f}] "
+                f"slot_demand={_demand} pushable={_pushable} "
+                f"uncovered={[s for s in _demand if s not in _pushable]}",
+                flush=True)
+    else:
+        repref_epoch = 0
+        repref_desc_count = 0
+        repref_etc = desc_ids = p1["recv_per_expert"]
+        repref_gate_ready = repref_down_ready = signal_mem
+        repref_gate_ready_u64 = repref_down_ready_u64 = \
+            signal_mem[:2].view(torch.uint64)
 
     launch_options = (
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
@@ -2894,6 +3233,21 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         ACC_BLK=blk6, TM6=tm6, TN6=tn6, BLK6=blk6,
         ts_ptr=ts_buf, wait1_ptr=wait1_buf,
         TS_SLOTS=MEGA_TS_SLOTS, TIMING=timing_on,
+        # re-prefetch (dead-arg pattern when REPREFETCH=False)
+        repref_etc_ptr=repref_etc, repref_desc_ids_ptr=desc_ids,
+        repref_desc_count=repref_desc_count,
+        repref_gate_ready_ptr=repref_gate_ready,
+        repref_down_ready_ptr=repref_down_ready,
+        repref_epoch=repref_epoch,
+        REPREFETCH=reprefetch,
+        REPREFETCH_WAIT=reprefetch_wait,
+        wait_dbg_ptr=wait_dbg, WAIT_DEBUG=wait_debug,
+        rref_rb_ptr=rref_rb,
+        rref_gu_src_ptr=rref_gu_src, rref_dn_src_ptr=rref_dn_src,
+        repref_gate_ready_u64_ptr=repref_gate_ready_u64,
+        repref_down_ready_u64_ptr=repref_down_ready_u64,
+        RREF_GU_ELEMS=gu_elems, RREF_GU_CHUNK=gu_chunk, RREF_GU_NCHUNK=gu_nchunk,
+        RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
     if saved_recompute:
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
@@ -2911,6 +3265,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # attribution probe: launch call returned (async) — with [mega-it] this
     # bounds the triton launch host overhead; with the NEXT [mega-ent] it
     # bounds the pure-host autograd segment after this launch.
+    if wait_debug:
+        _entries = wait_dbg.view(-1, 8).cpu()
+        _nz = _entries[_entries[:, 0] > 0]
+        if len(_nz):
+            for _e in _nz.tolist():
+                print(f"[mega-waitdbg r{rank}] TIMEOUT site={_e[0]} "
+                      f"slot={_e[1]} want={_e[2]} observed={_e[3]} "
+                      f"expert={_e[4]} spins={_e[5]}", flush=True)
+
     if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
         print(f"[mega-post r{rank} t={time.time():.2f}]", flush=True)
 
@@ -2940,6 +3303,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             # launch); the in-kernel P6c tail's zero stores proved
             # unreliable on this backend (see the module docstring).
             zero_consumed_replica_slots(grad_transport.buffers, consumed)
+            # barrier #3 (2026-09-20): publish the zeroing before any next
+            # forward's owner-push — an unordered next push could otherwise
+            # be wiped by this zeroing (the mirror race of barrier #2).
+            # (w8 bisect arm1 cleared it of hang causation.)
+            launch_replica_grad_barrier(grad_transport.num_barrier_programs)
             grad_fc1_reduced = torch.empty(
                 (epn6, 2 * ffn, H), dtype=dy.dtype, device=device
             ).copy_(acc_gate_up.transpose(1, 2))
