@@ -4,7 +4,7 @@
 > 目标硬件:2 节点 × 8 卡 Ascend950DT(98GB HDM)
 > 软件环境:cann-shmem 1.6.0(`import shmem as ash`)、triton 3.5.0 + triton_dist overlay、torch 2.10.0 + torch_npu
 > 参考上游:[Ascend/Triton-distributed-ascend#184 — cross-node support for put/get mem, allgather-gemm and reverse-all2all](https://gitcode.com/Ascend/Triton-distributed-ascend/pull/184)
-> 状态:方案文档,尚未实施
+> 状态:**阶段 1-3 已实施**(两仓 `dual-node` 分支,自 `release_v1.0`/`5d68e95` 拉出;2026-09-22)。实施中的两个方案变更见 §3.2a。G0 单机回归绿(w2 51.76s);G2+ 双机验证因对端暂不可用而挂起。
 
 ---
 
@@ -143,6 +143,13 @@ def device_str(dev: int) -> str:
 - `tests/_moe_testkit.py` 的 `make_peer_mem`/`make_moonep_backward_peer_mem` 内部 `dev = resolve_local_device(rank)`(签名不变)
 - `tests/fstage/test_mega_bwd_probes.py`(~8 处)、`tests/layer/test_moe_suite.py`(~20 处)、`benchmark/layer/profile_single_kernel_forward.py:301,309` 机械替换;kernel launch 的 `LOCAL_RANK=rank`(PE)不动
 
+### 3.2a 实施记录(2026-09-22,dual-node 分支):两个方案变更
+
+1. **引导:uniqueid → ip_port(必改)**。实施时核实 python API:`aclshmem_init_using_unique_id(mype, npes, mem_size, uid)` **没有 attr 参数**,内部固定默认引擎 MTE——无法带 `MTE|UDMA` 掩码,即无法跨节点(`aclshmemx_set_attr_uniqueid_args`/`aclshmemx_init_attr` 存在于 C 库但未导出到 python)。因此双机主路径 = **ip_port 引导 + 两节点显式一致的 `ASH_MASTER_ADDR=<node0-IP>` + 固定 `ASH_MASTER_PORT`**,与上游 PR#184 的跨机做法一致。防御:`MEGAMOE_MULTI_NODE=1` 且 `ASH_MASTER_ADDR` 为回环时,testkit 与框架 dispatcher 均**快速报错**(否则表现为首个跨节点 kernel 内挂死)。
+2. **设备拆分落点比 §2.3 清单更广**。除表列 30 处外,实测还有:`tests/_moe_baselines.py`、`tests/layer/test_{single_kernel_moonep,fwd_phase_timing,debug_moonep_saved}.py`、`tests/fstage/test_f0b_probes.py`(4 处)、`benchmark/layer/bench_moe_suite.py`(5 处)——已全部经 `mega_moe.runtime.device` 收口。`kernels/fc2_combine.py` 的 `local_rank` 形参是 PE 语义(`< world_size` 校验),**不改**。
+
+其余按本方案落地:`src/mega_moe/runtime/device.py`(唯一解析源,`MEGAMOE_LOCAL_DEVICE > MULTI_NODE=1→current_device > PE`)、conftest `MMT_NNODES/MMT_NODE_RANK` 偏移(`MASTER_ADDR/PORT` 双机必须显式一致,parent 侧校验)、goldens `RANK/LOCAL_RANK` 拆分、`kernels/common.py` LOCAL_RANK 命名契约注释、框架 `_local_device`/ensure 守卫/heap 预警/会话日志、`finetune_kimik3.sh` 拓扑参数化 + `kimik3_config_2n.yaml`(EP=16)。
+
 ### 3.2 阶段 2:初始化/引导 + 引擎
 
 **引导选型:uniqueid 经 HCCL 广播(推荐),ip_port env 为显式覆盖**
@@ -184,6 +191,17 @@ def device_str(dev: int) -> str:
 - `conftest.py::_worker_wrapper(local_i, global_world, ..., nproc_per_node, node_rank)`:`rank = node_rank*nproc_per_node + local_i`(全局 PE);`torch.npu.set_device(local_i)`;`init_process_group(rank=rank, world_size=global_world)`
 - `run_dist_test`:读 `MMT_NNODES`(默认 1)/`MMT_NODE_RANK`(默认 0)→ `nprocs = world_size // nnodes`;默认路径与现状逐位一致
 - 双机运行 = 两节点各起一次 pytest,共享:`MASTER_ADDR=<node0-IP>`、相同 `MASTER_PORT`、`MMT_NNODES=2`、`MMT_NODE_RANK=0/1`、`MEGAMOE_MULTI_NODE=1`
+- G2(2×2,W4)可直接复制的命令(两节点均在 mmt 仓根;`<node0-ip>` 替换;`w2` 门形状即 world=4 用例按需换名):
+  ```bash
+  source <venv>/activate-moe.sh
+  export MMT_NNODES=2 MMT_NODE_RANK=<0|1> MEGAMOE_MULTI_NODE=1 \
+         MASTER_ADDR=<node0-ip> MASTER_PORT=29511 ASH_MASTER_ADDR=<node0-ip> \
+         ASH_MASTER_PORT=41888 DIST_TEST_TIMEOUT_S=3600 MOE_FUSED_ASH_SIZE_GB=2 \
+         TRITON_CACHE_DIR=/tmp/triton-moe-g2-$MMT_NODE_RANK \
+         MOE_MEGA_GRAD_TRANSPORT=udma MOE_MEGA_REPREFETCH_TRANSPORT=udma MOE_MEGA_HEAP_PROBE=1
+  python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autograd_w2" -x -q -s
+  ```
+  (引擎在 MULTI_NODE=1 下自动 `MTE|UDMA`,无需 MOE_ASH_ENGINE;先 `ping <node0-ip>` 两网段各一次确认路由。)
 - goldens 修复(`_goldens/bigop_ref.py`、`backward.py` 的 `_main`):`rank=int(os.environ["RANK"])`、`set_device(LOCAL_RANK)`、`init_process_group(rank=rank)`、`device=f"npu:{local}"`
 
 ### 4.2 递进门禁 G0→G5
