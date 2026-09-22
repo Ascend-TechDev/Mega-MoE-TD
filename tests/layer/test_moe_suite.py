@@ -817,14 +817,26 @@ def run_single_kernel_forward_case(
                     op.forward(
                         hs, expert_indices, packed_w1, w2, routing_weights)
                 torch.npu.synchronize(device)
-                plain_timing = op.read_last_forward_phase_timing()
+                # Snapshot immediately: read_last_forward_phase_timing hands
+                # out the LIVE shared buffers, and the saved launch below
+                # zeroes and rewrites them — a bare reference would let the
+                # saved run's save column leak into the plain assertions.
+                plain_timing = {
+                    key: value.clone()
+                    for key, value in
+                    op.read_last_forward_phase_timing().items()
+                }
                 with torch.no_grad():
                     _, timing_saved = op.forward(
                         saved_hs, saved_experts, packed_w1, w2, saved_weights,
                         return_saved=True,
                     )
                 torch.npu.synchronize(device)
-                saved_timing = op.read_last_forward_phase_timing()
+                saved_timing = {
+                    key: value.clone()
+                    for key, value in
+                    op.read_last_forward_phase_timing().items()
+                }
 
                 timing_ok = (
                     fused_forward_module.FWD_TS_SLOTS
