@@ -11,6 +11,8 @@ import triton_dist.language as dl
 import triton.extension.buffer.language as bl
 from triton.language.extra.cann.extension import sub_vec_id
 import triton.language.extra.cann.extension as al
+from triton.language.extra.cann.extension import semantic as _cann_semantic
+from triton.language.extra.cann.extension.core import builtin as _tl_builtin
 from triton_dist.language.extra import libshmem_device
 
 from .common import _sys_cnt_tick
@@ -28,6 +30,25 @@ from .fused_moonep import (
 _ROUTE_BLOCK = tl.constexpr(256)
 _SCATTER_BLOCK = tl.constexpr(128)
 _REDUCE_BLOCK_N = tl.constexpr(4096)
+
+
+@_tl_builtin
+def _fixpipe_f322bf16(
+        src, dst, dual_dst_mode=al.FixpipeDualDstMode.NO_DUAL,
+        dma_mode=al.FixpipeDMAMode.NZ2ND, _semantic=None):
+    """``al.fixpipe`` with the F322BF16 pre-quant mode.
+
+    The stock wrapper hardcodes ``FixpipePreQuantMode.NO_QUANT``, which the
+    CANN fixpipe verifier only accepts for f32->f32 / i32->i32 destinations
+    (``'hivm.hir.fixpipe' op pre_quant mode 'NO_QUANT' requires ...`` on an
+    f32 L0C accumulator into a bf16 UB buffer).  F322BF16 performs the
+    conversion inside the fixpipe itself, so the UB buffers keep their bf16
+    layout and the historical pre-activation numerics.
+    """
+    return _cann_semantic.fixpipe(
+        src, dst, dma_mode, dual_dst_mode,
+        al.FixpipePreQuantMode.F322BF16, al.FixpipePreReluMode.NO_RELU,
+        _semantic)
 
 # ----------------------------------------------------------------------------
 # MOE_FWD_TIMING=1 (single-kernel forward): per-program SYS_CNT products.
@@ -274,8 +295,13 @@ def _build_destination_metadata(
         send_running += local_count
         expert_base += target_total
     if dst_rank == LOCAL_RANK:
-        if EXPERTS_PER_RANK > 1:
-            tl.store(recv_expert_offs_ptr + EXPERTS_PER_RANK, expert_base)
+        # Only the loop store above is skippable at EPR==1 (its one entry is
+        # the invariant zero base, host-initialized).  The EPR sentinel —
+        # this rank's total received rows — is dynamic and must always land:
+        # the saved contract reads it as offsets[-1] == total_recv, and at
+        # EPR==1 (one expert per rank, the wide-world shapes) skipping it
+        # left the workspace zero there.
+        tl.store(recv_expert_offs_ptr + EXPERTS_PER_RANK, expert_base)
         tl.store(stats_ptr, expert_base)
     tl.store(stats_ptr + 2 + dst_rank, expert_base)
 
@@ -687,13 +713,13 @@ def _partition_pipeline_fc1_activation_group_ub(
                     else:
                         _wait_fc1_vector_ack(1)
                 if pipeline_step % 2 == 0:
-                    al.fixpipe(gate_acc, gate_buffer_0, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
-                    al.fixpipe(up_acc, up_buffer_0, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
+                    _fixpipe_f322bf16(gate_acc, gate_buffer_0, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
+                    _fixpipe_f322bf16(up_acc, up_buffer_0, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
                     al.sync_block_set('cube', 'vector', 8, al.PIPE.PIPE_FIX,
                                       al.PIPE.PIPE_V)
                 else:
-                    al.fixpipe(gate_acc, gate_buffer_1, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
-                    al.fixpipe(up_acc, up_buffer_1, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
+                    _fixpipe_f322bf16(gate_acc, gate_buffer_1, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
+                    _fixpipe_f322bf16(up_acc, up_buffer_1, dual_dst_mode=al.FixpipeDualDstMode.ROW_SPLIT)
                     al.sync_block_set('cube', 'vector', 9, al.PIPE.PIPE_FIX,
                                       al.PIPE.PIPE_V)
             if pipeline_step == pipeline_tiles:
@@ -1249,14 +1275,21 @@ def _run_dynamic_wave_pipeline(
     # the acc columns (each part updates only its own columns with a
     # tl.where mask).  The scattered per-site form cost one auto-buffer UB
     # allocation per tiny value and overflowed UB (2026-09-17).  Everything
-    # sits inside `if TIMING:` so the default binary carries none of it.
+    # except the three hoisted names below sits inside `if TIMING:` so the
+    # default binary carries none of it.
     # The Cube engine cannot execute any of this arithmetic (no vector/
     # scalar ALU — 2026-09-18), so every Cube-side quantity is bracketed
     # from the Vector lanes instead; columns 0/1 hold the last dispatch
     # site's RAW entry/exit ticks (the in-kernel delta collapsed to 0 via
     # read merging) and column 7 the FC2-wave wall sum.
+    # Hoisted out of `if TIMING:` on purpose: the `_return_dynamic_wave`
+    # call passes them as kwargs unconditionally (Assign-form call, see the
+    # return block), so the names must exist under TIMING=0 too — dead
+    # values there, DCE'd by the backend.
+    dummy_ts = tl.arange(0, 1)
+    _fc2_s1 = tl.zeros((1,), dtype=tl.int64)
+    _fc2_s2 = tl.zeros((1,), dtype=tl.int64)
     if TIMING:
-        dummy_ts = tl.arange(0, 1)
         acc_row_ptr = acc_ptr + pid * 3 * ACC_SLOTS
         busy = tl.zeros((8,), dtype=tl.int64)
         busy_offs = tl.arange(0, 8)
@@ -1265,8 +1298,6 @@ def _run_dynamic_wave_pipeline(
         # (the return at iteration K waits FC2 wave K-2, hence the
         # two-step shift).
         fc2_wall = tl.zeros((1,), dtype=tl.int64)
-        _fc2_s1 = tl.zeros((1,), dtype=tl.int64)
-        _fc2_s2 = tl.zeros((1,), dtype=tl.int64)
     fc1_ring_call = 0
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 1:
@@ -1397,6 +1428,13 @@ def _run_dynamic_wave_pipeline(
             if (step >= 2) & (step - 2 < local_waves):
                 if TIMING:
                     _r0 = _sys_cnt_tick(dummy_ts)
+                # Keep this an ASSIGNMENT call: triton's ContainsReturnChecker
+                # skips Assign right-hand sides, so the callee's
+                # `if TIMING: return fc2_wave_end` stays invisible here.  A
+                # bare-statement call would trip the no-return-inside-loop
+                # check for both TIMING values (the checker ignores
+                # constexpr guards), and the kwargs need `dummy_ts` /
+                # `_fc2_s2` even when TIMING=0 — hence their hoisted defs.
                 _fc2_end = _return_dynamic_wave(
                     pid * 2 + sub_vec_id(), step - 2, combine_buf_ptr,
                     fc2_output_ptr, recv_seg_starts_ptr, pull_tile_dst_start_ptr, pipeline_signal_ptr,
