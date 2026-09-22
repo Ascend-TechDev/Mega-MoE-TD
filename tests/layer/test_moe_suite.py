@@ -2481,11 +2481,12 @@ def _assert_forward_after_grad_transport(
     """
     pooled = os.environ.get("MEGAMOE_REPLICA_POOL") == "1"
     # the backward's in-kernel re-push minted from the shared counter iff the
-    # mega path ran with the knob on (every caller of this helper has replica
-    # traffic, i.e. active_e > home_e, so the wrapper's reprefetch was live)
+    # mega path ran with the knob on (default on since 2026-09-22 — mirrors
+    # mega_bwd's gate; every caller of this helper has replica traffic, i.e.
+    # active_e > home_e, so the wrapper's reprefetch was live)
     bwd_mints = 1 if (
         os.environ.get("MOE_BWD_MEGA") == "1"
-        and os.environ.get("MOE_MEGA_REPREFETCH") == "1"
+        and os.environ.get("MOE_MEGA_REPREFETCH", "1") == "1"
         and getattr(op, "enable_moonep", False)
     ) else 0
     epoch_after_push = epoch_before_lend + 1 + bwd_mints
@@ -5208,6 +5209,305 @@ def run_single_kernel_situglu_autograd_case(
                 os.environ[key] = value
 
 
+def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
+    """Single-kernel MoonEP forward + mega recompute backward + reprefetch.
+
+    ``enable_single_kernel_forward`` + ``enable_moonep``: the minimal
+    contract's layout tables are PHYSICAL-slot (home | replica); the
+    adapter's MoonEP branch expands them into the physical backward contract
+    (plan tables snapshotted from the device planner's metadata, live
+    replica weight tables, auto-lend staged) and the backward runs the
+    one-launch mega kernel.  Gradients pin to the SAME SiTU eager golden as
+    the non-MoonEP case — MoonEP only moves rows between slots, so every
+    gradient must be numerically identical.
+
+    The step interleave is the megamoe_shared_op whole-net scenario in
+    miniature on ONE operator: fwd(step1) -> fwd(step2) -> bwd(step2) ->
+    bwd(step1).  Step 2 uses SCALED weights, so at bwd(step1) time both the
+    operator's replica tables and its staged ETC cache hold step 2's state —
+    the grads can only match the golden if (a) MOE_MEGA_REPREFETCH (default
+    on) really re-pushed step 1's replica weights in-launch, and (b) the
+    grad transport pulled over step 1's own ETC (the saved-dict override),
+    not the operator cache's.  Skewed Kimi routes guarantee replica traffic
+    in both steps (asserted against the host planning oracle up front).
+    """
+    if kit.ash is None or kit.torch_npu is None:
+        raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
+    if MegaMoEFunction is None:
+        raise RuntimeError("MegaMoEFunction is unavailable")
+
+    # MOE_MEGA_REPREFETCH stays UNSET: default-on is part of the contract
+    # under test (pooled/rewritten tables are only correct with the
+    # in-launch re-push; =0 is valid only with per-layer, per-step tables).
+    _bwd_env = {
+        "MOE_BWD_MEGA": "1",
+        "MOE_SAVED_RECOMPUTE": "1",
+        "MEGAMOE_REPLICA_POOL": "1",
+    }
+    _env_before = {k: os.environ.get(k) for k in _bwd_env}
+    os.environ.update(_bwd_env)
+
+    # Same shapes as the non-MoonEP single-kernel case: w2 small smoke
+    # (E=32, epn=16), w8 the exact Kimi-K3 integration shape (E=32, EPR=4,
+    # needs the 8GB symmetric heap like its non-MoonEP twin).
+    if world_size == 8:
+        tokens, hidden, ffn, topk, num_experts = 1024, 7168, 3072, 8, 32
+    else:
+        tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
+    situ_beta, situ_linear_beta = 4.0, 25.0
+    device = f"npu:{rank}"
+    dtype = torch.bfloat16
+    ep_group = dist.group.WORLD
+    label = f"single-kernel-moonep-autograd-w{world_size}"
+
+    from benchmark.layer._kimi_routes import kimi_skewed_routes
+
+    def cpu_step_routes(shift, r):
+        """Replica-engaging routes per (step shift, source rank), CPU int64.
+
+        w8/Kimi shape: the recorded router-collapse profile (the helper
+        requires W8 + topk 8/16).  w2 smoke: one hot expert per step
+        (alternating home ranks) plus a per-rank random spread — the hot
+        expert overflows its home budget onto replicas while the rest keeps
+        every expert's gradient exercised.
+        """
+        if world_size == 8:
+            return (
+                (kimi_skewed_routes(tokens, num_experts, topk, r) + shift)
+                % num_experts
+            )
+        torch.manual_seed(9000 + r * 10 + shift)
+        routes = torch.randint(
+            0, num_experts, (tokens, topk), dtype=torch.int64
+        )
+        # step1 hammers rank0's first home expert, step2 rank1's — each
+        # step's overflow lands on the OTHER rank's replica slots.
+        routes[:, 0] = 0 if shift == 0 else num_experts // world_size
+        return routes
+
+    def skewed_step_routes(shift):
+        return cpu_step_routes(shift, rank).to(
+            device=device, dtype=torch.int32
+        ).contiguous()
+
+    # The skewed routes must actually engage replicas in every step — check
+    # against the host planning oracle BEFORE running, so a routing change
+    # that silently drops replica traffic fails loudly here, not as a
+    # vacuous pass downstream.
+    for shift in (0, 4):
+        counts = torch.stack(
+            [
+                torch.bincount(
+                    cpu_step_routes(shift, r).flatten().long(),
+                    minlength=num_experts,
+                )
+                for r in range(world_size)
+            ]
+        )
+        oracle = plan_moonep_b0_b3(counts)
+        if not bool((oracle.experts_to_copy >= 0).any()):
+            raise AssertionError(
+                f"{label}: skewed routes (shift={shift}) produced no "
+                "replicas; the case cannot exercise the replica paths"
+            )
+
+    try:
+        with kit.aclshmem_session(
+            rank, world_size, kit.get_ash_size_bytes(default_gb=2),
+            enable_udma=True,
+        ):
+            peer_mem = kit.make_moonep_backward_peer_mem(
+                tokens * topk * world_size, tokens * topk, hidden, dtype, rank,
+                ep_group,
+            )
+            try:
+                op = FusedMoEForward(
+                    ep_group,
+                    max_tokens_per_rank=tokens,
+                    hidden_size=hidden,
+                    top_k=topk,
+                    num_experts=num_experts,
+                    config=MoEForwardConfig(
+                        receive_capacity_factor=float(world_size),
+                        activation="situglu",
+                        situ_beta=situ_beta,
+                        situ_linear_beta=situ_linear_beta,
+                        enable_single_kernel_forward=True,
+                        enable_moonep=True,
+                        fc1_gemm_block_size_m=256,
+                        fc2_combine_block_size_m=256,
+                    ),
+                )
+                try:
+                    w_gate, w_up = make_gate_up_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+                    w2 = make_down_weights(
+                        num_experts, hidden, ffn, world_size, rank, dtype,
+                        device,
+                    )
+
+                    def make_golden(hs, rw, ei, dy, gate_w, up_w, down_w):
+                        # same SiTU eager recipe as the situglu autograd case
+                        with torch.no_grad():
+                            _, gs = moe_forward(
+                                hs, rw, ei, gate_w, up_w, down_w, ep_group,
+                                topk, return_saved=True,
+                            )
+                            gate = gs["gate"].float()
+                            up = gs["up"].float()
+                            situ_a = (
+                                situ_beta
+                                * torch.tanh(gate / situ_beta)
+                                * torch.sigmoid(gate)
+                            )
+                            up_v = situ_linear_beta * torch.tanh(
+                                up / situ_linear_beta
+                            )
+                            gs["swiglu_out_weighted"] = (
+                                situ_a
+                                * up_v
+                                * gs["recv_weights_sorted"]
+                                .float()
+                                .unsqueeze(-1)
+                            ).to(dtype)
+                            gs["activation"] = "situglu"
+                            gs["situ_beta"] = situ_beta
+                            gs["situ_linear_beta"] = situ_linear_beta
+                            return backward_torch_baseline(gs, dy)
+
+                    # Two steps: different routes AND different weight values
+                    # (step 2 scaled), so the pooled replica content at
+                    # bwd(step1) time is step 2's — reading it un-repushed
+                    # would produce wrong grads, not just a stale-but-equal
+                    # pass.
+                    steps = []
+                    for idx, (shift, g_scale, d_scale) in enumerate(
+                        ((0, 1.0, 1.0), (4, 0.75, 0.5))
+                    ):
+                        hs, _ = prepare_inputs(
+                            tokens, hidden, num_experts, topk, dtype, device,
+                            seed=2303 + rank + idx,
+                        )
+                        rw = make_routing_weights(
+                            tokens, topk, device, seed=2304 + rank + idx
+                        )
+                        torch.manual_seed(2305 + rank + idx)
+                        dy = torch.randn(
+                            tokens, hidden, dtype=dtype, device=device
+                        )
+                        ei = skewed_step_routes(shift)
+                        gate_w = w_gate * g_scale
+                        up_w = w_up * g_scale
+                        down_w = w2 * d_scale
+                        steps.append(
+                            dict(
+                                hs=hs, rw=rw, ei=ei, dy=dy,
+                                gate_w=gate_w, up_w=up_w, down_w=down_w,
+                                packed=pack_gate_up_weights(gate_w, up_w),
+                                golden=make_golden(
+                                    hs, rw, ei, dy, gate_w, up_w, down_w
+                                ),
+                            )
+                        )
+
+                    state = SimpleNamespace(
+                        signal_mem=None, epoch=0, mega_persistent={}
+                    )
+
+                    def forward_step(step):
+                        hidden_leaf = step["hs"].clone().requires_grad_(True)
+                        routing_leaf = (
+                            step["rw"].clone().requires_grad_(True)
+                        )
+                        gate_up_leaf = (
+                            step["packed"].clone().requires_grad_(True)
+                        )
+                        down_leaf = step["down_w"].clone().requires_grad_(True)
+                        output = MegaMoEFunction.apply(
+                            op, hidden_leaf, routing_leaf, step["ei"],
+                            gate_up_leaf, down_leaf, peer_mem, state,
+                        )
+                        return output, (
+                            hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
+                        )
+
+                    dist.barrier()
+                    out1, leaves1 = forward_step(steps[0])
+                    if op._replica_experts_cache is None:
+                        raise AssertionError(
+                            f"{label}: the adapter did not stage "
+                            "op._replica_experts_cache for the auto-lend"
+                        )
+                    # fwd(step2) rewrites the shared planning workspaces,
+                    # the replica tables AND the operator's ETC cache.
+                    out2, leaves2 = forward_step(steps[1])
+
+                    # Reverse-order backwards (framework autograd order).
+                    out2.backward(steps[1]["dy"])
+                    grads2 = _megamoe_function_grads(leaves2, ffn)
+                    out1.backward(steps[0]["dy"])
+                    grads1 = _megamoe_function_grads(leaves1, ffn)
+
+                    for step_name, grads, step in (
+                        ("step2", grads2, steps[1]),
+                        ("step1", grads1, steps[0]),
+                    ):
+                        all_ok, details = compare_backward_gradients(
+                            grads, step["golden"]
+                        )
+                        if not all_ok:
+                            print(
+                                f"{label} {step_name} rank{rank} LOCAL-FAIL "
+                                f"gradient details: {details}",
+                                flush=True,
+                            )
+                        flag = torch.tensor(
+                            [1 if all_ok else 0],
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        dist.all_reduce(
+                            flag, op=dist.ReduceOp.MIN, group=ep_group
+                        )
+                        if not bool(flag.item()):
+                            raise AssertionError(
+                                f"{label}: {step_name} single-kernel MoonEP "
+                                "forward + mega recompute backward grads "
+                                "mismatched the SiTU eager golden"
+                            )
+
+                    # Post-lend recovery: the backwards invalidated the
+                    # replica weight cache; a plain forward must re-push and
+                    # still match the independent forward golden.
+                    expected1 = torch_moe_fwd_golden(
+                        steps[0]["hs"], steps[0]["rw"], steps[0]["ei"],
+                        steps[0]["gate_w"], steps[0]["up_w"],
+                        steps[0]["down_w"], num_experts, ep_group,
+                    )
+                    with torch.no_grad():
+                        produced1, _ = op.forward(
+                            steps[0]["hs"], steps[0]["ei"],
+                            steps[0]["packed"], steps[0]["down_w"],
+                            steps[0]["rw"], return_saved=True,
+                        )
+                    assert_close(
+                        produced1, expected1,
+                        rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL,
+                    )
+                finally:
+                    op.finalize()
+            finally:
+                kit.ash.aclshmem_free_tensor(peer_mem)
+    finally:
+        for key, value in _env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_single_kernel_shared_op_interleave_case(
     rank: int, world_size: int
 ) -> None:
@@ -5488,6 +5788,19 @@ def test_single_kernel_situglu_autograd_fc1offload_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_situglu_autograd_w8(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_w2(dist_test):
+    dist_test(run_single_kernel_moonep_autograd_case, world_size=2)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.kimi
+def test_single_kernel_moonep_autograd_w8(dist_test):
+    dist_test(run_single_kernel_moonep_autograd_case, world_size=8)
 
 
 @pytest.mark.dist

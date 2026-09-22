@@ -36,6 +36,20 @@ over the send table, so swapping the table keeps them mutually consistent.
 Two cheap tripwires below still verify the segment algebra and the send
 table's layout at runtime — never silence them.
 
+MoonEP (``enable_moonep``, 2026-09-22): the single-kernel planner already
+produces every layout table in PHYSICAL slot order (home | replica,
+EPR = epn + budget), so the same closed forms run unchanged over the
+physical stride.  The send side is NOT derivable from expert bincounts (a
+route's destination is the planner's choice), so it is snapshotted from the
+kernel's own metadata count row and cross-checked against the send bucket
+starts (tripwire 2b becomes a per-bucket expert-identity check against the
+planner's ``experts_to_copy``).  The MoonEP saved sections mirror
+``_attach_moonep_plan_sections`` / ``build_physical_saved_from_plan``, with
+the replica weight tables / ready slabs borrowed LIVE (pooled content is
+re-pushed in-launch by the backward under MOE_MEGA_REPREFETCH, default on),
+and ``op._replica_experts_cache`` is staged so the auto-lend in
+``MegaMoEFunction.backward`` succeeds.
+
 Droless routing is REQUIRED: the backward's map build asserts
 ``bincount(selected_experts).sum() == total_send``, so dropped routes
 (capacity_factor < world_size) fail here first with a clear message.
@@ -64,13 +78,7 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     from the operator's internal staging buffers (those are copy_-refreshed
     every call and would go stale between layers).
     """
-    if op.enable_moonep:
-        raise NotImplementedError(
-            "single-kernel forward + MoonEP backward is not wired yet: the "
-            "upstream single-kernel MoonEP path never validates its replica "
-            "weight cache, so lend_replica_weight_tables_for_grad() would "
-            "raise.  Target A is the non-MoonEP layout."
-        )
+    use_moonep = bool(op.enable_moonep)
     if int(op.world_size) * int(op.experts_per_rank) > 32:
         # workspace.py pads the bins to next_power_of_2(E); above 32 the
         # scatter's multi-bin-block loop (bin_block=32) corrupts the send
@@ -92,7 +100,10 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         )
     device = hidden_states.device
     W = int(op.world_size)
-    EPR = int(op.experts_per_rank)
+    epn = int(op.experts_per_rank)
+    # Slot stride of every layout table below: the MoonEP physical table
+    # (home | replica) under enable_moonep, the home table otherwise.
+    EPR = int(op.physical_experts_per_rank) if use_moonep else epn
     total_send = int(saved["total_send"])
     total_recv = int(saved["total_recv"])
 
@@ -148,8 +159,81 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
             f"distinct={int(torch.unique(send_route).numel())} "
             f"head={send_route[:8].tolist()}"
         )
+    # MoonEP plan snapshot: the device planner's products, settled by the
+    # forward's metadata .item() sync before this adapter runs.  Cloned here
+    # because a framework host sharing one operator across same-shape layers
+    # lets a LATER forward rewrite the planning workspaces before this
+    # layer's backward (the _single_kernel_snapshot contract).
+    experts_to_copy = experts_to_copy_cpu = None
+    active_phys = 0
+    if use_moonep:
+        ctxn = op.context
+        if op._replica_weight_buffers is None:
+            raise RuntimeError(
+                "single-kernel MoonEP forward returned without replica "
+                "weight buffers; cannot build the physical backward contract"
+            )
+        experts_to_copy = ctxn.planning_experts_to_copy.clone()
+        experts_to_copy_cpu = ctxn.planning_experts_to_copy.cpu().contiguous()
+        # world-max replica count, mirroring build_routing_plan
+        # (runtime/routing.py): active is rank-uniform by construction.
+        active_phys = epn + int(ctxn.planning_replica_counts.max().item())
+        replica_budget = int(experts_to_copy.shape[1])
+        if EPR != epn + replica_budget:
+            raise RuntimeError(
+                "physical expert stride disagrees with the plan table: "
+                f"EPR={EPR} != epn({epn}) + budget({replica_budget})"
+            )
+
     expert_seq = flat[send_route]
-    if bool((expert_seq[1:] < expert_seq[:-1]).any()):
+    if use_moonep:
+        # MoonEP tripwire 2b: buckets are (dst, PHYSICAL slot) and a route's
+        # flat expert id is NOT monotone along the table (a replica bucket
+        # holds its owner's expert id, which may sort anywhere).  The strong
+        # invariant instead: every bucket's rows carry exactly the expert
+        # that bucket holds — dst*epn+slot for home slots, the copied expert
+        # for replica slots — checked against the planner's own count row.
+        counts_row = op.context.metadata_counts_mem.view(
+            W, op.context.metadata_num_bins
+        )[op.rank, : W * EPR].to(torch.int64).reshape(-1)          # [W*EPR]
+        if int(counts_row.sum().item()) != total_send:
+            raise RuntimeError(
+                "MoonEP send count row disagrees with the contract: "
+                f"{int(counts_row.sum().item())} != {total_send}"
+            )
+        # Cross-check two independent kernel products: the metadata count
+        # row and the send bucket starts must be each other's cumsum.
+        expected_starts = counts_row.cumsum(0) - counts_row
+        if not torch.equal(
+            op.context.metadata_send_bucket_starts.to(torch.int64),
+            expected_starts,
+        ):
+            raise RuntimeError(
+                "MoonEP send bucket starts are not the exclusive cumsum of "
+                "the metadata count row — the backward's bucket walk would "
+                "scatter rows to wrong slots"
+            )
+        bucket_ids = torch.arange(W * EPR, dtype=torch.int64, device=device)
+        dst_of = bucket_ids // EPR
+        slot_of = bucket_ids % EPR
+        etc_flat = experts_to_copy.reshape(-1).to(torch.int64)
+        replica_expert = etc_flat[
+            dst_of * replica_budget + (slot_of - epn).clamp_min(0)
+        ]
+        expected_expert = torch.where(
+            slot_of < epn, dst_of * epn + slot_of, replica_expert
+        )
+        expected_seq = torch.repeat_interleave(
+            expected_expert, counts_row, output_size=total_send
+        )
+        if not torch.equal(expert_seq, expected_seq):
+            raise RuntimeError(
+                "single-kernel send_route_indices disagrees with the MoonEP "
+                "plan: a (dst, slot) bucket's rows must carry exactly the "
+                "expert that slot holds (home: dst*epn+slot; replica: the "
+                "planner's experts_to_copy entry)"
+            )
+    elif bool((expert_seq[1:] < expert_seq[:-1]).any()):
         raise RuntimeError(
             "single-kernel send_route_indices is not bucket-segmented "
             "(flat expert ids decrease along the table): the backward's "
@@ -209,9 +293,15 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
 
     # Send-side per-destination totals: the same bincount the backward's
     # _dispatch_static_maps runs — done here once, host-side, so the split
-    # lists need no extra collective round.
-    send_counts_re = torch.bincount(
-        flat, minlength=W * EPR).to(torch.int64).reshape(W, EPR)  # [W, EPR]
+    # lists need no extra collective round.  Under MoonEP the destination is
+    # the PLANNER's choice (home hit stays home, overflow lands on a replica
+    # holder), so the counts are not derivable from expert bincounts — reuse
+    # the kernel's own count row validated by the tripwire above.
+    if use_moonep:
+        send_counts_re = counts_row.reshape(W, EPR)             # [W, phys]
+    else:
+        send_counts_re = torch.bincount(
+            flat, minlength=W * EPR).to(torch.int64).reshape(W, EPR)  # [W, EPR]
     splits_send_list = send_counts_re.sum(dim=1).tolist()
     splits_recv_list = recv_counts64.sum(dim=1).tolist()
     if sum(splits_send_list) != total_send:
@@ -264,7 +354,13 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     # same-shape MoE layers: layer N's forward may bump the generation
     # before layer N-1's backward runs, and that is fine here (the 5-op
     # saved contract DOES alias those workspaces, so the guard stays
-    # strict for it).
+    # strict for it).  MoonEP exception, by design: the replica weight
+    # tables / ready slabs / pool object below are LIVE shared workspaces —
+    # under table pooling their content at backward time is another layer's
+    # weights, which is exactly what MOE_MEGA_REPREFETCH=1 (default on)
+    # repairs by re-pushing this layer's tables in-launch before P1 reads
+    # them.  Everything the guard actually protects (the plan tables) is
+    # still cloned above.
     saved["_single_kernel_snapshot"] = True
     _situ_beta = getattr(op, "situ_beta", None)
     _situ_linear_beta = getattr(op, "situ_linear_beta", None)
@@ -276,13 +372,58 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         world_size=W,
         ep_rank=int(op.rank),
         ep_group=op.ep_group,
-        experts_per_rank=EPR,
+        # HOME experts per rank under MoonEP (mirrors saved_phys in
+        # _moonep_torch_forward); the physical stride rides separately.
+        experts_per_rank=epn,
         activation=str(getattr(op, "activation", None) or "swiglu"),
         situ_beta=1.0 if _situ_beta is None else float(_situ_beta),
         situ_linear_beta=(
             None if _situ_linear_beta is None else float(_situ_linear_beta)
         ),
     )
+    if use_moonep:
+        saved.update(
+            # MoonEP physical-slot sections, mirroring
+            # _attach_moonep_plan_sections / build_physical_saved_from_plan.
+            use_moonep=True,
+            num_experts=epn * W,
+            home_experts_per_rank=epn,
+            physical_experts_per_rank=EPR,
+            active_physical_experts_per_rank=active_phys,
+            experts_to_copy=experts_to_copy,
+            experts_to_copy_cpu=experts_to_copy_cpu,
+            # Live symmetric tables (see the snapshot-marker note above):
+            # the backward sinks replica weight GRADIENTS into these slots
+            # and MOE_MEGA_REPREFETCH re-pushes this layer's weights into
+            # them in-launch.
+            replica_gate_up=op._replica_weight_buffers.gate_up,
+            replica_down=op._replica_weight_buffers.down,
+            replica_buffers=op._replica_weight_buffers,
+            replica_gate_ready=op.context.replica_gate_ready,
+            replica_down_ready=op.context.replica_down_ready,
+            # Physical plan tables consumed by _dispatch_static_maps_moonep.
+            # plan_recv_* / plan_received_* ARE the contract tables (already
+            # clones in physical slot order); the send side re-serves the
+            # tripwire-validated count row and the kernel's bucket starts.
+            plan_send_counts_by_rank_expert=(
+                send_counts_re.to(torch.int32).contiguous()
+            ),
+            plan_send_bucket_starts=(
+                op.context.metadata_send_bucket_starts.clone()
+            ),
+            plan_send_bucket_dst_starts=(
+                op.context.metadata_send_bucket_dst_starts.clone()
+            ),
+            plan_recv_counts_by_source_expert=(
+                saved["recv_counts_by_source_expert"]
+            ),
+            plan_received_expert_offsets=saved["recv_expert_offsets"],
+        )
+        # MegaMoEFunction.backward auto-lends the replica tables for the
+        # grad transport whenever saved["use_moonep"]; lend requires the
+        # ETC snapshot this path never staged (the single-kernel forward
+        # always invalidates the weight cache instead of caching it).
+        op._replica_experts_cache = experts_to_copy_cpu.clone()
     return saved
 
 
