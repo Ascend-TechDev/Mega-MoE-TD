@@ -3580,6 +3580,12 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         RREF_GU_ELEMS=gu_elems, RREF_GU_CHUNK=gu_chunk, RREF_GU_NCHUNK=gu_nchunk,
         RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        # variance hunt (2026-09-22): with [mega-heap4]/[mega-heap5] this
+        # splits the launch-site window into args-build | launch call |
+        # device drain — the run-9 log showed one ~8.5s stall somewhere in
+        # there per slow iteration, all ranks in lockstep.
+        print(f"[mega-lpre r{rank} t={time.time():.2f}]", flush=True)
     if saved_recompute:
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
@@ -3593,6 +3599,8 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         kernel_moe_backward_mega[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             num_warps=8, **launch_options)
+    if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+        print(f"[mega-lret r{rank} t={time.time():.2f}]", flush=True)
     # attribution probe: launch call returned (async) — with [mega-it] this
     # bounds the triton launch host overhead; with the NEXT [mega-ent] it
     # bounds the pure-host autograd segment after this launch.
@@ -3674,6 +3682,26 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
                       f"missing={len(_miss)} by_prog={sorted(_prog.items())} "
                       f"miss_tasks={sorted(_miss)[:40]}", flush=True)
 
+    if timing_on:
+        # variance hunt (2026-09-22): reduce the per-core SYS_CNT phase
+        # stamps to per-segment max(end)-min(start) (see _phase_stamp) —
+        # if the ~8.5s stall is device-side inside THIS kernel, the
+        # segment table shows which phase (P1 spin on dl.wait etc).
+        # SYS_CNT ≈ 978 ticks/us (measured 977.97, common.py).
+        torch.npu.synchronize()
+        _ts = ts_buf.cpu()
+        _lo = _ts.min(dim=0).values
+        _hi = _ts.max(dim=0).values
+        _names = ("entry>P1iss", "P1cube", "B1", "P2|P3", "B2",
+                  "P4", "P5a", "B4", "tail")
+        _segs = " ".join(
+            f"{_n}={float(_hi[_i + 1] - _lo[_i]) / 978000.0:.1f}"
+            for _i, _n in enumerate(_names))
+        print(
+            f"[mega-phases r{rank}] {_segs} "
+            f"total={float(_hi[9] - _lo[0]) / 978000.0:.1f}ms",
+            flush=True,
+        )
     if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
         print(f"[mega-post r{rank} t={time.time():.2f}]", flush=True)
 
