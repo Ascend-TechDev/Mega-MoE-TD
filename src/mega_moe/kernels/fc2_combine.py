@@ -968,7 +968,15 @@ def _launch_fc2_combine(
     )
     if any(tensor.device != weighted_activation.device for tensor in tensors):
         raise ValueError("all FC2/combine tensors must be on the same device")
-    if any(not tensor.is_contiguous() for tensor in tensors):
+    # The two down tables may be the caller's strided natural-layout
+    # [E, F, H] views — the launches below address them through stride
+    # parameters (down_weight.stride(0/1/2)).  Everything else stays
+    # contiguous (row-addressed buffers and metadata tables).
+    contiguous_tensors = tuple(
+        tensor for tensor in tensors
+        if tensor is not down_weight and tensor is not replica_down_weight
+    )
+    if any(not tensor.is_contiguous() for tensor in contiguous_tensors):
         raise ValueError("all FC2/combine tensors must be contiguous")
     activation_args = (
         activation_fc1_output,

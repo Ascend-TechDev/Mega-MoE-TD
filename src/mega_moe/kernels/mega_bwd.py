@@ -111,8 +111,8 @@
 #  orchestrator knobs are inert (the early return in ops/backward.py skips
 #  them). MOE_DISPATCH_GEMM_* / MOE_COMBINE_GEMM_* / MOE_COMBINE_PUSH_BN /
 #  MOE_FUSED_WGRAD_BLOCK_M tiles still apply (the kernel reuses those
-#  getters), plus the mega-local MOE_MEGA_WGRAD_BN / MOE_MEGA_WGRAD_BK /
-#  MOE_MEGA_WGRAD_NS wgrad tile knobs, MOE_MEGA_TILE_B3=1 (replace the
+#  getters), plus the mega-local MOE_MEGA_WGRAD_BK / MOE_MEGA_WGRAD_NS
+#  wgrad tile knobs, MOE_MEGA_TILE_B3=1 (replace the
 #  B3 barrier with per-(tile,n) readiness signals; the local cube->vector
 #  fence/signal/dl.wait chain it rests on is proven by probes 3/4,
 #  w8 910B1) and MOE_MEGA_FUSE_P4=1 (the P4a+P4b self-produce-self-push
@@ -1080,6 +1080,7 @@ def _redispatch_hidden_direct(
     hidden_ptr, stride_rm,
     send_src_idx_ptr, redis_buf_ptr,
     send_bucket_starts_ptr, send_counts_re_ptr, send_bucket_dst_starts_ptr,
+    task_begin, task_end,
     H: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     EXPERTS_PER_RANK: tl.constexpr,
@@ -1101,11 +1102,11 @@ def _redispatch_hidden_direct(
     B3.  Rides the B2->B3 window's leading vec scope beside the cube P4a
     (moved out of the P1 window 2026-09-16; see the recompute block
     comment)."""
-    num_tasks: tl.constexpr = WORLD_SIZE * EXPERTS_PER_RANK
     rows = tl.arange(0, BLOCK_M)
     cols = tl.arange(0, BLOCK_N)
-    for work_id in range(pid, num_tasks, nprogs):
-        dst_rank = work_id % WORLD_SIZE
+    for work_id in range(task_begin + pid, task_end, nprogs):
+        # i32 for dl.symm_at's rank operand
+        dst_rank = (work_id % WORLD_SIZE).to(tl.int32)
         expert_id = work_id // WORLD_SIZE
         task_id = dst_rank * EXPERTS_PER_RANK + expert_id
         task_start = tl.load(send_bucket_starts_ptr + task_id)
@@ -1887,6 +1888,16 @@ def kernel_moe_backward_mega_recompute(
     redis_buf_ptr,                         # symmetric slab [rows, H] = P5's B
     SAVED_RECOMPUTE: tl.constexpr,
     REDIS_BM: tl.constexpr, REDIS_BN: tl.constexpr,
+    # ---- local-phase DUALVEC partitioning (2026-09-21 bisect winners, now the
+    # defaults): P2 swiglu-bwd rows and P4c topk-reduce tokens partitioned
+    # across BOTH vec subcores (virtual pid = pid + sv*nprogs, stride 2*nprogs
+    # — each row/token handled exactly once).  SAFE because both phases are
+    # pure-local reads/writes with disjoint outputs; remote-store phases (P1
+    # gco / P4b push / re-dispatch) must NEVER be dual-partitioned — subcore-1
+    # remote symm_at stores are not fenced by barrier_all (w2 oracle bisect
+    # 2026-09-21 convicted REDIS/PUSH_DUALVEC, GCO same family). ----
+    P2_DUALVEC: tl.constexpr,
+    REDUCE_DUALVEC: tl.constexpr,
 ):
     """One launch for the whole non-MoonEP MoE backward — see the module
     docstring for the phase/barrier map and the M0 probe evidence.  Grid MUST
@@ -2006,6 +2017,19 @@ def kernel_moe_backward_mega_recompute(
                         HAS_LINEAR_BETA=HAS_LINEAR_BETA,
                         fc1_scale_ptr=fc1_scale_ptr,
                         FC1_FP8=FC1_FP8, FC1_GROUP_N=FC1_GROUP_N)
+            elif P2_DUALVEC:
+                # default path (2026-09-21 bisect winner): rows partitioned
+                # across BOTH subcores — the ungated form duplicated the full
+                # sweep per subcore instead of splitting it
+                _mega_swiglu_bwd(
+                    (pid + sub_vec_id() * num_cores).to(tl.int32),
+                    2 * num_cores,
+                    grad_swiglu_ptr, N1,
+                    AB_ptr, K4,
+                    ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
+                    situ_beta, situ_linear_beta,
+                    BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
+                    fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
             else:
                 _mega_swiglu_bwd(
                     pid, num_cores,
@@ -2060,6 +2084,11 @@ def kernel_moe_backward_mega_recompute(
     # and the only consumer is the B5->B6 owner-pull — no new barrier needed.
     if SAVED_RECOMPUTE:
         with al.scope(core_mode="vector", disable_auto_sync=True):
+            # sub_vec0-gated on purpose: remote symm_at stores from vec
+            # subcore 1 are NOT fenced/published by the closing barrier_all
+            # (w2 oracle bisect 2026-09-21 convicted the dual-partitioned
+            # variant — P5a read a stale slab; see _mega_push_rows'
+            # docstring contract).
             if sub_vec_id() == 0:
                 _redispatch_hidden_direct(
                     pid, num_cores,
@@ -2067,6 +2096,7 @@ def kernel_moe_backward_mega_recompute(
                     send_src_idx_ptr, redis_buf_ptr,
                     send_bucket_starts_ptr, send_counts_re_ptr,
                     send_bucket_dst_starts_ptr,
+                    0, WORLD_SIZE * EXPERTS_PER_RANK,
                     H, WORLD_SIZE, EXPERTS_PER_RANK,
                     REDIS_BM, REDIS_BN)
     if GRAD_REDUCE:
@@ -2205,8 +2235,9 @@ def kernel_moe_backward_mega_recompute(
         # ~97% idle across the kernel, so this window was pure loss before.
         if P4_ON:
             with al.scope(core_mode="vector", disable_auto_sync=True):
-                if sub_vec_id() == 0:
-                    if TILE_B3:
+                if TILE_B3:
+                    # dl.wait/consume_token body — stays sub_vec0-gated
+                    if sub_vec_id() == 0:
                         _mega_push_rows_tiled(
                             pid, num_cores,
                             hidden_buf_ptr,
@@ -2217,7 +2248,11 @@ def kernel_moe_backward_mega_recompute(
                             num_tiles_m4, num_tiles_n4,
                             H, M4,
                             BLOCK_N_PUSH, GATE_PAD_C)
-                    else:
+                else:
+                    # sub_vec0-gated on purpose: remote symm_at stores from
+                    # vec subcore 1 are not fenced by barrier_all (w2 oracle
+                    # bisect 2026-09-21 — see _mega_push_rows' docstring).
+                    if sub_vec_id() == 0:
                         _mega_push_rows(
                             pid, num_cores,
                             hidden_buf_ptr,
@@ -2239,7 +2274,8 @@ def kernel_moe_backward_mega_recompute(
                 orig_in5_ptr, stride_om5, stride_ok5,
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
-                N5, K5, num_tn5, num_tk5, 0, w5_split, max_rows_w,
+                N5, K5, num_tn5, num_tk5,
+                0, w5_split, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -2260,13 +2296,26 @@ def kernel_moe_backward_mega_recompute(
     # subset).
     if P4_ON:
         with al.scope(core_mode="vector", disable_auto_sync=True):
-            _mega_reduce(
-                pid, num_cores,
-                inv_sort_ptr, combine_buf_ptr,
-                grad_hidden_ptr, grad_routing_ptr,
-                B4, topk4, H,
-                H, 1,
-                BLOCK_N_PUSH, GATE_PAD_C)
+            if REDUCE_DUALVEC:
+                # default path (2026-09-21 bisect winner): token rows
+                # partitioned across BOTH subcores — the ungated form
+                # duplicated the sweep
+                _mega_reduce(
+                    (pid + sub_vec_id() * num_cores).to(tl.int32),
+                    2 * num_cores,
+                    inv_sort_ptr, combine_buf_ptr,
+                    grad_hidden_ptr, grad_routing_ptr,
+                    B4, topk4, H,
+                    H, 1,
+                    BLOCK_N_PUSH, GATE_PAD_C)
+            else:
+                _mega_reduce(
+                    pid, num_cores,
+                    inv_sort_ptr, combine_buf_ptr,
+                    grad_hidden_ptr, grad_routing_ptr,
+                    B4, topk4, H,
+                    H, 1,
+                    BLOCK_N_PUSH, GATE_PAD_C)
     if P5_ON:
         with al.scope(core_mode="cube", disable_auto_sync=True):
             _mega_wgrad_sweep(
@@ -2275,7 +2324,8 @@ def kernel_moe_backward_mega_recompute(
                 orig_in5_ptr, stride_om5, stride_ok5,
                 grad_fc1_ptr, stride_we5, stride_wn5, stride_wk5,
                 split_cum_ptr, expert_counts_ptr,
-                N5, K5, num_tn5, num_tk5, w5_split, w5_total, max_rows_w,
+                N5, K5, num_tn5, num_tk5,
+                w5_split, w5_total, max_rows_w,
                 W_BM, W_BN, W_BK, W_NS,
                 WAIT_DISP=0,
                 signal_mem_ptr=signal_mem_ptr, signal_epoch_val=signal_epoch,
@@ -2657,7 +2707,11 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # showed the cube MTE2 (GM->L1 feed) pipe ~93% busy on kimi t4k — wider
     # N/K tiles amortize the transposed feed (L0C=256KB bounds BN*BK*4B).
     wbm = int(os.environ.get("MOE_FUSED_WGRAD_BLOCK_M", str(FUSED_WBM)))
-    wbn = int(os.environ.get("MOE_MEGA_WGRAD_BN", str(FUSED_WBN)))
+    # WGRAD_BN fixed at 256 (was the fused 128): the 2026-09-21 knob bisect's
+    # it13 winner (balanced 14.55ms / skew 22.08ms, w2 value oracle green) —
+    # wider N amortizes the transposed GM->L1 feed.  Hardcoded per user
+    # instruction: no env override, this is simply how the kernel runs.
+    wbn = 256
     wbk = int(os.environ.get("MOE_MEGA_WGRAD_BK", str(FUSED_WBK)))
     wns = int(os.environ.get("MOE_MEGA_WGRAD_NS", "2"))
     dbm, dbn, dbk = _dispatch_gemm_tile()
@@ -3250,11 +3304,22 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         RREF_DN_ELEMS=dn_elems, RREF_DN_CHUNK=dn_chunk, RREF_DN_NCHUNK=dn_nchunk,
     )
     if saved_recompute:
+        # 2026-09-21 bisect resolution: the it13 winners are baked in with no
+        # switches (P2_DUALVEC + REDUCE_DUALVEC below, WGRAD_BN=256 above) —
+        # this is simply how the kernel runs.  The placement/shape experiment
+        # knobs of the masking-iteration round (ACTREC_MOVE/BM/BN, REDIS_
+        # SPLIT/EARLY_FRAC/DUALVEC, SLAB_PREFETCH/PF_ROWS, W5_SPLIT_FRAC/
+        # SWAP, PUSH/GCO_DUALVEC) were deleted — the three remote-store
+        # DUALVEC variants were convicted by the w2 value oracle (subcore-1
+        # remote stores escape barrier_all's fence), the rest never beat the
+        # baseline cleanly.
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),
             send_src_idx_ptr=send_src_idx, redis_buf_ptr=orig_in5,
-            SAVED_RECOMPUTE=True, REDIS_BM=64, REDIS_BN=1024,
+            SAVED_RECOMPUTE=True,
+            REDIS_BM=64, REDIS_BN=1024,
+            P2_DUALVEC=True, REDUCE_DUALVEC=True,
             num_warps=8, **launch_options)
     else:
         # the ORIGINAL kernel (kept verbatim above): the non-recompute

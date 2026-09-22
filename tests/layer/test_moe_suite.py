@@ -4946,13 +4946,14 @@ def run_single_kernel_situglu_autograd_case(
     stream and the backward entry H2Ds it back (the SwapTensor idiom from
     the framework's async_offload.py) — the grads must stay identical.
 
-    ``down_direct=True`` additionally sets ``MOE_DOWN_DIRECT=1`` and hands
-    the op the FRAMEWORK'S down-projection view — a transposed stride view
-    of an ``[E, F, H]`` table (values identical, strides ``(F*H, 1, H)``)
-    — instead of a contiguous ``[E, H, F]`` table: the single-kernel
-    forward and the mega backward must address it through their stride
-    parameters with no staging (no ``_fc2_ws``, no backward
-    ``.contiguous()``).
+    ``down_direct=True`` additionally hands the op the FRAMEWORK'S
+    down-projection view — a transposed stride view of an ``[E, F, H]``
+    table (values identical, strides ``(F*H, 1, H)``) — instead of a
+    contiguous ``[E, H, F]`` table: with the staging removal every path
+    addresses the down table through stride parameters (the XW
+    natural-layout read), so this case pins the framework hand-off
+    end-to-end; the default ``down_direct=False`` keeps the contiguous
+    special case covered.
     """
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("single-kernel autograd requires NPU and ACLSHMEM")
@@ -4965,8 +4966,6 @@ def run_single_kernel_situglu_autograd_case(
     _bwd_env = {"MOE_BWD_MEGA": "1", "MOE_SAVED_RECOMPUTE": "1"}
     if fc1_offload:
         _bwd_env["MEGAMOE_FC1_OFFLOAD"] = "1"
-    if down_direct:
-        _bwd_env["MOE_DOWN_DIRECT"] = "1"
     _env_before = {k: os.environ.get(k) for k in _bwd_env}
     os.environ.update(_bwd_env)
 
@@ -5130,10 +5129,10 @@ def run_single_kernel_situglu_autograd_case(
                             f"{label}: the mega backward did not persist its "
                             "slabs/epochs in state.mega_persistent"
                         )
-                    if down_direct and op._fc2_ws is not None:
+                    if down_direct and getattr(op, "_fc2_ws", None) is not None:
                         raise AssertionError(
-                            f"{label}: MOE_DOWN_DIRECT staged the down weight "
-                            "anyway (op._fc2_ws is allocated)"
+                            f"{label}: the down weight was staged anyway "
+                            "(op._fc2_ws is allocated)"
                         )
 
                     # Slab/epoch reuse across steps must stay bitwise.

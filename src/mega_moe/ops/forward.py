@@ -230,9 +230,6 @@ class FusedMoEForward(torch.nn.Module):
         # the per-step allocation (leaks ~3.8 GiB/iter on the integrated
         # training path — the autograd ctx pins the saved dict).
         self._saved_ws = None
-        # Fixed-address staging for a strided down (fc2) weight view (see
-        # _materialize_down_weight) — same persistent-buffer rationale.
-        self._fc2_ws = None
 
         # All ranks must observe zeroed symmetric buffers before first use.
         torch.npu.synchronize()
@@ -276,38 +273,6 @@ class FusedMoEForward(torch.nn.Module):
                     dtype=self.activation_dtype, device=dev),
             }
         return self._saved_ws
-
-    def _materialize_down_weight(self, down_weight):
-        """Fixed-address contiguous staging for a strided down (fc2) view.
-
-        The integrated host stores down_proj as ``[E, F, H]`` and used to hand
-        over a fresh ``transpose(1, 2).contiguous()`` copy every step (~84 MB
-        per layer at the kimi-k3 shape) because the GEMM contract asked for a
-        contiguous table.  That per-step copy is retained by the autograd
-        ctx's pinned ``saved`` dict on the training path — +336 MB/iter of
-        live-set growth.  A stride view is acceptable to both fc2 GEMMs (they
-        address the table through explicit strides), but staging it here is
-        strictly better: the copy lands in a persistent buffer (address never
-        changes, so no block is ever recycled under a free-flight task) and
-        ``copy_`` refreshes it every step, so optimizer updates flow through.
-        ``MOE_SAVED_WORKSPACE=0`` restores the historical per-step
-        ``.contiguous()``.
-        """
-        if down_weight.is_contiguous():
-            return down_weight
-        if os.environ.get("MOE_SAVED_WORKSPACE", "1") == "0":
-            return down_weight.contiguous()
-        if (
-            self._fc2_ws is None
-            or tuple(self._fc2_ws.shape) != tuple(down_weight.shape)
-        ):
-            self._fc2_ws = torch.empty(
-                down_weight.shape,
-                dtype=down_weight.dtype,
-                device=down_weight.device,
-            )
-        self._fc2_ws.copy_(down_weight)
-        return self._fc2_ws
 
     def sync(self):
         torch.npu.synchronize()
@@ -1431,20 +1396,27 @@ class FusedMoEForward(torch.nn.Module):
             raise ValueError(
                 "down_weight and weighted_activation must be on the same device"
             )
-        if not down_weight.is_contiguous():
-            raise ValueError(
-                "down_weight must be contiguous with layout "
-                "[experts_per_rank, hidden_size, ffn_size]"
-            )
+        # down_weight may be the caller's strided natural-layout [E, F, H]
+        # view — every kernel below addresses it through stride parameters
+        # (no staging).  A MoonEP replica table rides a symmetric heap slab
+        # and stays contiguous; the non-MoonEP default passes the home
+        # tensor itself as the "replica".
         if (
             replica_down_weight.shape != expected_weight_shape
             or replica_down_weight.dtype != down_weight.dtype
             or replica_down_weight.device != down_weight.device
-            or not replica_down_weight.is_contiguous()
         ):
             raise ValueError(
-                "replica_down_weight must be a contiguous tensor matching "
-                "down_weight shape, dtype, and device"
+                "replica_down_weight must match down_weight shape, dtype, "
+                "and device"
+            )
+        if (
+            replica_down_weight.data_ptr() != down_weight.data_ptr()
+            and not replica_down_weight.is_contiguous()
+        ):
+            raise ValueError(
+                "replica_down_weight must be a contiguous symmetric table "
+                "or the same tensor as down_weight"
             )
 
         output = torch.empty(
@@ -1912,33 +1884,18 @@ class FusedMoEForward(torch.nn.Module):
                 "and device as selected_experts"
             )
         # Framework callers hand down_proj as a transposed stride view of
-        # their [E, F, H] table (MindSpeed-MM megamoe dispatcher); the FC2
-        # kernels address raw memory and need a row-major [E, H, F].  Copy
-        # once here so both callers work; the fresh allocation also keeps
-        # the replica weight cache honestly miss-per-step, which matches
-        # optimizer-updated weights.
-        # MOE_DOWN_DIRECT=1 (single-kernel, non-MoonEP only): the fused
-        # kernel addresses the down table through its stride parameters, so
-        # the caller's strided view can flow through UNSTAGED — no ~88MB/layer
-        # persistent _fc2_ws, no per-step copy_ (and the backward drops its
-        # .contiguous() twin, see dispatch_fc2_bwd).  Strides are constexpr:
-        # (E*F*H, 1, H) for the caller's view vs (E*H*F, F, 1) staged — one
-        # stable specialization either way, but K-major vs N-major
-        # contiguity differs, hence the perf A/B before defaulting it on.
-        _down_direct = (
-            self.enable_single_kernel_forward
-            and not self.enable_moonep
-            and os.environ.get("MOE_DOWN_DIRECT", "0") == "1"
-        )
-        if (self.enable_single_kernel_forward
-                and not down_weight.is_contiguous() and not _down_direct):
-            # The one-launch kernel addresses the down table through raw
-            # strides, so stage a strided view into the operator's persistent
-            # fc2 buffer (fixed address, copy_-refreshed every step).  The
-            # single path re-pushes replica weights every call, so the
-            # constant buffer address cannot serve stale weights.
-            down_weight = self._materialize_down_weight(down_weight)
-        if not down_weight.is_contiguous() and not _down_direct:
+        # their natural [E, F, H] table (MindSpeed-MM megamoe dispatcher).
+        # Every FC2 consumer — the single-kernel wave, the 5-op combine, and
+        # both backwards — addresses the down table through its stride
+        # parameters, so the natural-layout view flows through UNSTAGED: the
+        # GEMM reads XW directly (B-tile unit stride along the hidden dim,
+        # which is N for the forward and K for the backward dX = dY @ W).
+        # The historical transposed [E, H, F] staging (~88 MB/layer/step at
+        # the kimi shape) is gone.  MoonEP still materializes one contiguous
+        # copy here: the replica RMA push reads flat offsets off the home
+        # table, and a fresh per-step allocation keeps the replica weight
+        # cache honestly miss-per-step, which matches optimizer updates.
+        if self.enable_moonep and not down_weight.is_contiguous():
             down_weight = down_weight.contiguous()
         expected_down_shape = (
             self.experts_per_rank,
@@ -1953,12 +1910,9 @@ class FusedMoEForward(torch.nn.Module):
         ):
             raise ValueError(
                 "down_weight must be BF16 with shape "
-                f"{expected_down_shape} on the input device (a strided view "
-                "is staged into the operator's persistent fc2 buffer, or "
-                "flows through unstaged under MOE_DOWN_DIRECT=1)"
+                f"{expected_down_shape} on the input device (a strided "
+                "natural-layout [E, F, H] view flows through unstaged)"
             )
-        if not _down_direct:
-            down_weight = self._materialize_down_weight(down_weight)
         ffn_size = gate_up_weight.shape[2] // 2
         if (
             gate_up_weight.shape[2] % self.config.fc1_gemm_block_size_n
