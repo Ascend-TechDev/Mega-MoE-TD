@@ -1280,7 +1280,7 @@ class FusedMoEForward(torch.nn.Module):
             send_route_indices=send_route_indices,
         )
 
-    def lend_replica_weight_tables_for_grad(self):
+    def lend_replica_weight_tables_for_grad(self, *, experts_to_copy_cpu=None):
         """Hand the symmetric replica weight tables to a physical backward.
 
         The M3 backward sinks its replica weight gradients into these same
@@ -1315,7 +1315,19 @@ class FusedMoEForward(torch.nn.Module):
 
         from ..runtime.replica_grad_transport import ReplicaGradTransport
 
-        experts_to_copy_cpu = self._replica_experts_cache.clone()
+        # ``experts_to_copy_cpu`` override: a framework host sharing one
+        # operator across same-shape MoE layers (megamoe_shared_op, no
+        # recompute) runs fwd1 -> fwd2 -> bwd2 -> bwd1, so the operator's
+        # staged cache holds the LAST forward's plan by the time the earlier
+        # layer's backward lends.  The saved dict carries this layer's own
+        # cloned ETC (single-kernel adapter / _attach_moonep_plan_sections)
+        # — passing it here keeps the owner-pull layout aligned with the
+        # slot layout the backward actually sinks into.  Default None keeps
+        # the historical operator-cache semantics for direct callers.
+        if experts_to_copy_cpu is not None:
+            experts_to_copy_cpu = experts_to_copy_cpu.clone().cpu().contiguous()
+        else:
+            experts_to_copy_cpu = self._replica_experts_cache.clone()
         self._replica_weight_cache_valid = False
         return ReplicaGradTransport(
             buffers=self._replica_weight_buffers,

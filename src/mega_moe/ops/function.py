@@ -182,7 +182,13 @@ class MegaMoEFunction(torch.autograd.Function):
         # the borrowed transport has been reduced.
         grad_transport = None
         if saved.get("use_moonep"):
-            grad_transport = op.lend_replica_weight_tables_for_grad()
+            # Pass THIS layer's cloned ETC: under megamoe_shared_op the
+            # operator cache holds the LAST forward's plan (fwd1 -> fwd2 ->
+            # bwd2 -> bwd1), which would mis-align the owner-pull with the
+            # slots this backward actually sinks into.
+            grad_transport = op.lend_replica_weight_tables_for_grad(
+                experts_to_copy_cpu=saved.get("experts_to_copy_cpu")
+            )
         grads = moe_backward_triton(saved, dy, ctx.peer_mem,
                                     grad_transport=grad_transport,
                                     hidden_states=getattr(

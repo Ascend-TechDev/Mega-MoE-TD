@@ -333,6 +333,43 @@ def _kernel_replica_repush_store(
 
 
 @triton.jit
+def _kernel_replica_repush_udma(
+        gu_src_ptr, dn_src_ptr,
+        replica_gu_ptr, replica_dn_ptr,
+        gate_ready_u64_ptr, down_ready_u64_ptr,
+        experts_to_copy_ptr, signal_epoch,
+        LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
+        EPR: tl.constexpr,
+        GU_ELEMS: tl.constexpr, GU_CHUNK: tl.constexpr,
+        DN_ELEMS: tl.constexpr, DN_CHUNK: tl.constexpr):
+    """UDMA-panel twin of ``_kernel_replica_repush_store`` (2026-09-22, the
+    MTE|UDMA combo plan): same ETC ownership scan as the forward's
+    _single_moonep_push, riding the peer QPs via _udma_push_panel.  Needs
+    the combo session (MOE_MEGA_REPREFETCH_TRANSPORT=udma); the store twin
+    stays the pure-MTE fallback.
+
+    The tail put_signal WQEs are NON-BLOCKING — the R1
+    launch_replica_grad_barrier publication edge is only sound once every
+    WQE this rank issued has COMPLETED, so each program drains its own
+    peers' QPs before exiting (the strided peer loop gives every peer
+    exactly one owner program).  The store twin needs no drain (plain
+    remote stores retire with the kernel); skipping it here would let the
+    mega kernel read pre-push replica slots through a passed barrier."""
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        for peer in range(pid, WORLD_SIZE, nprogs):
+            if peer != LOCAL_RANK:
+                _push_replica_weights_udma_peer(
+                    peer, gu_src_ptr, dn_src_ptr,
+                    replica_gu_ptr, replica_dn_ptr,
+                    gate_ready_u64_ptr, down_ready_u64_ptr,
+                    experts_to_copy_ptr, signal_epoch,
+                    LOCAL_RANK, EPR, GU_ELEMS, GU_CHUNK, DN_ELEMS, DN_CHUNK)
+                _udma_quiet(peer)
+
+
+@triton.jit
 def _kernel_replica_weight_prefetch_barrier():
     """Fence all weight puts with the backend-required barrier-sized grid."""
     libshmem_device.barrier_all_vec()

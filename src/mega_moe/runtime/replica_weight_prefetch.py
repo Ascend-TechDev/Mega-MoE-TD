@@ -122,6 +122,55 @@ class ReplicaWeightBuffers:
     # new wait -> silently wrong weights; same family as the mega_persistent
     # epoch-reset bug).
     push_epoch: int = 0
+    # MOE_MEGA_GRAD_TRANSPORT=udma scratch (2026-09-22 combo plan): the
+    # owner-pull's getmem is corrupt under MTE|UDMA, so the mega backward
+    # inverts to a credit-protocol UDMA push; these symmetric slabs are the
+    # push destinations and handshake words.  Cached on the (pooled) buffers
+    # so the ACLSHMEM allocation order stays rank-collective and the
+    # epoch-monotonic SET words need no cross-call zeroing.
+    grad_push_scratch: Optional[dict] = None
+
+    def ensure_grad_push_scratch(
+        self, gu_tasks, gu_chunk, dn_tasks, dn_chunk, device,
+    ) -> dict:
+        """Allocate (once) the symmetric grad-push staging and word slabs.
+
+        Staging rows are TASK-indexed (``home * chunks + chunk``), one row
+        per (home, chunk) task, reused across ordinals under the owner's
+        credit handshake.  Arrival/credit words are int32 pairs viewed as
+        uint64 for the UDMA tail SET and read as the low int32 by the
+        local ``dl.wait`` — values are ``epoch * 256 + ordinal``, strictly
+        increasing across calls, which is why zero-init once suffices.
+        """
+        key = (gu_tasks, gu_chunk, dn_tasks, dn_chunk)
+        cached = self.grad_push_scratch
+        if cached is not None:
+            if cached["key"] != key:
+                raise ValueError(
+                    "grad push scratch geometry changed on live buffers: "
+                    f"{cached['key']} -> {key}"
+                )
+            return cached
+        import shmem as ash
+
+        def _alloc(count, dtype):
+            tensor = ash.aclshmem_create_tensor(
+                [count], dtype=dtype, device_id=self.rank)
+            tensor.zero_()
+            return tensor
+
+        # int32 pairs (u64-viewable), 2 words per task per family
+        scratch = {
+            "key": key,
+            "staging_gu": _alloc(gu_tasks * gu_chunk, torch.bfloat16),
+            "staging_dn": _alloc(dn_tasks * dn_chunk, torch.bfloat16),
+            "arr_gu": _alloc(2 * gu_tasks, torch.int32),
+            "arr_dn": _alloc(2 * dn_tasks, torch.int32),
+            "cred_gu": _alloc(2 * gu_tasks, torch.int32),
+            "cred_dn": _alloc(2 * dn_tasks, torch.int32),
+        }
+        self.grad_push_scratch = scratch
+        return scratch
 
     def next_push_epoch(self, floor: int = 0) -> int:
         """Mint the next push epoch, never at or below ``floor``.
@@ -177,6 +226,11 @@ class ReplicaWeightBuffers:
         if self.gate_up_mem is not None:
             ash.aclshmem_free_tensor(self.gate_up_mem)
             self.gate_up_mem = None
+        if self.grad_push_scratch is not None:
+            for name in ("cred_dn", "cred_gu", "arr_dn", "arr_gu",
+                         "staging_dn", "staging_gu"):
+                ash.aclshmem_free_tensor(self.grad_push_scratch[name])
+            self.grad_push_scratch = None
 
 
 def allocate_replica_weight_buffers(
