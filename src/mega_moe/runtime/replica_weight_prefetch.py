@@ -132,17 +132,22 @@ class ReplicaWeightBuffers:
 
     def ensure_grad_push_scratch(
         self, gu_tasks, gu_chunk, dn_tasks, dn_chunk, device,
+        ord_stride=1,
     ) -> dict:
         """Allocate (once) the symmetric grad-push staging and word slabs.
 
-        Staging rows are TASK-indexed (``home * chunks + chunk``), one row
-        per (home, chunk) task, reused across ordinals under the owner's
-        credit handshake.  Arrival/credit words are int32 pairs viewed as
-        uint64 for the UDMA tail SET and read as the low int32 by the
-        local ``dl.wait`` — values are ``epoch * 256 + ordinal``, strictly
-        increasing across calls, which is why zero-init once suffices.
+        Staging rows are (task, ordinal)-indexed (``(home * chunks + chunk)
+        * ord_stride + ordinal``) — credit-free since the 2026-09-22
+        zengwang fix (signal_op credit SETs dropped 33-41% under framework
+        load while put_signal_nbi arrivals landed 100%), every ordinal owns
+        a private row so pushers never wait.  Arrival words are int32 pairs
+        viewed as uint64 for the UDMA tail SET and read as the low int32 by
+        the local ``dl.wait`` — values are ``epoch * 256 + ordinal``,
+        strictly increasing across calls, which is why zero-init once
+        suffices.  ``cred_*`` stay allocated for the frozen kernel
+        signature but are written by nobody.
         """
-        key = (gu_tasks, gu_chunk, dn_tasks, dn_chunk)
+        key = (gu_tasks, gu_chunk, dn_tasks, dn_chunk, ord_stride)
         cached = self.grad_push_scratch
         if cached is not None:
             if cached["key"] != key:
@@ -159,15 +164,17 @@ class ReplicaWeightBuffers:
             tensor.zero_()
             return tensor
 
-        # int32 pairs (u64-viewable), 2 words per task per family
+        # int32 pairs (u64-viewable), 2 words per (task, ordinal) per family
+        gu_cells = gu_tasks * ord_stride
+        dn_cells = dn_tasks * ord_stride
         scratch = {
             "key": key,
-            "staging_gu": _alloc(gu_tasks * gu_chunk, torch.bfloat16),
-            "staging_dn": _alloc(dn_tasks * dn_chunk, torch.bfloat16),
-            "arr_gu": _alloc(2 * gu_tasks, torch.int32),
-            "arr_dn": _alloc(2 * dn_tasks, torch.int32),
-            "cred_gu": _alloc(2 * gu_tasks, torch.int32),
-            "cred_dn": _alloc(2 * dn_tasks, torch.int32),
+            "staging_gu": _alloc(gu_cells * gu_chunk, torch.bfloat16),
+            "staging_dn": _alloc(dn_cells * dn_chunk, torch.bfloat16),
+            "arr_gu": _alloc(2 * gu_cells, torch.int32),
+            "arr_dn": _alloc(2 * dn_cells, torch.int32),
+            "cred_gu": _alloc(2 * gu_cells, torch.int32),
+            "cred_dn": _alloc(2 * dn_cells, torch.int32),
         }
         self.grad_push_scratch = scratch
         return scratch
