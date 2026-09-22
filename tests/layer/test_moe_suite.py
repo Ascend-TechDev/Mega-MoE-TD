@@ -66,6 +66,7 @@ from tests._numeric import (
     OUTPUT_ATOL,
     OUTPUT_RTOL,
     assert_close,
+    cmp_grad,
     diagnose,
 )
 
@@ -5209,7 +5210,46 @@ def run_single_kernel_situglu_autograd_case(
                 os.environ[key] = value
 
 
-def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
+def _quantize_fc1_half(x, group_n: int):
+    """Golden-side twin of the kernel's fp8 save leg (fused_forward's
+    FC1_FP8 block): per-(row, group) E4M3 quantize-dequantize with scale =
+    max(amax, 1e-3-sentinel)/448.  Applying it to the EAGER golden's gate/up
+    halves makes the gradient comparison measure the MoonEP path's handling
+    of the quantized save, not fp8 rounding noise (both sides then sit at
+    the same quantized point; the residual is the two implementations'
+    usual ~2e-2 plus e4m3 cast-boundary ulps)."""
+    rows, ffn_dim = x.shape
+    if ffn_dim % group_n:
+        raise ValueError(
+            f"quantize groups must tile the half: ffn={ffn_dim} "
+            f"group_n={group_n}")
+    g = x.float().view(rows, ffn_dim // group_n, group_n)
+    amax = g.abs().amax(dim=-1, keepdim=True)
+    safe = torch.where(amax > 1e-3, amax, torch.ones_like(amax))
+    q = (g * (448.0 / safe)).to(torch.float8_e4m3fn)
+    deq = (q.float() * (safe / 448.0)).view(rows, ffn_dim)
+    return deq.to(x.dtype)
+
+
+def _compare_grads_relaxed(grads, golden, *, rtol, atol):
+    """cmp_grad over the five canonical keys with explicit tolerances —
+    compare_backward_gradients' fixed GRAD_* bound does not fit a
+    quantized-save gate."""
+    rows = []
+    all_ok = True
+    for name in ("grad_hidden", "grad_routing_weights", "grad_fc1_1",
+                 "grad_fc1_2", "grad_fc2"):
+        ok, max_abs, rel, nbad = cmp_grad(
+            name, grads[name], golden[name], rtol=rtol, atol=atol)
+        rows.append({"name": name, "ok": bool(ok), "max_abs": max_abs,
+                     "relative": rel, "mismatches": nbad})
+        all_ok = all_ok and ok
+    return bool(all_ok), rows
+
+
+def run_single_kernel_moonep_autograd_case(
+    rank: int, world_size: int, save_fc1_dtype: str = "bf16",
+) -> None:
     """Single-kernel MoonEP forward + mega recompute backward + reprefetch.
 
     ``enable_single_kernel_forward`` + ``enable_moonep``: the minimal
@@ -5244,6 +5284,10 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
         "MOE_SAVED_RECOMPUTE": "1",
         "MEGAMOE_REPLICA_POOL": "1",
     }
+    if save_fc1_dtype == "fp8":
+        # production pairing (!59): the fp8 save rides the FC1 host-offload
+        # leg in the 整网 config — exercise both together under moonep
+        _bwd_env["MEGAMOE_FC1_OFFLOAD"] = "1"
     _env_before = {k: os.environ.get(k) for k in _bwd_env}
     os.environ.update(_bwd_env)
 
@@ -5259,6 +5303,8 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-moonep-autograd-w{world_size}"
+    if save_fc1_dtype == "fp8":
+        label += "-fp8"
 
     from benchmark.layer._kimi_routes import kimi_skewed_routes
 
@@ -5334,8 +5380,17 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
                         situ_linear_beta=situ_linear_beta,
                         enable_single_kernel_forward=True,
                         enable_moonep=True,
-                        fc1_gemm_block_size_m=256,
-                        fc2_combine_block_size_m=256,
+                        save_fc1_dtype=save_fc1_dtype,
+                        # fp8 halves the fc1 payload UB demand (e4m3 pair
+                        # buffer rides the block), so the quantized config
+                        # halves the M blocks — mirrors the !29 quantized-run
+                        # geometry
+                        fc1_gemm_block_size_m=(
+                            128 if save_fc1_dtype == "fp8" else 256
+                        ),
+                        fc2_combine_block_size_m=(
+                            128 if save_fc1_dtype == "fp8" else 256
+                        ),
                     ),
                 )
                 try:
@@ -5357,6 +5412,16 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
                             )
                             gate = gs["gate"].float()
                             up = gs["up"].float()
+                            if save_fc1_dtype == "fp8":
+                                # the mega backward reads the QUANTIZED save;
+                                # quantize the golden to the same point so the
+                                # compare measures the moonep path's handling
+                                # of the fp8 save, not e4m3 noise.  Kernel
+                                # group size: fc1_scale_group_size =
+                                # fc1_gemm_block_size_n // 2
+                                group_n = op.config.fc1_gemm_block_size_n // 2
+                                gate = _quantize_fc1_half(gate, group_n)
+                                up = _quantize_fc1_half(up, group_n)
                             situ_a = (
                                 situ_beta
                                 * torch.tanh(gate / situ_beta)
@@ -5454,9 +5519,18 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
                         ("step2", grads2, steps[1]),
                         ("step1", grads1, steps[0]),
                     ):
-                        all_ok, details = compare_backward_gradients(
-                            grads, step["golden"]
-                        )
+                        if save_fc1_dtype == "fp8":
+                            # e4m3 cast boundaries move the activation a
+                            # quantization step; the fixed GRAD_* bound of
+                            # compare_backward_gradients does not fit a
+                            # quantized-save gate
+                            all_ok, details = _compare_grads_relaxed(
+                                grads, step["golden"], rtol=1e-1, atol=5e-2
+                            )
+                        else:
+                            all_ok, details = compare_backward_gradients(
+                                grads, step["golden"]
+                            )
                         if not all_ok:
                             print(
                                 f"{label} {step_name} rank{rank} LOCAL-FAIL "
@@ -5476,6 +5550,22 @@ def run_single_kernel_moonep_autograd_case(rank: int, world_size: int) -> None:
                                 f"{label}: {step_name} single-kernel MoonEP "
                                 "forward + mega recompute backward grads "
                                 "mismatched the SiTU eager golden"
+                            )
+
+                    if save_fc1_dtype == "fp8":
+                        # the offload swap ran on BOTH steps — one D2H per
+                        # forward, one H2D per backward (mirrors the
+                        # fc1offload twin's assertion); counters are final
+                        # behind the grad checks above
+                        from mega_moe.ops._fc1_host_offload import (
+                            fc1_offload_stats,
+                        )
+                        d2h_n, h2d_n, d2h_bytes = fc1_offload_stats()
+                        if d2h_n < 2 or h2d_n < 2 or d2h_bytes <= 0:
+                            raise AssertionError(
+                                f"{label}: fc1 host offload did not run "
+                                f"(d2h={d2h_n} h2d={h2d_n} "
+                                f"bytes={d2h_bytes})"
                             )
 
                     # Post-lend recovery: the backwards invalidated the
@@ -5801,6 +5891,23 @@ def test_single_kernel_moonep_autograd_w2(dist_test):
 @pytest.mark.kimi
 def test_single_kernel_moonep_autograd_w8(dist_test):
     dist_test(run_single_kernel_moonep_autograd_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_fp8_w2(dist_test):
+    """fp8 saved-FC1 + FC1 host offload under the single-kernel moonep path.
+
+    The production quantized config (!29/!59) pairs the e4m3 save with the
+    host offload; this exercises both through the moonep adapter (FC1_FP8
+    and MOONEP are independent constexprs in the forward launch, the scale
+    save is moonep-agnostic, the mega backward dequantizes at load sites).
+    The golden quantizes its gate/up to the same e4m3 point, so the relaxed
+    compare isolates the moonep handling from quantization noise.
+    """
+    dist_test(
+        run_single_kernel_moonep_autograd_case, world_size=2, args=("fp8",)
+    )
 
 
 @pytest.mark.dist

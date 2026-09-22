@@ -137,20 +137,17 @@ python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autog
 | probe w2（single + combo + udma 双 transport） | ✅ PASS |
 | autograd w2（GRAD=udma） | ✅ PASS 23.3s |
 | autograd w2（GRAD+REPREFETCH 均 udma） | ✅ PASS 14.19s |
-| autograd w8（双 udma） | ❌ 564.77s 挂死 → 定位 credit 环 → **预 credit 修复已写、未验证** |
-| A 框架 dispatcher/脚本 | ✅ 代码完成，随本次一并提交 |
-| #6 FC1_OFFLOAD/DOWN_DIRECT/量化 MoonEP 补齐 | 分析完成、验证未跑（见 §8） |
-| #5 整网 | 未开始（等上面全绿） |
+| autograd w8（双 udma） | ✅ **PASS 47.16s**（此前 564.77s 挂死；根因 ordinal ABI §3.5，w2 门 53.33s） |
+| A 框架 dispatcher/脚本 | ✅ 代码完成，已提交推送 |
+| #6 FC1_OFFLOAD/DOWN_DIRECT/量化 MoonEP 补齐 | fp8+offload moonep 用例已写（`test_single_kernel_moonep_autograd_fp8_w2`），验证跑中；DOWN_DIRECT 按 §8 结论保留 guard |
+| #5 整网 | 未开始（w8 已绿，就差 #6 用例验证 + 整网脚本起跑） |
 
 ## 8. 后续计划（按序）
 
-1. **验证预 credit 修复**：
-   a. w2 autograd 复跑（双 udma）——确认无 codegen 回归（协议上 w2 单 ordinal，行为应与旧版一致）；
-   b. w8 复跑（双 udma，后台任务）；若仍挂，用 `MOE_MEGA_WAIT_DEBUG=1` 定位自旋的 wait（site/slot/want/observed），区分 credit-wait 还是 arrival-wait。
-2. **#6 MoonEP 补齐验证**（分析已做完，按结论执行）：
-   - FC1_OFFLOAD：`maybe_offload_fc1/maybe_reload_fc1`（`ops/function.py`）moonep 无关、结构性完备 → 跑 w2 autograd 加 `MEGAMOE_FC1_OFFLOAD=1` 验证；
-   - DOWN_DIRECT：**不要**删 `forward.py` 里 `_down_direct` 的 `not self.enable_moonep` 条件——MoonEP 下 flat RMA push（`fused_moonep.py::_single_moonep_push` 的面板寻址）要求 home down 表连续，strided home 表会打乱推送；后向 `dispatch_fc2_bwd.py` 的 `fc2=saved["fc2"].contiguous()` 双胞胎在 saved fc2 已是 staged 连续 `_fc2_ws` 时本来就是 no-op → 验证该别名关系即可；
-   - 量化（save_fc1_dtype=fp8）：mega 侧 FC1_FP8 反量化加载已支持（非 moonep 单卡用例有误差界断言），**缺 moonep 覆盖** → 在 `test_moe_suite.py` 给 `run_single_kernel_moonep_autograd_case` 加 fp8 save 子用例。
+1. ~~验证预 credit 修复~~ **已完成**（commit `bb6fe9b`）：真根因是 ordinal ABI（§3.5），预 credit 保留为多持有者 home 的正确协议；w2 门 53.33s + w8 47.16s 双绿。
+2. **#6 MoonEP 补齐验证**：
+   - fp8+FC1_OFFLOAD（生产配对，合并验证）：`test_single_kernel_moonep_autograd_fp8_w2` —— golden 侧 gate/up 同点 e4m3 量化（`_quantize_fc1_half`，group = block_n//2）+ `_compare_grads_relaxed(rtol=1e-1, atol=5e-2)` + offload 计数断言（d2h≥2/h2d≥2/bytes>0）；fp8 配置下 M 块减半（128）镜像 !29 量化几何；
+   - DOWN_DIRECT：**不要**删 `forward.py` 里 `_down_direct` 的 `not self.enable_moonep` 条件——MoonEP 下 flat RMA push（`fused_moonep.py::_single_moonep_push` 的面板寻址）要求 home down 表连续，strided home 表会打乱推送；后向 `dispatch_fc2_bwd.py` 的 `fc2=saved["fc2"].contiguous()` 双胞胎在 saved fc2 已是 staged 连续 `_fc2_ws` 时本来就是 no-op → 验证该别名关系即可。
 3. **#10/#5 整网**：framework `examples/kimi_k3/finetune_kimik3.sh` 8 卡跑；观察 `[mega-heap]` 审计行、首次迭代数值与 hang。
 4. **cutover 决策（推迟到整网绿后，需用户确认）**：算子侧默认值仍是 `getmem/store`（`MOE_MEGA_GRAD_TRANSPORT`/`MOE_MEGA_REPREFETCH_TRANSPORT`），框架脚本显式 export udma；整网绿后再议是否把默认翻成 udma。
 5. 遗留：REPREFETCH=1 的 W4 回归（旧项，未在本轮复现）；memory 文件更新（本次已做）。
