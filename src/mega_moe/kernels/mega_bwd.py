@@ -948,11 +948,13 @@ def _mega_grad_owner_pull(
     grad_cred_gu_ptr, grad_cred_dn_ptr,   # credit words, int32 views (UDMA)
     gtrans_epoch,
     gu_elems, dn_elems,
+    wait_dbg_ptr,
     EPN: tl.constexpr,
     GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr, ACC_BLK: tl.constexpr,
     LOCAL_RANK: tl.constexpr,
     PULL_GU: tl.constexpr, PULL_DN: tl.constexpr,
     GRAD_UDMA: tl.constexpr,
+    WAIT_DEBUG: tl.constexpr,
 ):
     """P6b owner-pull, SPLIT BY TABLE for the transport wave (2026-09-10):
     PULL_DN=1 runs in the B5->B6 window (peers' down slots were sunk in the
@@ -998,7 +1000,7 @@ def _mega_grad_owner_pull(
                     if first_peer != LOCAL_RANK:
                         libshmem_device.signal_op(
                             grad_cred_gu_ptr + 2 * task,
-                            gtrans_epoch * 256 + start,
+                            gtrans_epoch * 256,
                             libshmem_device.ACLSHMEM_SIGNAL_SET, first_peer)
         for task in range(pid, EPN * gu_chunks, ncores):
             home = task // gu_chunks
@@ -1029,17 +1031,32 @@ def _mega_grad_owner_pull(
                         # dl.wait races the still-landing payload (w2
                         # grad-debug: run-varying 43-46k elem mismatches,
                         # mean 1.16 — the P1/push-mtile idiom).
-                        val = gtrans_epoch * 256 + ordinal
+                        val = gtrans_epoch * 256 + (ordinal - start)
                         if ordinal > start:
                             libshmem_device.signal_op(
                                 grad_cred_gu_ptr + 2 * task, val,
                                 libshmem_device.ACLSHMEM_SIGNAL_SET, peer)
-                        token = dl.wait(
-                            grad_arr_gu_ptr + 2 * task, 1, 'gpu',
-                            'acquire', waitValue=val)
-                        row = dl.consume_token(
-                            staging_gu_ptr, token
-                        ) + task.to(tl.int64) * GU_CHUNK
+                        if WAIT_DEBUG:
+                            # fast deadlock diagnosis (2026-09-22): bounded
+                            # spin on the arrival word, then report+fall
+                            # through with a BARE row pointer — a stuck
+                            # handshake fails the run in seconds at the
+                            # grad compare with a [mega-waitdbg] record
+                            # (site 10) instead of riding the aicore
+                            # watchdog.  Numerics under WAIT_DEBUG are
+                            # forfeit by design (no acquire fence on the
+                            # satisfied path either).
+                            _wait_bounded_report(
+                                grad_arr_gu_ptr + 2 * task, val, 10, task,
+                                ordinal, pid, wait_dbg_ptr)
+                            row = staging_gu_ptr + task.to(tl.int64) * GU_CHUNK
+                        else:
+                            token = dl.wait(
+                                grad_arr_gu_ptr + 2 * task, 1, 'gpu',
+                                'acquire', waitValue=val)
+                            row = dl.consume_token(
+                                staging_gu_ptr, token
+                            ) + task.to(tl.int64) * GU_CHUNK
                         _mega_grad_accum(
                             acc_gate_up_ptr, row,
                             home, cs, cnt, gu_elems, ACC_BLK)
@@ -1067,7 +1084,7 @@ def _mega_grad_owner_pull(
                     if first_peer != LOCAL_RANK:
                         libshmem_device.signal_op(
                             grad_cred_dn_ptr + 2 * task,
-                            gtrans_epoch * 256 + start,
+                            gtrans_epoch * 256,
                             libshmem_device.ACLSHMEM_SIGNAL_SET, first_peer)
         for task in range(pid, EPN * dn_chunks, ncores):
             home = task // dn_chunks
@@ -1092,17 +1109,24 @@ def _mega_grad_owner_pull(
                         # same visibility contract).  Credit for ordinal
                         # k>start follows the k-1 consume; start was
                         # pre-credited above.
-                        val = gtrans_epoch * 256 + ordinal
+                        val = gtrans_epoch * 256 + (ordinal - start)
                         if ordinal > start:
                             libshmem_device.signal_op(
                                 grad_cred_dn_ptr + 2 * task, val,
                                 libshmem_device.ACLSHMEM_SIGNAL_SET, peer)
-                        token = dl.wait(
-                            grad_arr_dn_ptr + 2 * task, 1, 'gpu',
-                            'acquire', waitValue=val)
-                        row = dl.consume_token(
-                            staging_dn_ptr, token
-                        ) + task.to(tl.int64) * DN_CHUNK
+                        if WAIT_DEBUG:
+                            # DN twin of the site-10 arm (site 11)
+                            _wait_bounded_report(
+                                grad_arr_dn_ptr + 2 * task, val, 11, task,
+                                ordinal, pid, wait_dbg_ptr)
+                            row = staging_dn_ptr + task.to(tl.int64) * DN_CHUNK
+                        else:
+                            token = dl.wait(
+                                grad_arr_dn_ptr + 2 * task, 1, 'gpu',
+                                'acquire', waitValue=val)
+                            row = dl.consume_token(
+                                staging_dn_ptr, token
+                            ) + task.to(tl.int64) * DN_CHUNK
                         _mega_grad_accum(
                             acc_down_ptr, row,
                             home, cs, cnt, dn_elems, ACC_BLK)
@@ -1123,10 +1147,12 @@ def _mega_grad_udma_push_sweep(
         grad_arr_gu_ptr, grad_arr_dn_ptr,  # arrival words, u64 views (tail SET)
         grad_cred_gu_ptr, grad_cred_dn_ptr,  # credit words, LOW int32 views
         gu_elems, dn_elems, gtrans_epoch,
+        wait_dbg_ptr,
         EPN: tl.constexpr,
         GU_CHUNK: tl.constexpr, DN_CHUNK: tl.constexpr,
         LOCAL_RANK: tl.constexpr,
         PUSH_GU: tl.constexpr, PUSH_DN: tl.constexpr,
+        WAIT_DEBUG: tl.constexpr,
 ):
     """Peer side of the GRAD_UDMA grad transport (2026-09-22 combo plan).
 
@@ -1156,8 +1182,17 @@ def _mega_grad_udma_push_sweep(
                     cs = chunk * GU_CHUNK
                     cnt = tl.minimum(GU_CHUNK, gu_elems - cs)
                     task = home * gu_chunks + chunk
-                    dl.wait(grad_cred_gu_ptr + 2 * task, 1, 'gpu',
-                            'acquire', waitValue=val)
+                    if WAIT_DEBUG:
+                        # fast deadlock diagnosis (site 12): bounded spin on
+                        # the owner's credit, then report and push anyway —
+                        # numerics are forfeit under WAIT_DEBUG; the point is
+                        # bailing the kernel out in seconds with the record
+                        _wait_bounded_report(
+                            grad_cred_gu_ptr + 2 * task, val, 12, task,
+                            my_ord, pid, wait_dbg_ptr)
+                    else:
+                        dl.wait(grad_cred_gu_ptr + 2 * task, 1, 'gpu',
+                                'acquire', waitValue=val)
                     _udma_put_signal_nbi(
                         staging_gu_ptr + task.to(tl.int64) * GU_CHUNK,
                         gate_up_slot_ptr + slot64 * gu_elems + cs,
@@ -1177,8 +1212,14 @@ def _mega_grad_udma_push_sweep(
                     cs = chunk * DN_CHUNK
                     cnt = tl.minimum(DN_CHUNK, dn_elems - cs)
                     task = home * dn_chunks + chunk
-                    dl.wait(grad_cred_dn_ptr + 2 * task, 1, 'gpu',
-                            'acquire', waitValue=val)
+                    if WAIT_DEBUG:
+                        # DN twin of the site-12 arm (site 13)
+                        _wait_bounded_report(
+                            grad_cred_dn_ptr + 2 * task, val, 13, task,
+                            my_ord, pid, wait_dbg_ptr)
+                    else:
+                        dl.wait(grad_cred_dn_ptr + 2 * task, 1, 'gpu',
+                                'acquire', waitValue=val)
                     _udma_put_signal_nbi(
                         staging_dn_ptr + task.to(tl.int64) * DN_CHUNK,
                         down_slot_ptr + slot64 * dn_elems + cs,
@@ -1870,10 +1911,11 @@ def kernel_moe_backward_mega(
                     staging_gu_ptr, staging_dn_ptr,
                     grad_arr_gu_i32_ptr, grad_arr_dn_i32_ptr,
                     grad_cred_gu_ptr, grad_cred_dn_ptr, gtrans_epoch,
-                    gu6_elems, dn6_elems,
+                    gu6_elems, dn6_elems, wait_dbg_ptr,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
-                    PULL_GU=0, PULL_DN=1, GRAD_UDMA=GRAD_UDMA)
+                    PULL_GU=0, PULL_DN=1, GRAD_UDMA=GRAD_UDMA,
+                    WAIT_DEBUG=WAIT_DEBUG)
             if GRAD_UDMA:
                 if sub_vec_id() == 1:
                     _mega_grad_udma_push_sweep(
@@ -1883,10 +1925,10 @@ def kernel_moe_backward_mega(
                         staging_gu_ptr, staging_dn_ptr,
                         grad_arr_gu_ptr, grad_arr_dn_ptr,
                         grad_cred_gu_ptr, grad_cred_dn_ptr,
-                        gu6_elems, dn6_elems, gtrans_epoch,
+                        gu6_elems, dn6_elems, gtrans_epoch, wait_dbg_ptr,
                         EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                         LOCAL_RANK=LOCAL_RANK,
-                        PUSH_GU=0, PUSH_DN=1)
+                        PUSH_GU=0, PUSH_DN=1, WAIT_DEBUG=WAIT_DEBUG)
             # ungated like the old P6a: idempotent plain stores, so running
             # on BOTH vector subcores with the same pid is harmless.
             _mega_grad_seed_sink(
@@ -1909,10 +1951,11 @@ def kernel_moe_backward_mega(
                     staging_gu_ptr, staging_dn_ptr,
                     grad_arr_gu_i32_ptr, grad_arr_dn_i32_ptr,
                     grad_cred_gu_ptr, grad_cred_dn_ptr, gtrans_epoch,
-                    gu6_elems, dn6_elems,
+                    gu6_elems, dn6_elems, wait_dbg_ptr,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
-                    PULL_GU=1, PULL_DN=0, GRAD_UDMA=GRAD_UDMA)
+                    PULL_GU=1, PULL_DN=0, GRAD_UDMA=GRAD_UDMA,
+                    WAIT_DEBUG=WAIT_DEBUG)
             if GRAD_UDMA:
                 if sub_vec_id() == 1:
                     _mega_grad_udma_push_sweep(
@@ -1922,10 +1965,10 @@ def kernel_moe_backward_mega(
                         staging_gu_ptr, staging_dn_ptr,
                         grad_arr_gu_ptr, grad_arr_dn_ptr,
                         grad_cred_gu_ptr, grad_cred_dn_ptr,
-                        gu6_elems, dn6_elems, gtrans_epoch,
+                        gu6_elems, dn6_elems, gtrans_epoch, wait_dbg_ptr,
                         EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                         LOCAL_RANK=LOCAL_RANK,
-                        PUSH_GU=1, PUSH_DN=0)
+                        PUSH_GU=1, PUSH_DN=0, WAIT_DEBUG=WAIT_DEBUG)
         # barrier #2 (2026-09-20, zero-race fix): retire every rank's w3
         # getmem readers BEFORE kernel exit — the host-side
         # zero_consumed_replica_slots is stream-ordered only behind THIS
@@ -2524,10 +2567,11 @@ def kernel_moe_backward_mega_recompute(
                     staging_gu_ptr, staging_dn_ptr,
                     grad_arr_gu_i32_ptr, grad_arr_dn_i32_ptr,
                     grad_cred_gu_ptr, grad_cred_dn_ptr, gtrans_epoch,
-                    gu6_elems, dn6_elems,
+                    gu6_elems, dn6_elems, wait_dbg_ptr,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
-                    PULL_GU=0, PULL_DN=1, GRAD_UDMA=GRAD_UDMA)
+                    PULL_GU=0, PULL_DN=1, GRAD_UDMA=GRAD_UDMA,
+                    WAIT_DEBUG=WAIT_DEBUG)
             if GRAD_UDMA:
                 if sub_vec_id() == 1:
                     _mega_grad_udma_push_sweep(
@@ -2537,10 +2581,10 @@ def kernel_moe_backward_mega_recompute(
                         staging_gu_ptr, staging_dn_ptr,
                         grad_arr_gu_ptr, grad_arr_dn_ptr,
                         grad_cred_gu_ptr, grad_cred_dn_ptr,
-                        gu6_elems, dn6_elems, gtrans_epoch,
+                        gu6_elems, dn6_elems, gtrans_epoch, wait_dbg_ptr,
                         EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                         LOCAL_RANK=LOCAL_RANK,
-                        PUSH_GU=0, PUSH_DN=1)
+                        PUSH_GU=0, PUSH_DN=1, WAIT_DEBUG=WAIT_DEBUG)
             # ungated like the old P6a: idempotent plain stores, so running
             # on BOTH vector subcores with the same pid is harmless.
             _mega_grad_seed_sink(
@@ -2563,10 +2607,11 @@ def kernel_moe_backward_mega_recompute(
                     staging_gu_ptr, staging_dn_ptr,
                     grad_arr_gu_i32_ptr, grad_arr_dn_i32_ptr,
                     grad_cred_gu_ptr, grad_cred_dn_ptr, gtrans_epoch,
-                    gu6_elems, dn6_elems,
+                    gu6_elems, dn6_elems, wait_dbg_ptr,
                     EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                     ACC_BLK=ACC_BLK, LOCAL_RANK=LOCAL_RANK,
-                    PULL_GU=1, PULL_DN=0, GRAD_UDMA=GRAD_UDMA)
+                    PULL_GU=1, PULL_DN=0, GRAD_UDMA=GRAD_UDMA,
+                    WAIT_DEBUG=WAIT_DEBUG)
             if GRAD_UDMA:
                 if sub_vec_id() == 1:
                     _mega_grad_udma_push_sweep(
@@ -2576,10 +2621,10 @@ def kernel_moe_backward_mega_recompute(
                         staging_gu_ptr, staging_dn_ptr,
                         grad_arr_gu_ptr, grad_arr_dn_ptr,
                         grad_cred_gu_ptr, grad_cred_dn_ptr,
-                        gu6_elems, dn6_elems, gtrans_epoch,
+                        gu6_elems, dn6_elems, gtrans_epoch, wait_dbg_ptr,
                         EPN=EPN6, GU_CHUNK=GU_CHUNK, DN_CHUNK=DN_CHUNK,
                         LOCAL_RANK=LOCAL_RANK,
-                        PUSH_GU=1, PUSH_DN=0)
+                        PUSH_GU=1, PUSH_DN=0, WAIT_DEBUG=WAIT_DEBUG)
         # barrier #2 (2026-09-20, zero-race fix): see the non-recompute
         # kernel's note (w8 bisect arm1 cleared it of hang causation).
         libshmem_device.barrier_all()
@@ -3596,6 +3641,34 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
                 print(f"[mega-waitdbg r{rank}] TIMEOUT site={_e[0]} "
                       f"slot={_e[1]} want={_e[2]} observed={_e[3]} "
                       f"expert={_e[4]} spins={_e[5]}", flush=True)
+
+    if grad_udma and os.environ.get("MOE_MEGA_GRAD_PROBE") == "1":
+        # grad-push protocol audit (w8 site-10/12 observed=0 hunt, 2026-09-22):
+        # host-only probe — dumps BOTH protocol sides' tables (owner desc vs
+        # peer sched, both derived from the same ETC), the minted epoch, the
+        # scratch addresses (symmetric-offset sanity across ranks), and the
+        # post-launch word contents (did ANY credit/arrival land, and where).
+        torch.npu.synchronize()
+        _g = {
+            "epoch": gtrans_epoch, "epn": epn6,
+            "gu_elems": gu6_elems, "gu_chunk": gu_chunk6,
+            "dn_elems": dn6_elems, "dn_chunk": dn_chunk6,
+            "etc": grad_transport.experts_to_copy_cpu.tolist(),
+            "desc_peer": desc_peer6.cpu().tolist(),
+            "desc_slot": desc_slot6.cpu().tolist(),
+            "home_off": home_off6.cpu().tolist(),
+            "sched": grad_push_sched.cpu().tolist(),
+            "ptrs": [int(scratch[k].data_ptr())
+                     for k in ("staging_gu", "staging_dn",
+                               "arr_gu", "arr_dn", "cred_gu", "cred_dn")],
+        }
+        print(f"[mega-heap5 r{rank} t={time.time():.2f}] {_g}", flush=True)
+        for _k in ("arr_gu", "cred_gu", "arr_dn", "cred_dn"):
+            _v = scratch[_k].cpu()
+            _idx = torch.nonzero(_v).flatten().tolist()
+            _head = [(i, int(_v[i])) for i in _idx[:24]]
+            print(f"[mega-heap5w r{rank}] {_k} nz={len(_idx)} "
+                  f"first={_head}", flush=True)
 
     if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
         print(f"[mega-post r{rank} t={time.time():.2f}]", flush=True)

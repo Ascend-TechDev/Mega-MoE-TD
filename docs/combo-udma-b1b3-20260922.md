@@ -73,7 +73,21 @@ for task in ...:                                # 原消费循环
         _mega_grad_accum(...)
 ```
 无死锁归纳：所有 0 号 credit 无条件先落地 → 每个 pusher 首个 credit-wait 必解除 → 所有 0 号 arrival 必到 → k 号 credit 在消费 k−1 后即发 → 归纳成立。同 task 内 exact-match `dl.wait` 安全：k+1 号 credit 只会在 k 号 arrival（pusher 已过其 credit-wait 并发出 put）之后才写。
-**注意：此修复刚落盘，尚未跑任何验证（w2 复验 + w8 复跑是第一优先级）。**
+
+### 3.5 真正的 w8 根因：ordinal 编码 ABI 不一致（2026-09-22 下午定位，已修）
+
+预 credit 修复后 w8 仍挂 → 加 `MOE_MEGA_WAIT_DEBUG=1`（有界自旋 bail，见 3.6）+ `MOE_MEGA_GRAD_PROBE=1`（heap5 协议审计）两轮 102s 快速诊断定位：
+
+- **site=12 记录**（pusher 等 credit）：`want=512 observed=513/514` —— credit 写**能落地**，但值对不上；
+- **heap5 表 dump**：w8 实际 ETC 极稀疏（每 owner 仅 3 个单持有者 home：r1←{r0,r5,r6}、r2←{r3,r4,r7}，home_off=[0,1,2,3,3]，每个 home 仅 1 个持有者）；
+- **根因**：consumer 的 credit/arrival 值用**全局描述符序号**（`epoch*256 + ordinal`，ordinal=start..end 是 owner 描述符表的全局下标），pusher 用 **home 内序号**（`epoch*256 + my_ord`，host 端 sched 按持有者数计的位置）。home0（start=0）两编码碰巧相同能通，home1/2 永远错位（513/514 vs 512）→ 双向 exact-match wait 全部卡死。w8 观察到的"credit 环"其实从未形成（单持有者 home 无链）；原始 w8 挂死由此 ABI 不一致完全解释。
+- **修复**：consumer 统一改 home 内序号 —— pre-credit 值 `epoch*256`（首序号=0），循环内 `val = epoch*256 + (ordinal - start)`；pusher 不变（`my_ord` 本就是 home 内序号）。GU/DN 对称各两处。
+- 观察到的 `observed=0` 条目是时序伪影：owner 的 stride-32 程序尚未预 credit 到该 task 时 pusher 已 1M 自旋 bail；正常路径（无 bail）不受影响。epoch 每 rank 均匀（同一 launch 全 rank 相同：2→4），无跨 rank 漂移。
+
+### 3.6 快速死锁定位（用户要求缩短定位时间，已落地）
+
+- CANN 无 aicore watchdog 的环境变量可调（libruntime.so 只暴露 rtSetOpExecuteTimeOut API）→ 改为**kernel 内有界自旋 bail**：`_wait_bounded_report`（dispatch_fc2_bwd.py）把 grad 传输 4 类 wait（site 10=GU arrival、11=DN arrival、12=GU credit、13=DN credit）换成 ~1M 次自旋后记录 `[site,slot,want,observed,expert,spins]` 到 `dbg_ptr+pid*8` 并**带错继续**。死锁从 ~10min watchdog 变成 **~102s** 在梯度比对处快速失败，且记录齐全（w8 实测：128 条 site-10 + 12 条 site-12，两步 backward 的记录分别可辨）。
+- `MOE_MEGA_WAIT_DEBUG=1` 牺牲数值正确性（满足路径也无 acquire fence），只用于诊断；`MOE_MEGA_GRAD_PROBE=1`（host-only，不触发 kernel 重编译）dump 双方表 + epoch + scratch 指针 + launch 后四族 word 非零内容。
 
 ## 4. B1/B3/A 三个交付点
 
