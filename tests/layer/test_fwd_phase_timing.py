@@ -52,6 +52,7 @@ from config import CaseSpec, select_cases
 from mega_moe import FusedMoEForward, MoEForwardConfig
 from mega_moe.kernels import fused_forward as fused_forward_module
 from tests import _moe_testkit as kit
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 KIMI_FORWARD_CASES = kit.make_pytest_params(
@@ -104,7 +105,7 @@ def run_fwd_phase_timing_case(
             "(raise MOE_FUSED_ASH_SIZE_GB)"
         )
 
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     with kit.aclshmem_session(rank, world_size, heap_size):
         op = FusedMoEForward(

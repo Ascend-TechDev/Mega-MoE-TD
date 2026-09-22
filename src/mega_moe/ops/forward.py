@@ -43,6 +43,7 @@ from ..runtime.replica_weight_prefetch import (
     replica_pool_enabled,
     replica_weight_push_geometry,
 )
+from ..runtime.device import resolve_local_device
 from ..runtime.workspace import create_moe_forward_context
 from ._native_saved import (
     assemble_native_saved,
@@ -112,6 +113,10 @@ class FusedMoEForward(torch.nn.Module):
             self.world_size = torch.distributed.get_world_size()
         if num_experts % self.world_size:
             raise ValueError("num_experts must be divisible by the EP world size")
+        # self.rank is the ACLSHMEM global PE (peer addressing, kernel
+        # LOCAL_RANK); local_device is the NPU ordinal for allocations.
+        # Single-node the two coincide (see mega_moe.runtime.device).
+        self.local_device = resolve_local_device(self.rank)
 
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden_size = hidden_size
@@ -167,6 +172,7 @@ class FusedMoEForward(torch.nn.Module):
             dispatch_fc1_block_size_m=self.config.dispatch_fc1_block_size_m,
             enable_moonep=self.enable_moonep,
             ep_group=self.ep_group,
+            local_device=self.local_device,
         )
 
         # FC2/combine workspaces remain lazy so
@@ -416,6 +422,7 @@ class FusedMoEForward(torch.nn.Module):
                         down_weight,
                         rank=self.rank,
                         world_size=self.world_size,
+                        local_device=self.local_device,
                     )
                 )
                 self._replica_weight_pooled = True
@@ -426,6 +433,7 @@ class FusedMoEForward(torch.nn.Module):
                         down_weight,
                         rank=self.rank,
                         world_size=self.world_size,
+                        local_device=self.local_device,
                     )
                 )
                 fresh = True
@@ -587,7 +595,7 @@ class FusedMoEForward(torch.nn.Module):
         self._combine_fc2_storage = ash.aclshmem_create_tensor(
             [max_send * self.hidden_size],
             dtype=self.activation_dtype,
-            device_id=self.rank,
+            device_id=self.local_device,
         )
         self._combine_fc2_buf = self._combine_fc2_storage.view(
             max_send, self.hidden_size
@@ -691,7 +699,7 @@ class FusedMoEForward(torch.nn.Module):
             self._single_pipeline_signal_storage = ash.aclshmem_create_tensor(
                 [pipeline_slots * 16],
                 dtype=torch.int32,
-                device_id=self.rank,
+                device_id=self.local_device,
             )
             self._single_pipeline_signal_storage.zero_()
             # MOE_FWD_TIMING dead-arg buffers: the launch always receives

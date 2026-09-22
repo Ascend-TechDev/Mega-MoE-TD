@@ -37,6 +37,8 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
+from mega_moe.runtime.device import device_str, resolve_local_device
+
 from mega_moe._goldens._torch_forward_for_backward import (
     grouped_matmul,
     grouped_transposed_matmul,
@@ -219,7 +221,7 @@ def run_cross_check(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group, s
     # precision path than explicit torch.matmul). The bf16 triton-vs-golden
     # comparison lives in run_moe_backward.py with pad-256 + looser tolerance.
     dtype = torch.float32
-    device = f"npu:{pe}"
+    device = device_str(resolve_local_device(pe))
 
     torch.manual_seed(seed + pe * 1000)
     hidden_states = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
@@ -288,8 +290,10 @@ def run_test_distributed():
 
 
 if __name__ == "__main__":
-    local_pe = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(local_pe)
+    # torchrun semantics: RANK is the global rank (the ACLSHMEM PE on
+    # multi-node), LOCAL_RANK the device index; single-node they are equal.
+    local_pe = int(os.environ.get("RANK", os.environ["LOCAL_RANK"]))
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group(backend="hccl", rank=local_pe)
     print(f"[INFO] Rank {local_pe} of {dist.get_world_size()} initialised", flush=True)
     dist.barrier()

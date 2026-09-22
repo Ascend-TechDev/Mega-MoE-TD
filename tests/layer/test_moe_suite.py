@@ -31,6 +31,7 @@ from mega_moe.ops._moonep_torch_forward import (
 )
 from mega_moe.ops._torch_forward import moe_forward
 from mega_moe.kernels.common import all_gather_list
+from mega_moe.runtime.device import device_str, resolve_local_device
 import mega_moe.kernels.fc2_combine as fc2_combine_module
 import mega_moe.kernels.fused_forward as fused_forward_module
 from benchmark.layer import _fwd_phase_timing as fwd_timing_table
@@ -255,7 +256,7 @@ def run_forward_case(rank: int, world_size: int, case: CaseSpec) -> None:
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("functional forward requires torch_npu and ACLSHMEM")
 
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     heap_size = kit.get_ash_size_bytes(default_gb=1)
@@ -375,7 +376,7 @@ def run_single_kernel_forward_case(
         raise RuntimeError("single-kernel forward requires NPU and ACLSHMEM")
 
     hidden, ffn, topk = 256, 512, 2
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     all_passed = True
@@ -948,7 +949,7 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
             f"required={required_heap}, configured={heap_size}"
         )
 
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     with kit.aclshmem_session(rank, world_size, heap_size):
         op = FusedMoEForward(
@@ -1030,7 +1031,7 @@ def run_moonep_hot_expert_case(
         raise RuntimeError("MoonEP forward smoke requires NPU and ACLSHMEM")
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     with kit.aclshmem_session(
         rank, world_size, kit.get_ash_size_bytes(default_gb=1)
@@ -1434,7 +1435,7 @@ def run_moonep_planning_oracle_case(rank: int, world_size: int) -> None:
     tpe_all_cpu = row.repeat(world_size, 1).contiguous()
     torch_plan = plan_moonep_b0_b3(tpe_all_cpu)
     row_stride = 1 << num_experts.bit_length()
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
 
     with kit.aclshmem_session(
         rank, world_size, kit.get_ash_size_bytes(default_gb=1)
@@ -1509,7 +1510,7 @@ def run_moonep_moderate_wide_forward_case(rank: int, world_size: int) -> None:
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     torch.manual_seed(1701 + rank)
 
@@ -1701,7 +1702,7 @@ def run_moonep_physical_forward_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
 
@@ -1811,7 +1812,7 @@ def run_moonep_physical_forward_moderate_wide_case(
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     torch.manual_seed(1801 + rank)
@@ -2024,7 +2025,7 @@ def run_moonep_backward_hot_expert_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
 
@@ -2161,7 +2162,7 @@ def run_moonep_backward_moderate_wide_case(rank: int, world_size: int) -> None:
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     torch.manual_seed(1901 + rank)
@@ -2532,7 +2533,7 @@ def run_moonep_backward_symmetric_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-symmetric-hot-expert-backward"
@@ -2762,7 +2763,7 @@ def run_moonep_backward_symmetric_moderate_wide_case(
     tokens, hidden, ffn, topk, num_experts = 64, 256, 256, 8, 112
     experts_per_rank = num_experts // world_size
     owner_counts = (19, 27, 11, 11, 15, 15, 15, 15)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-symmetric-w8-moderate-wide-backward"
@@ -3677,7 +3678,7 @@ def run_megamoe_native_saved_metadata_case(
     # capacity mirrors the functional forward smoke cases.
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"megamoe-native-saved-metadata-w{world_size}"
@@ -4012,7 +4013,7 @@ def run_moonep_native_saved_hot_expert_case(
         )
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"moonep-native-saved-hot-expert-w{world_size}"
@@ -4142,7 +4143,7 @@ def run_moonep_native_backward_symmetric_hot_expert_case(
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     experts_per_rank = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-native-backward-symmetric-hot-expert"
@@ -4379,7 +4380,7 @@ def run_moonep_multilayer_pool_epoch_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 32, 256, 512, 2, 8
     num_layers = 3
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "moonep-multilayer-pool-epoch"
@@ -4603,7 +4604,7 @@ def run_megamoe_native_autograd_case(rank: int, world_size: int) -> None:
         raise RuntimeError("MegaMoEFunction is unavailable")
 
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "megamoe-native-autograd-w2"
@@ -4792,7 +4793,7 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
 
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 128
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = "megamoe-situglu-autograd-w2"
@@ -4993,7 +4994,7 @@ def run_single_kernel_situglu_autograd_case(
     else:
         tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-situglu-autograd-w{world_size}"
@@ -5299,7 +5300,7 @@ def run_single_kernel_moonep_autograd_case(
     else:
         tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-moonep-autograd-w{world_size}"
@@ -5628,7 +5629,7 @@ def run_single_kernel_shared_op_interleave_case(
     # per the adapter's scatter guard)
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"single-kernel-shared-op-interleave-w{world_size}"

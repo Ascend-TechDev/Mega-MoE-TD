@@ -4,6 +4,14 @@
 #
 #  Shared configuration + helpers for the Ascend MoE-backward triton kernels.
 #  GEMM dot-tiles match 06 / the GPU backward tiling.
+#
+#  NAMING CONTRACT — kernel parameter LOCAL_RANK is the ACLSHMEM GLOBAL PE
+#  (= ep_group.rank(), 0..world_size-1 across ALL nodes) and has nothing to
+#  do with torchrun's $LOCAL_RANK env (the per-node device index).  The two
+#  coincide on a single node only.  Host code allocating on a device must
+#  resolve through mega_moe.runtime.device, never the PE.  (Renaming the
+#  kernel parameter is forbidden: it is a constexpr in the compiled kernel
+#  cache and would re-roll the 950DT miscompilation dice.)
 # ============================================================================
 
 import torch

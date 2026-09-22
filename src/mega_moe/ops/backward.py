@@ -40,6 +40,7 @@ import torch_npu  # noqa: F401
 import torch.distributed as dist
 
 from ._torch_forward import moe_forward
+from ..runtime.device import device_str, saved_device_id
 from ..kernels import (
     dispatch_fc2_bwd_triton,
     swiglu_bwd_triton,
@@ -245,7 +246,7 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None,
         # cube+vector triton kernels; here the overlap window contains only
         # pure-cube (s_cube) + pure-vector (s_vec), mirroring /tmp/dual_stream.py.
         cur = torch.npu.current_stream()
-        device = f"npu:{saved['ep_rank']}"
+        device = device_str(saved_device_id(saved))
         if saved.get("_dual_cube_stream") is None:
             saved["_dual_cube_stream"] = torch.npu.Stream(device=device)
             saved["_dual_vec_stream"] = torch.npu.Stream(device=device)
@@ -334,7 +335,7 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None,
         _sev[5].synchronize()
         _iv = [_sev[i].elapsed_time(_sev[i + 1]) for i in range(5)]
         _tmax = torch.tensor(_iv, dtype=torch.float32,
-                             device=f"npu:{saved['ep_rank']}")
+                             device=device_str(saved_device_id(saved)))
         dist.all_reduce(_tmax, op=dist.ReduceOp.MAX, group=saved["ep_group"])
         saved.setdefault("_bwd_stage_samples", []).append(
             [float(x) for x in _tmax.cpu().tolist()])

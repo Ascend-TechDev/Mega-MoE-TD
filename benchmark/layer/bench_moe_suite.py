@@ -104,6 +104,7 @@ from tests._moe_baselines import (
     build_backward_saved,
     torch_moe_fwd_golden,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 
 ACTIVATION_DTYPE = torch.bfloat16
@@ -1536,7 +1537,7 @@ def run_forward_benchmark(rank: int, world_size: int, case: CaseSpec):
 
     ep_group = dist.group.WORLD
     with kit.aclshmem_session(rank, world_size, G_ASH_SIZE):
-        device = f"npu:{rank}"
+        device = device_str(resolve_local_device(rank))
         experts_per_rank = case.num_experts // world_size
         grouped_baseline = GroupedForwardBaseline(case, ep_group)
         config = MoEForwardConfig(
@@ -1867,7 +1868,7 @@ def run_moonep_forward_benchmark(
     required_free_hbm = _required_moonep_free_hbm_bytes(case, world_size)
     local_free_hbm, local_total_hbm = torch.npu.mem_get_info()
     hbm_info = torch.tensor(
-        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=f"npu:{rank}"
+        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=device_str(resolve_local_device(rank))
     )
     dist.all_reduce(hbm_info, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
     min_free_hbm, min_total_hbm = (int(value) for value in hbm_info.cpu().tolist())
@@ -1885,7 +1886,7 @@ def run_moonep_forward_benchmark(
     }
 
     ep_group = dist.group.WORLD
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     experts_per_rank = case.num_experts // world_size
     _log_moonep_phase(rank, case, "allocating weights and deterministic hot routes")
     packed_w1, down_weight, _ = _make_local_weights(
@@ -2519,7 +2520,7 @@ def run_moonep_backward_benchmark(
     required_free_hbm = _required_moonep_free_hbm_bytes(case, world_size)
     local_free_hbm, local_total_hbm = torch.npu.mem_get_info()
     hbm_info = torch.tensor(
-        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=f"npu:{rank}"
+        [local_free_hbm, local_total_hbm], dtype=torch.int64, device=device_str(resolve_local_device(rank))
     )
     dist.all_reduce(hbm_info, op=dist.ReduceOp.MIN, group=dist.group.WORLD)
     min_free_hbm, min_total_hbm = (int(value) for value in hbm_info.cpu().tolist())
@@ -2537,7 +2538,7 @@ def run_moonep_backward_benchmark(
     }
 
     ep_group = dist.group.WORLD
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     experts_per_rank = case.num_experts // world_size
 
     # Logical Torch baseline first, outside the symmetric session: the

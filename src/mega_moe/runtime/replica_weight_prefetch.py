@@ -111,6 +111,11 @@ class ReplicaWeightBuffers:
     gate_up_expert_shape: tuple[int, int]
     down_expert_shape: tuple[int, int]
     rank: int
+    # Local NPU ordinal for every symmetric allocation owned by these buffers
+    # (tables themselves and the grad-push scratch).  ``rank`` stays the
+    # ACLSHMEM global PE; multi-node splits the two
+    # (see mega_moe.runtime.device).
+    local_device: Optional[int] = None
     # Table-level SET-epoch counter (pooling era, 2026-09-17): EVERY push
     # into these slots — forward prefetch or backward re-prefetch, any layer
     # sharing the pool entry — mints the next value here.  Monotonic
@@ -158,9 +163,11 @@ class ReplicaWeightBuffers:
             return cached
         import shmem as ash
 
+        dev = self.rank if self.local_device is None else self.local_device
+
         def _alloc(count, dtype):
             tensor = ash.aclshmem_create_tensor(
-                [count], dtype=dtype, device_id=self.rank)
+                [count], dtype=dtype, device_id=dev)
             tensor.zero_()
             return tensor
 
@@ -246,6 +253,7 @@ def allocate_replica_weight_buffers(
     *,
     rank: int,
     world_size: int,
+    local_device: Optional[int] = None,
 ) -> ReplicaWeightBuffers:
     """Allocate equal-shaped symmetric replica tables on every EP rank.
 
@@ -266,16 +274,17 @@ def allocate_replica_weight_buffers(
             "replica prefetch requires the EP group to match the ACLSHMEM world"
         )
 
+    dev = rank if local_device is None else local_device
     gate_up_mem = ash.aclshmem_create_tensor(
         [experts_per_rank * gate_up_elements],
         dtype=torch.bfloat16,
-        device_id=rank,
+        device_id=dev,
     )
     try:
         down_mem = ash.aclshmem_create_tensor(
             [experts_per_rank * down_elements],
             dtype=torch.bfloat16,
-            device_id=rank,
+            device_id=dev,
         )
     except Exception:
         ash.aclshmem_free_tensor(gate_up_mem)
@@ -288,6 +297,7 @@ def allocate_replica_weight_buffers(
         gate_up_expert_shape=tuple(gate_up_weight.shape[1:]),
         down_expert_shape=tuple(down_weight.shape[1:]),
         rank=rank,
+        local_device=dev,
     )
 
 
@@ -326,6 +336,7 @@ def acquire_replica_weight_buffers(
     *,
     rank: int,
     world_size: int,
+    local_device: Optional[int] = None,
 ) -> tuple[ReplicaWeightBuffers, bool]:
     """Take a pooled handle; returns ``(buffers, fresh)``.
 
@@ -347,8 +358,10 @@ def acquire_replica_weight_buffers(
     if entry is not None and not entry[0].closed:
         entry[1] += 1
         return entry[0], False
+    # Pool key intentionally omits local_device: it is constant per process.
     buffers = allocate_replica_weight_buffers(
-        gate_up_weight, down_weight, rank=rank, world_size=world_size
+        gate_up_weight, down_weight, rank=rank, world_size=world_size,
+        local_device=local_device,
     )
     _REPLICA_POOL[key] = [buffers, 1]
     return buffers, True

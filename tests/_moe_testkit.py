@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 
 from mega_moe.kernels.combine_fc1_bwd import GATE_PAD
+from mega_moe.runtime.device import device_str, multi_node_enabled, resolve_local_device
 
 try:  # Keep registry/collection checks usable on a CPU-only Python install.
     import torch_npu  # noqa: F401
@@ -77,9 +78,25 @@ def get_ash_size_bytes(default_gb=2):
 
 
 def get_ash_ip_port():
-    """ACLSHMEM bootstrap endpoint, overridable via ``ASH_MASTER_ADDR/PORT``."""
+    """ACLSHMEM bootstrap endpoint, overridable via ``ASH_MASTER_ADDR/PORT``.
+
+    Multi-node NOTE (2026-09-22 dual-node adaptation): the ip_port bootstrap is
+    the ONLY python-reachable path that can carry an engine mask —
+    ``aclshmem_init_using_unique_id(rank, npes, size, uid)`` has no attributes
+    parameter and always initializes with the MTE default, which cannot cross
+    nodes.  Dual-node therefore REQUIRES an explicit ``ASH_MASTER_ADDR``
+    pointing at node 0 (this mirrors upstream PR#184's cross-node fix); a
+    loopback default under ``MEGAMOE_MULTI_NODE=1`` is rejected loudly instead
+    of deadlocking later inside the first cross-node kernel.
+    """
     addr = os.environ.get("ASH_MASTER_ADDR", "127.0.0.1")
     port = os.environ.get("ASH_MASTER_PORT", "8666")
+    if multi_node_enabled() and addr == "127.0.0.1":
+        raise RuntimeError(
+            "MEGAMOE_MULTI_NODE=1 requires ASH_MASTER_ADDR=<node0-IP> (and a "
+            "node0-fixed ASH_MASTER_PORT on both nodes): the ip_port bootstrap "
+            "is the only one that can set the cross-node MTE|UDMA engine mask"
+        )
     return f"tcp://{addr}:{port}"
 
 
@@ -103,15 +120,23 @@ def init_aclshmem(
     attr.local_mem_size = size_bytes
     attr.ip_port = ip_port if ip_port is not None else get_ash_ip_port()
     # Data-op engine for the symmetric heap.  MTE is the proven default for
-    # the signal/wait + symm_at kernels.  Two enable paths:
+    # the signal/wait + symm_at kernels.  Engine tiers:
     #  - MOE_ASH_ENGINE=udma (mega-kernel experiments): pure UDMA — the
     #    08-ascend-transpose-all2all notes warn getmem/putmem_signal corrupt
     #    on this box, so signal_op paths need the correctness gates re-run
     #    under UDMA before trusting any number.
-    #  - enable_udma (main's single-kernel-forward tests): MTE|UDMA combo.
+    #  - MOE_ASH_ENGINE=combo, enable_udma, or MEGAMOE_MULTI_NODE=1:
+    #    MTE|UDMA combo — MTE physically cannot cross nodes
+    #    (shmem_device_mte.h: "does not support cross-PCIe"), so multi-node
+    #    defaults to the combo mask (intra-node MTE, inter-node UDMA, both
+    #    udma transports MOE_MEGA_{GRAD,REPREFETCH}_TRANSPORT=udma included).
+    #  - MOE_ASH_ENGINE=mte or unset: pure MTE (bit-identical single-node
+    #    default; mte also lets G1 isolate the device-split variable).
     if os.environ.get("MOE_ASH_ENGINE") == "udma":
         attr.option_attr.data_op_engine_type = ash.OpEngineType.UDMA
-    elif enable_udma:
+    elif os.environ.get("MOE_ASH_ENGINE") == "mte":
+        attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    elif enable_udma or os.environ.get("MOE_ASH_ENGINE") == "combo" or multi_node_enabled():
         attr.option_attr.data_op_engine_type = ash.OpEngineType(
             ash.OpEngineType.MTE.value | ash.OpEngineType.UDMA.value)
     else:
@@ -134,10 +159,10 @@ def make_peer_mem(saved, dtype, rank):
     if ash is None:
         raise RuntimeError("ACLSHMEM support is unavailable in this Python environment")
     local_elems = max(saved["total_recv"], saved["total_send"]) * (saved["hidden_dim"] + GATE_PAD)
-    t = torch.tensor([local_elems], dtype=torch.int64, device=f"npu:{rank}")
+    t = torch.tensor([local_elems], dtype=torch.int64, device=device_str(resolve_local_device(rank)))
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=saved["ep_group"])
     peer_elems = int(t.item())
-    return ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=rank)
+    return ash.aclshmem_create_tensor([peer_elems], dtype=dtype, device_id=resolve_local_device(rank))
 
 
 def make_moonep_backward_peer_mem(
@@ -169,10 +194,10 @@ def make_moonep_backward_peer_mem(
     if ash is None:
         raise RuntimeError("ACLSHMEM support is unavailable in this Python environment")
     local_elems = max(int(total_recv), int(total_send)) * (hidden_dim + GATE_PAD)
-    t = torch.tensor([local_elems], dtype=torch.int64, device=f"npu:{rank}")
+    t = torch.tensor([local_elems], dtype=torch.int64, device=device_str(resolve_local_device(rank)))
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=ep_group)
     return ash.aclshmem_create_tensor(
-        [int(t.item())], dtype=dtype, device_id=rank
+        [int(t.item())], dtype=dtype, device_id=resolve_local_device(rank)
     )
 
 

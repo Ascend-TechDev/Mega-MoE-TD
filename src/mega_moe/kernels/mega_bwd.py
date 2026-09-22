@@ -215,6 +215,7 @@ from .replica_weight_prefetch import (
     _udma_quiet,
 )
 from ..runtime.replica_weight_prefetch import replica_weight_push_geometry
+from ..runtime.device import saved_device_id
 from .replica_grad_reduce import (
     build_owner_pull_descriptors_by_home,
     launch_replica_grad_barrier,
@@ -2603,7 +2604,7 @@ def _ensure_mega_combine_buf(saved, elems):
     if mem is not None:
         ash.aclshmem_free_tensor(mem)
     mem = ash.aclshmem_create_tensor(
-        [elems], dtype=torch.bfloat16, device_id=saved["ep_rank"])
+        [elems], dtype=torch.bfloat16, device_id=saved_device_id(saved))
     mem.zero_()
     saved["_mega_combine_buf"] = mem
     return mem
@@ -2627,7 +2628,7 @@ def _ensure_mega_redispatch_buf(saved, elems):
     if mem is not None:
         ash.aclshmem_free_tensor(mem)
     mem = ash.aclshmem_create_tensor(
-        [elems], dtype=torch.bfloat16, device_id=saved["ep_rank"])
+        [elems], dtype=torch.bfloat16, device_id=saved_device_id(saved))
     mem.zero_()
     saved["_mega_redispatch_buf"] = mem
     return mem
@@ -2647,7 +2648,7 @@ def _ensure_mega_signal_local(saved, key, slots):
     if mem is not None:
         ash.aclshmem_free_tensor(mem)
     mem = ash.aclshmem_create_tensor(
-        [slots * 16], dtype=torch.int32, device_id=saved["ep_rank"])
+        [slots * 16], dtype=torch.int32, device_id=saved_device_id(saved))
     mem.zero_()
     saved[key] = mem
     return mem

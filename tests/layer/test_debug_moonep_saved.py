@@ -28,6 +28,7 @@ from tests._moe_baselines import (
     make_routing_weights,
     prepare_inputs,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 
 def _per_expert_mismatch(tr_val, gold_val, tol):
@@ -46,7 +47,7 @@ def run_debug_probe(rank: int, world_size: int) -> None:
     tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
     situ_beta, situ_linear_beta = 4.0, 25.0
     epn = num_experts // world_size
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
 

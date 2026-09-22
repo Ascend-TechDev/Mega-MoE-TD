@@ -53,6 +53,7 @@ from benchmark.layer._npu_occupancy import check_npu_occupancy
 from benchmark.layer._pipe_profile_summary import write_pipe_profile_summary
 from config import resolve_case
 from mega_moe import FusedMoEForward, MoEForwardConfig
+from mega_moe.runtime.device import device_str, resolve_local_device
 from tests import _moe_testkit as kit
 
 
@@ -298,7 +299,7 @@ def _worker(
     faulthandler.dump_traceback_later(120, repeat=True)
     if rank == 0:
         print("[setup] initializing NPU and HCCL", flush=True)
-    torch.npu.set_device(rank)
+    torch.npu.set_device(resolve_local_device(rank))
     dist.init_process_group("hccl", rank=rank, world_size=world_size)
     ep_group = dist.group.WORLD
     case = _case(case_id)
@@ -306,7 +307,7 @@ def _worker(
         raise ValueError(
             f"worker world_size={world_size} does not match {case.case_id}"
         )
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
 
     try:
         if rank == 0:

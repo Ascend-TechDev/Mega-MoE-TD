@@ -7,6 +7,8 @@ from typing import Optional
 import torch
 import triton
 
+from mega_moe.runtime.device import resolve_local_device
+
 
 @dataclass
 class MoEForwardContext:
@@ -25,6 +27,10 @@ class MoEForwardContext:
     rank: int
     receive_capacity_factor: float
     max_source_tiles: int
+    # Local NPU ordinal for every symmetric allocation below.  ``rank`` stays
+    # the ACLSHMEM global PE (peer addressing, kernel LOCAL_RANK); multi-node
+    # splits the two (see mega_moe.runtime.device).
+    local_device: Optional[int] = None
 
     peer_mem: Optional[torch.Tensor] = None
     routing_weight_mem: Optional[torch.Tensor] = None
@@ -114,6 +120,7 @@ def create_moe_forward_context(
     dispatch_fc1_block_size_m: int,
     enable_moonep: bool = False,
     ep_group=None,
+    local_device: Optional[int] = None,
 ) -> MoEForwardContext:
     """Allocate BF16 token buffers and an FP32 routing-weight buffer."""
     import shmem as ash
@@ -127,6 +134,8 @@ def create_moe_forward_context(
         )
     if type(enable_moonep) is not bool:
         raise TypeError("enable_moonep must be a bool")
+
+    dev = resolve_local_device(rank) if local_device is None else local_device
 
     experts_per_rank = num_experts // world_size
     replica_budget = experts_per_rank if enable_moonep else 0
@@ -146,12 +155,13 @@ def create_moe_forward_context(
         receive_capacity_factor=receive_capacity_factor,
         max_source_tiles=max_source_tiles,
         ep_group=ep_group,
+        local_device=dev,
     )
 
     context.peer_mem = ash.aclshmem_create_tensor(
         [max_received_routes * hidden_size],
         dtype=torch.bfloat16,
-        device_id=rank,
+        device_id=dev,
     )
     context.peer_mem.zero_()
 
@@ -160,7 +170,7 @@ def create_moe_forward_context(
     context.routing_weight_mem = ash.aclshmem_create_tensor(
         [max_received_routes],
         dtype=torch.float32,
-        device_id=rank,
+        device_id=dev,
     )
     context.routing_weight_mem.zero_()
 
@@ -178,7 +188,7 @@ def create_moe_forward_context(
     context.signal_mem = ash.aclshmem_create_tensor(
         [signal_slots * 16],
         dtype=torch.int32,
-        device_id=rank,
+        device_id=dev,
     )
     context.signal_mem.zero_()
     if replica_budget:
@@ -200,7 +210,7 @@ def create_moe_forward_context(
         context.planning_counts_mem = ash.aclshmem_create_tensor(
             [world_size * context.planning_num_bins],
             dtype=torch.int32,
-            device_id=rank,
+            device_id=dev,
         )
         context.planning_counts_mem.zero_()
 
@@ -209,7 +219,7 @@ def create_moe_forward_context(
     context.metadata_counts_mem = ash.aclshmem_create_tensor(
         [world_size * metadata_num_bins],
         dtype=torch.int32,
-        device_id=rank,
+        device_id=dev,
     )
     context.metadata_counts_mem.zero_()
 

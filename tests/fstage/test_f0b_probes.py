@@ -96,6 +96,7 @@ from tests._numeric import (
     assert_close,
     diagnose,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 # The H3 merged native-saved autograd Function (plan §3.2.3).  Collection must
 # keep working on a tree without it, so the import degrades to ``None`` and the
@@ -489,7 +490,7 @@ def run_f0b_probe1_situglu_parity(rank: int, world_size: int) -> None:
     """
     _require_runtime("f0b probe1")
     tokens, hidden, ffn, num_experts, topk, epn = _probe_shape(world_size)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"f0b-probe1-situglu-parity-w{world_size}-epn{epn}"
@@ -576,7 +577,7 @@ def run_f0b_probe2_real_shape_backward(rank: int, world_size: int) -> None:
         raise RuntimeError("MegaMoEFunction is unavailable")
     _require_runtime("f0b probe2")
     tokens, hidden, ffn, num_experts, topk, epn = _probe_shape(world_size)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"f0b-probe2-real-shape-bwd-w{world_size}-epn{epn}"
@@ -727,7 +728,7 @@ def run_f0b_probe3_state_reuse_bitwise(rank: int, world_size: int) -> None:
         raise RuntimeError("MegaMoEFunction is unavailable")
     _require_runtime("f0b probe3")
     tokens, hidden, ffn, num_experts, topk, epn = _probe_shape(world_size)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"f0b-probe3-state-reuse-w{world_size}-epn{epn}"
@@ -906,7 +907,7 @@ def run_f0b_probe4_shared_op_forward(rank: int, world_size: int) -> None:
     """
     _require_runtime("f0b probe4")
     tokens_max, hidden, ffn, num_experts, topk, epn = _probe_shape(world_size)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     dtype = torch.bfloat16
     ep_group = dist.group.WORLD
     label = f"f0b-probe4-shared-op-fwd-w{world_size}-epn{epn}"

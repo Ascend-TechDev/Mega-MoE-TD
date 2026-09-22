@@ -371,6 +371,9 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         topk=int(op.top_k),
         world_size=W,
         ep_rank=int(op.rank),
+        # ep_rank is the ACLSHMEM global PE (kernel LOCAL_RANK); local_device
+        # is the NPU ordinal for backward-side allocations (multi-node split).
+        local_device=int(getattr(op, "local_device", op.rank)),
         ep_group=op.ep_group,
         # HOME experts per rank under MoonEP (mirrors saved_phys in
         # _moonep_torch_forward); the physical stride rides separately.

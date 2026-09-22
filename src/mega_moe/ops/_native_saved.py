@@ -441,6 +441,9 @@ def assemble_native_saved(
         topk=int(op.top_k),
         world_size=int(op.world_size),
         ep_rank=int(op.rank),
+        # ep_rank is the ACLSHMEM global PE (kernel LOCAL_RANK); local_device
+        # is the NPU ordinal for backward-side allocations (multi-node split).
+        local_device=int(getattr(op, "local_device", op.rank)),
         ep_group=op.ep_group,
         experts_per_rank=int(op.experts_per_rank),
         selected_experts=selected_experts,

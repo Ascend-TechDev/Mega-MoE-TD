@@ -42,6 +42,7 @@ def _wait_bounded_report(sig_ptr, want, site, slot_id, expert_id, pid,
         tl.store(dbg_ptr + pid * 8 + 5, spins)
 from triton.language.extra.cann.extension import sub_vec_id
 
+from ..runtime.device import device_str, saved_device_id
 from .common import (
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
@@ -68,7 +69,7 @@ def _dispatch_static_maps(saved):
         return cache
     if saved.get("use_moonep"):
         return _dispatch_static_maps_moonep(saved)
-    device = f"npu:{saved['ep_rank']}"
+    device = device_str(saved_device_id(saved))
     pe = saved["ep_rank"]; W = saved["world_size"]; H = saved["hidden_dim"]
     ep_group = saved["ep_group"]; total_send = saved["total_send"]
 
@@ -161,7 +162,7 @@ def _dispatch_static_maps_moonep(saved):
     collective: it bounds the per-(source, slot) 64-row push tiles, which every
     rank derives from its own plan send counts and MAX-reduces over the group.
     """
-    device = f"npu:{saved['ep_rank']}"
+    device = device_str(saved_device_id(saved))
     ep_group = saved["ep_group"]
     physical_experts = int(saved["physical_experts_per_rank"])
     send_counts = saved["plan_send_counts_by_rank_expert"].to(device)
@@ -608,7 +609,7 @@ def _ensure_bwd_signal_mem(saved, W, EPR, MAX_BWD_TILES):
         signal_mem = ash.aclshmem_create_tensor(
             [W * EPR * max(MAX_BWD_TILES, _bound) * 16],
             dtype=torch.int32,
-            device_id=saved["ep_rank"])
+            device_id=saved_device_id(saved))
         signal_mem.zero_()
         saved["_bwd_tile_signal_mem"] = signal_mem
     return signal_mem

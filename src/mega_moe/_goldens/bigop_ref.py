@@ -25,6 +25,7 @@ import torch.distributed as dist
 
 from bigop import _grouped_matmul, _grouped_wgrad
 from mega_moe._goldens._torch_forward_for_backward import moe_forward
+from mega_moe.runtime.device import device_str, resolve_local_device
 from mega_moe._goldens.backward import combine_bwd_a2a, dispatch_bwd, moe_backward_torch
 
 GREEN = "\033[92m"
@@ -118,7 +119,7 @@ def _run_gold_vs_big(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group, 
     world_size = dist.get_world_size(ep_group)
     epr = num_experts // world_size
     dtype = torch.bfloat16
-    device = f"npu:{pe}"
+    device = device_str(resolve_local_device(pe))
     torch.manual_seed(seed + pe * 1000)
 
     hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
@@ -150,8 +151,10 @@ def _run_gold_vs_big(ntokens, hidden_dim, ffn_dim, topk, num_experts, ep_group, 
 
 
 def _main():
-    local_pe = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(local_pe)
+    # torchrun semantics: RANK is the global rank (the ACLSHMEM PE on
+    # multi-node), LOCAL_RANK the device index; single-node they are equal.
+    local_pe = int(os.environ.get("RANK", os.environ["LOCAL_RANK"]))
+    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group(backend="hccl", rank=local_pe)
     print(f"[INFO] Rank {local_pe} of {dist.get_world_size()} initialised", flush=True)
     ep_group = dist.group.WORLD

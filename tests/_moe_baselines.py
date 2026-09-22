@@ -28,6 +28,7 @@ from tests._numeric import (
     OUTPUT_ATOL,
     OUTPUT_RTOL,
 )
+from mega_moe.runtime.device import device_str, resolve_local_device
 
 
 __all__ = [
@@ -55,7 +56,7 @@ def make_backward_inputs(
     world_size = dist.get_world_size(ep_group)
     epr = num_experts // world_size
     dtype = torch.bfloat16
-    device = f"npu:{pe}"
+    device = device_str(resolve_local_device(pe))
     torch.manual_seed(seed + pe * 1000)
     hs = torch.randn(ntokens, hidden_dim, dtype=dtype, device=device)
     gw = torch.randn(num_experts, hidden_dim, dtype=dtype, device=device)

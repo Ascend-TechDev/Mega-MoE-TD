@@ -146,6 +146,7 @@ import triton.language.extra.cann.extension as al
 from triton.language.extra.cann.extension import sub_vec_id
 
 from mega_moe.kernels.common import ncore
+from mega_moe.runtime.device import device_str, resolve_local_device
 from triton.backends.ascend.driver import NPUUtils
 from tests import _moe_testkit as kit
 
@@ -459,14 +460,14 @@ def _run_probe_mixed(rank: int, world_size: int, *, barrier_vec: bool,
                      async_scopes: bool, label: str) -> None:
     """Probe-1 driver shared by variants 1a/1b/1c."""
     _require_runtime(label)
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
 
     with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
         # peer_mem FIRST symmetric allocation (dl.symm_at offset-0 discipline)
         peer_mem = kit.ash.aclshmem_create_tensor(
-            [world_size * nprog * PROBE_PATN], dtype=torch.int32, device_id=rank)
+            [world_size * nprog * PROBE_PATN], dtype=torch.int32, device_id=resolve_local_device(rank))
         try:
             peer_mem.zero_()
             torch.manual_seed(2115 + rank)
@@ -540,7 +541,7 @@ def run_mega_probe2_barrier_chain(rank: int, world_size: int) -> None:
     """Probe 2a (primary): five literal in-kernel barrier_all() phases with
     mixed-scope work between — the mega kernel's structure."""
     _require_runtime("mega probe2")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     label = f"mega-probe2a-barrier-chain-w{world_size}"
@@ -575,7 +576,7 @@ def run_mega_probe2c_barrier_vec_only(rank: int, world_size: int) -> None:
     five barriers — run it if 2a wedges to split the loop/grid axis from the
     mixed-scope axis."""
     _require_runtime("mega probe2c")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     label = f"mega-probe2c-barrier-vec-only-w{world_size}"
@@ -670,7 +671,7 @@ def run_mega_probe3_local_signal(rank: int, world_size: int) -> None:
     """Probe 3 driver: local cube->vector signal visibility, no barrier.
     MOE_PROBE3_QUIET=1 swaps fence() for quiet() (fallback rung)."""
     _require_runtime("mega probe3")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     quiet = os.environ.get("MOE_PROBE3_QUIET") == "1"
@@ -678,7 +679,7 @@ def run_mega_probe3_local_signal(rank: int, world_size: int) -> None:
 
     with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
         signal_mem = kit.ash.aclshmem_create_tensor(
-            [nprog * 16], dtype=torch.int32, device_id=rank)
+            [nprog * 16], dtype=torch.int32, device_id=resolve_local_device(rank))
         try:
             signal_mem.zero_()
             torch.manual_seed(2315 + rank)
@@ -793,7 +794,7 @@ def run_mega_probe4_fused_loop(rank: int, world_size: int) -> None:
     self-signal (the MOE_MEGA_FUSE_P4 gate).  MOE_PROBE4_QUIET=1 swaps
     fence() for quiet(); MOE_PROBE4_ITERS overrides the iteration count."""
     _require_runtime("mega probe4")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     niter = int(os.environ.get("MOE_PROBE4_ITERS", "8"))
@@ -802,7 +803,7 @@ def run_mega_probe4_fused_loop(rank: int, world_size: int) -> None:
 
     with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(default_gb=2)):
         signal_mem = kit.ash.aclshmem_create_tensor(
-            [nprog * niter * 16], dtype=torch.int32, device_id=rank)
+            [nprog * niter * 16], dtype=torch.int32, device_id=resolve_local_device(rank))
         try:
             signal_mem.zero_()
             torch.manual_seed(2415 + rank)
@@ -849,7 +850,7 @@ def run_mega_probe2b_barrier_chain_loop(rank: int, world_size: int) -> None:
     wedged all ranks at w8 — kept to document the constraint, re-enabled with
     MOE_PROBE_RUN_CHAIN_LOOP=1."""
     _require_runtime("mega probe2b")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     label = f"mega-probe2b-barrier-chain-loop-w{world_size}"
@@ -1037,7 +1038,7 @@ def run_mega_probe5_ub_pingpong(rank: int, world_size: int) -> None:
     MOE_PROBE5_ITERS overrides the iteration count (default 16 -- enough for
     seven full ping-pong cycles of backpressure)."""
     _require_runtime("mega probe5")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     niter = int(os.environ.get("MOE_PROBE5_ITERS", "16"))
@@ -1221,7 +1222,7 @@ def kernel_probe6b_symm_at_offset(
 def _run_probe6(rank: int, world_size: int, *, symm: bool, label: str) -> None:
     """Shared 6a/6b driver: identical geometry, only the write form differs."""
     _require_runtime("mega probe6")
-    device = f"npu:{rank}"
+    device = device_str(resolve_local_device(rank))
     ep_group = dist.group.WORLD
     nprog = ncore()
     dst_rank = (rank + 1) % world_size
@@ -1231,9 +1232,9 @@ def _run_probe6(rank: int, world_size: int, *, symm: bool, label: str) -> None:
         # allocation ORDER is the point: dummy owns heap offset 0, buf sits
         # at a nonzero offset exactly like a combine_buf behind peer_mem
         dummy = kit.ash.aclshmem_create_tensor(
-            [nprog * PROBE_PATN], dtype=torch.int32, device_id=rank)
+            [nprog * PROBE_PATN], dtype=torch.int32, device_id=resolve_local_device(rank))
         buf = kit.ash.aclshmem_create_tensor(
-            [2 * nprog * PROBE_PATN], dtype=torch.int32, device_id=rank)
+            [2 * nprog * PROBE_PATN], dtype=torch.int32, device_id=resolve_local_device(rank))
         try:
             dummy.zero_()
             buf.zero_()
