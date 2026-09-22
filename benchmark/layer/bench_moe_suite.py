@@ -2446,7 +2446,9 @@ def _moonep_backward_transport_samples(
             setup_ms.append((time.perf_counter() - setup_start) * 1000.0)
         start = time.perf_counter()
         with torch.no_grad():
-            moe_backward_triton(sample_saved, dy, peer_mem, grad_transport=transport)
+            moe_backward_triton(
+                sample_saved, dy, peer_mem, grad_transport=transport,
+                hidden_states=hidden_states)
         torch.npu.synchronize(device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         value = torch.tensor([elapsed_ms], dtype=torch.float32, device=device)
@@ -2626,7 +2628,12 @@ def run_moonep_backward_benchmark(
 
                 _log_moonep_phase(rank, case, "running untimed structure gate")
                 with torch.no_grad():
-                    gate_result = moe_backward_triton(native_saved, dy, peer_mem)
+                    # hidden_states kwarg: the MOE_SAVED_RECOMPUTE=1 backward
+                    # re-dispatches from the forward's pre-dispatch token copy
+                    # (production autograd hands it via ctx.hidden_states; the
+                    # bench bypasses autograd so it must pass it explicitly).
+                    gate_result = moe_backward_triton(
+                        native_saved, dy, peer_mem, hidden_states=hidden_states)
                 gate_keys = sorted(gate_result)
                 for key, value in gate_result.items():
                     if not _all_finite_memory_lean(value):
@@ -2641,7 +2648,8 @@ def run_moonep_backward_benchmark(
 
                 def _local():
                     with torch.no_grad():
-                        moe_backward_triton(native_saved, dy, peer_mem)
+                        moe_backward_triton(
+                            native_saved, dy, peer_mem, hidden_states=hidden_states)
 
                 local_timing, _ = kit.PerformanceRunner(
                     _local, _local, BACKWARD_TIMING, device=device, ep_group=ep_group
