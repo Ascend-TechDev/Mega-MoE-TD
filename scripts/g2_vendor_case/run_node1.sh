@@ -4,9 +4,12 @@
 set -eu
 CASE=${1:-push}
 ENGINE=${2:-udma}
-SP=$(python3 -c "import shmem, os; print(os.path.dirname(os.path.dirname(shmem.__file__)))" 2>/dev/null || echo /usr/local/python3.11.10/lib/python3.11/site-packages)
 
 source /root/moe-venv/activate-moe.sh 2>/dev/null || true
+# Probe AFTER the venv is active: the system python3 has no shmem module, so
+# probing before would fall through to a fallback path that may not exist on
+# this node (peer-reported, r33).
+SP=$(python3 -c "import shmem, os; print(os.path.dirname(os.path.dirname(shmem.__file__)))" 2>/dev/null || echo /usr/local/python3.11.10/lib/python3.11/site-packages)
 export LD_LIBRARY_PATH=$SP/shmem/backends/950:${LD_LIBRARY_PATH:-}
 export ASH_MASTER_ADDR=141.61.95.70 ASH_MASTER_PORT=41921
 export MOE_ASH_ENGINE=$ENGINE
