@@ -121,6 +121,10 @@ FWD7(get_wrap, _ZN3shm5store11ConfigStore3GetERKNSt7__cxx1112basic_stringIcSt11c
      tlog("[gwtrace] ConfigStore::Get key=%s timeout=%ld", cstr(a1, 0), (long)a3);,
      tlog("[gwtrace] ConfigStore::Get ret=%ld", r);)
 
+FWD7(set_wrap, _ZN3shm5store14TcpConfigStore3SetERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERKSt6vectorIhSaIhEE,
+     tlog("[gwtrace] Set key=%s dlen=%zu", cstr(a1, 0), vsize(a2));,
+     tlog("[gwtrace] Set ret=%ld", r);)
+
 FWD7(plugin_wrap, aclshmemi_bootstrap_plugin_init,
      tlog("[gwtrace] ==== bootstrap_plugin_init enter");,
      tlog("[gwtrace] ==== bootstrap_plugin_init ret=%ld", r);)
