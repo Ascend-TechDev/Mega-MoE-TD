@@ -159,7 +159,18 @@ def init_aclshmem(
     # code 4 — proven locally, r22-R2).  The runner's trap restores the
     # per-machine resting file at exit.
     swap = os.environ.get("MOE_ROOTINFO_SWAP")
-    if swap:
+    if swap == "REMOVE":
+        # G2 r25: libshmem falls back to GENERATING a rootinfo view from the
+        # driver topo json (atlas_950_1.json, full 64-peer supernode) when
+        # /etc/hccl_rootinfo.json is absent.  Hand-merged files are exhausted
+        # (r22-R2/r23/r24: rank_list[world_rank] target lookup vs first-entry
+        # self-check cannot both hold on node1), so let the library build its
+        # own view.  The runner trap still restores the resting file at exit.
+        try:
+            os.remove("/etc/hccl_rootinfo.json")
+        except FileNotFoundError:
+            pass
+    elif swap:
         import shutil
         shutil.copy(swap, "/etc/hccl_rootinfo.json")
     if ash.aclshmem_init(attr) != 0:
