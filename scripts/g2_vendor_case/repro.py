@@ -60,7 +60,7 @@ def setup():
     attr.my_rank = rank
     attr.n_ranks = world
     attr.local_mem_size = 1 << 30  # 1 GB symmetric heap
-    attr.ip_port = (os.environ["ASH_MASTER_ADDR"], int(os.environ["ASH_MASTER_PORT"]))
+    attr.ip_port = f"tcp://{os.environ['ASH_MASTER_ADDR']}:{os.environ['ASH_MASTER_PORT']}"
     engine = os.environ.get("MOE_ASH_ENGINE", "udma")
     if engine == "udma":
         attr.option_attr.data_op_engine_type = ash.OpEngineType.UDMA
