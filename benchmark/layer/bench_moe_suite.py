@@ -2659,24 +2659,39 @@ def run_moonep_backward_benchmark(
                 _log_moonep_phase(
                     rank, case, "timing physical backward with grad transport"
                 )
-                transport_samples, setup_samples = (
-                    _moonep_backward_transport_samples(
-                        device,
-                        ep_group,
-                        op,
-                        dy,
-                        peer_mem,
-                        hidden_states,
-                        selected_experts,
-                        packed_w1,
-                        down_weight,
-                        routing_weights,
-                        warmup=BACKWARD_TIMING.warmup,
-                        iterations=BACKWARD_TIMING.iterations,
+                # MOE_MOONEP_BENCH_SKIP_TRANSPORT=1: 跳过带 grad transport 的
+                # 计时相（该相每样本重捕获+lend，在脱离训练框架的裸 bench 环境
+                # 下两次踩 aicore trap——getmem 与 udma 都见过；训练框架内 udma
+                # 已被 5d68e95 之后的全网跑验证）。本地相 local_only_ms 不受
+                # 影响，JSON 里 with_transport_ms 记 null。
+                if os.environ.get("MOE_MOONEP_BENCH_SKIP_TRANSPORT") == "1":
+                    _log_moonep_phase(
+                        rank, case, "skipping grad transport phase (env)"
                     )
+                    transport_samples, setup_samples = [], []
+                else:
+                    transport_samples, setup_samples = (
+                        _moonep_backward_transport_samples(
+                            device,
+                            ep_group,
+                            op,
+                            dy,
+                            peer_mem,
+                            hidden_states,
+                            selected_experts,
+                            packed_w1,
+                            down_weight,
+                            routing_weights,
+                            warmup=BACKWARD_TIMING.warmup,
+                            iterations=BACKWARD_TIMING.iterations,
+                        )
+                    )
+                transport_ms = (
+                    statistics.median(transport_samples) if transport_samples else None
                 )
-                transport_ms = statistics.median(transport_samples)
-                setup_stats = _stats(setup_samples, device)
+                setup_stats = (
+                    _stats(setup_samples, device) if setup_samples else None
+                )
 
                 # Per-stage breakdown of the SERIAL transport backward —
                 # skipped under MOE_BWD_MEGA: the one-launch path records no
@@ -2769,7 +2784,9 @@ def run_moonep_backward_benchmark(
                             else None
                         ),
                         "with_transport_over_torch": (
-                            torch_ms / transport_ms if transport_ms > 0 else float("inf")
+                            torch_ms / transport_ms
+                            if transport_ms is not None and transport_ms > 0
+                            else None
                         ),
                         "local_over_torch": (
                             torch_ms / local_ms if local_ms > 0 else float("inf")
