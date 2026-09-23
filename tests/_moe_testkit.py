@@ -136,11 +136,32 @@ def init_aclshmem(
         attr.option_attr.data_op_engine_type = ash.OpEngineType.UDMA
     elif os.environ.get("MOE_ASH_ENGINE") == "mte":
         attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    elif os.environ.get("MOE_ASH_ENGINE") == "roce":
+        # Cross-node leg over the RoCE NICs (G2 r22-R3): UDMA/combo route
+        # cross-server traffic through the CLOS plane and the local-view
+        # /etc rootinfo mis-resolves the peer (r20 topo_reader log) — the
+        # fabric-standard cross-server path is the RoCE engine.
+        attr.option_attr.data_op_engine_type = ash.OpEngineType.ROCE
+    elif os.environ.get("MOE_ASH_ENGINE") == "combo_roce":
+        attr.option_attr.data_op_engine_type = ash.OpEngineType(
+            ash.OpEngineType.MTE.value | ash.OpEngineType.UDMA.value
+            | ash.OpEngineType.ROCE.value)
     elif enable_udma or os.environ.get("MOE_ASH_ENGINE") == "combo" or multi_node_enabled():
         attr.option_attr.data_op_engine_type = ash.OpEngineType(
             ash.OpEngineType.MTE.value | ash.OpEngineType.UDMA.value)
     else:
         attr.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+    # G2 r23 two-phase /etc: HCCL parsed the file at comm init (the conftest
+    # barrier) long before this point; the shmem topo reader parses it HERE.
+    # Swapping a world-scoped rootinfo in between gives the data plane a
+    # cross-server view without breaking HCCL's local-only validation
+    # (hand-merged remote entries make hcclCommInitRootInfoConfig fail with
+    # code 4 — proven locally, r22-R2).  The runner's trap restores the
+    # per-machine resting file at exit.
+    swap = os.environ.get("MOE_ROOTINFO_SWAP")
+    if swap:
+        import shutil
+        shutil.copy(swap, "/etc/hccl_rootinfo.json")
     if ash.aclshmem_init(attr) != 0:
         raise RuntimeError("aclshmem_init failed")
 
