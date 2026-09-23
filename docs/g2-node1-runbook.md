@@ -51,6 +51,7 @@ source /root/moe-venv/activate-moe.sh
 MOE_FUSED_ASH_SIZE_GB=2 DIST_TEST_TIMEOUT_S=3600 \
 ASH_MASTER_PORT=$((40000+RANDOM%20000)) \
 TRITON_CACHE_DIR=/tmp/triton-moe-g2-1 \
+MOE_MEGA_GRAD_TRANSPORT=udma MOE_MEGA_REPREFETCH_TRANSPORT=udma \
 python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autograd_w2" \
     -m dist -v 2>&1 | tee /tmp/g2_smoke_node1.log
 ```
@@ -59,7 +60,10 @@ python -m pytest "tests/layer/test_moe_suite.py::test_single_kernel_moonep_autog
 - **首轮含冷编译，5–20 分钟正常**（`DIST_TEST_TIMEOUT_S=3600` 已放宽；日志若是
   `dist workers did not finish within ...s` 才是超时，真实 traceback 才是失败）。
 - 预期 `1 passed`。此步同时在 `/tmp/triton-moe-g2-1` 预热了 G2a 要用的 kernel cache（形状/world 与 G2a 完全一致）。
-- 冒烟红：按 §6 采集回报，**不要自行改代码**。
+- **两个 transport env 必须带上**：不带（默认 getmem）时该用例在交错场景必红——这是
+  release_v1.0@5d68e95 就存在的存量问题（node0 侧已双端验证，非双机回归），udma 全绿。
+  若没带 env 跑红了，补上 env 重跑即可，不用报错。
+- 其余情况的冒烟红：按 §6 采集回报，**不要自行改代码**。
 
 Step 1 绿 → 回传结果，然后**等人工信号**："node0 已起"。
 
