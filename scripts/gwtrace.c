@@ -24,6 +24,45 @@ static void tlog(const char* fmt, ...) {
     }
 }
 
+
+#include <signal.h>
+#include <ucontext.h>
+static void segv_handler(int sig, siginfo_t* si, void* uc) {
+    ucontext_t* c = uc;
+    char b[256];
+    int n = snprintf(b, sizeof(b),
+        "[gwtrace] !! SIGSEGV addr=%p pc=%p (offset in lib?) lr=%p\n",
+        si->si_addr, (void*)c->uc_mcontext.pc, (void*)c->uc_mcontext.regs[30]);
+    if (n > 0) { ssize_t w = write(2, b, n); (void)w; }
+    { /* locate pc & lr in /proc/self/maps */
+        FILE* f = fopen("/proc/self/maps", "r");
+        if (f) {
+            char line[512];
+            unsigned long lo, hi;
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) {
+                    unsigned long pcs[2] = {c->uc_mcontext.pc, c->uc_mcontext.regs[30]};
+                    for (int k = 0; k < 2; k++)
+                        if (pcs[k] >= lo && pcs[k] < hi) {
+                            char b2[600];
+                            int n2 = snprintf(b2, sizeof(b2), "[gwtrace]   pc%d maps: %s", k, line);
+                            if (n2 > 0) { ssize_t w2 = write(2, b2, n2 > 0 ? (size_t)n2 : 0); (void)w2; }
+                        }
+                }
+            }
+            fclose(f);
+        }
+    }
+    _exit(88);
+}
+__attribute__((constructor)) static void segv_install(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = segv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, 0);
+    sigaction(SIGBUS, &sa, 0);
+}
+
 /* libstdc++ cxx11 string: {ptr, size, sso[16]} */
 static const char* cstr(const void* sp, size_t* len) {
     const unsigned char* p = sp;
@@ -43,7 +82,18 @@ static size_t vsize(const void* vp) {
     static T##_fn T##_real;                                                   \
     long name(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6) __asm__(#T); \
     long name(void* a0, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6) { \
-        if (!T##_real) T##_real = (T##_fn)dlsym(RTLD_NEXT, #T);               \
+        if (!T##_real) {                                                         \
+        T##_real = (T##_fn)dlsym(RTLD_NEXT, #T);                             \
+        if (!T##_real) {                                                     \
+            static const char* libs[] = {"aclshmem_bootstrap_config_store.so", "libshmem.so", NULL}; \
+            for (int i = 0; libs[i] && !T##_real; i++) {                     \
+                void* h = dlopen(libs[i], RTLD_LAZY | RTLD_NOLOAD);          \
+                if (!h) h = dlopen(libs[i], RTLD_LAZY | RTLD_GLOBAL);        \
+                if (h) T##_real = (T##_fn)dlsym(h, #T);                      \
+            }                                                                \
+        }                                                                    \
+        if (!T##_real) { tlog("[gwtrace] !! cannot resolve " #T); *(volatile int*)0 = 0; } \
+    }                                                                        \
         { log_entry }                                                          \
         long r = T##_real(a0, a1, a2, a3, a4, a5, a6);                        \
         { log_exit }                                                           \
@@ -70,15 +120,6 @@ FWD7(getreal_wrap, _ZN3shm5store14TcpConfigStore7GetRealERKNSt7__cxx1112basic_st
 FWD7(get_wrap, _ZN3shm5store11ConfigStore3GetERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERS7_l,
      tlog("[gwtrace] ConfigStore::Get key=%s timeout=%ld", cstr(a1, 0), (long)a3);,
      tlog("[gwtrace] ConfigStore::Get ret=%ld", r);)
-
-/* --- transport layer (libshmem.so) --- */
-FWD7(exch_wrap, _ZNK3shm9transport6device20UdmaTransportManager27ExchangeEndpointDescriptorsERNS2_16EndpointExchangeE,
-     tlog("[gwtrace] >> ExchangeEndpointDescriptors enter (this=%p)", a0);,
-     tlog("[gwtrace] << ExchangeEndpointDescriptors ret=%ld", r);)
-
-FWD7(gather_wrap, _ZN3shm9transport6device20UdmaTransportManager20GatherEndpointChunksERKSt6vectorINS2_21ExchangedEndpointDescESaIS4_EEjjRNS2_16EndpointExchangeE,
-     tlog("[gwtrace] GatherEndpointChunks desc.size=%zu u1=%u u2=%u", vsize(a1), (unsigned)(uintptr_t)a2, (unsigned)(uintptr_t)a3);,
-     tlog("[gwtrace] GatherEndpointChunks ret=%ld", r);)
 
 FWD7(plugin_wrap, aclshmemi_bootstrap_plugin_init,
      tlog("[gwtrace] ==== bootstrap_plugin_init enter");,
