@@ -16,7 +16,7 @@ signal 腿（控制面）双向全通——证明链路与引导层健康，故�
 | 角色 | srv_24, 141.61.95.70, rank0 | srv_28, 141.61.95.30, rank1 |
 | SuperPoD | superpod_16383（UB fabric, df30↔df34 已核实） | 同 |
 | 芯片/固件 | Atlas 950 V120 / fw 9.1.13.0.b130 | 同型号（对端采集见附录） |
-| CANN toolkit | 26.2.0.b007 | 同 |
+| CANN toolkit | 26.2.0.b007（version.cfg 串；安装目录名 cann-9.2.0-beta.2，同一 toolkit 双版本串，双侧一致） | 同 |
 | cann_shmem wheel | 1.6.0 cp311，双侧统一安装，libshmem.so md5 `e3d35af94b238c49aa0a77a554d9cb40` | 同 md5 |
 | python/torch | python 3.11.10 / torch 2.10.0 | 同 |
 | OS | openEuler 24.03 LTS-SP3, kernel 6.6.0-145.3.29.160 | 同 |
