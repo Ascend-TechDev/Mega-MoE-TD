@@ -1758,6 +1758,9 @@ class FusedMoEForward(torch.nn.Module):
             FFN=ffn_size,
             MAX_RECEIVED_ROUTES=max_received_routes,
             NUM_BINS_PAD=self.context.metadata_num_bins,
+            # Bounded counts-arrival gate spin bound (see _publish_count_row);
+            # 0 = compiled out, single-node bit-identical.
+            COUNTS_GATE=int(os.environ.get("MOE_FUSED_COUNTS_GATE", "0")),
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
             DISPATCH_BLOCK_M=self.config.dispatch_fc1_block_size_m,

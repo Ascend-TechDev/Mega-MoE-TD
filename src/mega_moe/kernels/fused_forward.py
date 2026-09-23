@@ -221,6 +221,7 @@ def _publish_count_row(
     num_routes=0,
     MOONEP: tl.constexpr = False,
     CURSOR_STRIDE: tl.constexpr = 0,
+    COUNTS_GATE: tl.constexpr = 0,
 ):
     cursor_stride: tl.constexpr = CURSOR_STRIDE if CURSOR_STRIDE else NUM_BINS_PAD
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
@@ -255,6 +256,29 @@ def _publish_count_row(
                 libshmem_device.putmem(
                     local_row_ptr, local_row_ptr, NUM_BINS_PAD * 4, peer_rank)
     libshmem_device.fence()
+    # Cross-node arrival gate (G2 r21): nothing below orders the PEER's
+    # row write against this rank's reads — intra-node HCCS latency always
+    # won that race, cross-node CLOS/UDMA latency always lost it (r18/r19:
+    # each kernel materialized only its own routing rows, both directions,
+    # deterministically; slab offsets were verified identical).  Bounded
+    # poll on the peer row's live-bin sum: opens as soon as the write
+    # lands; a peer with genuinely nothing to send exits via the spin
+    # bound.  COUNTS_GATE=0 (default) compiles the gate out entirely —
+    # single-node behavior is bit-identical.
+    if COUNTS_GATE > 0:
+        gate_bins = tl.arange(0, NUM_BINS_PAD)
+        spins = 0
+        ready = 0
+        while (ready == 0) & (spins < COUNTS_GATE):
+            acc = tl.zeros((NUM_BINS_PAD,), dtype=tl.int32)
+            for peer_rank in range(0, WORLD_SIZE):
+                if peer_rank != LOCAL_RANK:
+                    acc += tl.load(
+                        counts_mem_ptr +
+                        peer_rank * NUM_BINS_PAD + gate_bins)
+            ready = tl.sum(
+                tl.where(gate_bins < NUM_EXPERTS, acc, 0), axis=0)
+            spins += 1
 
 
 @triton.jit
@@ -1520,6 +1544,7 @@ def _kernel_fused_forward(
         LOCAL_RANK, WORLD_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, TOPK: tl.constexpr, HIDDEN: tl.constexpr, FFN: tl.constexpr,
         MAX_RECEIVED_ROUTES: tl.constexpr, NUM_BINS_PAD: tl.constexpr,
+        COUNTS_GATE: tl.constexpr,
         MAX_SOURCE_TILES: tl.constexpr, MAX_PIPELINE_GROUPS: tl.constexpr,
         DISPATCH_BLOCK_M: tl.constexpr, FC1_BLOCK_M: tl.constexpr, FC1_BLOCK_N: tl.constexpr,
         FC1_BLOCK_K: tl.constexpr, FC2_BLOCK_N: tl.constexpr,
@@ -1564,11 +1589,13 @@ def _kernel_fused_forward(
             if MOONEP:
                 _publish_count_row(core_bucket_cursor_ptr, raw_counts_ptr,
                                    LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
-                                   NUM_EXPERTS, RAW_NUM_BINS, num_routes, True, NUM_BINS_PAD)
+                                   NUM_EXPERTS, RAW_NUM_BINS, num_routes, True, NUM_BINS_PAD,
+                                   COUNTS_GATE=COUNTS_GATE)
             else:
                 _publish_count_row(core_bucket_cursor_ptr, counts_mem_ptr,
                                    LOCAL_RANK, WORLD_SIZE, NUM_PROGRAM_CORES,
-                                   NUM_EXPERTS, NUM_BINS_PAD)
+                                   NUM_EXPERTS, NUM_BINS_PAD,
+                                   COUNTS_GATE=COUNTS_GATE)
     _mixed_forward_barrier()
     if TIMING:
         _fwd_stamp_lane0(ts_row, 2, ts_dummy)   # counts published
