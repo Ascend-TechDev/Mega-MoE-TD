@@ -4,6 +4,7 @@
  * Output goes to stderr with a [gwtrace] prefix; single write() per line.
  */
 #define _GNU_SOURCE
+#include <string.h>
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -63,6 +64,26 @@ __attribute__((constructor)) static void segv_install(void) {
     sigaction(SIGBUS, &sa, 0);
 }
 
+
+static void hexdump(const char* tag, const unsigned char* p, size_t n) {
+    size_t lim = n > 256 ? 256 : n;
+    tlog("[gwtrace] %s len=%zu", tag, n);
+    for (size_t i = 0; i < lim; i += 16) {
+        char b[128]; size_t o = 0;
+        o += (size_t)snprintf(b + o, sizeof(b) - o, "[gwtrace]  %04zx ", i);
+        for (size_t j = 0; j < 16 && i + j < lim; j++)
+            o += (size_t)snprintf(b + o, sizeof(b) - o, "%02x", p[i + j]);
+        o += (size_t)snprintf(b + o, sizeof(b) - o, "  ");
+        for (size_t j = 0; j < 16 && i + j < lim; j++) {
+            unsigned char c = p[i + j];
+            b[o++] = (c >= 32 && c < 127) ? c : '.';
+        }
+        b[o] = 0;
+        tlog("%s", b);
+    }
+    if (n > lim) tlog("[gwtrace]  ... (%zu more)", n - lim);
+}
+
 /* libstdc++ cxx11 string: {ptr, size, sso[16]} */
 static const char* cstr(const void* sp, size_t* len) {
     const unsigned char* p = sp;
@@ -102,11 +123,13 @@ static size_t vsize(const void* vp) {
 
 /* --- store engine / tcp config store --- */
 FWD7(ga_wrap, _ZN3shm5store18SmemNetGroupEngine14GroupAllGatherEPKcjPcj,
-     tlog("[gwtrace] GroupAllGather key=%s", (char*)a1); tlog("[gwtrace]   in klen=%u out=%p outlen=%u", (unsigned)(uintptr_t)a2, a3, (unsigned)(uintptr_t)a4);,
+     tlog("[gwtrace] GroupAllGather klen=%u out=%p outlen=%u", (unsigned)(uintptr_t)a2, a3, (unsigned)(uintptr_t)a4);
+     if ((unsigned)(uintptr_t)a2 > 50) hexdump("GA name buf", (const unsigned char*)a1, (unsigned)(uintptr_t)a2);,
      tlog("[gwtrace] GroupAllGather ret=%ld", r);)
 
 FWD7(append_wrap, _ZN3shm5store14TcpConfigStore6AppendERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERKSt6vectorIhSaIhEERm,
-     { size_t n; tlog("[gwtrace] Append key=%s dlen=%zu", cstr(a1, &n), vsize(a2)); },
+     { size_t n; const char* k = cstr(a1, &n); tlog("[gwtrace] Append key=%s dlen=%zu", k, vsize(a2));
+       if (strstr(k, "_8_") || strstr(k, "_4_GA")) { const unsigned char* const* v = a2; hexdump("Append payload", v[0], vsize(a2)); } },
      tlog("[gwtrace] Append ret=%ld", r);)
 
 FWD7(add_wrap, _ZN3shm5store14TcpConfigStore3AddERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEElRl,
