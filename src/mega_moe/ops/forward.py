@@ -1657,6 +1657,30 @@ class FusedMoEForward(torch.nn.Module):
             self._fwd_acc_buf.zero_()
             self._fwd_ring_buf.zero_()
             self._fwd_fc2w_buf.zero_()
+        # MOE_MEGA_HEAP_PROBE=1: forward-side symmetric-heap audit.  The
+        # backward audit (mega_bwd) prints offsets RELATIVE to peer_mem;
+        # putmem/symm_at translation actually assumes the ABSOLUTE offset
+        # (slab ptr - aclshmemx heap base) is identical on every PE.  HCCL's
+        # own InitSymmetricMemory slab (400M cclBuffer) shares the heap and
+        # can shift it per node — compare this line across nodes.
+        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+            import shmem as ash
+
+            try:
+                _base = ash.aclshmemx_get_heap_base()
+
+                def _abs(t):
+                    return None if t is None else hex(t.data_ptr() - _base)
+
+                print(
+                    f"[fwd-heap r{self.rank}] base=0x{_base:x} "
+                    f"peer={_abs(self.context.peer_mem)} "
+                    f"sig={_abs(self.context.signal_mem)} "
+                    f"md_counts={_abs(self.context.metadata_counts_mem)} "
+                    f"pl_counts={_abs(self.context.planning_counts_mem)}",
+                    flush=True)
+            except Exception as e:  # probe must never break the launch
+                print(f"[fwd-heap r{self.rank}] probe-failed {e}", flush=True)
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
             selected_experts,
