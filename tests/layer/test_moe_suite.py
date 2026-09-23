@@ -580,6 +580,49 @@ def run_single_kernel_forward_case(
                     and (saved["send_token_indices"] < tokens).all()
                 )
             )
+            flat_experts = saved_experts.reshape(-1).cpu().tolist()
+            expected_routes = sorted(
+                (route for route, expert in enumerate(flat_experts)
+                 if 0 <= expert < num_experts),
+                key=flat_experts.__getitem__,
+            )
+            send_tables_ok &= (
+                saved["send_route_indices"].cpu().tolist() == expected_routes
+                and saved["send_token_indices"].cpu().tolist()
+                == [route // topk for route in expected_routes]
+            )
+            expected_inverse = [-1] * len(flat_experts)
+            for send_row, route in enumerate(expected_routes):
+                expected_inverse[route] = send_row
+            send_tables_ok &= (
+                op._route_to_send[:len(flat_experts)].cpu().tolist()
+                == expected_inverse
+            )
+            wave_table = op._single_wave_expert_offsets.cpu().tolist()
+            task_offsets = op._single_wave_task_offsets.cpu().tolist()
+            task_table = op._single_wave_tasks.cpu().tolist()
+            max_waves = op._single_pipeline_max_groups
+            windows = op.config.single_kernel_group_windows
+            tasks_ok = True
+            for destination in range(world_size):
+                for wave in range(max_waves):
+                    expected_tasks = []
+                    for expert in range(experts_per_rank):
+                        first_block, row_base = wave_table[destination][expert]
+                        rows = wave_table[destination][expert + 1][1] - row_base
+                        begin = min(rows, max(wave * windows - first_block, 0) * fc1_block_m)
+                        end = min(rows, max((wave + 1) * windows - first_block, 0) * fc1_block_m)
+                        if begin < end:
+                            expected_tasks.append([expert, row_base, begin, end, first_block])
+                    start, end = task_offsets[destination][wave:wave + 2]
+                    tasks_ok &= task_table[destination][start:end] == expected_tasks
+            checkers = min(2 * op.num_aicore_programs, world_size)
+            checked_base = max_waves * (2 * op.num_aicore_programs + world_size)
+            checked_epochs = op._single_pipeline_signal_storage[
+                checked_base * 16:(checked_base + checkers) * 16:16
+            ].cpu().tolist()
+            tasks_ok &= checked_epochs == [op._tile_signal_epoch - 1] * checkers
+            send_tables_ok &= tasks_ok
             recv_layout_ok = (
                 tuple(saved["recv_counts_by_source_expert"].shape)
                 == (world_size, experts_per_rank)
@@ -5839,6 +5882,16 @@ def test_single_kernel_dynamic_waves_w8(dist_test, tokens, block_m):
     dist_test(
         run_single_kernel_forward_case, world_size=8,
         args=(block_m, tokens, 32),
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("num_experts", (128, 896), ids=("e128", "e896"))
+def test_single_kernel_routing_large_experts_w8(dist_test, num_experts):
+    dist_test(
+        run_single_kernel_forward_case, world_size=8,
+        args=(256, 2051, num_experts),
     )
 
 

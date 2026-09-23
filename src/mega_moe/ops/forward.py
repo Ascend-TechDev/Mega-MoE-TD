@@ -195,6 +195,8 @@ class FusedMoEForward(torch.nn.Module):
         self._single_send_token_indices = None
         self._single_send_route_indices = None
         self._single_wave_expert_offsets = None
+        self._single_wave_task_offsets = None
+        self._single_wave_tasks = None
         # MOE_FWD_TIMING=1 single-kernel phase stamps (dead-arg buffers,
         # allocated with the single-kernel workspaces).
         self._fwd_ts_buf = None
@@ -348,6 +350,8 @@ class FusedMoEForward(torch.nn.Module):
         self._single_send_token_indices = None
         self._single_send_route_indices = None
         self._single_wave_expert_offsets = None
+        self._single_wave_task_offsets = None
+        self._single_wave_tasks = None
         self._fwd_ts_buf = None
         self._fwd_acc_buf = None
         self._fwd_ring_buf = None
@@ -649,10 +653,21 @@ class FusedMoEForward(torch.nn.Module):
                 max_recv + pipeline_group_rows - 1
                 + self.physical_experts_per_rank * (self.config.fc1_gemm_block_size_m - 1)
             ) // pipeline_group_rows
+            self._single_wave_task_offsets = torch.empty(
+                (self.world_size, self._single_pipeline_max_groups + 1),
+                dtype=torch.int32, device=device,
+            )
+            self._single_wave_tasks = torch.empty(
+                (self.world_size,
+                 self._single_pipeline_max_groups + self.physical_experts_per_rank, 5),
+                dtype=torch.int32, device=device,
+            )
             import shmem as ash
 
+            # One epoch slot per return-checking worker follows the wave slabs.
             pipeline_slots = self._single_pipeline_max_groups * (
-                2 * self.num_aicore_programs + self.world_size)
+                2 * self.num_aicore_programs + self.world_size) + min(
+                    2 * self.num_aicore_programs, self.world_size)
             self._single_pipeline_signal_storage = ash.aclshmem_create_tensor(
                 [pipeline_slots * 16],
                 dtype=torch.int32,
@@ -1651,6 +1666,8 @@ class FusedMoEForward(torch.nn.Module):
             self._route_to_send,
             self._pull_tile_dst_start,
             self._single_wave_expert_offsets,
+            self._single_wave_task_offsets,
+            self._single_wave_tasks,
             self.context.planning_counts_mem if self.enable_moonep else self.context.metadata_counts_mem,
             self.context.planning_expert_count,
             self.context.planning_transfers,

@@ -141,43 +141,23 @@ def _mixed_forward_barrier():
 
 
 @triton.jit
-def _zero_route_workspaces(
-    pid,
-    core_bucket_cursor_ptr,
-    route_to_send_ptr,
-    num_routes,
-    NUM_PROGRAM_CORES: tl.constexpr,
-    NUM_BINS_PAD: tl.constexpr,
-    ROUTE_BLOCK: tl.constexpr,
-):
-    bucket_offsets = tl.arange(0, NUM_BINS_PAD)
-    tl.store(
-        core_bucket_cursor_ptr + pid * NUM_BINS_PAD + bucket_offsets,
-        0,
-    )
-
-    num_route_tiles = tl.cdiv(num_routes, ROUTE_BLOCK)
-    for tile_id in range(pid, num_route_tiles, NUM_PROGRAM_CORES):
-        route_ids = tile_id * ROUTE_BLOCK + tl.arange(0, ROUTE_BLOCK)
-        tl.store(
-            route_to_send_ptr + route_ids,
-            -1,
-            mask=route_ids < num_routes,
-        )
-
-
-@triton.jit
 def _zero_pipeline_counters(pid, pipeline_signal_ptr,
                             NUM_PROGRAM_CORES: tl.constexpr,
                             NUM_COUNTERS: tl.constexpr):
     # The first rank barrier separates per-call ADD resets from publication.
-    for counter_id in range(pid, NUM_COUNTERS, NUM_PROGRAM_CORES):
-        tl.store(pipeline_signal_ptr + counter_id * 16, 0)
+    block: tl.constexpr = min(256, triton.next_power_of_2(
+        max(1, triton.cdiv(NUM_COUNTERS, NUM_PROGRAM_CORES))))
+    offsets = tl.arange(0, block)
+    for start in range(pid * block, NUM_COUNTERS, NUM_PROGRAM_CORES * block):
+        counters = start + offsets
+        safe_counters = tl.minimum(counters, NUM_COUNTERS - 1)
+        tl.store(pipeline_signal_ptr + safe_counters * 16, 0,
+                 mask=counters < NUM_COUNTERS)
 
 
 @triton.jit
 def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
-                          num_routes, NUM_PROGRAM_CORES: tl.constexpr,
+                          route_to_send_ptr, num_routes, NUM_PROGRAM_CORES: tl.constexpr,
                           NUM_EXPERTS: tl.constexpr,
                           NUM_BINS_PAD: tl.constexpr,
                           BLOCK_SIZE: tl.constexpr):
@@ -196,7 +176,9 @@ def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
     for block_start in range(route_start, route_end, BLOCK_SIZE):
         route_ids = block_start + block_offsets
         mask = route_ids < route_end
-        experts = tl.load(selected_experts_ptr + route_ids,
+        safe_routes = tl.minimum(route_ids, num_routes - 1)
+        tl.store(route_to_send_ptr + safe_routes, -1, mask=mask)
+        experts = tl.load(selected_experts_ptr + safe_routes,
                           mask=mask,
                           other=-1)
         valid = mask & (experts >= 0) & (experts < NUM_EXPERTS)
@@ -261,39 +243,56 @@ def _publish_count_row(
 def _build_destination_metadata(
         dst_rank, counts_mem_ptr, send_bucket_starts_ptr,
         send_bucket_dst_starts_ptr, recv_counts_re_ptr, recv_per_expert_ptr,
-        recv_expert_offs_ptr, stats_ptr, LOCAL_RANK,
+        recv_expert_offs_ptr, stats_ptr, wave_expert_offsets_ptr, LOCAL_RANK,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
-        NUM_BINS_PAD: tl.constexpr):
+        NUM_BINS_PAD: tl.constexpr, BLOCK_M: tl.constexpr):
     local_row_ptr = counts_mem_ptr + LOCAL_RANK * NUM_BINS_PAD
     first_bucket = dst_rank * EXPERTS_PER_RANK
-    send_running = 0
-    for bucket in range(0, first_bucket):
-        send_running += tl.load(local_row_ptr + bucket)
+    bins = tl.arange(0, NUM_BINS_PAD)
+    send_running = tl.sum(tl.load(local_row_ptr + bins,
+                                  mask=bins < first_bucket, other=0), 0)
+    block_e: tl.constexpr = min(32, triton.next_power_of_2(EXPERTS_PER_RANK))
+    sources = tl.arange(0, triton.next_power_of_2(WORLD_SIZE))
+    safe_sources = tl.minimum(sources, WORLD_SIZE - 1)
+    expert_offsets = tl.arange(0, block_e)
     expert_base = 0
-    for local_expert in range(0, EXPERTS_PER_RANK):
-        bucket = first_bucket + local_expert
-        local_count = tl.load(local_row_ptr + bucket)
-        target_total = 0
-        source_prefix = 0
-        for source_rank in range(0, WORLD_SIZE):
-            source_count = tl.load(counts_mem_ptr +
-                                   source_rank * NUM_BINS_PAD + bucket)
-            target_total += source_count
-            if source_rank < LOCAL_RANK:
-                source_prefix += source_count
-            if dst_rank == LOCAL_RANK:
-                tl.store(
-                    recv_counts_re_ptr + source_rank * EXPERTS_PER_RANK +
-                    local_expert, source_count)
-        tl.store(send_bucket_starts_ptr + bucket, send_running)
-        tl.store(send_bucket_dst_starts_ptr + bucket,
-                 expert_base + source_prefix)
+    block_base = 0
+    wave_table = wave_expert_offsets_ptr + dst_rank * (EXPERTS_PER_RANK + 1) * 2
+    for e0 in range(0, EXPERTS_PER_RANK, block_e):
+        experts = e0 + expert_offsets
+        valid = experts < EXPERTS_PER_RANK
+        safe_experts = tl.minimum(experts, EXPERTS_PER_RANK - 1)
+        buckets = first_bucket + safe_experts
+        counts = tl.load(
+            counts_mem_ptr + safe_sources[:, None] * NUM_BINS_PAD + buckets[None, :],
+            mask=(sources[:, None] < WORLD_SIZE) & valid[None, :], other=0)
+        totals = tl.sum(counts, 0)
+        source_prefix = tl.sum(tl.where(sources[:, None] < LOCAL_RANK, counts, 0), 0)
+        local_counts = tl.load(local_row_ptr + buckets, mask=valid, other=0)
+        send_starts = send_running + tl.cumsum(local_counts, 0) - local_counts
+        expert_starts = expert_base + tl.cumsum(totals, 0) - totals
+        tiles = tl.cdiv(totals, BLOCK_M)
+        block_starts = block_base + tl.cumsum(tiles, 0) - tiles
+        tl.store(send_bucket_starts_ptr + buckets, send_starts, mask=valid)
+        tl.store(send_bucket_dst_starts_ptr + buckets,
+                 expert_starts + source_prefix, mask=valid)
+        # EPR1 bases stay workspace-initialized: native putmem scratch can
+        # alias a constant zero kept live in UB across the publish phase.
+        if EXPERTS_PER_RANK > 1:
+            tl.store(wave_table + safe_experts * 2, block_starts, mask=valid)
+            tl.store(wave_table + safe_experts * 2 + 1, expert_starts, mask=valid)
         if dst_rank == LOCAL_RANK:
-            tl.store(recv_per_expert_ptr + local_expert, target_total)
+            tl.store(recv_counts_re_ptr + safe_sources[:, None] * EXPERTS_PER_RANK
+                     + safe_experts[None, :], counts,
+                     mask=(sources[:, None] < WORLD_SIZE) & valid[None, :])
+            tl.store(recv_per_expert_ptr + safe_experts, totals, mask=valid)
             if EXPERTS_PER_RANK > 1:
-                tl.store(recv_expert_offs_ptr + local_expert, expert_base)
-        send_running += local_count
-        expert_base += target_total
+                tl.store(recv_expert_offs_ptr + safe_experts, expert_starts, mask=valid)
+        send_running += tl.sum(local_counts, 0)
+        expert_base += tl.sum(totals, 0)
+        block_base += tl.sum(tiles, 0)
+    tl.store(wave_table + EXPERTS_PER_RANK * 2, block_base)
+    tl.store(wave_table + EXPERTS_PER_RANK * 2 + 1, expert_base)
     if dst_rank == LOCAL_RANK:
         # Only the loop store above is skippable at EPR==1 (its one entry is
         # the invariant zero base, host-initialized).  The EPR sentinel —
@@ -316,19 +315,24 @@ def _convert_counts_to_stable_cursors(
     NUM_BINS_PAD: tl.constexpr,
     MOONEP: tl.constexpr = False,
 ):
-    for bucket in range(pid, NUM_EXPERTS, NUM_PROGRAM_CORES):
-        cursor = 0
+    block_e: tl.constexpr = min(32, triton.next_power_of_2(
+        triton.cdiv(NUM_EXPERTS, NUM_PROGRAM_CORES)))
+    cores = tl.arange(0, triton.next_power_of_2(NUM_PROGRAM_CORES))
+    safe_cores = tl.minimum(cores, NUM_PROGRAM_CORES - 1)
+    expert_offsets = tl.arange(0, block_e)
+    for e0 in range(pid * block_e, NUM_EXPERTS, NUM_PROGRAM_CORES * block_e):
+        experts = e0 + expert_offsets
+        safe_experts = tl.minimum(experts, NUM_EXPERTS - 1)
+        valid = (cores[:, None] < NUM_PROGRAM_CORES) & (experts[None, :] < NUM_EXPERTS)
+        pointers = (core_bucket_cursor_ptr + safe_cores[:, None] * NUM_BINS_PAD
+                    + safe_experts[None, :])
+        counts = tl.load(pointers, mask=valid, other=0)
+        starts = tl.zeros((block_e,), tl.int32)
         if not MOONEP:
-            cursor = tl.load(send_bucket_starts_ptr + bucket)
-        for core_id in range(0, NUM_PROGRAM_CORES):
-            count_ptr = (
-                core_bucket_cursor_ptr
-                + core_id * NUM_BINS_PAD
-                + bucket
-            )
-            count = tl.load(count_ptr)
-            tl.store(count_ptr, cursor)
-            cursor += count
+            starts = tl.load(send_bucket_starts_ptr + safe_experts,
+                             mask=experts < NUM_EXPERTS, other=0)
+        cursors = starts[None, :] + tl.cumsum(counts, 0) - counts
+        tl.store(pointers, cursors, mask=valid)
 
 
 @triton.jit
@@ -342,20 +346,56 @@ def _build_pull_destination_starts(
     NUM_EXPERTS: tl.constexpr,
     NUM_BINS_PAD: tl.constexpr,
 ):
-    remote_send_cursor = 0
-    for bucket in range(0, NUM_EXPERTS):
-        route_count = tl.load(
-            counts_mem_ptr + source_rank * NUM_BINS_PAD + bucket
-        )
-        destination_rank = bucket // EXPERTS_PER_RANK
-        local_expert = bucket % EXPERTS_PER_RANK
-        if destination_rank == LOCAL_RANK:
-            segment_id = local_expert * WORLD_SIZE + source_rank
-            tl.store(
-                pull_tile_dst_start_ptr + segment_id,
-                remote_send_cursor,
-            )
-        remote_send_cursor += route_count
+    first_bucket = LOCAL_RANK * EXPERTS_PER_RANK
+    bins = tl.arange(0, NUM_BINS_PAD)
+    row = counts_mem_ptr + source_rank * NUM_BINS_PAD
+    prefix = tl.sum(tl.load(row + bins, mask=bins < first_bucket, other=0), 0)
+    experts = tl.arange(0, triton.next_power_of_2(EXPERTS_PER_RANK))
+    safe_experts = tl.minimum(experts, EXPERTS_PER_RANK - 1)
+    counts = tl.load(row + first_bucket + safe_experts,
+                     mask=experts < EXPERTS_PER_RANK, other=0)
+    starts = prefix + tl.cumsum(counts, 0) - counts
+    tl.store(pull_tile_dst_start_ptr + safe_experts * WORLD_SIZE + source_rank,
+             starts, mask=experts < EXPERTS_PER_RANK)
+
+
+@triton.jit
+def _scatter_routes_by_ordinal(
+        pid, selected_experts_ptr, core_bucket_cursor_ptr,
+        send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
+        num_routes, NUM_PROGRAM_CORES: tl.constexpr, NUM_EXPERTS: tl.constexpr,
+        NUM_BINS_PAD: tl.constexpr, TOPK: tl.constexpr):
+    block: tl.constexpr = 32
+    lane_bins: tl.constexpr = NUM_BINS_PAD // 2
+    first_bin = sub_vec_id() * lane_bins
+    bins = tl.arange(0, lane_bins)
+    cursors = tl.load(core_bucket_cursor_ptr + pid * NUM_BINS_PAD + first_bin + bins)
+    per_core = tl.cdiv(num_routes, NUM_PROGRAM_CORES)
+    begin = pid * per_core
+    end = tl.minimum(begin + per_core, num_routes)
+    offsets = tl.arange(0, block)
+    earlier = offsets[None, :] < offsets[:, None]
+    for start in range(begin, end, block):
+        routes = start + offsets
+        safe_routes = tl.minimum(routes, num_routes - 1)
+        experts = tl.load(selected_experts_ptr + safe_routes,
+                          mask=routes < end, other=-1)
+        valid = ((routes < end) & (experts >= first_bin)
+                 & (experts < tl.minimum(first_bin + lane_bins, NUM_EXPERTS)))
+        local_experts = tl.where(valid, experts - first_bin, 0).to(tl.int32)
+        matches = (experts[:, None] == experts[None, :]) & earlier & valid[None, :]
+        ordinal = tl.sum(matches.to(tl.int32), 1)
+        rows = tl.gather(cursors, local_experts, 0) + ordinal
+        safe_rows = tl.where(valid, rows, 0)
+        tl.store(send_token_indices_ptr + safe_rows, routes // TOPK, mask=valid)
+        tl.store(send_route_indices_ptr + safe_rows, routes, mask=valid)
+        tl.store(route_to_send_ptr + safe_routes, rows, mask=valid)
+        # Duplicate experts update one histogram bin, never conflicting stores.
+        counts = tl.histogram(local_experts, lane_bins)
+        invalid = tl.sum((~valid).to(tl.int32), 0)
+        counts = tl.where(bins == 0, counts - invalid, counts)
+        cursors += counts
+    tl.store(core_bucket_cursor_ptr + pid * NUM_BINS_PAD + first_bin + bins, cursors)
 
 
 @triton.jit
@@ -366,54 +406,42 @@ def _scatter_stable_routes(pid, selected_experts_ptr, core_bucket_cursor_ptr,
                            NUM_EXPERTS: tl.constexpr,
                            NUM_BINS_PAD: tl.constexpr, TOPK: tl.constexpr,
                            BLOCK_SIZE: tl.constexpr):
-    """Scatter this core's route chunk to its stable send-row positions.
-
-    Both Vector subcores run this helper and split the bin blocks
-    (lane-interleaved, one whole bin block per step).  A bin's send rows
-    depend only on that bin's own cursor and cumsum chain over the core's
-    route blocks in order — bins are independent — so the split keeps the
-    output byte-for-byte identical to the single-lane walk while halving
-    the wall (the second subcore idled through the whole routing phase
-    before, 2026-09-18).  Writes stay race-free: each lane touches only
-    its own bins' cursor slices, send-row segments, and route_to_send
-    entries."""
-    routes_per_core = tl.cdiv(num_routes, NUM_PROGRAM_CORES)
-    route_start = pid * routes_per_core
-    route_end = tl.minimum(route_start + routes_per_core, num_routes)
-    route_offsets = tl.arange(0, BLOCK_SIZE)
-    # Bound the cumsum's bin-by-route matrix for full-expert configurations.
-    bin_block: tl.constexpr = 32 if NUM_BINS_PAD > 32 else NUM_BINS_PAD
-    # Sweep only padded-bin blocks that can hold a real expert: at the Kimi
-    # w8 shape (896 experts in 1024 padded bins) the old full-pad sweep
-    # re-read the route chunk 32x where 28 blocks suffice.
-    bin_sweep = ((NUM_EXPERTS + bin_block - 1) // bin_block) * bin_block
-    lane = sub_vec_id()
-    for bin_start in range(lane * bin_block, bin_sweep, 2 * bin_block):
-        bin_offsets = bin_start + tl.arange(0, bin_block)
-        cursors = tl.load(core_bucket_cursor_ptr + pid * NUM_BINS_PAD +
-                          bin_offsets)
-        for block_start in range(route_start, route_end, BLOCK_SIZE):
-            route_ids = block_start + route_offsets
-            route_mask = route_ids < route_end
-            experts = tl.load(selected_experts_ptr + route_ids,
-                              mask=route_mask,
-                              other=-1)
-            valid = route_mask & (experts >= 0) & (experts < NUM_EXPERTS)
-            if NUM_BINS_PAD > bin_block:
-                valid &= (experts >= bin_start) & (experts < bin_start + bin_block)
-            matches = (experts[None, :] == bin_offsets[:, None]) & valid[None, :]
-            matches_i32 = matches.to(tl.int32)
-            within_block = tl.cumsum(matches_i32, axis=1) - matches_i32
-            send_rows = tl.sum((cursors[:, None] + within_block) * matches_i32,
-                               axis=0)
-            tl.store(send_token_indices_ptr + send_rows,
-                     route_ids // TOPK,
-                     mask=valid)
-            tl.store(send_route_indices_ptr + send_rows, route_ids, mask=valid)
-            tl.store(route_to_send_ptr + route_ids, send_rows, mask=valid)
-            cursors += tl.sum(matches_i32, axis=1)
-        tl.store(core_bucket_cursor_ptr + pid * NUM_BINS_PAD + bin_offsets,
-                 cursors)
+    """Stable expert-major scatter; each lane owns disjoint expert bins."""
+    if NUM_EXPERTS >= 128:
+        _scatter_routes_by_ordinal(
+            pid, selected_experts_ptr, core_bucket_cursor_ptr,
+            send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
+            num_routes, NUM_PROGRAM_CORES, NUM_EXPERTS, NUM_BINS_PAD, TOPK)
+    else:
+        routes_per_core = tl.cdiv(num_routes, NUM_PROGRAM_CORES)
+        route_start = pid * routes_per_core
+        route_end = tl.minimum(route_start + routes_per_core, num_routes)
+        route_offsets = tl.arange(0, BLOCK_SIZE)
+        bin_block: tl.constexpr = min(32, NUM_BINS_PAD)
+        bin_sweep = ((NUM_EXPERTS + bin_block - 1) // bin_block) * bin_block
+        lane = sub_vec_id()
+        for bin_start in range(lane * bin_block, bin_sweep, 2 * bin_block):
+            bin_offsets = bin_start + tl.arange(0, bin_block)
+            cursors = tl.load(core_bucket_cursor_ptr + pid * NUM_BINS_PAD + bin_offsets)
+            for block_start in range(route_start, route_end, BLOCK_SIZE):
+                route_ids = block_start + route_offsets
+                safe_routes = tl.minimum(route_ids, num_routes - 1)
+                route_mask = route_ids < route_end
+                experts = tl.load(selected_experts_ptr + safe_routes,
+                                  mask=route_mask, other=-1)
+                valid = route_mask & (experts >= 0) & (experts < NUM_EXPERTS)
+                if NUM_BINS_PAD > bin_block:
+                    valid &= (experts >= bin_start) & (experts < bin_start + bin_block)
+                matches = (experts[None, :] == bin_offsets[:, None]) & valid[None, :]
+                matches_i32 = matches.to(tl.int32)
+                within_block = tl.cumsum(matches_i32, axis=1) - matches_i32
+                send_rows = tl.sum((cursors[:, None] + within_block) * matches_i32,
+                                   axis=0)
+                tl.store(send_token_indices_ptr + send_rows, route_ids // TOPK, mask=valid)
+                tl.store(send_route_indices_ptr + send_rows, route_ids, mask=valid)
+                tl.store(route_to_send_ptr + safe_routes, send_rows, mask=valid)
+                cursors += tl.sum(matches_i32, axis=1)
+            tl.store(core_bucket_cursor_ptr + pid * NUM_BINS_PAD + bin_offsets, cursors)
 
 
 @triton.jit
@@ -511,9 +539,16 @@ def _wait_fc1_vector_ack(SLOT: tl.constexpr):
 
 
 @triton.jit
+def _advance_fc1_tile(row_part, n_tile, row_parts, row_step, n_step):
+    row = row_part + row_step
+    carry = row >= row_parts
+    return tl.where(carry, row - row_parts, row), n_tile + n_step + carry.to(tl.int32)
+
+
+@triton.jit
 def _partition_pipeline_fc1_activation_group_ub(
         pid, input_ptr, signal_mem_ptr, weight_ptr, routing_weight_ptr, output_ptr,
-        fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr, recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
+        fc1_output_ptr, fc1_scale_ptr, wave_expert_offset, recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
         stride_input_m, stride_input_k, stride_weight_e, stride_weight_n, stride_weight_k,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
         FFN: tl.constexpr, K: tl.constexpr, DISPATCH_BLOCK_M: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -571,10 +606,20 @@ def _partition_pipeline_fc1_activation_group_ub(
         _ub_ack_1 = tl.zeros((1,), dtype=tl.int64)
         _ub_ack_2 = tl.zeros((1,), dtype=tl.int64)
     cube_expert_id = wave_expert
-    cube_expert_off = tl.load(recv_expert_offs_ptr + wave_expert)
+    cube_expert_off = wave_expert_offset
     cube_group_start = wave_row_start
     cube_group_size = wave_rows
-    cube_group_row_parts = tl.cdiv(wave_rows, pair_block_m)
+    if FULL_GROUP:
+        cube_group_row_parts = GROUP_WINDOWS
+        core_power_two: tl.constexpr = FC1_CORES & -FC1_CORES
+        first_sweep_steps = max(1, GROUP_WINDOWS // core_power_two)
+    else:
+        cube_group_row_parts = tl.cdiv(wave_rows, pair_block_m)
+        row_power_two = cube_group_row_parts & -cube_group_row_parts
+        shared_factor = tl.minimum(row_power_two, FC1_CORES & -FC1_CORES)
+        first_sweep_steps = cube_group_row_parts // shared_factor
+    input_group_offset = (cube_expert_off.to(tl.int64)
+                          + cube_group_start.to(tl.int64)) * stride_input_m
     # The caller supplies a nonempty expert range and a lane in [0, cores).
     cube_lane_tiles = tl.cdiv(
         cube_group_row_parts * num_n_tiles - pid, FC1_CORES)
@@ -589,35 +634,23 @@ def _partition_pipeline_fc1_activation_group_ub(
             # Each UB owner releases its storage before the next Fixpipe.
             al.sync_block_set('vector', 'cube', 7, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_FIX)
     pipeline_tiles = cube_lane_tiles
+    row_step = FC1_CORES % cube_group_row_parts
+    n_step = FC1_CORES // cube_group_row_parts
+    cube_row_part = pid % cube_group_row_parts
+    cube_n_tile = pid // cube_group_row_parts
+    vector_row_part = cube_row_part
+    vector_n_tile = cube_n_tile
     for pipeline_step in range(0, pipeline_tiles + 1):
         with al.scope(core_mode='cube', disable_auto_sync=True):
             # No timing here: the Cube engine cannot execute data-path
             # arithmetic (see the scratch comment above).
-            tile_id = pid + pipeline_step * FC1_CORES
-            row_part = tile_id % cube_group_row_parts
-            n_tile = tile_id // cube_group_row_parts
+            row_part = cube_row_part
+            n_tile = cube_n_tile
             if pipeline_step < cube_lane_tiles:
-                input_group_offset = (cube_expert_off.to(
-                    tl.int64) + cube_group_start.to(tl.int64)) * stride_input_m
                 local_row_start = row_part * pair_block_m
                 row_count = pair_block_m if FULL_GROUP else tl.minimum(
                     pair_block_m, cube_group_size - local_row_start)
-                if FULL_GROUP:
-                    # With a power-of-two wave, a strided lane revisits
-                    # its rows after W / gcd(W, cores) steps, often one.
-                    core_power_two: tl.constexpr = FC1_CORES & -FC1_CORES
-                    first_sweep_steps: tl.constexpr = (
-                        GROUP_WINDOWS // core_power_two
-                        if GROUP_WINDOWS > core_power_two else 1)
-                    first_sweep = pipeline_step < first_sweep_steps
-                else:
-                    # Striding by FC1_CORES revisits rows after r/gcd(r, cores)
-                    # steps. Its power-of-two factor gives a safe bound even
-                    # for core counts with odd factors, and is exact on 32 cores.
-                    row_power_two = cube_group_row_parts & -cube_group_row_parts
-                    shared_factor = tl.minimum(row_power_two, FC1_CORES & -FC1_CORES)
-                    first_sweep = pipeline_step < cube_group_row_parts // shared_factor
-                if first_sweep:
+                if pipeline_step < first_sweep_steps:
                     group_ready_token += _wait_dispatch_row_range(
                         signal_mem_ptr, recv_seg_starts_ptr, cube_expert_id,
                         cube_group_start + local_row_start,
@@ -736,9 +769,8 @@ def _partition_pipeline_fc1_activation_group_ub(
                             _wait_fc1_vector_ack(1)
         with al.scope(core_mode='vector', disable_auto_sync=True):
             previous_step = pipeline_step - 1
-            tile_id = pid + previous_step * FC1_CORES
-            row_part = tile_id % vector_group_row_parts
-            n_tile = tile_id // vector_group_row_parts
+            row_part = vector_row_part
+            n_tile = vector_n_tile
             previous_valid = (pipeline_step >= 1) & (
                 previous_step < vector_lane_tiles)
             if previous_valid:
@@ -959,6 +991,11 @@ def _partition_pipeline_fc1_activation_group_ub(
                                     * FWD_RING_COLS + FWD_RING_CUBE
                                     + tl.arange(0, 1),
                                     cube_wall)
+        cube_row_part, cube_n_tile = _advance_fc1_tile(
+            cube_row_part, cube_n_tile, cube_group_row_parts, row_step, n_step)
+        if pipeline_step >= 1:
+            vector_row_part, vector_n_tile = _advance_fc1_tile(
+                vector_row_part, vector_n_tile, vector_group_row_parts, row_step, n_step)
 
 
 @triton.jit
@@ -980,28 +1017,65 @@ def _return_rows_direct(combine_buf_ptr, fc2_output_ptr, source_row,
 
 
 @triton.jit
-def _build_dynamic_wave_offsets(
-        destination_rank, counts_mem_ptr, wave_expert_offsets_ptr,
-        WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
-        NUM_BINS_PAD: tl.constexpr, BLOCK_M: tl.constexpr):
-    row_offset = 0
-    block_offset = 0
-    table = wave_expert_offsets_ptr + destination_rank * (EXPERTS_PER_RANK + 1) * 2
-    for expert in range(EXPERTS_PER_RANK):
-        # EPR1 has invariant zero bases, initialized with the workspace.
-        # A constant GM store can keep its zero in UB across native putmem,
-        # whose scratch overwrites that UB slot on the metadata publisher.
-        if EXPERTS_PER_RANK > 1:
-            tl.store(table + expert * 2, block_offset)
-            tl.store(table + expert * 2 + 1, row_offset)
-        rows = 0
-        for source in range(WORLD_SIZE):
-            rows += tl.load(counts_mem_ptr + source * NUM_BINS_PAD
-                            + destination_rank * EXPERTS_PER_RANK + expert)
-        row_offset += rows
-        block_offset += tl.cdiv(rows, BLOCK_M)
-    tl.store(table + EXPERTS_PER_RANK * 2, block_offset)
-    tl.store(table + EXPERTS_PER_RANK * 2 + 1, row_offset)
+def _build_wave_tasks(
+        rank, wave_expert_offsets_ptr, wave_task_offsets_ptr, wave_tasks_ptr,
+        EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
+        BLOCK_M: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
+        MAX_RECEIVED_ROUTES: tl.constexpr):
+    table = wave_expert_offsets_ptr + rank * (EXPERTS_PER_RANK + 1) * 2
+    total_rows = tl.load(table + EXPERTS_PER_RANK * 2 + 1)
+    if total_rows <= MAX_RECEIVED_ROUTES:
+        experts = tl.arange(0, triton.next_power_of_2(EXPERTS_PER_RANK))
+        safe_experts = tl.minimum(experts, EXPERTS_PER_RANK - 1)
+        valid = experts < EXPERTS_PER_RANK
+        first_block = tl.load(table + safe_experts * 2, mask=valid, other=0)
+        end_block = tl.load(table + (safe_experts + 1) * 2, mask=valid, other=0)
+        row_base = tl.load(table + safe_experts * 2 + 1, mask=valid, other=0)
+        row_end = tl.load(table + (safe_experts + 1) * 2 + 1, mask=valid, other=0)
+        first_wave = first_block // WAVE_WINDOWS
+        task_counts = tl.where(valid & (row_end > row_base),
+                               tl.cdiv(end_block, WAVE_WINDOWS) - first_wave, 0)
+        task_starts = tl.cumsum(task_counts, 0) - task_counts
+        max_tasks: tl.constexpr = MAX_WAVES + EXPERTS_PER_RANK
+        task_base = wave_tasks_ptr + rank * max_tasks * 5
+        offset_base = wave_task_offsets_ptr + rank * (MAX_WAVES + 1)
+        for part in range(tl.max(task_counts, 0)):
+            active = part < task_counts
+            wave = first_wave + part
+            task = task_starts + part
+            safe_task = tl.minimum(task, max_tasks - 1)
+            begin = tl.maximum(wave * WAVE_WINDOWS - first_block, 0) * BLOCK_M
+            end = tl.minimum(row_end - row_base,
+                             ((wave + 1) * WAVE_WINDOWS - first_block) * BLOCK_M)
+            tl.store(task_base + safe_task * 5, experts, mask=active)
+            tl.store(task_base + safe_task * 5 + 1, row_base, mask=active)
+            tl.store(task_base + safe_task * 5 + 2, begin, mask=active)
+            tl.store(task_base + safe_task * 5 + 3, end, mask=active)
+            tl.store(task_base + safe_task * 5 + 4, first_block, mask=active)
+            # Expert block intervals partition the wave axis. Exactly one
+            # nonempty expert covers its first block, including across holes.
+            first_in_wave = active & (first_block <= wave * WAVE_WINDOWS)
+            tl.store(offset_base + tl.minimum(wave, MAX_WAVES), task,
+                     mask=first_in_wave)
+        blocks = tl.load(table + EXPERTS_PER_RANK * 2)
+        waves = tl.cdiv(blocks, WAVE_WINDOWS)
+        tail = tl.arange(0, triton.next_power_of_2(MAX_WAVES + 1))
+        tl.store(offset_base + tl.minimum(tail, MAX_WAVES), tl.sum(task_counts, 0),
+                 mask=(tail >= waves) & (tail <= MAX_WAVES))
+
+
+@triton.jit
+def _wave_task_range(wave_task_offsets_ptr, rank, wave, MAX_WAVES: tl.constexpr):
+    table = wave_task_offsets_ptr + rank * (MAX_WAVES + 1)
+    return tl.load(table + wave), tl.load(table + wave + 1)
+
+
+@triton.jit
+def _load_wave_task(wave_tasks_ptr, rank, task,
+                    EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr):
+    entry = wave_tasks_ptr + (rank * (MAX_WAVES + EXPERTS_PER_RANK) + task) * 5
+    return (tl.load(entry), tl.load(entry + 2), tl.load(entry + 3),
+            tl.load(entry + 1), tl.load(entry + 4))
 
 
 @triton.jit
@@ -1025,13 +1099,13 @@ def _dispatch_dynamic_wave(
         pid, wave, hidden_states_ptr, peer_mem_ptr, routing_weights_ptr,
         routing_weight_recv_ptr, signal_mem_ptr, send_token_indices_ptr,
         send_route_indices_ptr, send_bucket_dst_starts_ptr,
-        send_bucket_starts_ptr, local_counts_ptr, wave_expert_offsets_ptr,
+        send_bucket_starts_ptr, local_counts_ptr, wave_task_offsets_ptr, wave_tasks_ptr,
         signal_epoch, stride_hidden_m,
         NUM_CORES: tl.constexpr, LOCAL_RANK,
         WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
         HIDDEN: tl.constexpr, BLOCK_M: tl.constexpr,
         WAVE_WINDOWS: tl.constexpr, MAX_SOURCE_TILES: tl.constexpr,
-        DISPATCH_BLOCK_M: tl.constexpr):
+        DISPATCH_BLOCK_M: tl.constexpr, MAX_WAVES: tl.constexpr):
     # Worlds wider than the core count stride one program across several
     # destinations (TOTAL_UNITS > NUM_CORES); worlds that fit keep the
     # historical single assignment (unit == pid, destination = pid %
@@ -1042,10 +1116,11 @@ def _dispatch_dynamic_wave(
         destination = unit % WORLD_SIZE
         lane = unit // WORLD_SIZE
         lanes = tl.cdiv(TOTAL_UNITS - destination, WORLD_SIZE)
-        for expert in range(EXPERTS_PER_RANK):
-            begin, end, expert_offset, _ = _dynamic_wave_expert_range(
-                wave_expert_offsets_ptr, destination, expert, wave,
-                EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+        task_begin, task_end = _wave_task_range(
+            wave_task_offsets_ptr, destination, wave, MAX_WAVES)
+        for task in range(task_begin, task_end):
+            expert, begin, end, expert_offset, _ = _load_wave_task(
+                wave_tasks_ptr, destination, task, EXPERTS_PER_RANK, MAX_WAVES)
             if begin < end:
                 bucket = destination * EXPERTS_PER_RANK + expert
                 source_begin = tl.load(send_bucket_dst_starts_ptr + bucket) - expert_offset
@@ -1068,7 +1143,8 @@ def _dispatch_dynamic_wave(
 
 @triton.jit
 def _fc2_dynamic_wave(
-        pid, wave, input_ptr, weight_ptr, output_ptr, pipeline_signal_ptr, wave_expert_offsets_ptr,
+        pid, wave, input_ptr, weight_ptr, output_ptr, pipeline_signal_ptr,
+        wave_task_offsets_ptr, wave_tasks_ptr,
         signal_epoch, stride_weight_e, stride_weight_n, stride_weight_k, NUM_CORES: tl.constexpr,
         LOCAL_RANK, EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
         HIDDEN: tl.constexpr, FFN: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -1077,14 +1153,15 @@ def _fc2_dynamic_wave(
         HOME_EXPERTS: tl.constexpr, MOONEP: tl.constexpr):
     completion_base: tl.constexpr = MAX_WAVES * NUM_CORES
     n_tiles: tl.constexpr = (HIDDEN + BLOCK_N - 1) // BLOCK_N
+    task_begin, task_end = _wave_task_range(
+        wave_task_offsets_ptr, LOCAL_RANK, wave, MAX_WAVES)
     activation_ready = dl.wait(
         pipeline_signal_ptr + wave * NUM_CORES * 16,
         NUM_CORES, 'gpu', 'acquire', waitValue=2)
     wave_input = dl.consume_token(input_ptr, activation_ready)
-    for expert in range(EXPERTS_PER_RANK):
-        begin, end, expert_offset, first_block = _dynamic_wave_expert_range(
-            wave_expert_offsets_ptr, LOCAL_RANK, expert, wave,
-            EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+    for task in range(task_begin, task_end):
+        expert, begin, end, expert_offset, first_block = _load_wave_task(
+            wave_tasks_ptr, LOCAL_RANK, task, EXPERTS_PER_RANK, MAX_WAVES)
         if begin < end:
             row_tiles = tl.cdiv(end - begin, BLOCK_M)
             tile_base = (first_block + begin // BLOCK_M) * n_tiles
@@ -1122,7 +1199,8 @@ def _fc2_dynamic_wave(
 @triton.jit
 def _return_dynamic_wave(
         worker, wave, combine_buf_ptr, fc2_output_ptr, recv_seg_starts_ptr,
-        pull_tile_dst_start_ptr, pipeline_signal_ptr, wave_expert_offsets_ptr, signal_epoch,
+        pull_tile_dst_start_ptr, pipeline_signal_ptr, wave_task_offsets_ptr, wave_tasks_ptr,
+        signal_epoch,
         NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr, HIDDEN: tl.constexpr,
         BLOCK_M: tl.constexpr, WAVE_WINDOWS: tl.constexpr,
@@ -1148,14 +1226,15 @@ def _return_dynamic_wave(
         # GEMM for this wave) is done.
         fc2_wave_end = _sys_cnt_tick(dummy)
     wave_fc2 = dl.consume_token(fc2_output_ptr, ready)
+    task_begin, task_end = _wave_task_range(
+        wave_task_offsets_ptr, LOCAL_RANK, wave, MAX_WAVES)
     for unit in range(worker, TOTAL_RETURN_UNITS, 2 * NUM_CORES):
         source = unit % WORLD_SIZE
         lane = unit // WORLD_SIZE
         lanes = tl.cdiv(TOTAL_RETURN_UNITS - source, WORLD_SIZE)
-        for expert in range(EXPERTS_PER_RANK):
-            begin, end, expert_offset, _ = _dynamic_wave_expert_range(
-                wave_expert_offsets_ptr, LOCAL_RANK, expert, wave,
-                EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+        for task in range(task_begin, task_end):
+            expert, begin, end, expert_offset, _ = _load_wave_task(
+                wave_tasks_ptr, LOCAL_RANK, task, EXPERTS_PER_RANK, MAX_WAVES)
             if begin < end:
                 # Segment-start table replaces the O(W) prior-source scan.
                 seg_row = recv_seg_starts_ptr + expert * (WORLD_SIZE + 1)
@@ -1185,25 +1264,34 @@ def _return_dynamic_wave(
 
 @triton.jit
 def _wait_dynamic_wave_returns(
-        wave_expert_offsets_ptr, pipeline_signal_ptr, NUM_CORES: tl.constexpr,
-        LOCAL_RANK, WORLD_SIZE: tl.constexpr, EXPERTS_PER_RANK: tl.constexpr,
-        MAX_WAVES: tl.constexpr, WAVE_WINDOWS: tl.constexpr):
+        worker, wave_expert_offsets_ptr, pipeline_signal_ptr, signal_epoch,
+        NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
+        EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
+        WAVE_WINDOWS: tl.constexpr):
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
-    # Mirrors TOTAL_RETURN_UNITS in _return_dynamic_wave: every return unit
-    # fires one ADD on its source's slot, so the waiter expects one ADD per
-    # unit assigned to its rank.
+    checked_base: tl.constexpr = MAX_WAVES * (2 * NUM_CORES + WORLD_SIZE)
+    CHECKERS: tl.constexpr = min(2 * NUM_CORES, WORLD_SIZE)
     TOTAL_RETURN_UNITS: tl.constexpr = max(2 * NUM_CORES, WORLD_SIZE)
-    ready = 0
-    for destination in range(WORLD_SIZE):
-        blocks = tl.load(wave_expert_offsets_ptr
-                         + (destination * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK) * 2)
-        waves = tl.cdiv(blocks, WAVE_WINDOWS)
-        for wave in range(waves):
-            expected = tl.cdiv(TOTAL_RETURN_UNITS - LOCAL_RANK, WORLD_SIZE)
-            ready += dl.wait(
-                pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + destination) * 16,
-                1, 'gpu', 'acquire', waitValue=expected)
-    return ready
+    expected = tl.cdiv(TOTAL_RETURN_UNITS - LOCAL_RANK, WORLD_SIZE)
+    if worker < CHECKERS:
+        ready = 0
+        for destination in range(worker, WORLD_SIZE, CHECKERS):
+            blocks = tl.load(wave_expert_offsets_ptr
+                             + (destination * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK) * 2)
+            waves = tl.cdiv(blocks, WAVE_WINDOWS)
+            for wave in range(waves):
+                ready += dl.wait(
+                    pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + destination) * 16,
+                    1, 'gpu', 'acquire', waitValue=expected)
+        # Relay every remote acquire through a fenced local epoch publication.
+        # The consumed allocation base keeps publication dependent on all waits.
+        checked_signals = dl.consume_token(pipeline_signal_ptr, ready)
+        libshmem_device.fence()
+        libshmem_device.signal_op(
+            checked_signals + (checked_base + worker) * 16,
+            signal_epoch, libshmem_device.ACLSHMEM_SIGNAL_SET, LOCAL_RANK)
+    return dl.wait(pipeline_signal_ptr + checked_base * 16, CHECKERS,
+                   'gpu', 'acquire', waitValue=signal_epoch)
 
 
 @triton.jit
@@ -1241,7 +1329,8 @@ def _run_dynamic_wave_pipeline(
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr,
         recv_seg_starts_ptr,
-        pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
+        pull_tile_dst_start_ptr, wave_expert_offsets_ptr, wave_task_offsets_ptr, wave_tasks_ptr,
+        num_routes, signal_epoch, capacity_ok,
         situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
         NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
@@ -1310,10 +1399,10 @@ def _run_dynamic_wave_pipeline(
                         routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
                         send_token_indices_ptr, send_route_indices_ptr,
                         send_bucket_dst_starts_ptr, send_bucket_starts_ptr,
-                        local_counts_ptr, wave_expert_offsets_ptr, signal_epoch,
+                        local_counts_ptr, wave_task_offsets_ptr, wave_tasks_ptr, signal_epoch,
                         stride_hidden_m, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                         EXPERTS_PER_RANK, HIDDEN, BLOCK_M, WAVE_WINDOWS,
-                        MAX_SOURCE_TILES, DISPATCH_BLOCK_M)
+                        MAX_SOURCE_TILES, DISPATCH_BLOCK_M, MAX_WAVES)
                     if TIMING:
                         # Raw pair (cols 0/1, last site wins): the in-kernel
                         # delta read pair collapsed to 0 (2026-09-18), so
@@ -1337,19 +1426,20 @@ def _run_dynamic_wave_pipeline(
                     routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
                     send_token_indices_ptr, send_route_indices_ptr,
                     send_bucket_dst_starts_ptr, send_bucket_starts_ptr,
-                    local_counts_ptr, wave_expert_offsets_ptr, signal_epoch,
+                    local_counts_ptr, wave_task_offsets_ptr, wave_tasks_ptr, signal_epoch,
                     stride_hidden_m, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                     EXPERTS_PER_RANK, HIDDEN, BLOCK_M, WAVE_WINDOWS,
-                    MAX_SOURCE_TILES, DISPATCH_BLOCK_M)
+                    MAX_SOURCE_TILES, DISPATCH_BLOCK_M, MAX_WAVES)
                 if TIMING:
                     busy = tl.where(busy_offs == 0, _d0, busy)
                     busy = tl.where(busy_offs == 1,
                                     _sys_cnt_tick(dummy_ts), busy)
         if step < local_waves:
-            for expert in range(EXPERTS_PER_RANK):
-                begin, end, _, first_block = _dynamic_wave_expert_range(
-                    wave_expert_offsets_ptr, LOCAL_RANK, expert, step,
-                    EXPERTS_PER_RANK, BLOCK_M, WAVE_WINDOWS)
+            task_begin, task_end = _wave_task_range(
+                wave_task_offsets_ptr, LOCAL_RANK, step, MAX_WAVES)
+            for task in range(task_begin, task_end):
+                expert, begin, end, expert_offset, first_block = _load_wave_task(
+                    wave_tasks_ptr, LOCAL_RANK, task, EXPERTS_PER_RANK, MAX_WAVES)
                 if begin < end:
                     tile_base = (first_block + begin // BLOCK_M) * fc1_n_tiles
                     lane = (pid + NUM_CORES - tile_base % NUM_CORES) % NUM_CORES
@@ -1369,7 +1459,7 @@ def _run_dynamic_wave_pipeline(
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
                                     recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
@@ -1390,7 +1480,7 @@ def _run_dynamic_wave_pipeline(
                                 _partition_pipeline_fc1_activation_group_ub(
                                     lane, peer_mem_ptr, signal_mem_ptr,
                                     replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, recv_expert_offs_ptr,
+                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
                                     recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
                                     stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
                                     stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
@@ -1420,7 +1510,7 @@ def _run_dynamic_wave_pipeline(
             if (step > 0) & (step - 1 < local_waves):
                 _fc2_dynamic_wave(
                     pid, step - 1, weighted_activation_ptr, down_weight_ptr, fc2_output_ptr,
-                    pipeline_signal_ptr, wave_expert_offsets_ptr, signal_epoch, stride_down_e,
+                    pipeline_signal_ptr, wave_task_offsets_ptr, wave_tasks_ptr, signal_epoch, stride_down_e,
                     stride_down_n, stride_down_k, NUM_CORES, LOCAL_RANK, EXPERTS_PER_RANK, MAX_WAVES,
                     HIDDEN, FFN, BLOCK_M, FC2_BLOCK_N, FC2_BLOCK_K, WAVE_WINDOWS,
                     replica_down_ptr, down_ready_ptr, HOME_EXPERTS, MOONEP)
@@ -1438,7 +1528,8 @@ def _run_dynamic_wave_pipeline(
                 _fc2_end = _return_dynamic_wave(
                     pid * 2 + sub_vec_id(), step - 2, combine_buf_ptr,
                     fc2_output_ptr, recv_seg_starts_ptr, pull_tile_dst_start_ptr, pipeline_signal_ptr,
-                    wave_expert_offsets_ptr, signal_epoch, NUM_CORES, LOCAL_RANK, WORLD_SIZE,
+                    wave_task_offsets_ptr, wave_tasks_ptr, signal_epoch,
+                    NUM_CORES, LOCAL_RANK, WORLD_SIZE,
                     EXPERTS_PER_RANK, MAX_WAVES, HIDDEN, BLOCK_M, WAVE_WINDOWS,
                     fc2_wave_start=_fc2_s2, TIMING=TIMING, dummy=dummy_ts)
                 if TIMING:
@@ -1469,7 +1560,8 @@ def _run_dynamic_wave_pipeline(
             if TIMING:
                 _w0 = _sys_cnt_tick(dummy_ts)
             return_ready = _wait_dynamic_wave_returns(
-                wave_expert_offsets_ptr, pipeline_signal_ptr, NUM_CORES, LOCAL_RANK,
+                pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,
+                pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,
                 WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)
             if TIMING:
                 # dl.wait blocks the issuing stream: this one is exact.
@@ -1507,7 +1599,7 @@ def _kernel_fused_forward(
         recv_seg_starts_ptr, recv_per_expert_ptr,
         recv_expert_offs_ptr, stats_ptr, core_bucket_cursor_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, pull_tile_dst_start_ptr, wave_expert_offsets_ptr,
-        raw_counts_ptr, expert_count_ptr, transfers_ptr, allocation_ptr, alloc_cumsum_ptr,
+        wave_task_offsets_ptr, wave_tasks_ptr, raw_counts_ptr, expert_count_ptr, transfers_ptr, allocation_ptr, alloc_cumsum_ptr,
         experts_to_copy_ptr, inverse_ptr, replica_counts_ptr, source_prefix_ptr,
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         gate_notify_ptr, down_notify_ptr,
@@ -1540,20 +1632,16 @@ def _kernel_fused_forward(
         _fwd_stamp_lane0(ts_row, 0, ts_dummy)   # entry
     physical_experts: tl.constexpr = EXPERTS_PER_RANK * (2 if MOONEP else 1)
     pipeline_counter_count: tl.constexpr = MAX_PIPELINE_GROUPS * (
-        2 * NUM_PROGRAM_CORES + WORLD_SIZE)
+        2 * NUM_PROGRAM_CORES + WORLD_SIZE) + min(2 * NUM_PROGRAM_CORES, WORLD_SIZE)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
-            _zero_route_workspaces(pid, core_bucket_cursor_ptr,
-                                   route_to_send_ptr, num_routes,
-                                   NUM_PROGRAM_CORES, NUM_BINS_PAD,
-                                   _ROUTE_BLOCK)
             _zero_pipeline_counters(
                 pid, pipeline_signal_ptr, NUM_PROGRAM_CORES,
                 pipeline_counter_count)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
             _count_routes_by_core(pid, selected_experts_ptr,
-                                  core_bucket_cursor_ptr, num_routes,
+                                  core_bucket_cursor_ptr, route_to_send_ptr, num_routes,
                                   NUM_PROGRAM_CORES, NUM_EXPERTS, NUM_BINS_PAD,
                                   _ROUTE_BLOCK)
     _mixed_forward_barrier()
@@ -1635,9 +1723,7 @@ def _kernel_fused_forward(
                     dst_rank, counts_mem_ptr, send_bucket_starts_ptr,
                     send_bucket_dst_starts_ptr, recv_counts_re_ptr,
                     recv_per_expert_ptr, recv_expert_offs_ptr, stats_ptr,
-                    LOCAL_RANK, WORLD_SIZE, physical_experts, NUM_BINS_PAD)
-                _build_dynamic_wave_offsets(
-                    dst_rank, counts_mem_ptr, wave_expert_offsets_ptr, WORLD_SIZE,
+                    wave_expert_offsets_ptr, LOCAL_RANK, WORLD_SIZE,
                     physical_experts, NUM_BINS_PAD, FC1_BLOCK_M)
     _mixed_forward_barrier()
     if TIMING:
@@ -1660,6 +1746,11 @@ def _kernel_fused_forward(
                 pid, recv_counts_re_ptr, recv_seg_starts_ptr, NUM_PROGRAM_CORES,
                 physical_experts, WORLD_SIZE,
                 triton.next_power_of_2(WORLD_SIZE))
+            for destination in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
+                _build_wave_tasks(
+                    destination, wave_expert_offsets_ptr, wave_task_offsets_ptr,
+                    wave_tasks_ptr, physical_experts, MAX_PIPELINE_GROUPS,
+                    FC1_BLOCK_M, PIPELINE_GROUP_WINDOWS, MAX_RECEIVED_ROUTES)
             for source_rank in range(pid, WORLD_SIZE, NUM_PROGRAM_CORES):
                 _build_pull_destination_starts(
                     source_rank, counts_mem_ptr, pull_tile_dst_start_ptr,
@@ -1686,8 +1777,7 @@ def _kernel_fused_forward(
                     EXPERTS_PER_RANK, NUM_BINS_PAD, TOPK,
                     WORLD_SEARCH_STEPS, _SCATTER_BLOCK)
         else:
-            # Both Vector subcores: _scatter_stable_routes splits its bin
-            # blocks lane-interleaved (byte-identical output, half the wall).
+            # Both Vector subcores own disjoint expert bins and send rows.
             _scatter_stable_routes(pid, selected_experts_ptr,
                                    core_bucket_cursor_ptr,
                                    send_token_indices_ptr,
@@ -1708,7 +1798,8 @@ def _kernel_fused_forward(
         send_bucket_starts_ptr, send_bucket_dst_starts_ptr, send_token_indices_ptr,
         send_route_indices_ptr, route_to_send_ptr, recv_expert_offs_ptr,
         recv_seg_starts_ptr,
-        pull_tile_dst_start_ptr, wave_expert_offsets_ptr, num_routes, signal_epoch, capacity_ok,
+        pull_tile_dst_start_ptr, wave_expert_offsets_ptr, wave_task_offsets_ptr, wave_tasks_ptr,
+        num_routes, signal_epoch, capacity_ok,
         situ_beta, situ_linear_beta, stride_hidden_m, stride_hidden_k, stride_gate_up_e,
         stride_gate_up_n, stride_gate_up_k, stride_down_e, stride_down_n, stride_down_k,
         NUM_PROGRAM_CORES, LOCAL_RANK, WORLD_SIZE, physical_experts, HIDDEN, FFN, TOPK,
