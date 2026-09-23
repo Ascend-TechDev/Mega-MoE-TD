@@ -100,6 +100,21 @@ python3 -m pytest --noconftest -q \
 
 ## NPU 验收入口
 
+### phase timing 自带的精度门
+
+`tests/layer/test_fwd_phase_timing.py` 的每个节点在**计时循环之前**跑两道精度门，用的是 benchmark 套件同一套独立 logical-owner Torch/HCCL golden：
+
+1. **production 门**（`MOE_FWD_TIMING` 尚未设置）：验证 TIMING=0 的生产二进制；
+2. **timing 门**（`MOE_FWD_TIMING=1` 之后）：验证计时数据实际来自的那个二进制——TIMING=1 有自己的 UB 预算和自己的历史缺陷（README 2026-09-17），必须单独把关。
+
+两道门都对最终输出做 `rtol=atol=5e-2` 的集合比较（与 `_assert_close_collective` 同口径）；saved 变体另外校验后向契约依赖的路由表不变量：`send_route_indices` 是 `0..total_send-1` 的真排列、按桶分段（expert id 非降）、`send_token_indices == send_route_indices // topk`、`route_to_send` 是其精确逆、`recv_expert_offsets[-1] == total_recv`；dropless 配置下还要求它等于稳定 expert-major 序。**scatter 回归即使数值仍在容差内，也会在这里被抓住。**
+
+门先检查接收容量：一旦超容，内核的 capacity 标志会让整条 wave pipeline 不执行（输出全零），此时耗时数字毫无意义——这种情况直接报错说明，而不是给出一个看起来很快的结果。
+
+JSON 新增 `correctness.production_build` / `correctness.timed_build`（`status`、`max_abs_diff`、`tolerance_violations`、`max_receive_rows`、`receive_capacity_rows` 等）。`MOE_FWD_TIMING_SKIP_CORRECTNESS=1` 可跳过比较（JSON 记为 `"skipped"`），供只取数的运行使用——此时产物本身会显示该次数据没有精度背书。golden 只算一次、两道门共用，并在计时前释放其 route-major 临时量，避免影响 allocator 状态。
+
+### 编译与正确性
+
 先做 compile-only，分别覆盖默认、timing/saved，以及 MoonEP 和宽 world。输出目录须不存在或为空：
 
 ```bash
@@ -130,5 +145,7 @@ python -m pytest tests/layer/test_single_kernel_moonep.py -v -s
 MOE_FUSED_ASH_SIZE_GB=6 python -m pytest tests/layer/test_fwd_phase_timing.py \
   -k 'performance-fwd-kimi-k3-w8-t4k and fp16 and not unsaved' -m dist -v -s
 ```
+
+每个节点现在先付一次独立 golden（两道门共用）再计时，所以单节点耗时明显变长；t16k 若时间/HBM 紧张可用 `MOE_FWD_TIMING_SKIP_CORRECTNESS=1` 只取数，但该次 JSON 会标记 `"skipped"`。
 
 基线与修改版用相同 case、saved 格式、warmup/samples。完整与 trimmed 分开测。记录各 routing 段原始 ticks、wave_pipeline、return_wait、事件钟 e2e，并看首次 Cube 发射和 Scalar 空洞。`fc1_cube_wall`、`fc2_wave_wall` 都包含等待，不是纯 GEMM 或纯 Scalar 耗时。

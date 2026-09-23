@@ -1,7 +1,9 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Host-only checks for the single-kernel forward phase-timing reduction."""
 
+import ast
 import json
+from pathlib import Path
 
 import pytest
 
@@ -212,3 +214,66 @@ def test_summaries_stay_json_serializable():
         "ring": summarize_ring([ring]),
     }
     assert isinstance(json.loads(json.dumps(payload)), dict)
+
+
+def test_accuracy_gate_runs_before_the_timed_loop_for_both_builds():
+    """A timing number must describe a configuration that was checked.
+
+    The worker gates the production build (TIMING=0) and then the measured
+    build (TIMING=1) against the same independent golden, both BEFORE the
+    timed loop — otherwise the recorded numbers could describe a kernel
+    whose answer was never verified.  This is source-level because the
+    ordering is the whole point and no NPU is available to run it.
+    """
+    path = (Path(__file__).resolve().parents[1] / "layer"
+            / "test_fwd_phase_timing.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    worker = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "run_fwd_phase_timing_case"
+    )
+    gates = sorted(
+        ((node.lineno,
+          next(keyword.value.value for keyword in node.keywords
+               if keyword.arg == "label"))
+         for node in ast.walk(worker)
+         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+         and node.func.id == "_accuracy_gate"),
+        key=lambda item: item[0],
+    )
+    labels = [label for _, label in gates]
+    assert labels == ["production", "timing"], labels
+
+    timed_loop = [
+        node for node in ast.walk(worker)
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+        and node.target.id == "iteration"
+    ]
+    assert len(timed_loop) == 1
+    assert gates[-1][0] < timed_loop[0].lineno, (
+        "the accuracy gate must run before the timed loop")
+
+    env_set = [
+        node for node in ast.walk(worker)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant) and node.value.value == "1"
+        and any(isinstance(target, ast.Subscript)
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value == "MOE_FWD_TIMING"
+                for target in node.targets)
+    ]
+    assert len(env_set) == 1
+    assert gates[0][0] < env_set[0].lineno < gates[1][0], (
+        "gate A checks the production build before MOE_FWD_TIMING is set; "
+        "gate B checks the measured build after it")
+
+    # The golden is computed once and shared, and the JSON records both gates.
+    golden_calls = [
+        node for node in ast.walk(worker)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_logical_torch_golden"
+    ]
+    assert len(golden_calls) == 1, "the golden must be computed exactly once"
+    assert "production_build" in path.read_text(encoding="utf-8")
+    assert "timed_build" in path.read_text(encoding="utf-8")
