@@ -142,3 +142,63 @@ def run_g2_pull_probe_case(rank, world_size):
 @pytest.mark.functional
 def test_g2_pull_probe_w2(dist_test):
     dist_test(run_g2_pull_probe_case, world_size=2)
+
+
+def run_g2_pull1_probe_case(rank, world_size):
+    """G2 asymmetric pull probe: ONLY rank 1 (node1) getmems from rank 0.
+
+    The r27-r30 matrix: every cross-node op node1 INITIATES under udma works
+    (push, r27d/r28/r29A); every node0-initiated op dies (push silent-drops,
+    getmem SIGABRTs with ERR02005, r29B); mixed engine masks fail init (r30).
+    The untested cell — node1-initiated getmem from node0 — carries the
+    "node1 initiates everything" workaround architecture: node1 would push
+    its own payloads AND pull node0's.  Rank 0 stays passive here (no local
+    RMA), so a node1 crash surfaces as a spawn ProcessExitedException on
+    rank 0 rather than a wrong-data assert.
+    """
+    import shmem as ash
+
+    dev_id = kit.resolve_local_device(rank)
+    torch.npu.set_device(kit.device_str(dev_id))
+    peer = 1 - rank
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(1)):
+        n = 64
+        data = ash.aclshmem_create_tensor([n], dtype=torch.int64, device_id=dev_id)
+        recv = ash.aclshmem_create_tensor([n], dtype=torch.int64, device_id=dev_id)
+        data.fill_(0)
+        recv.fill_(0)
+        torch.npu.synchronize()
+        dist.barrier()
+
+        data.fill_(MAGIC + rank)
+        torch.npu.synchronize()
+        dist.barrier()
+
+        if rank == 1:
+            ash.aclshmem_getmem(recv.data_ptr(), data.data_ptr(),
+                                data.numel() * data.element_size(), peer)
+            torch.npu.synchronize()
+        dist.barrier()
+
+        ok = True
+        if rank == 1:
+            got = recv.tolist()
+            want = MAGIC + peer
+            bad_idx = next((i for i, v in enumerate(got) if v != want), -1)
+            print(f"[pull1 r1] data@{hex(data.data_ptr())} recv@{hex(recv.data_ptr())} "
+                  f"recv[0]={got[0]:#x} want={want:#x} bad_idx={bad_idx}", flush=True)
+            ok = bad_idx == -1
+        verdict = torch.tensor([1 if ok else 0], dtype=torch.int64,
+                               device=kit.device_str(dev_id))
+        dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+        assert int(verdict.item()) == 1, (
+            f"node1-initiated getmem probe failed on rank {rank}"
+        )
+        print(f"[pull1 r{rank}] PASS: node1-initiated cross-node getmem works", flush=True)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_g2_pull1_probe_w2(dist_test):
+    dist_test(run_g2_pull1_probe_case, world_size=2)
