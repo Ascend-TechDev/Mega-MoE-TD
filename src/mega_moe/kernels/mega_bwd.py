@@ -235,7 +235,7 @@ def _mega_swiglu_bwd_row(
     scale_ptr,
     dAB_ptr,
     dscale_ptr,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
@@ -269,6 +269,14 @@ def _mega_swiglu_bwd_row(
         dact_a = act_a * (1 - sigmoid_a) + sigmoid_a
         v = b
         dv = 1.0
+    elif ACTIVATION == 2:
+        gc = tl.minimum(a, clamp_limit)
+        uc = tl.minimum(tl.maximum(b, -clamp_limit), clamp_limit)
+        sig = tl.sigmoid(gc)
+        act_a = gc * sig
+        dact_a = (sig + gc * sig * (1.0 - sig)) * (a <= clamp_limit).to(tl.float32)
+        v = uc
+        dv = (tl.abs(b) <= clamp_limit).to(tl.float32)
     else:
         t = 2.0 * tl.sigmoid(2.0 * a / situ_beta) - 1.0
         s = tl.sigmoid(a)
@@ -301,7 +309,7 @@ def _mega_swiglu_bwd(
     dAB_ptr,
     dscale_ptr,
     n_rows,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
@@ -314,7 +322,7 @@ def _mega_swiglu_bwd(
         _mega_swiglu_bwd_row(
             row, dC_ptr, dC_stride, AB_ptr, AB_stride, ffn,
             scale_ptr, dAB_ptr, dscale_ptr,
-            situ_beta, situ_linear_beta,
+            situ_beta, situ_linear_beta, clamp_limit,
             BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
             fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
 
@@ -331,7 +339,7 @@ def _mega_swiglu_bwd_windowed(
     recv_per_expert_ptr, recv_expert_offs_ptr,
     b1_signal_ptr, b1_epoch,
     num_n_tiles,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     EPR: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -371,7 +379,7 @@ def _mega_swiglu_bwd_windowed(
                     _mega_swiglu_bwd_row(
                         row0 + r, dC_ready, dC_stride, AB_ptr, AB_stride, ffn,
                         scale_ptr, dAB_ptr, dscale_ptr,
-                        situ_beta, situ_linear_beta,
+                        situ_beta, situ_linear_beta, clamp_limit,
                         BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                         fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
             gw += 1
@@ -1343,7 +1351,7 @@ def _recompute_act_rows(
     scale_ptr,
     actw_ptr, stride_am,
     ffn, n_rows,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
@@ -1375,6 +1383,10 @@ def _recompute_act_rows(
                               mask=mask, other=0.0)
         if ACTIVATION == 0:
             act = gate * tl.sigmoid(gate) * up
+        elif ACTIVATION == 2:
+            gc = tl.minimum(gate, clamp_limit)
+            uc = tl.minimum(tl.maximum(up, -clamp_limit), clamp_limit)
+            act = gc * tl.sigmoid(gc) * uc
         else:
             situ_a = situ_beta * tl.math.tanh(gate / situ_beta) * tl.sigmoid(gate)
             if HAS_LINEAR_BETA:
@@ -1415,7 +1427,7 @@ def kernel_moe_backward_mega(
     dAB_ptr,                    # grad_fc1_output out [M, 2*ffn] (== inp4_ptr)
     dscale_ptr,                 # grad_gate out [M] (== grad_gate_ptr)
     ffn, n_rows,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     # ---- P3: fc2 wgrad (grad_out == peer_mem alias [M, H], strides H/1) ----
     orig_in3_ptr, stride_om3, stride_ok3,      # swiglu_out_weighted [M, ffn]
     grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
@@ -1613,7 +1625,7 @@ def kernel_moe_backward_mega(
                         recv_per_expert_ptr, recv_expert_offs_ptr,
                         b1_signal_ptr, b1_epoch,
                         num_n_tiles1,
-                        situ_beta, situ_linear_beta,
+                        situ_beta, situ_linear_beta, clamp_limit,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
                         HAS_LINEAR_BETA=HAS_LINEAR_BETA,
@@ -1625,7 +1637,7 @@ def kernel_moe_backward_mega(
                     grad_swiglu_ptr, N1,
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
-                    situ_beta, situ_linear_beta,
+                    situ_beta, situ_linear_beta, clamp_limit,
                     BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                     fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -2022,7 +2034,7 @@ def kernel_moe_backward_mega_recompute(
     dAB_ptr,                    # grad_fc1_output out [M, 2*ffn] (== inp4_ptr)
     dscale_ptr,                 # grad_gate out [M] (== grad_gate_ptr)
     ffn, n_rows,
-    situ_beta, situ_linear_beta,
+    situ_beta, situ_linear_beta, clamp_limit,
     # ---- P3: fc2 wgrad (grad_out == peer_mem alias [M, H], strides H/1) ----
     orig_in3_ptr, stride_om3, stride_ok3,      # swiglu_out_weighted [M, ffn]
     grad_fc2_ptr, stride_we3, stride_wn3, stride_wk3,
@@ -2182,7 +2194,7 @@ def kernel_moe_backward_mega_recompute(
                     AB_ptr, K4,
                     scale_ptr,
                     orig_in3_ptr, stride_om3,
-                    ffn, n_rows, situ_beta, situ_linear_beta,
+                    ffn, n_rows, situ_beta, situ_linear_beta, clamp_limit,
                     BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                     fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         if TIMING:
@@ -2258,7 +2270,7 @@ def kernel_moe_backward_mega_recompute(
                         recv_per_expert_ptr, recv_expert_offs_ptr,
                         b1_signal_ptr, b1_epoch,
                         num_n_tiles1,
-                        situ_beta, situ_linear_beta,
+                        situ_beta, situ_linear_beta, clamp_limit,
                         EPR=EXPERTS_PER_RANK, BLOCK_M=D_BM,
                         BLOCK_SIZE=BLOCK_SIZE, ACTIVATION=ACTIVATION,
                         HAS_LINEAR_BETA=HAS_LINEAR_BETA,
@@ -2283,7 +2295,7 @@ def kernel_moe_backward_mega_recompute(
                     grad_swiglu_ptr, N1,
                     AB_ptr, K4,
                     ffn, scale_ptr, dAB_ptr, dscale_ptr, n_rows,
-                    situ_beta, situ_linear_beta,
+                    situ_beta, situ_linear_beta, clamp_limit,
                     BLOCK_SIZE, ACTIVATION, HAS_LINEAR_BETA,
                     fc1_scale_ptr, FC1_FP8, FC1_GROUP_N)
         with al.scope(core_mode="cube", disable_auto_sync=True):
@@ -3025,13 +3037,19 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # step-2 activation derivative selection (ops/backward.py semantics)
     activation = saved.get("activation", "swiglu")
     if activation in (None, "swiglu"):
-        act, beta, lbeta, has_lb = 0, 1.0, 1.0, False
+        act, beta, lbeta, has_lb, clamp_lim = 0, 1.0, 1.0, False, 7.0
     elif activation == "situglu":
         act = 1
         beta = 1.0 if saved.get("situ_beta") is None else float(saved["situ_beta"])
         lbeta = (1.0 if saved.get("situ_linear_beta") is None
                  else float(saved["situ_linear_beta"]))
         has_lb = saved.get("situ_linear_beta") is not None
+        clamp_lim = 7.0
+    elif activation == "clamp_swiglu":
+        act = 2
+        beta, lbeta, has_lb = 1.0, 1.0, False
+        clamp_lim = (7.0 if saved.get("clamp_limit") is None
+                     else float(saved["clamp_limit"]))
     else:
         raise ValueError(f"unknown activation for the backward: {activation!r}")
 
@@ -3587,7 +3605,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         saved["recv_weights_sorted"],
         grad_fc1_output,
         grad_gate,
-        ffn, M, beta, lbeta,
+        ffn, M, beta, lbeta, clamp_lim,
         # P3
         orig_in3, orig_in3.stride(0), orig_in3.stride(1),
         grad_fc2, grad_fc2.stride(0), grad_fc2.stride(1), grad_fc2.stride(2),

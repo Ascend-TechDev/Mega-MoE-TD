@@ -201,6 +201,7 @@ def moe_backward_triton(saved, dy, peer_mem, grad_transport=None,
         activation=saved.get("activation", "swiglu"),
         situ_beta=saved.get("situ_beta"),
         situ_linear_beta=saved.get("situ_linear_beta"),
+        clamp_limit=saved.get("clamp_limit"),
     )
 
     def _run_wgrad(fn, *args):
