@@ -30,6 +30,7 @@ MAGIC = 0x5A5A
 def run_g2_transport_probe_case(rank, world_size):
     import shmem as ash
     from shmem.core.direct import SignalOp
+    from shmem.core.rma import put_signal
     from shmem.core.utils import Buffer
 
     dev_id = kit.resolve_local_device(rank)
@@ -51,8 +52,8 @@ def run_g2_transport_probe_case(rank, world_size):
         torch.npu.synchronize()
         data_buf = Buffer(data.data_ptr(), data.numel() * data.element_size())
         sig_buf = Buffer(sig.data_ptr(), sig.numel() * sig.element_size())
-        ash.put_signal(data_buf, data_buf, sig_buf, 1, SignalOp.SIGNAL_ADD,
-                       remote_pe=peer)
+        put_signal(data_buf, data_buf, sig_buf, 1, SignalOp.SIGNAL_ADD,
+                   remote_pe=peer)
         dist.barrier()
         torch.npu.synchronize()
 
