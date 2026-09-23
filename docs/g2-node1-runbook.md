@@ -120,3 +120,10 @@ dmesg | tail -30                           # 仅挂死/trap 时附
 - 禁止：git push、改 release 分支、pip install / 卸载任何包、改 venv 与 CANN、自行跑 G3+、
   自行"修复"红测（采集回报即可）。
 - bigop 子模块不用装（G2 不依赖）。
+
+## 8. G2 传输层现状（r27d-r34 判死，2026-09-23/24）
+
+跨节点数据面在传输层被完整判死（bulk 每引擎单向静默丢 / getmem 双向 SIGABRT / 混堆 init 死），
+**在 vendor 修复前 G2 数据面用例跑不绿是预期行为**，不要当配置问题排查。完整矩阵、证据链与
+复现器见 `docs/g2-vendor-escalation.md` 与 `scripts/g2_vendor_case/`（本仓 dual-node 分支）。
+对端值守期间按通道协议（/mnt/share/mmt-g2-channel/，marker v2）协调联合窗口。

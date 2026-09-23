@@ -235,7 +235,7 @@ def device_str(dev: int) -> str:
 | 引导失败(aclshmem_init 挂/报错) | 挂在 ensure 内、无 kernel 日志;`ASCEND_SLOG_PRINT_TO_STDOUT=1` 看 aclshmem 日志;先验 HCCL broadcast 是否完成 | 显式 export `ASH_MASTER_ADDR/PORT` 走 ipport 覆盖;仍失败则 `NNODES=1` |
 | **signal 错位死锁**(对称 slab 尺寸发散) | 一 rank 在 kernel 内 spin、其余 rank 卡 barrier;**先看 heap probe 偏移是否全 rank 一致**;再查两节点 yaml/env 是否同步 | 修配置;`MOE_BENCH_BWD_WARMUP/ITERS=1` + 分段计时二分 |
 | epoch 语义破坏(重置/重叠) | 表现为**静默错值**而非挂死;跑 fstage probes 的 epoch 单调用例 | 本方案不触碰 epoch 计数任何代码 |
-| 跨节点 UDMA 数据损坏 | golden 数值错/NaN 而非挂死;单机 `MTE\|UDMA` vs 双机对比二分;dmesg 查设备 SMMU 错误 | 纯 UDMA 实验回 `MTE\|UDMA`;双机无 MTE-only 回退(MTE 不过节点),只能回单机 |
+| 跨节点 UDMA 数据损坏 | ~~golden 数值错/NaN~~ **实际形态=r27d-r34 判明的方向性静默丢(见 §7)**;发送侧任何日志级别零痕迹,只能行为探针判 | 纯 UDMA 实验回 `MTE\|UDMA`;双机无 MTE-only 回退(MTE 不过节点),只能回单机 |
 | W16 heap 不足 | `aclshmem_create_tensor` OOM/分配失败(显式,易定位) | `MOE_FUSED_ASH_SIZE_GB` 16→24;或临时压 `megamoe_max_tokens_per_rank`(勿压 cf) |
 | HCCL 16 rank 建网超时 | 卡在建网、日志 EI0020/超时 | `HCCL_CONNECT_TIMEOUT`;每节点独立 `SOCKET_PORT_RANGE` 段 |
 | 分段路径 W16 编译膨胀 | 首次 launch 前长编译 | `static_range→range` 局部降级(应急) |
@@ -256,3 +256,24 @@ def device_str(dev: int) -> str:
 - 新建:`examples/kimi_k3/kimik3_config_2n.yaml`
 
 **实施顺序**:阶段 1(设备号)→ G0/G1 → 阶段 2(引导/引擎)→ G2/G3 → 阶段 3(框架)→ G4/G5 → 收尾(文档、静态审计、可选纯 UDMA 实验)。每阶段独立可验证、可合并。
+
+---
+
+## 7. G2 传输层判决心得(r27d-r34,2026-09-23/24)
+
+G2 双机数据面在传输层被完整判死,矩阵见 **docs/g2-vendor-escalation.md**(vendor 主文,含环境指纹/证据链/四条诉求):
+
+| 操作 | n1→n0 | n0→n1 |
+|---|---|---|
+| put_signal bulk 腿 / udma | ✅ | ❌ 静默丢(任何日志级别零痕迹) |
+| put_signal bulk 腿 / mte | ❌ 静默丢 | ✅ |
+| put_signal bulk 腿 / combo | ✅ | ❌(=udma 形,无 op 级选引擎) |
+| signal 腿(任意引擎) | ✅ | ✅(连续 256×SIGNAL_SET 载 2KB 载荷亦全落,~6µs/op) |
+| getmem(任意发起方) | SIGABRT(node1 发起=device aicore 271) | SIGABRT(node0 发起) |
+| 混引擎堆(n0=mte/n1=udma) | init 120s 死:`SHM_(0)_S_0_1_GW` 键 AllGather 双侧互空 | 同 |
+
+- **跟机器不跟角色**:r28 四变量全翻(rank/role/master/channel-client)断向不变。
+- **rootinfo 轨道关闭**:官方生成器(unofficial-ascend-tools 0.0.7rc2)rank_list 只从本地 /dev/davinci* 枚举——每机自述即官方形态,r14-r26 手拼文件全是自造问题。
+- **复现器**:`scripts/g2_vendor_case/`(无仓 torchrun 依赖,push/pull/tunnel 三用例,r34 双机验证全成立)。
+- **残余缓解**:counts 级小载荷(1-4KB)可走 signal 腿隧道(~6µs/op)——host 编排低频交换可用;进每 iter 热循环属架构决策,未评估。
+- **python API 坑**:`InitAttr.ip_port` 收 `tcp://addr:port` 字符串(元组 TypeError);`put_signal`/`SignalOp` 须从 `shmem.core.rma/direct` 显式 import;`LD_LIBRARY_PATH` 须含 `<SP>/shmem/backends/950`。
