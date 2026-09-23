@@ -202,3 +202,104 @@ def run_g2_pull1_probe_case(rank, world_size):
 @pytest.mark.functional
 def test_g2_pull1_probe_w2(dist_test):
     dist_test(run_g2_pull1_probe_case, world_size=2)
+
+
+def run_g2_sig_tunnel_case(rank, world_size):
+    """G2 signal-leg tunnel probe: carry a payload through signal values.
+
+    After r27d-r31 the matrix has exactly one cross-node write path alive in
+    BOTH directions: the signal leg of put_signal (engine-independent, four
+    confirmations).  The bulk leg drops silently in each engine's dead
+    direction, host getmem SIGABRTs for either initiator, and mixed-engine
+    heaps die at init — so the signal leg is the only candidate left for an
+    in-repo counts-exchange workaround while a vendor case runs.
+
+    Each sender issues N put_signal ops; op i writes payload word i into the
+    peer's sig-array slot i (SIGNAL_SET to sig + 8*i) while the bulk leg
+    carries a dummy copy that may legitimately drop.  The receiver checks
+    every slot.  Send-loop wall time is reported per direction so a counts
+    workaround can be sized (N words over the wire vs budget).
+    """
+    import time
+
+    import shmem as ash
+    from shmem.core.direct import SignalOp
+    from shmem.core.rma import put_signal
+    from shmem.core.utils import Buffer
+
+    dev_id = kit.resolve_local_device(rank)
+    torch.npu.set_device(kit.device_str(dev_id))
+    peer = 1 - rank
+
+    with kit.aclshmem_session(rank, world_size, kit.get_ash_size_bytes(1)):
+        n_words = 256
+        data = ash.aclshmem_create_tensor([64], dtype=torch.int64, device_id=dev_id)
+        sigarr = ash.aclshmem_create_tensor([n_words], dtype=torch.int64,
+                                            device_id=dev_id)
+        data.fill_(0)
+        sigarr.fill_(0)
+        torch.npu.synchronize()
+        dist.barrier()
+
+        data_buf = Buffer(data.data_ptr(), data.numel() * data.element_size())
+
+        def send_tunnel(base):
+            payload = [base + i for i in range(n_words)]
+            t0 = time.perf_counter()
+            for i, val in enumerate(payload):
+                put_signal(data_buf, data_buf,
+                           Buffer(sigarr.data_ptr() + i * 8, 8), val,
+                           SignalOp.SIGNAL_SET, remote_pe=peer)
+            dt = time.perf_counter() - t0
+            print(f"[tunnel r{rank}] sent {n_words} signal words in {dt*1000:.1f}ms "
+                  f"({dt/n_words*1e6:.0f}us/op)", flush=True)
+            return payload
+
+        def check_tunnel(payload, tag):
+            torch.npu.synchronize()
+            got = sigarr.tolist()
+            bad = [i for i, v in enumerate(got) if v != payload[i]]
+            print(f"[tunnel r{rank}] {tag}: got[0]={got[0]:#x} want[0]={payload[0]:#x} "
+                  f"bad_slots={len(bad)}{f' first_bad={bad[:8]}' if bad else ''}",
+                  flush=True)
+            return not bad
+
+        results = {}
+
+        # leg A: rank1 tunnels into rank0 (bulk direction alive anyway)
+        if rank == 1:
+            sent_a = send_tunnel(0x5A5A0000)
+            torch.npu.synchronize()
+        dist.barrier()
+        if rank == 0:
+            results["A_r1_to_r0"] = check_tunnel(
+                [0x5A5A0000 + i for i in range(n_words)], "A(r1->r0)")
+
+        sigarr.fill_(0)
+        torch.npu.synchronize()
+        dist.barrier()
+
+        # leg B: rank0 tunnels into rank1 (the dead bulk direction under udma)
+        if rank == 0:
+            send_tunnel(0x5B5B0000)
+            torch.npu.synchronize()
+        dist.barrier()
+        if rank == 1:
+            results["B_r0_to_r1"] = check_tunnel(
+                [0x5B5B0000 + i for i in range(n_words)], "B(r0->r1)")
+
+        ok = all(results.values())
+        verdict = torch.tensor([1 if ok else 0], dtype=torch.int64,
+                               device=kit.device_str(dev_id))
+        dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+        assert int(verdict.item()) == 1, (
+            f"signal-leg tunnel failed on rank {rank}: {results}"
+        )
+        print(f"[tunnel r{rank}] PASS: signal leg carries payload both directions",
+              flush=True)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_g2_sig_tunnel_w2(dist_test):
+    dist_test(run_g2_sig_tunnel_case, world_size=2)
