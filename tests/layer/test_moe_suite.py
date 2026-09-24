@@ -5527,9 +5527,15 @@ def run_single_kernel_moonep_autograd_case(
                     # (mapping).  Step1 has no earlier panel version, so
                     # it only gets the zero-vs-other split.
                     if os.environ.get("MOE_MEGA_FWD_DUMP", "0") == "1":
-                        for name, out, step, other, g_scale, d_scale in (
-                            ("step1", out1, steps[0], None, 1.0, 1.0),
-                            ("step2", out2, steps[1], steps[0], 0.75, 0.5),
+                        # Exactly ONE distributed eager per step per side
+                        # (2<->2, issue-order symmetric — the r43 lesson:
+                        # n_bad-gated extra refs made it 4 vs 5, the HCCL
+                        # collectives cross-paired, and the unpaired fifth
+                        # hung the peer 12 min to SIGKILL).  All stale/zero
+                        # fingerprint work runs OFFLINE from the raw dump.
+                        for name, out, step, g_scale, d_scale in (
+                            ("step1", out1, steps[0], 1.0, 1.0),
+                            ("step2", out2, steps[1], 0.75, 0.5),
                         ):
                             hot = 0 if name == "step1" else (
                                 num_experts // world_size
@@ -5564,14 +5570,15 @@ def run_single_kernel_moonep_autograd_case(
                                 # BEFORE the bad-row early-out: unconditional
                                 # (green steps too — they validate the save
                                 # path and land a baseline).  The backward
-                                # below (and the fingerprint references,
-                                # cross-node collectives) can still kill
-                                # this worker — the r43 round died exactly
-                                # there on both nodes.  One weight set
-                                # (step2's is step1's scaled by g/d_scale)
-                                # plus the scales rebuilds every reference
-                                # offline; NFS so both nodes' files land in
-                                # one place.
+                                # below can still kill this worker (r43:
+                                # collective-ordering mismatch, then the
+                                # bwd waiting on a dead peer).  One weight
+                                # set (step2's is step1's scaled by
+                                # g/d_scale) plus the scales rebuilds every
+                                # reference offline — stale/zero refs, full
+                                # argmin classification, portraits, all of
+                                # it; NFS so both nodes' files land in one
+                                # place.
                                 dump_dir = os.path.join(
                                     "/mnt/share/mmdumps",
                                     os.environ.get(
@@ -5647,66 +5654,6 @@ def run_single_kernel_moonep_autograd_case(
                                     f"{float(colfrac.max()):.3f} "
                                     f"rows[:32,+8]={show}",
                                     flush=True,
-                                )
-                                # Fingerprint references.
-                                refs = {}
-                                if other is not None:
-                                    refs["stale"] = moe_forward(
-                                        step["hs"], step["rw"],
-                                        step["ei"], other["gate_w"],
-                                        other["up_w"], other["down_w"],
-                                        ep_group, topk, return_saved=False,
-                                        activation="situglu",
-                                        situ_beta=situ_beta,
-                                        situ_linear_beta=situ_linear_beta,
-                                    ).float()
-                                hot_mask = step["ei"] == hot
-                                refs["zero"] = moe_forward(
-                                    step["hs"],
-                                    step["rw"].masked_fill(
-                                        hot_mask, 0.0),
-                                    step["ei"], step["gate_w"],
-                                    step["up_w"], step["down_w"],
-                                    ep_group, topk, return_saved=False,
-                                    activation="situglu",
-                                    situ_beta=situ_beta,
-                                    situ_linear_beta=situ_linear_beta,
-                                ).float()
-                                d_true = (out[bad_ids].float()
-                                          - ref[bad_ids].float())
-                                d_true = d_true.norm(dim=-1)
-                                # Exclusive argmin classification: each
-                                # bad row lands in exactly one bucket —
-                                # whichever reference (stale / zero / the
-                                # true one) it sits closest to.
-                                keys = list(refs) + ["other"]
-                                cand = [
-                                    (out[bad_ids].float()
-                                     - refs[k][bad_ids]).norm(dim=-1)
-                                    for k in refs
-                                ] + [d_true]
-                                win = torch.stack(cand, dim=0).argmin(
-                                    dim=0)
-                                tally = {
-                                    k: int((win == i).sum().item())
-                                    for i, k in enumerate(keys)
-                                }
-                                parts = " ".join(
-                                    f"{k}={v}" for k, v in tally.items())
-                                print(
-                                    f"[fwd-dump r{rank}] {name} "
-                                    f"fingerprint(of {n_bad}): {parts}",
-                                    flush=True,
-                                )
-                                # Best-effort: the references ride along
-                                # when they computed (a hung or killed
-                                # worker still leaves the raw dump above).
-                                torch.save(
-                                    {k: v.cpu()
-                                     for k, v in refs.items()},
-                                    os.path.join(
-                                        dump_dir,
-                                        f"r{rank}_{name}_refs.pt"),
                                 )
 
                     # Reverse-order backwards (framework autograd order).
