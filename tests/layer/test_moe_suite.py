@@ -5499,8 +5499,74 @@ def run_single_kernel_moonep_autograd_case(
                             hidden_leaf, routing_leaf, gate_up_leaf, down_leaf
                         )
 
+                    # G2 r45: per-step workspace + replica-panel forensics.
+                    # The op reuses these buffers across forward calls, so
+                    # step1's state must be captured BEFORE fwd(step2)
+                    # overwrites it — hence the in-place dump right after
+                    # each forward instead of inside the deferred probe
+                    # below.  Offline chain: zero-served token ->
+                    # route_to_send -> destination row -> activation /
+                    # fc2_output row -> combine row -> out; the panel
+                    # end-state vs the expected scaled weights splits
+                    # read-before-landing (race) from a permanent hole.
+                    # Host-side sync only; no extra collectives (r43
+                    # lesson: every online collective must be symmetric).
+                    def _fwd_ws_dump(step_name):
+                        if os.environ.get(
+                                "MOE_MEGA_FWD_DUMP", "0") != "1":
+                            return
+                        payload = {
+                            "step": step_name, "rank": rank,
+                            "label": label,
+                            "activation":
+                                op._single_weighted_activation.cpu(),
+                            "fc2_output": op._single_fc2_output.cpu(),
+                            "combine_buf": op._combine_fc2_buf.cpu(),
+                            "route_to_send": op._route_to_send.cpu(),
+                            "pull_tile_dst_start":
+                                op._pull_tile_dst_start.cpu(),
+                        }
+                        rb = op._replica_weight_buffers
+                        if rb is not None:
+                            payload["replica_gate_up"] = (
+                                rb.gate_up_mem.cpu())
+                            payload["replica_down"] = rb.down_mem.cpu()
+                            payload["replica_push_epoch"] = (
+                                int(rb.push_epoch))
+                            payload["gate_up_expert_shape"] = (
+                                rb.gate_up_expert_shape)
+                            payload["down_expert_shape"] = (
+                                rb.down_expert_shape)
+                            payload["replica_epn"] = rb.experts_per_rank
+                        for nm in ("replica_gate_ready",
+                                   "replica_down_ready"):
+                            buf = getattr(op.context, nm, None)
+                            if buf is not None:
+                                payload[nm] = buf.cpu()
+                        dump_dir = os.path.join(
+                            "/mnt/share/mmdumps",
+                            os.environ.get(
+                                "MOE_MEGA_FWD_DUMP_TAG", "fwd"),
+                        )
+                        os.makedirs(dump_dir, exist_ok=True)
+                        torch.save(
+                            payload,
+                            os.path.join(
+                                dump_dir,
+                                f"r{rank}_{step_name}_ws.pt"),
+                        )
+                        print(
+                            f"[fwd-dump r{rank}] {step_name} ws saved "
+                            f"act={tuple(payload['activation'].shape)} "
+                            f"combine="
+                            f"{tuple(payload['combine_buf'].shape)} "
+                            f"epoch={payload.get('replica_push_epoch')}",
+                            flush=True,
+                        )
+
                     dist.barrier()
                     out1, leaves1 = forward_step(steps[0])
+                    _fwd_ws_dump("step1")
                     if op._replica_experts_cache is None:
                         raise AssertionError(
                             f"{label}: the adapter did not stage "
@@ -5509,6 +5575,7 @@ def run_single_kernel_moonep_autograd_case(
                     # fwd(step2) rewrites the shared planning workspaces,
                     # the replica tables AND the operator's ETC cache.
                     out2, leaves2 = forward_step(steps[1])
+                    _fwd_ws_dump("step2")
 
                     # G2 r42b/r43: forward-output row-level probe.  The
                     # grads compare never looks at out1/out2, so "forward
