@@ -5510,6 +5510,47 @@ def run_single_kernel_moonep_autograd_case(
                     # the replica tables AND the operator's ETC cache.
                     out2, leaves2 = forward_step(steps[1])
 
+                    # G2 r42b: forward-output row-level probe.  The grads
+                    # compare never looks at out1/out2, so "forward green"
+                    # was an assumption; this decides serve-vs-backward by
+                    # direct row compare against the same SiTU eager recipe
+                    # make_golden trusts.  Hot row = one of the token's
+                    # routes hits the step's hammered expert — exactly the
+                    # rows the OTHER rank's replica slots serve.
+                    if os.environ.get("MOE_MEGA_FWD_DUMP", "0") == "1":
+                        for name, out, step in (
+                            ("step1", out1, steps[0]),
+                            ("step2", out2, steps[1]),
+                        ):
+                            hot = 0 if name == "step1" else (
+                                num_experts // world_size
+                            )
+                            with torch.no_grad():
+                                # return_saved=False yields the bare output
+                                # tensor (no saved-state tuple to unpack).
+                                ref = moe_forward(
+                                    step["hs"], step["rw"], step["ei"],
+                                    step["gate_w"], step["up_w"],
+                                    step["down_w"], ep_group, topk,
+                                    return_saved=False,
+                                    activation="situglu",
+                                    situ_beta=situ_beta,
+                                    situ_linear_beta=situ_linear_beta,
+                                )
+                            diff = (out.float() - ref.float()).abs()
+                            rowbad = (diff > 5e-2).any(dim=-1)
+                            has_hot = (step["ei"] == hot).any(dim=-1)
+                            print(
+                                f"[fwd-dump r{rank}] {name} "
+                                f"rows_bad={int(rowbad.sum())}/{tokens} "
+                                f"hot_bad={int((rowbad & has_hot).sum())}"
+                                f"/{int(has_hot.sum())} "
+                                f"nonhot_bad="
+                                f"{int((rowbad & ~has_hot).sum())} "
+                                f"max_abs={float(diff.max()):.6f}",
+                                flush=True,
+                            )
+
                     # Reverse-order backwards (framework autograd order).
                     out2.backward(steps[1]["dy"])
                     grads2 = _megamoe_function_grads(leaves2, ffn)
