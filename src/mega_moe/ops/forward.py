@@ -1819,6 +1819,31 @@ class FusedMoEForward(torch.nn.Module):
         # The saved capture needs the receive row count on host; the .item()
         # drains the launch (the only host sync on this path).
         num_received_routes = int(self.context.metadata_stats[0].item())
+        # MOE_MEGA_COUNTS_DEBUG=1: G2 r38 cross-node counts forensics.  Dumps
+        # every input to the saved-layout assertion on both ranks: the
+        # symmetric counts table (peer putmem landing), the receive tables
+        # (_build_destination_metadata output), and metadata_stats — one line
+        # per artifact so cross-node diffing stays unambiguous.
+        if os.environ.get("MOE_MEGA_COUNTS_DEBUG") == "1":
+            _cm = self.context.metadata_counts_mem
+            _rows = [
+                int(_cm[r * self.context.metadata_num_bins:
+                        (r + 1) * self.context.metadata_num_bins].sum().item())
+                for r in range(self.world_size)
+            ]
+            _live = [
+                _cm[r * self.context.metadata_num_bins:
+                    r * self.context.metadata_num_bins
+                    + self.context.num_experts].tolist()
+                for r in range(self.world_size)
+            ]
+            print(
+                f"[counts-dbg r{self.rank}] stats={self.context.metadata_stats.tolist()}"
+                f" num_recv={num_received_routes}"
+                f" table_rowsum={_rows} live_bins={_live}"
+                f" recv_re={self.context.metadata_recv_counts_re.tolist()}"
+                f" recv_offs={self.context.metadata_recv_expert_offs.tolist()}",
+                flush=True)
         # Dropped routes keep their route_to_send sentinel (-1); the send
         # tables below are only populated for the valid prefix.
         num_sent_routes = int(
