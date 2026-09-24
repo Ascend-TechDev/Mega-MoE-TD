@@ -5527,9 +5527,9 @@ def run_single_kernel_moonep_autograd_case(
                     # (mapping).  Step1 has no earlier panel version, so
                     # it only gets the zero-vs-other split.
                     if os.environ.get("MOE_MEGA_FWD_DUMP", "0") == "1":
-                        for name, out, step, other in (
-                            ("step1", out1, steps[0], None),
-                            ("step2", out2, steps[1], steps[0]),
+                        for name, out, step, other, g_scale, d_scale in (
+                            ("step1", out1, steps[0], None, 1.0, 1.0),
+                            ("step2", out2, steps[1], steps[0], 0.75, 0.5),
                         ):
                             hot = 0 if name == "step1" else (
                                 num_experts // world_size
@@ -5558,6 +5558,55 @@ def run_single_kernel_moonep_autograd_case(
                                     f"nonhot_bad="
                                     f"{int((rowbad & ~has_hot).sum())} "
                                     f"max_abs={float(diff.max()):.6f}",
+                                    flush=True,
+                                )
+                                # Raw dump BEFORE anything that can hang and
+                                # BEFORE the bad-row early-out: unconditional
+                                # (green steps too — they validate the save
+                                # path and land a baseline).  The backward
+                                # below (and the fingerprint references,
+                                # cross-node collectives) can still kill
+                                # this worker — the r43 round died exactly
+                                # there on both nodes.  One weight set
+                                # (step2's is step1's scaled by g/d_scale)
+                                # plus the scales rebuilds every reference
+                                # offline; NFS so both nodes' files land in
+                                # one place.
+                                dump_dir = os.path.join(
+                                    "/mnt/share/mmdumps",
+                                    os.environ.get(
+                                        "MOE_MEGA_FWD_DUMP_TAG", "fwd"),
+                                )
+                                os.makedirs(dump_dir, exist_ok=True)
+                                torch.save(
+                                    {
+                                        "label": label, "rank": rank,
+                                        "step": name, "tokens": tokens,
+                                        "num_experts": num_experts,
+                                        "topk": topk, "hot": hot,
+                                        "situ_beta": situ_beta,
+                                        "situ_linear_beta":
+                                            situ_linear_beta,
+                                        "g_scale": g_scale,
+                                        "d_scale": d_scale,
+                                        "out": out.cpu(),
+                                        "ref": ref.cpu(),
+                                        "hs": step["hs"].cpu(),
+                                        "rw": step["rw"].cpu(),
+                                        "ei": step["ei"].cpu(),
+                                        "gate_w":
+                                            steps[0]["gate_w"].cpu(),
+                                        "up_w": steps[0]["up_w"].cpu(),
+                                        "down_w":
+                                            steps[0]["down_w"].cpu(),
+                                    },
+                                    os.path.join(
+                                        dump_dir,
+                                        f"r{rank}_{name}.pt"),
+                                )
+                                print(
+                                    f"[fwd-dump r{rank}] {name} saved "
+                                    f"{dump_dir}/r{rank}_{name}.pt",
                                     flush=True,
                                 )
                                 bad_ids = rowbad.nonzero(
@@ -5648,6 +5697,16 @@ def run_single_kernel_moonep_autograd_case(
                                     f"[fwd-dump r{rank}] {name} "
                                     f"fingerprint(of {n_bad}): {parts}",
                                     flush=True,
+                                )
+                                # Best-effort: the references ride along
+                                # when they computed (a hung or killed
+                                # worker still leaves the raw dump above).
+                                torch.save(
+                                    {k: v.cpu()
+                                     for k, v in refs.items()},
+                                    os.path.join(
+                                        dump_dir,
+                                        f"r{rank}_{name}_refs.pt"),
                                 )
 
                     # Reverse-order backwards (framework autograd order).
