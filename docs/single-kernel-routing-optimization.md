@@ -21,7 +21,7 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 - stable cursor 改为 `[cores, expert_block]` exclusive scan。
 - destination 与 wave offsets 复用 source counts 归约。
 - pull starts 改向量归约/前缀。
-- 去掉 histogram 预清零，向量化 signal counter reset；逆映射 `route_to_send=-1` 在独立循环中初始化，不再融合进 histogram 遍历。
+- 去掉 histogram 预清零，向量化 signal counter reset；逆映射 `route_to_send=-1` 由 host 侧 `fill_` 在 fused launch 之前重置（EXP-L，设备已验证），kernel 内的 reset 循环保留但停用。
 - E≥128 的非 MoonEP scatter 使用 32-route block、32×32 两两匹配求块内序号，再用 histogram 更新块间 cursor。两个 Vector lane 各拥有互斥 expert 半区；E<128 保留原 dense 路径。
 
 完整 Kimi E=896、R=65536 时，expert-ID 扫描由 28 遍减少到两个 lane 各 1 遍。pairwise 匹配累计约 419 万元素，原 dense 匹配约 5872 万元素。新路径也有 histogram/gather/循环开销，不能把元素数比例当作加速比。128 的分支阈值未做 NPU 调优。
@@ -35,6 +35,14 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 当前恢复独立的 `_reset_route_to_send`，按原先的跨 core tile 分配方式，在 histogram 之前的 Vector lane0 scope 中执行；不恢复多余的 histogram 预清零，不增加 launch 或 phase barrier。单纯删除初始化不可用：scatter 不写 dropped route，重复调用会保留旧 send row，导致 combine 错误累加。初始化必须覆盖本次全部 route，每轮重置为 `-1`，由 scatter 覆盖有效项。
 
 完整 W8/T4K、topk16 每 rank 有 65536 个 int32 映射项，初始化写入量为 256 KiB。与融合版相比写入量不变，但恢复了独立循环的调度和地址计算；对 `zero_histogram` 段及 e2e 的实际影响待 NPU 测量。新增 host 回归覆盖同一 workspace 的“有效 → 部分 dropped → 全 dropped → 有效”，设备现有连续调用用例额外检查全 dropped 后逆映射全部为 `-1`。用户的删除实验通过不等于本次独立初始化版本已完成设备验收。
+
+### EXP-L：host 侧重置（设备验证通过）
+
+独立 kernel 内 reset（703d8b9）在设备上仍失败，但错误签名变化：5 个 rank 共约 2163 个超差元素（融合版约 11.3 万），最大误差 token 全部落在 0–15 —— 恰是 256-route tile 分配下 pid0 的第一个 reset tile，而 pid0 同时执行 putmem counts 发布。这支持“kernel 内 reset 的 UB 生命周期与 putmem/常量 scratch 交互”这条主线，但 IR/lowering 层根因仍未证实。
+
+当前采用 host 侧方案（1e6c948）：launch 之前在同一条 stream 上 `self._route_to_send[:num_routes].fill_(-1)`，kernel 内调用注释停用。8 卡 W8 E896 saved-fp16 精度门通过。语义不变：每次调用重置有效前缀，scatter 覆盖有效项，dropped route 保持 `-1`。
+
+注意：该构建每次 forward 多一个设备 fill 操作，**e2e 事件计时包含它，不能代表单 kernel 性能**；phase 内 SYS_CNT 段不受影响。若后续查明 kernel 内 reset 的 lowering 根因并恢复，移除 host fill 即可，host 测试约束“恰好一个 reset 机制生效”。
 
 ## FC1 / FC2 入口：紧凑 wave 任务表
 

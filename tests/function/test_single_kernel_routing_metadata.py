@@ -254,25 +254,27 @@ def test_route_reset_is_separate_from_histogram():
     assert "core_bucket_cursor_ptr" in ast.unparse(stores[0].args[0])
 
     kernel = functions["_kernel_fused_forward"]
-    scopes = [node for node in kernel.body if isinstance(node, ast.With)]
-    def scope_for(name):
-        return next(scope for scope in scopes if any(
-            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id == name for node in ast.walk(scope)))
-    reset_scope = scope_for("_reset_route_to_send")
-    count_scope = scope_for("_count_routes_by_core")
-    assert reset_scope is not count_scope
-    assert reset_scope.lineno < count_scope.lineno
-    guard = reset_scope.body[0]
-    assert isinstance(guard, ast.If)
-    assert ast.unparse(guard.test) == "sub_vec_id() == 0"
     reset_calls = [node for node in ast.walk(kernel)
                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                    and node.func.id == "_reset_route_to_send"]
-    assert len(reset_calls) == 1
-    assert ast.unparse(reset_calls[0]) == (
-        "_reset_route_to_send(pid, route_to_send_ptr, num_routes, "
-        "NUM_PROGRAM_CORES, _ROUTE_BLOCK)")
+    host = ast.parse((SOURCE.parents[3] / "src/mega_moe/ops/forward.py").read_text())
+    launch = next(node for node in ast.walk(host)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+                  and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id == "_kernel_fused_forward")
+    fills = [node for node in ast.walk(host)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "fill_"
+             and "_route_to_send" in ast.unparse(node.func.value)
+             and ast.unparse(node.args[0]) == "-1"]
+    # Exactly one reset mechanism per launch.  EXP-L (device-verified on the
+    # w8 E896 shape) keeps the host-side fill and leaves the kernel call
+    # disabled: the in-kernel reset's UB lifetime interacts with the putmem
+    # count publish and drops the first per-core slice.  Restoring the
+    # in-kernel loop later is fine as long as the host fill goes away.
+    assert len(reset_calls) + len(fills) == 1
+    if fills:
+        assert fills[0].lineno < launch.lineno
 
 
 def test_metadata_does_not_repeat_wave_reductions():
