@@ -1647,8 +1647,9 @@ def _kernel_fused_forward(
         2 * NUM_PROGRAM_CORES + WORLD_SIZE) + min(2 * NUM_PROGRAM_CORES, WORLD_SIZE)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
-            _reset_route_to_send(pid, route_to_send_ptr, num_routes,
-                                 NUM_PROGRAM_CORES, _ROUTE_BLOCK)
+            # EXP-L: kernel-internal reset disabled; host fill_(-1) handles it.
+            # _reset_route_to_send(pid, route_to_send_ptr, num_routes,
+            #                      NUM_PROGRAM_CORES, _ROUTE_BLOCK)
             _zero_pipeline_counters(
                 pid, pipeline_signal_ptr, NUM_PROGRAM_CORES,
                 pipeline_counter_count)
