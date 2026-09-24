@@ -246,15 +246,20 @@ def _publish_count_row(
     libshmem_device.fence()
     for peer_rank in range(0, WORLD_SIZE):
         if peer_rank != LOCAL_RANK:
-            if MOONEP:
-                # Keep fine-grained metadata off the UDMA weight QPs.
-                remote = dl.symm_at(counts_mem_ptr, peer_rank)
-                bins = tl.arange(0, NUM_BINS_PAD)
-                values = tl.load(local_row_ptr + bins)
-                tl.store(remote + LOCAL_RANK * NUM_BINS_PAD + bins, values)
-            else:
-                libshmem_device.putmem(
-                    local_row_ptr, local_row_ptr, NUM_BINS_PAD * 4, peer_rank)
+            # G2 r38: the bare engine putmem below never landed in the peer's
+            # symmetric table cross-node (both directions, every wheel/engine
+            # combination — counts-trace post-kernel peer row stayed 0 while
+            # the own row was full), which starved the backward's HCCL-truth
+            # assert (2024 != 997 family).  Both this kernel's token dispatch
+            # and its return rows already use the symm_at direct-store idiom
+            # (engine-free, no CQ — same rationale as dispatch_fc2_bwd's
+            # 2026-09-20 putmem -> put_store switch), so the count row now
+            # publishes the same way for every branch: keep fine-grained
+            # metadata off the UDMA weight QPs AND off the putmem engine leg.
+            remote = dl.symm_at(counts_mem_ptr, peer_rank)
+            bins = tl.arange(0, NUM_BINS_PAD)
+            values = tl.load(local_row_ptr + bins)
+            tl.store(remote + LOCAL_RANK * NUM_BINS_PAD + bins, values)
     libshmem_device.fence()
     # Cross-node arrival gate (G2 r21): nothing below orders the PEER's
     # row write against this rank's reads — intra-node HCCS latency always
