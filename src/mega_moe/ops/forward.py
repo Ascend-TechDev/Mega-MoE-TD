@@ -1681,6 +1681,28 @@ class FusedMoEForward(torch.nn.Module):
                     flush=True)
             except Exception as e:  # probe must never break the launch
                 print(f"[fwd-heap r{self.rank}] probe-failed {e}", flush=True)
+        # MOE_COUNTS_TRACE=1 (r38 probe): host-side sampling of the counts
+        # cube around the launch.  Row i of metadata_counts_mem is the row
+        # rank i publishes (local tl.store + cross-node putmem at the same
+        # symmetric offset), so on a healthy dual-node run BOTH row-sums are
+        # non-zero post-kernel; a zero PEER row with the own row intact is
+        # the "putmem never landed in peer GM" signature, separating a
+        # publish-side failure from gate/read-side staleness.
+        counts_trace = (
+            os.environ.get("MOE_COUNTS_TRACE") == "1" and self.world_size > 1
+        )
+
+        def _counts_row_sums(tag):
+            torch.npu.synchronize()
+            rows = self.context.metadata_counts_mem.view(
+                self.world_size, self.context.metadata_num_bins)
+            print(
+                f"[counts-trace r{self.rank}] {tag} row-sums="
+                f"{[int(r.sum().item()) for r in rows]}",
+                flush=True)
+
+        if counts_trace:
+            _counts_row_sums("pre-kernel")
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
             selected_experts,
@@ -1790,6 +1812,8 @@ class FusedMoEForward(torch.nn.Module):
             WORLD_SEARCH_STEPS=self.world_size.bit_length(),
             **launch_options,
         )
+        if counts_trace:
+            _counts_row_sums("post-kernel")
         self._tile_signal_epoch += 1
         if timing_on:
             self._fwd_timing_last = (
