@@ -5881,7 +5881,10 @@ def test_single_kernel_situglu_autograd_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
-def test_single_kernel_moonep_autograd_w2(dist_test):
+def test_single_kernel_moonep_autograd_w2(dist_test, monkeypatch):
+    # Exercise the default selection even when a launch script exports the
+    # UDMA workaround. Generic getmem in this combo session loses FC1 chunks.
+    monkeypatch.delenv("MOE_MEGA_GRAD_TRANSPORT", raising=False)
     dist_test(run_single_kernel_moonep_autograd_case, world_size=2)
 
 

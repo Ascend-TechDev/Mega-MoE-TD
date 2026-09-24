@@ -2790,6 +2790,15 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # a valid escape hatch or bisect control.
     grad_reduce = (use_moonep and grad_transport is not None
                    and os.environ.get("MOE_MEGA_P6", "1") != "0")
+    # Single-kernel MoonEP already requires an MTE|UDMA session for its
+    # replica-weight push. In that session generic getmem selects UDMA,
+    # whose peer QP cannot accept concurrent chunk issuers. Use the existing
+    # single-issuer push protocol by default for this saved contract; older
+    # MTE forwards retain getmem, and explicit transport overrides still win.
+    grad_transport_mode = os.environ.get(
+        "MOE_MEGA_GRAD_TRANSPORT",
+        "udma" if use_moonep and saved.get("_single_kernel_snapshot") else "getmem",
+    )
     device = dy.device
     rank = saved["ep_rank"]
     W = saved["world_size"]
@@ -3222,7 +3231,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
             f"comb_off={_off(combine_buf)} comb_n={combine_buf.numel()} "
             f"rfc2_off={_off(replica_fc2)} "
             f"ep={signal_epoch} b3e={b3_epoch} b1e={b1_epoch} "
-            f"gr={int(grad_reduce)} grad_tp={os.environ.get('MOE_MEGA_GRAD_TRANSPORT', 'getmem')}",
+            f"gr={int(grad_reduce)} grad_tp={grad_transport_mode}",
             flush=True)
 
     # P4a dual weight tables (MoonEP): replica_weight is the plan's packed
@@ -3286,10 +3295,10 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         # MOE_MEGA_GRAD_TRANSPORT=udma inverts the owner-pull: peers push
         # slot chunks over the peer QPs into TASK-indexed symmetric staging
         # rows under a credit handshake (see _mega_grad_udma_push_sweep).
-        # getmem stays the pure-MTE default; the word families are
-        # epoch-monetone SET-only so no cross-call zeroing is needed.
-        grad_udma = (
-            os.environ.get("MOE_MEGA_GRAD_TRANSPORT", "getmem") == "udma")
+        # getmem remains the default for older MTE forward contracts; the
+        # single-kernel MoonEP contract selects UDMA push above. The word
+        # families are epoch-monotone SET-only, with no cross-call zeroing.
+        grad_udma = grad_transport_mode == "udma"
         if grad_udma:
             gu_tasks = epn6 * triton.cdiv(gu6_elems, gu_chunk6)
             dn_tasks = epn6 * triton.cdiv(dn6_elems, dn_chunk6)
