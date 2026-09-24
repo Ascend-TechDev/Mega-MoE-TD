@@ -485,6 +485,12 @@ def run_single_kernel_forward_case(
                 rank,
                 device,
             )
+            dropped_inverse_ok = bool(
+                (op._route_to_send[:all_dropped.numel()] == -1).all().item())
+            all_passed &= dropped_inverse_ok
+            if not dropped_inverse_ok:
+                print(f"[rank {rank}] single-kernel all-dropped retained stale "
+                      "route_to_send entries", flush=True)
 
             # return_saved=True drives the same single launch and returns the
             # redesigned backward contract: the raw FC1 GEMM result plus the

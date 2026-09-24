@@ -116,7 +116,7 @@ def power2(value):
 def production_helpers(extra_names=(), extra_globals=None):
     tree = ast.parse(SOURCE.read_text())
     names = {
-        "_zero_pipeline_counters", "_count_routes_by_core",
+        "_reset_route_to_send", "_zero_pipeline_counters", "_count_routes_by_core",
         "_build_destination_metadata", "_convert_counts_to_stable_cursors",
         "_build_pull_destination_starts", "_build_recv_segment_starts",
         "_scatter_routes_by_ordinal", "_scatter_stable_routes",
@@ -226,6 +226,53 @@ def test_counter_reset_keeps_padding(count, cores):
     expected[::16] = 0
     np.testing.assert_array_equal(storage.values, expected)
     assert len(storage.writes) == count
+
+
+@pytest.mark.parametrize("routes,cores", [
+    (0, 32), (1, 32), (3, 32), (255, 3), (256, 32), (257, 3),
+    (2051, 32), (65536, 32),
+])
+def test_route_reset_covers_active_prefix_only(routes, cores):
+    h = production_helpers()
+    inverse = buffer(routes + 19, 99)
+    for core in reversed(range(cores)):
+        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    np.testing.assert_array_equal(inverse.values[:routes], -1)
+    np.testing.assert_array_equal(inverse.values[routes:], 99)
+    assert sorted(offset for _, offset in inverse.writes) == list(range(routes))
+
+
+def test_route_reset_is_separate_from_histogram():
+    tree = ast.parse(SOURCE.read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    count = functions["_count_routes_by_core"]
+    assert "route_to_send_ptr" not in {arg.arg for arg in count.args.args}
+    stores = [node for node in ast.walk(count)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "store"]
+    assert len(stores) == 1
+    assert "core_bucket_cursor_ptr" in ast.unparse(stores[0].args[0])
+
+    kernel = functions["_kernel_fused_forward"]
+    scopes = [node for node in kernel.body if isinstance(node, ast.With)]
+    def scope_for(name):
+        return next(scope for scope in scopes if any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == name for node in ast.walk(scope)))
+    reset_scope = scope_for("_reset_route_to_send")
+    count_scope = scope_for("_count_routes_by_core")
+    assert reset_scope is not count_scope
+    assert reset_scope.lineno < count_scope.lineno
+    guard = reset_scope.body[0]
+    assert isinstance(guard, ast.If)
+    assert ast.unparse(guard.test) == "sub_vec_id() == 0"
+    reset_calls = [node for node in ast.walk(kernel)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "_reset_route_to_send"]
+    assert len(reset_calls) == 1
+    assert ast.unparse(reset_calls[0]) == (
+        "_reset_route_to_send(pid, route_to_send_ptr, num_routes, "
+        "NUM_PROGRAM_CORES, _ROUTE_BLOCK)")
 
 
 def test_metadata_does_not_repeat_wave_reductions():

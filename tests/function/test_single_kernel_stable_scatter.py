@@ -29,7 +29,9 @@ def test_stable_scatter_matches_sort(experts, routes, cores, distribution):
     inverse = buffer(routes, 99)
     selected_ptr = Pointer(selected)
     for core in range(cores):
-        h._count_routes_by_core(core, selected_ptr, cursor, inverse,
+        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    for core in range(cores):
+        h._count_routes_by_core(core, selected_ptr, cursor,
                                routes, cores, experts, bins, 256)
     expected_histogram = np.bincount(selected[(selected >= 0) & (selected < experts)], minlength=bins)
     np.testing.assert_array_equal(cursor.values.reshape(cores, bins).sum(0), expected_histogram)
@@ -79,7 +81,9 @@ def test_destination_cursor_scatter_contract(world, epr):
     for rank in range(world):
         cursor, inverse = buffer(cores * bins, 99), buffer(routes, 99)
         for core in range(cores):
-            h._count_routes_by_core(core, Pointer(selected[rank]), cursor, inverse,
+            h._reset_route_to_send(core, inverse, routes, cores, 256)
+        for core in range(cores):
+            h._count_routes_by_core(core, Pointer(selected[rank]), cursor,
                                    routes, cores, experts, bins, 256)
         counts[rank] = cursor.values.reshape(cores, bins).sum(0)
         cursors.append(cursor)
@@ -114,6 +118,45 @@ def test_destination_cursor_scatter_contract(world, epr):
             assert dst_starts.values[expert] == receive_base
 
 
+@pytest.mark.parametrize("experts", [32, 128, 896])
+@pytest.mark.parametrize("cores", [3, 32])
+def test_route_inverse_reuse_across_dropped_routes(experts, cores):
+    h = production_helpers()
+    routes, topk, bins = 2050, 2, power2(experts)
+    rng = np.random.default_rng(experts + cores)
+    valid = rng.integers(0, experts, routes)
+    partial = valid.copy()
+    partial[::3] = -1
+    partial[1::7] = experts
+    dropped = np.full(routes, experts)
+    dropped[::2] = -1
+    cursor, inverse = buffer(cores * bins, 99), buffer(routes, 99)
+    send, tokens = buffer(routes, -9), buffer(routes, -9)
+    for selected in (valid, partial, dropped, valid[::-1].copy()):
+        for core in rng.permutation(cores):
+            h._reset_route_to_send(core, inverse, routes, cores, 256)
+        for core in rng.permutation(cores):
+            h._count_routes_by_core(core, Pointer(selected), cursor,
+                                   routes, cores, experts, bins, 256)
+        totals = cursor.values.reshape(cores, bins).sum(0)[:experts]
+        starts = Pointer(np.cumsum(totals) - totals)
+        for core in range(cores):
+            h._convert_counts_to_stable_cursors(core, cursor, starts, cores, experts, bins)
+        workers = [(core, lane) for core in range(cores) for lane in range(2)]
+        rng.shuffle(workers)
+        for core, lane in workers:
+            h.tl.lane = lane
+            h._scatter_stable_routes(core, Pointer(selected), cursor, tokens,
+                                     send, inverse, routes, cores, experts, bins, topk, 128)
+        active = np.flatnonzero((selected >= 0) & (selected < experts))
+        expected = active[np.argsort(selected[active], kind="stable")]
+        reference_inverse = np.full(routes, -1)
+        reference_inverse[expected] = np.arange(len(expected))
+        np.testing.assert_array_equal(inverse.values, reference_inverse)
+        np.testing.assert_array_equal(send.values[:len(expected)], expected)
+        np.testing.assert_array_equal(tokens.values[:len(expected)], expected // topk)
+
+
 def test_full_kimi_shape_stable_order():
     h = production_helpers()
     experts, routes, cores, bins, topk = 896, 65536, 32, 1024, 16
@@ -121,7 +164,9 @@ def test_full_kimi_shape_stable_order():
     selected = Pointer(rng.integers(0, experts, routes))
     cursor, inverse = buffer(cores * bins), buffer(routes)
     for core in range(cores):
-        h._count_routes_by_core(core, selected, cursor, inverse, routes, cores, experts, bins, 256)
+        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    for core in range(cores):
+        h._count_routes_by_core(core, selected, cursor, routes, cores, experts, bins, 256)
     totals = cursor.values.reshape(cores, bins).sum(0)[:experts]
     starts = Pointer(np.cumsum(totals) - totals)
     for core in range(cores):

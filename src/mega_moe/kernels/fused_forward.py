@@ -141,6 +141,19 @@ def _mixed_forward_barrier():
 
 
 @triton.jit
+def _reset_route_to_send(pid, route_to_send_ptr, num_routes,
+                        NUM_PROGRAM_CORES: tl.constexpr,
+                        BLOCK_SIZE: tl.constexpr):
+    # Dropped routes are not written by scatter; reset them on every launch.
+    offsets = tl.arange(0, BLOCK_SIZE)
+    num_tiles = tl.cdiv(num_routes, BLOCK_SIZE)
+    for tile in range(pid, num_tiles, NUM_PROGRAM_CORES):
+        routes = tile * BLOCK_SIZE + offsets
+        safe_routes = tl.minimum(routes, num_routes - 1)
+        tl.store(route_to_send_ptr + safe_routes, -1, mask=routes < num_routes)
+
+
+@triton.jit
 def _zero_pipeline_counters(pid, pipeline_signal_ptr,
                             NUM_PROGRAM_CORES: tl.constexpr,
                             NUM_COUNTERS: tl.constexpr):
@@ -157,7 +170,7 @@ def _zero_pipeline_counters(pid, pipeline_signal_ptr,
 
 @triton.jit
 def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
-                          route_to_send_ptr, num_routes, NUM_PROGRAM_CORES: tl.constexpr,
+                          num_routes, NUM_PROGRAM_CORES: tl.constexpr,
                           NUM_EXPERTS: tl.constexpr,
                           NUM_BINS_PAD: tl.constexpr,
                           BLOCK_SIZE: tl.constexpr):
@@ -177,7 +190,6 @@ def _count_routes_by_core(pid, selected_experts_ptr, core_bucket_cursor_ptr,
         route_ids = block_start + block_offsets
         mask = route_ids < route_end
         safe_routes = tl.minimum(route_ids, num_routes - 1)
-        tl.store(route_to_send_ptr + safe_routes, -1, mask=mask)
         experts = tl.load(selected_experts_ptr + safe_routes,
                           mask=mask,
                           other=-1)
@@ -1635,13 +1647,15 @@ def _kernel_fused_forward(
         2 * NUM_PROGRAM_CORES + WORLD_SIZE) + min(2 * NUM_PROGRAM_CORES, WORLD_SIZE)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
+            _reset_route_to_send(pid, route_to_send_ptr, num_routes,
+                                 NUM_PROGRAM_CORES, _ROUTE_BLOCK)
             _zero_pipeline_counters(
                 pid, pipeline_signal_ptr, NUM_PROGRAM_CORES,
                 pipeline_counter_count)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
             _count_routes_by_core(pid, selected_experts_ptr,
-                                  core_bucket_cursor_ptr, route_to_send_ptr, num_routes,
+                                  core_bucket_cursor_ptr, num_routes,
                                   NUM_PROGRAM_CORES, NUM_EXPERTS, NUM_BINS_PAD,
                                   _ROUTE_BLOCK)
     _mixed_forward_barrier()

@@ -21,12 +21,20 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 - stable cursor 改为 `[cores, expert_block]` exclusive scan。
 - destination 与 wave offsets 复用 source counts 归约。
 - pull starts 改向量归约/前缀。
-- 去掉 histogram 预清零，将逆映射初始化融合进 histogram 遍历，向量化 signal counter reset。
+- 去掉 histogram 预清零，向量化 signal counter reset；逆映射 `route_to_send=-1` 在独立循环中初始化，不再融合进 histogram 遍历。
 - E≥128 的非 MoonEP scatter 使用 32-route block、32×32 两两匹配求块内序号，再用 histogram 更新块间 cursor。两个 Vector lane 各拥有互斥 expert 半区；E<128 保留原 dense 路径。
 
 完整 Kimi E=896、R=65536 时，expert-ID 扫描由 28 遍减少到两个 lane 各 1 遍。pairwise 匹配累计约 419 万元素，原 dense 匹配约 5872 万元素。新路径也有 histogram/gather/循环开销，不能把元素数比例当作加速比。128 的分支阈值未做 NPU 调优。
 
 无效 route 的逆映射保持 `-1`；`send_route_indices` 必须是有效 route 的 expert-major 稳定排序；`send_token_indices = send_route_indices // TOPK`；`route_to_send` 是其逆映射。
+
+### 逆映射初始化回归处理
+
+设备实验由用户提供：perf 分支恢复标量 cursor、禁用 ordinal scatter 后仍失败；删除 histogram 内的 `route_to_send=-1` store 后，完整 E896 用例通过。这将融合初始化定位为回归触发点，但尚不能证明底层机制是 count/scatter 掩码不一致；源码中两个 scatter lane 的有效 expert 集合与 count 相同。
+
+当前恢复独立的 `_reset_route_to_send`，按原先的跨 core tile 分配方式，在 histogram 之前的 Vector lane0 scope 中执行；不恢复多余的 histogram 预清零，不增加 launch 或 phase barrier。单纯删除初始化不可用：scatter 不写 dropped route，重复调用会保留旧 send row，导致 combine 错误累加。初始化必须覆盖本次全部 route，每轮重置为 `-1`，由 scatter 覆盖有效项。
+
+完整 W8/T4K、topk16 每 rank 有 65536 个 int32 映射项，初始化写入量为 256 KiB。与融合版相比写入量不变，但恢复了独立循环的调度和地址计算；对 `zero_histogram` 段及 e2e 的实际影响待 NPU 测量。新增 host 回归覆盖同一 workspace 的“有效 → 部分 dropped → 全 dropped → 有效”，设备现有连续调用用例额外检查全 dropped 后逆映射全部为 `-1`。用户的删除实验通过不等于本次独立初始化版本已完成设备验收。
 
 ## FC1 / FC2 入口：紧凑 wave 任务表
 
@@ -71,7 +79,7 @@ FC1 的 dispatch source 区间二分和就绪 wait 仍保留；本次没有增�
 
 ## 本地验收
 
-2026-09-22：下列完整 host 回归 **375 passed**；Python 语法检查与 `git diff --check` 通过。NPU 编译、correctness 和性能未运行。
+当前修复的完整 host 回归 **391 passed**；Python 语法检查与 `git diff --check` 通过。内存中禁用 reset 的变异检查确认“有效前缀重置”和“dropped 连续调用”测试均能抓住遗漏初始化。NPU 编译、correctness 和性能未在本机运行。
 
 测试直接 AST 提取生产 helpers，使用带越界、重复写和 lane 互斥检查的 NumPy shim 执行。覆盖：
 
