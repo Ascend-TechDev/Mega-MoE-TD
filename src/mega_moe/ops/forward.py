@@ -209,6 +209,9 @@ class FusedMoEForward(torch.nn.Module):
         self._fwd_fc2w_buf = None
         self._fwd_ring_slots = 0
         self._fwd_timing_last = None
+        # MOE_MEGA_WAIT_DEBUG=1 (G2 r40): forward-side bounded replica-wait
+        # timeout reports (sites 1/2 in fused_forward).
+        self._fwd_wait_dbg = None
         self._routing_weights_keepalive = None
         self._replica_weight_buffers = None
         # True when _replica_weight_buffers came from the session pool
@@ -395,6 +398,7 @@ class FusedMoEForward(torch.nn.Module):
         self._fwd_fc2w_buf = None
         self._fwd_ring_slots = 0
         self._fwd_timing_last = None
+        self._fwd_wait_dbg = None
         self.context.finalize()
 
     def _ensure_replica_weight_buffers(
@@ -731,6 +735,13 @@ class FusedMoEForward(torch.nn.Module):
                 (self.num_aicore_programs,
                  self._single_pipeline_max_groups),
                 dtype=torch.int64,
+                device=device,
+            )
+            # One report row per core: [site, slot, want, observed, expert,
+            # spins] (see dispatch_fc2_bwd._wait_bounded_report).
+            self._fwd_wait_dbg = torch.zeros(
+                self.num_aicore_programs * 8,
+                dtype=torch.int32,
                 device=device,
             )
         elif (
@@ -1657,6 +1668,13 @@ class FusedMoEForward(torch.nn.Module):
             self._fwd_acc_buf.zero_()
             self._fwd_ring_buf.zero_()
             self._fwd_fc2w_buf.zero_()
+        # MOE_MEGA_WAIT_DEBUG=1: bounded replica-wait spins replace the two
+        # unbounded dl.waits, so a starving cross-node panel turns the
+        # deadlock into a diagnosable report + numeric failure instead of an
+        # aicore timeout (r40 mutual-spin form).
+        wait_debug_on = os.environ.get("MOE_MEGA_WAIT_DEBUG", "0") == "1"
+        if wait_debug_on:
+            self._fwd_wait_dbg.zero_()
         # MOE_MEGA_HEAP_PROBE=1: forward-side symmetric-heap audit.  The
         # backward audit (mega_bwd) prints offsets RELATIVE to peer_mem;
         # putmem/symm_at translation actually assumes the ABSOLUTE offset
@@ -1804,6 +1822,8 @@ class FusedMoEForward(torch.nn.Module):
             ACC_SLOTS=FWD_ACC_SLOTS,
             RING_SLOTS=self._fwd_ring_slots,
             TIMING=timing_on,
+            wait_dbg_ptr=self._fwd_wait_dbg,
+            WAIT_DEBUG=wait_debug_on,
             # Guarded fixed-step binary searches over the closed rank
             # interval [0, W] (scatter destination lookup and dispatch
             # readiness) converge in exactly W.bit_length() steps; fewer
@@ -1814,6 +1834,24 @@ class FusedMoEForward(torch.nn.Module):
         )
         if counts_trace:
             _counts_row_sums("post-kernel")
+        # MOE_MEGA_WAIT_DEBUG=1: drain the bounded replica-wait reports.
+        # site 1 = FC1 gate/up weight panel, site 2 = FC2 down weight panel;
+        # want/observed are the signal_epoch the waiter wanted vs the last
+        # value in the slot (0 = no panel ever landed, epoch-1 = the peer's
+        # push for THIS forward never arrived).
+        if wait_debug_on:
+            _wd = self._fwd_wait_dbg.view(-1, 8)
+            _rows = (_wd != 0).any(dim=1).nonzero().flatten().tolist()
+            if not _rows:
+                print(f"[wait-dbg r{self.rank}] no replica-wait starvation",
+                      flush=True)
+            for _r in _rows:
+                print(
+                    f"[wait-dbg r{self.rank}] core{_r}"
+                    f" site={int(_wd[_r, 0])} slot={int(_wd[_r, 1])}"
+                    f" want={int(_wd[_r, 2])} observed={int(_wd[_r, 3])}"
+                    f" expert={int(_wd[_r, 4])} spins={int(_wd[_r, 5])}",
+                    flush=True)
         self._tile_signal_epoch += 1
         if timing_on:
             self._fwd_timing_last = (
