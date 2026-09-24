@@ -5510,17 +5510,26 @@ def run_single_kernel_moonep_autograd_case(
                     # the replica tables AND the operator's ETC cache.
                     out2, leaves2 = forward_step(steps[1])
 
-                    # G2 r42b: forward-output row-level probe.  The grads
-                    # compare never looks at out1/out2, so "forward green"
-                    # was an assumption; this decides serve-vs-backward by
-                    # direct row compare against the same SiTU eager recipe
-                    # make_golden trusts.  Hot row = one of the token's
-                    # routes hits the step's hammered expert — exactly the
-                    # rows the OTHER rank's replica slots serve.
+                    # G2 r42b/r43: forward-output row-level probe.  The
+                    # grads compare never looks at out1/out2, so "forward
+                    # green" was an assumption; this decides serve-vs-
+                    # backward by direct row compare against the same SiTU
+                    # eager recipe make_golden trusts.  Hot row = one of
+                    # the token's routes hits the step's hammered expert —
+                    # exactly the rows the OTHER rank's replica slots
+                    # serve.  v2 adds the bad-row portrait: row ids and
+                    # contiguity (block=boundary bug vs scattered=chunk
+                    # index bug), per-row bad-column fraction, and the
+                    # stale/zero fingerprint — each bad row is classified
+                    # by which reference it sits closest to: step1's
+                    # unscaled weights (stale panel), the hot contribution
+                    # zeroed out (missing/zero panel), or neither
+                    # (mapping).  Step1 has no earlier panel version, so
+                    # it only gets the zero-vs-other split.
                     if os.environ.get("MOE_MEGA_FWD_DUMP", "0") == "1":
-                        for name, out, step in (
-                            ("step1", out1, steps[0]),
-                            ("step2", out2, steps[1]),
+                        for name, out, step, other in (
+                            ("step1", out1, steps[0], None),
+                            ("step2", out2, steps[1], steps[0]),
                         ):
                             hot = 0 if name == "step1" else (
                                 num_experts // world_size
@@ -5537,19 +5546,109 @@ def run_single_kernel_moonep_autograd_case(
                                     situ_beta=situ_beta,
                                     situ_linear_beta=situ_linear_beta,
                                 )
-                            diff = (out.float() - ref.float()).abs()
-                            rowbad = (diff > 5e-2).any(dim=-1)
-                            has_hot = (step["ei"] == hot).any(dim=-1)
-                            print(
-                                f"[fwd-dump r{rank}] {name} "
-                                f"rows_bad={int(rowbad.sum())}/{tokens} "
-                                f"hot_bad={int((rowbad & has_hot).sum())}"
-                                f"/{int(has_hot.sum())} "
-                                f"nonhot_bad="
-                                f"{int((rowbad & ~has_hot).sum())} "
-                                f"max_abs={float(diff.max()):.6f}",
-                                flush=True,
-                            )
+                                diff = (out.float() - ref.float()).abs()
+                                rowbad = (diff > 5e-2).any(dim=-1)
+                                has_hot = (step["ei"] == hot).any(dim=-1)
+                                print(
+                                    f"[fwd-dump r{rank}] {name} "
+                                    f"rows_bad={int(rowbad.sum())}/{tokens}"
+                                    f" hot_bad="
+                                    f"{int((rowbad & has_hot).sum())}"
+                                    f"/{int(has_hot.sum())} "
+                                    f"nonhot_bad="
+                                    f"{int((rowbad & ~has_hot).sum())} "
+                                    f"max_abs={float(diff.max()):.6f}",
+                                    flush=True,
+                                )
+                                bad_ids = rowbad.nonzero(
+                                    as_tuple=True)[0]
+                                n_bad = int(bad_ids.numel())
+                                if n_bad == 0:
+                                    continue
+                                # Contiguity: run-length summary over the
+                                # sorted bad ids plus head/tail samples.
+                                # max_run is the longest CONSECUTIVE run
+                                # (a span measure would read scattered
+                                # ids as one long block).
+                                gaps = bad_ids[1:] - bad_ids[:-1]
+                                breaks = (gaps != 1).nonzero(
+                                    as_tuple=True)[0]
+                                run_starts = torch.cat(
+                                    (bad_ids[:1],
+                                     bad_ids[breaks + 1]))
+                                run_ends = torch.cat(
+                                    (bad_ids[breaks],
+                                     bad_ids[-1:]))
+                                run_lens = run_ends - run_starts + 1
+                                n_runs = int(run_lens.numel())
+                                max_run = int(run_lens.max().item())
+                                colfrac = (
+                                    (diff[bad_ids] > 5e-2)
+                                    .float().mean(dim=-1)
+                                )
+                                show = bad_ids[:32].tolist()
+                                if n_bad > 40:
+                                    show += bad_ids[-8:].tolist()
+                                print(
+                                    f"[fwd-dump r{rank}] {name} portrait: "
+                                    f"n_runs={n_runs} max_run={max_run} "
+                                    f"colfrac(min/med/max)="
+                                    f"{float(colfrac.min()):.3f}/"
+                                    f"{float(colfrac.median()):.3f}/"
+                                    f"{float(colfrac.max()):.3f} "
+                                    f"rows[:32,+8]={show}",
+                                    flush=True,
+                                )
+                                # Fingerprint references.
+                                refs = {}
+                                if other is not None:
+                                    refs["stale"] = moe_forward(
+                                        step["hs"], step["rw"],
+                                        step["ei"], other["gate_w"],
+                                        other["up_w"], other["down_w"],
+                                        ep_group, topk, return_saved=False,
+                                        activation="situglu",
+                                        situ_beta=situ_beta,
+                                        situ_linear_beta=situ_linear_beta,
+                                    ).float()
+                                hot_mask = step["ei"] == hot
+                                refs["zero"] = moe_forward(
+                                    step["hs"],
+                                    step["rw"].masked_fill(
+                                        hot_mask, 0.0),
+                                    step["ei"], step["gate_w"],
+                                    step["up_w"], step["down_w"],
+                                    ep_group, topk, return_saved=False,
+                                    activation="situglu",
+                                    situ_beta=situ_beta,
+                                    situ_linear_beta=situ_linear_beta,
+                                ).float()
+                                d_true = (out[bad_ids].float()
+                                          - ref[bad_ids].float())
+                                d_true = d_true.norm(dim=-1)
+                                # Exclusive argmin classification: each
+                                # bad row lands in exactly one bucket —
+                                # whichever reference (stale / zero / the
+                                # true one) it sits closest to.
+                                keys = list(refs) + ["other"]
+                                cand = [
+                                    (out[bad_ids].float()
+                                     - refs[k][bad_ids]).norm(dim=-1)
+                                    for k in refs
+                                ] + [d_true]
+                                win = torch.stack(cand, dim=0).argmin(
+                                    dim=0)
+                                tally = {
+                                    k: int((win == i).sum().item())
+                                    for i, k in enumerate(keys)
+                                }
+                                parts = " ".join(
+                                    f"{k}={v}" for k, v in tally.items())
+                                print(
+                                    f"[fwd-dump r{rank}] {name} "
+                                    f"fingerprint(of {n_bad}): {parts}",
+                                    flush=True,
+                                )
 
                     # Reverse-order backwards (framework autograd order).
                     out2.backward(steps[1]["dy"])
