@@ -5543,6 +5543,22 @@ def run_single_kernel_moonep_autograd_case(
                             buf = getattr(op.context, nm, None)
                             if buf is not None:
                                 payload[nm] = buf.cpu()
+                        # Planning tables (node1's zero-cost pre-step,
+                        # G2 r45): if the hot expert's planned rows/blocks
+                        # are short here, the defect is in the planning
+                        # layer (_build_dynamic_wave_offsets /
+                        # _balanced_count_cube_destination) and the
+                        # execution-layer chain below is moot.
+                        payload["wave_expert_offsets"] = (
+                            op._single_wave_expert_offsets.cpu())
+                        buf = getattr(
+                            op.context, "metadata_recv_seg_starts", None)
+                        if buf is not None:
+                            payload["recv_seg_starts"] = buf.cpu()
+                        buf = getattr(
+                            op.context, "metadata_counts_mem", None)
+                        if buf is not None:
+                            payload["counts_mem"] = buf.cpu()
                         dump_dir = os.path.join(
                             "/mnt/share/mmdumps",
                             os.environ.get(
