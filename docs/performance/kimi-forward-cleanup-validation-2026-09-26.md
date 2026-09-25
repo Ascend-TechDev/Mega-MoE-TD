@@ -4,16 +4,16 @@
 
 ## 结论
 
-- 当前源码在 Ascend950DT 8 卡、E896、每卡 4096 tokens、top-k=16、偏斜路由、MoonEP 关闭下完成 correctness、occupancy、50 次 fused 和 50 次 Torch 计时。
+- 当前源码在 Ascend950DT 8 卡、E896、每卡 4096 tokens、top-k=16、均匀随机路由、MoonEP 关闭下完成 correctness、occupancy、50 次 fused 和 50 次 Torch 计时。
 - fused：median 15.129 / mean 15.035 / P95 15.432 / range 14.110-15.542 ms；Torch grouped-GEMM + HCCL：median 21.740 / mean 21.880 / P95 22.139 / range 21.641-24.166 ms；median 加速比 **1.437x**。
-- 与历史最佳统一口径结果（fused 15.095 ms、Torch 21.697 ms、1.437x）相比，本次复验为 15.129 ms、21.740 ms、1.437x，未见材料回退；一次复验不能证明每个删除项的独立收益。
+- 与历史最佳统一口径结果（fused 15.095 ms、Torch 21.697 ms、1.437x）相比，本次复验为 15.129 ms、21.740 ms、1.437x，未见明显性能回退；一次复验不能证明每个删除项的独立收益。
 - run artifact：/tmp/kimi_forward_cleanup_final_20260926/full_t4k_moonep0。原始 benchmark_result.json、逐卡区间、telemetry.jsonl、occupancy 日志和完整环境均保留。
 
 ## 测试输入与计时口径
 
 - case=performance-fwd-kimi-k3-w8-t4k；model=KIMI-K3；world=8；tokens/rank=4096；global tokens=32768；hidden=3584；ffn=3072；E=896；top-k=16；capacity factor=1.25；drop_frac=0.0。
 - 输入形状：hidden/output=[4096,3584]；routing indices/weights=[4096,16]；每 rank W1=[112,3584,6144]、W2=[112,3584,3072]；BF16 hidden/weights/output，FP32 routing weights，INT32 expert indices；SwiGLU。
-- owner route quota=[19,27,11,11,15,15,15,15]/128；实际 routes_received_per_rank=[65672, 65348, 65442, 65024, 65821, 65733, 65716, 65532]；所有 896 个 global experts active。
+- routing profile=uniform（均匀随机路由，不使用偏斜 owner quota）；实际 routes_received_per_rank=[65672, 65348, 65442, 65024, 65821, 65733, 65716, 65532]；所有 896 个 global experts active。
 - MoonEP=关闭；FC1 block=[128, 512, 128]；FC2 block=[128, 512, 128]；dispatch M=256；wave windows=16；AICore programs=32；AIVector programs=64；symmetric heap=16 GiB。
 - benchmark-only forward；计时边界是 router 后的完整 forward，包含 routing metadata、dispatch、FC1、SwiGLU、FC2、combine 和调用内 workspace reset；不含初始化、JIT 首次编译、权重/输入生成和 correctness。
 - correctness 在计时前覆盖 normal、zero-receive/empty-expert、negative/out-of-range all-drop，rtol=atol=0.05；warmup=5、iterations=50；NPU event；8 卡取 MAX。
@@ -72,6 +72,8 @@
 - kernel 内 reset 的底层 lowering/UB 机制尚未完全证明；当前 host reset 是通过 correctness 并纳入 e2e 计时的生产路径。
 
 ## 可复现入口
+
+下列命令记录原始运行；重跑时必须换用新的 output-dir 和独立 cache 目录，已有结果目录不能覆盖。
 
 source /tmp/kimi_forward_matrix_20260926_completion/environment.sh
 export TRITON_CACHE_DIR=/tmp/kimi_forward_cleanup_final_20260926_cache
