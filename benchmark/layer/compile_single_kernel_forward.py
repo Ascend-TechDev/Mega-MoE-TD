@@ -112,7 +112,6 @@ def main():
         RING_SLOTS=fwd_ring_slots(max_pipeline_groups, physical_experts),
         TIMING=args.timing,
         WORLD_SEARCH_STEPS=case.world_size.bit_length(),
-        LAST_RETURN_ONLY=True,
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",

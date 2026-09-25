@@ -141,19 +141,6 @@ def _mixed_forward_barrier():
 
 
 @triton.jit
-def _reset_route_to_send(pid, route_to_send_ptr, num_routes,
-                        NUM_PROGRAM_CORES: tl.constexpr,
-                        BLOCK_SIZE: tl.constexpr):
-    # Dropped routes are not written by scatter; reset them on every launch.
-    offsets = tl.arange(0, BLOCK_SIZE)
-    num_tiles = tl.cdiv(num_routes, BLOCK_SIZE)
-    for tile in range(pid, num_tiles, NUM_PROGRAM_CORES):
-        routes = tile * BLOCK_SIZE + offsets
-        safe_routes = tl.minimum(routes, num_routes - 1)
-        tl.store(route_to_send_ptr + safe_routes, -1, mask=routes < num_routes)
-
-
-@triton.jit
 def _zero_pipeline_counters(pid, pipeline_signal_ptr,
                             NUM_PROGRAM_CORES: tl.constexpr,
                             NUM_COUNTERS: tl.constexpr):
@@ -1289,7 +1276,7 @@ def _wait_dynamic_wave_returns(
         worker, wave_expert_offsets_ptr, pipeline_signal_ptr, signal_epoch,
         NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
-        WAVE_WINDOWS: tl.constexpr, LAST_RETURN_ONLY: tl.constexpr = False):
+        WAVE_WINDOWS: tl.constexpr):
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
     checked_base: tl.constexpr = MAX_WAVES * (2 * NUM_CORES + WORLD_SIZE)
     CHECKERS: tl.constexpr = min(2 * NUM_CORES, WORLD_SIZE)
@@ -1301,14 +1288,11 @@ def _wait_dynamic_wave_returns(
             blocks = tl.load(wave_expert_offsets_ptr
                              + (destination * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK) * 2)
             waves = tl.cdiv(blocks, WAVE_WINDOWS)
-            first_wave = 0
-            if LAST_RETURN_ONLY:
-                # Every return worker processes waves in order, fences its
-                # writes, and then increments the counter for that wave.  An
-                # acquire of the final wave from every worker therefore also
-                # observes all writes from the preceding waves.  Empty
-                # destinations have waves == 0 and contribute no wait.
-                first_wave = tl.maximum(waves - 1, 0)
+            # Every return worker processes waves in order, fences its writes,
+            # and then increments the counter for that wave. Acquiring the
+            # final wave therefore also observes all preceding writes. Empty
+            # destinations contribute no wait.
+            first_wave = tl.maximum(waves - 1, 0)
             for wave in range(first_wave, waves):
                 ready += dl.wait(
                     pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + destination) * 16,
@@ -1421,7 +1405,7 @@ def _run_dynamic_wave_pipeline(
         # accumulators and the per-call FC1 ring.
         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,
         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,
-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):
+        RING_SLOTS: tl.constexpr = 0):
     global_waves = 0
     for rank in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
@@ -1641,8 +1625,7 @@ def _run_dynamic_wave_pipeline(
             return_ready = _wait_dynamic_wave_returns(
                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,
                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,
-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,
-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)
+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)
             if TIMING:
                 # dl.wait blocks the issuing stream: this one is exact.
                 # Column 4 is reported from lane 0 (both lanes wait).
@@ -1704,8 +1687,7 @@ def _kernel_fused_forward(
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
         TS_SLOTS: tl.constexpr, ACC_SLOTS: tl.constexpr,
         RING_SLOTS: tl.constexpr, TIMING: tl.constexpr,
-        WORLD_SEARCH_STEPS: tl.constexpr,
-        LAST_RETURN_ONLY: tl.constexpr = False):
+        WORLD_SEARCH_STEPS: tl.constexpr):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
     # One shared dummy + one precomputed ts row for all ten stamps (the
@@ -1719,9 +1701,6 @@ def _kernel_fused_forward(
         2 * NUM_PROGRAM_CORES + WORLD_SIZE) + min(2 * NUM_PROGRAM_CORES, WORLD_SIZE)
     with al.scope(core_mode='vector', disable_auto_sync=True):
         if sub_vec_id() == 0:
-            # EXP-L: kernel-internal reset disabled; host fill_(-1) handles it.
-            # _reset_route_to_send(pid, route_to_send_ptr, num_routes,
-            #                      NUM_PROGRAM_CORES, _ROUTE_BLOCK)
             _zero_pipeline_counters(
                 pid, pipeline_signal_ptr, NUM_PROGRAM_CORES,
                 pipeline_counter_count)
@@ -1896,8 +1875,7 @@ def _kernel_fused_forward(
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         EXPERTS_PER_RANK, MOONEP, WORLD_SEARCH_STEPS,
         acc_ptr=acc_ptr, ring_ptr=ring_ptr, fc2w_ptr=fc2w_ptr,
-        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS,
-        LAST_RETURN_ONLY=LAST_RETURN_ONLY)
+        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS)
     if TIMING:
         _fwd_stamp_lane0(ts_row, 8, ts_dummy)   # pipeline + reduce done
     if MOONEP:

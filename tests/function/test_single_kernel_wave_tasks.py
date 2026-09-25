@@ -203,7 +203,7 @@ class ReturnRelay:
 
 @pytest.mark.parametrize("world,cores", [(1, 32), (3, 24), (8, 32), (64, 32), (128, 32)])
 @pytest.mark.parametrize("epoch", [1, 7])
-def test_return_relay_acquires_every_counter_once(world, cores, epoch):
+def test_return_relay_acquires_each_final_counter_once(world, cores, epoch):
     epr, max_waves, windows = 7, 23, 16
     wave_counts = [0 if rank % 5 == 0 else 1 + rank % 21 for rank in range(world)]
     table = np.zeros((world, epr + 1, 2), dtype=np.int64)
@@ -215,8 +215,8 @@ def test_return_relay_acquires_every_counter_once(world, cores, epoch):
         expected = (max(2 * cores, world) - local + world - 1) // world
         signals = buffer((checked_base + checkers) * 16)
         for destination, waves in enumerate(wave_counts):
-            for wave in range(waves):
-                signals.values[(return_base + wave * world + destination) * 16] = expected
+            if waves:
+                signals.values[(return_base + (waves - 1) * world + destination) * 16] = expected
         relay = ReturnRelay(signals, checked_base, checkers, epoch)
         h = production_helpers(("_wait_dynamic_wave_returns",),
                                {"dl": relay, "libshmem_device": relay})
@@ -225,49 +225,15 @@ def test_return_relay_acquires_every_counter_once(world, cores, epoch):
             h._wait_dynamic_wave_returns(worker, Pointer(table.reshape(-1)), signals,
                                          epoch, cores, local, world, epr, max_waves, windows)
         actual = Counter(slot for _, event, slot in relay.events if event == "remote-acquire")
-        desired = Counter(return_base + wave * world + destination
-                          for destination, waves in enumerate(wave_counts) for wave in range(waves))
+        desired = Counter(return_base + (waves - 1) * world + destination
+                          for destination, waves in enumerate(wave_counts) if waves)
         assert actual == desired
         assert sorted(relay.final_checks) == list(range(2 * cores))
         np.testing.assert_array_equal(signals.values[checked_base * 16::16], epoch)
 
 
-@pytest.mark.parametrize("world,cores", [(1, 32), (8, 32), (64, 32), (128, 32)])
-def test_return_relay_can_acquire_only_final_wave(world, cores):
-    """The final per-destination counter covers earlier fenced waves."""
-    epr, max_waves, windows, epoch = 7, 23, 16, 11
-    wave_counts = [0 if rank % 5 == 0 else 1 + rank % 21 for rank in range(world)]
-    table = np.zeros((world, epr + 1, 2), dtype=np.int64)
-    table[:, -1, 0] = np.asarray(wave_counts) * windows
-    checked_base = max_waves * (2 * cores + world)
-    checkers = min(2 * cores, world)
-    return_base = 2 * max_waves * cores
-    local = world // 2
-    expected = (max(2 * cores, world) - local + world - 1) // world
-    signals = buffer((checked_base + checkers) * 16)
-    for destination, waves in enumerate(wave_counts):
-        if waves:
-            signals.values[(return_base + (waves - 1) * world + destination) * 16] = expected
-    relay = ReturnRelay(signals, checked_base, checkers, epoch)
-    h = production_helpers(("_wait_dynamic_wave_returns",),
-                           {"dl": relay, "libshmem_device": relay})
-    for worker in reversed(range(2 * cores)):
-        relay.worker = worker
-        h._wait_dynamic_wave_returns(
-            worker, Pointer(table.reshape(-1)), signals, epoch, cores, local,
-            world, epr, max_waves, windows, LAST_RETURN_ONLY=True)
-    actual = Counter(slot for _, event, slot in relay.events if event == "remote-acquire")
-    desired = Counter(
-        return_base + (waves - 1) * world + destination
-        for destination, waves in enumerate(wave_counts) if waves)
-    assert actual == desired
-    assert sorted(relay.final_checks) == list(range(2 * cores))
-    np.testing.assert_array_equal(signals.values[checked_base * 16::16], epoch)
-
-
 @pytest.mark.parametrize("missing_destination", [0, 3, 7])
-@pytest.mark.parametrize("last_only", [False, True])
-def test_incomplete_return_cannot_publish_or_release_reduce(missing_destination, last_only):
+def test_incomplete_return_cannot_publish_or_release_reduce(missing_destination):
     world, cores, epr, max_waves, windows, epoch = 8, 32, 4, 3, 16, 9
     checked_base = max_waves * (2 * cores + world)
     return_base = 2 * max_waves * cores
@@ -275,7 +241,7 @@ def test_incomplete_return_cannot_publish_or_release_reduce(missing_destination,
     for wave in range(3):
         for destination in range(world):
             signals.values[(return_base + wave * world + destination) * 16] = 8
-    missing_wave = 2 if last_only else 0
+    missing_wave = 2
     missing_slot = return_base + missing_wave * world + missing_destination
     signals.values[missing_slot * 16] = 7
     signals.values[checked_base * 16::16] = epoch - 1
@@ -299,20 +265,17 @@ def test_incomplete_return_cannot_publish_or_release_reduce(missing_destination,
         relay.worker = worker
         with pytest.raises(Blocked):
             h._wait_dynamic_wave_returns(worker, Pointer(table.reshape(-1)), signals,
-                                         epoch, cores, 0, world, epr, max_waves, windows,
-                                         LAST_RETURN_ONLY=last_only)
+                                         epoch, cores, 0, world, epr, max_waves, windows)
     published = {worker for worker, event, _ in relay.events if event == "publish"}
     assert published == set(range(world)) - {missing_destination}
     signals.values[missing_slot * 16] = 8
     relay.worker = missing_destination
     h._wait_dynamic_wave_returns(missing_destination, Pointer(table.reshape(-1)), signals,
-                                 epoch, cores, 0, world, epr, max_waves, windows,
-                                 LAST_RETURN_ONLY=last_only)
+                                 epoch, cores, 0, world, epr, max_waves, windows)
     for worker in range(2 * cores):
         relay.worker = worker
         h._wait_dynamic_wave_returns(worker, Pointer(table.reshape(-1)), signals,
-                                     epoch, cores, 0, world, epr, max_waves, windows,
-                                     LAST_RETURN_ONLY=last_only)
+                                     epoch, cores, 0, world, epr, max_waves, windows)
 
 
 @pytest.mark.parametrize("cores,epr,windows", [(3, 7, 4), (32, 112, 16), (32, 4, 16)])

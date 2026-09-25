@@ -226,7 +226,7 @@ _CASE_GROUPS = (
         prefix="performance-fwd-kimi-k3-trimmed",
         direction="forward",
         model="KIMI-K3-TRIMMED",
-        tokens=(4096, 16384),
+        tokens=(4096, 8192, 16384),
         worlds=(8,),
         hidden=3584,
         ffn=3072,
@@ -241,7 +241,7 @@ _CASE_GROUPS = (
     CaseGroup(
         prefix="performance-fwd-kimi-k3-trimmed-top16",
         direction="forward", model="KIMI-K3-TRIMMED",
-        tokens=(4096,), worlds=(8,), hidden=3584, ffn=3072,
+        tokens=(4096, 8192, 16384), worlds=(8,), hidden=3584, ffn=3072,
         topk=16, num_experts=32,
         tags=frozenset({"performance", "forward", "kimi", "trimmed", "slow"}),
         capacity_factor=1.25,
@@ -252,7 +252,7 @@ _CASE_GROUPS = (
     CaseGroup(
         prefix="performance-fwd-kimi-k3-trimmed-skewed",
         direction="forward", model="KIMI-K3-TRIMMED",
-        tokens=(4096, 16384), worlds=(8,), hidden=3584, ffn=3072,
+        tokens=(4096, 8192, 16384), worlds=(8,), hidden=3584, ffn=3072,
         topk=16, num_experts=32,
         tags=frozenset({"performance", "forward", "kimi", "trimmed", "moonep-skewed", "slow"}),
         capacity_factor=1.6875,
@@ -260,7 +260,7 @@ _CASE_GROUPS = (
     CaseGroup(
         prefix="performance-fwd-kimi-k3-skewed",
         direction="forward", model="KIMI-K3",
-        tokens=(4096, 16384), worlds=(8,), hidden=3584, ffn=3072,
+        tokens=(4096, 8192, 16384), worlds=(8,), hidden=3584, ffn=3072,
         topk=16, num_experts=896,
         tags=frozenset({"performance", "forward", "kimi", "moonep-skewed", "slow"}),
         capacity_factor=1.6875,

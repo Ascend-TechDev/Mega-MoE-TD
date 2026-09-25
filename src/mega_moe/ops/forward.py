@@ -1640,9 +1640,9 @@ class FusedMoEForward(torch.nn.Module):
             self._fwd_acc_buf.zero_()
             self._fwd_ring_buf.zero_()
             self._fwd_fc2w_buf.zero_()
-        # EXP-L: host-side route_to_send reset (moved OUT of the fused kernel).
-        # Device op on the same stream as the launch; only for discrimination —
-        # timing from this build is NOT representative of single-kernel perf.
+        # Scatter does not write dropped routes. Reset the active inverse on
+        # the launch stream so reused workspaces cannot retain stale rows.
+        # This device fill is part of the end-to-end forward timing boundary.
         self._route_to_send[:num_routes].fill_(-1)
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
@@ -1750,11 +1750,6 @@ class FusedMoEForward(torch.nn.Module):
             # leaves the worst case unconverged (host-modeled in
             # tests/function/test_single_kernel_wide_world.py).
             WORLD_SEARCH_STEPS=self.world_size.bit_length(),
-            # A final-wave return counter is published only after each return
-            # worker has fenced its earlier waves, so acquiring that counter
-            # establishes visibility for the whole return stream.
-            LAST_RETURN_ONLY=bool(
-                getattr(self, "_single_wait_last_return", True)),
             **launch_options,
         )
         self._tile_signal_epoch += 1

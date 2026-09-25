@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from tests.function.test_single_kernel_routing_metadata import (
-    Pointer, buffer, power2, production_helpers,
+    Pointer, buffer, power2, production_helpers, reset_route_inverse,
 )
 
 
@@ -28,8 +28,7 @@ def test_stable_scatter_matches_sort(experts, routes, cores, distribution):
     cursor = buffer(cores * bins, 99)
     inverse = buffer(routes, 99)
     selected_ptr = Pointer(selected)
-    for core in range(cores):
-        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    reset_route_inverse(inverse, routes)
     for core in range(cores):
         h._count_routes_by_core(core, selected_ptr, cursor,
                                routes, cores, experts, bins, 256)
@@ -80,8 +79,7 @@ def test_destination_cursor_scatter_contract(world, epr):
     inverses = []
     for rank in range(world):
         cursor, inverse = buffer(cores * bins, 99), buffer(routes, 99)
-        for core in range(cores):
-            h._reset_route_to_send(core, inverse, routes, cores, 256)
+        reset_route_inverse(inverse, routes)
         for core in range(cores):
             h._count_routes_by_core(core, Pointer(selected[rank]), cursor,
                                    routes, cores, experts, bins, 256)
@@ -133,8 +131,7 @@ def test_route_inverse_reuse_across_dropped_routes(experts, cores):
     cursor, inverse = buffer(cores * bins, 99), buffer(routes, 99)
     send, tokens = buffer(routes, -9), buffer(routes, -9)
     for selected in (valid, partial, dropped, valid[::-1].copy()):
-        for core in rng.permutation(cores):
-            h._reset_route_to_send(core, inverse, routes, cores, 256)
+        reset_route_inverse(inverse, routes)
         for core in rng.permutation(cores):
             h._count_routes_by_core(core, Pointer(selected), cursor,
                                    routes, cores, experts, bins, 256)
@@ -163,8 +160,7 @@ def test_full_kimi_shape_stable_order():
     rng = np.random.default_rng(20260922)
     selected = Pointer(rng.integers(0, experts, routes))
     cursor, inverse = buffer(cores * bins), buffer(routes)
-    for core in range(cores):
-        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    reset_route_inverse(inverse, routes)
     for core in range(cores):
         h._count_routes_by_core(core, selected, cursor, routes, cores, experts, bins, 256)
     totals = cursor.values.reshape(cores, bins).sum(0)[:experts]

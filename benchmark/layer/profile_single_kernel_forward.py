@@ -35,6 +35,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +99,10 @@ def _parse_args():
         "--benchmark-only",
         action="store_true",
         help="run correctness gates and timing without collecting profiles",
+    )
+    parser.add_argument(
+        "--record-host-intervals", action="store_true",
+        help="record each call through event completion for external device telemetry",
     )
     parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
@@ -298,6 +303,7 @@ def _worker(
     metric: str,
     benchmark_only: bool,
     config_overrides: dict,
+    record_host_intervals: bool = False,
 ):
     faulthandler.dump_traceback_later(120, repeat=True)
     if rank == 0:
@@ -444,14 +450,43 @@ def _worker(
                 if rank == 0:
                     print("[timing] correctness passed; measuring Triton then Torch", flush=True)
                 faulthandler.cancel_dump_traceback_later()
-                runner = kit.PerformanceRunner(
-                    run_candidate,
-                    run_torch_grouped,
+                host_intervals = {"candidate": [], "baseline": []}
+                last_interval = [None]
+
+                def observe_call(fn, phase):
+                    if not record_host_intervals:
+                        return fn
+
+                    def observed():
+                        interval = [time.monotonic_ns(), None]
+                        output = fn()
+                        interval[1] = time.monotonic_ns()
+                        host_intervals[phase].append(interval)
+                        last_interval[0] = interval
+                        return output
+
+                    return observed
+
+                class ObservedRunner(kit.PerformanceRunner):
+                    def _rank_max(self, value_ms):
+                        # The runner has already synchronized the end event.
+                        # Record completion outside the event-timed region and
+                        # before the rank-MAX collective; warmups have no hook.
+                        last_interval[0][1] = time.monotonic_ns()
+                        return super()._rank_max(value_ms)
+
+                runner_type = ObservedRunner if record_host_intervals else kit.PerformanceRunner
+                runner = runner_type(
+                    observe_call(run_candidate, "candidate"),
+                    observe_call(run_torch_grouped, "baseline"),
                     kit.FORWARD_TIMING,
                     device=device,
                     ep_group=ep_group,
                 )
                 candidate_result, baseline_result = runner.run()
+                if record_host_intervals:
+                    (Path(output_dir) / f"host_call_intervals_rank{rank}.json").write_text(
+                        json.dumps(host_intervals, indent=2) + "\n")
                 if rank == 0:
                     _write_benchmark_result(
                         Path(output_dir),
@@ -593,7 +628,7 @@ def _configure_rendezvous():
 
 
 def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
-                    config_overrides: dict):
+                    config_overrides: dict, record_host_intervals: bool = False):
     source_paths = (
         Path(__file__).resolve(),
         _REPO_ROOT / "src/mega_moe/ops/forward.py",
@@ -624,6 +659,7 @@ def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
         "candidate": "single_kernel",
         "baseline": "Torch-NPU grouped-GEMM + HCCL",
         "benchmark_protocol": kit.FORWARD_TIMING.as_dict(),
+        "host_interval_recording": record_host_intervals,
         "communication_init_order": "hccl_collectives_then_aclshmem",
         "config_overrides": config_overrides,
         "environment": {
@@ -697,7 +733,7 @@ if __name__ == "__main__":
         raise ValueError("visible NPU devices do not cover the selected world")
     check_npu_occupancy(args.output_dir, device_ids, phase="before_spawn")
     _write_metadata(args.output_dir, args.metric, selected_case, args.benchmark_only,
-                    config_overrides)
+                    config_overrides, args.record_host_intervals)
     context = mp.spawn(
         _worker,
         args=(
@@ -707,6 +743,7 @@ if __name__ == "__main__":
             args.metric,
             args.benchmark_only,
             config_overrides,
+            args.record_host_intervals,
         ),
         nprocs=selected_case.world_size,
         join=False,

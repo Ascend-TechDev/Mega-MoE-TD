@@ -4,9 +4,9 @@
 
 修改保持单次 launch、send/recv 布局、稳定 route 顺序、每 core 的 GEMM tile 顺序和现有 phase barrier。不改 MoonEP scatter，不增加配置开关。
 
-新增普通 GM 的紧凑 wave 任务表，并在 pipeline signal slab 尾部增加本地 return-checker epoch slots。host 分配、释放和 kernel 参数已一起更新。FC1、FC2、dispatch、return 改为消费紧凑表；reduce 前改为分片 acquire 后发布本地完成信号。所有原先的 remote return counter 仍被逐波 acquire，不使用“仅等最后 wave”的推断。
+新增普通 GM 的紧凑 wave 任务表，并在 pipeline signal slab 尾部增加本地 return-checker epoch slots。host 分配、释放和 kernel 参数已一起更新。FC1、FC2、dispatch、return 改为消费紧凑表；reduce 前改为分片 acquire 后发布本地完成信号。当前固定使用已验证的 final-wave acquire：每个 return worker 按序逐 wave fence 后发布 counter，最后一波建立此前写入的可见性，再通过本地 epoch 通知所有 reducer。2026-09-26 清理移除了旧逐波扫描回退和隐藏开关。
 
-本地没有 torch、Triton 或 NPU。Host 测试只能验证整数计算、任务/信号覆盖和调用接口，不能证明 Ascend lowering、UB 分配、跨引擎调度或通信可见性。设备编译、正确性和耗时均待 NPU 验收；README 中历史 routing 10.0 → 3.4 ms 不是本次结果。
+本文早期记录来自 host-only 阶段。后续已完成 Ascend950DT 8 卡正确性和性能验证；最新结果见 `performance/kimi-forward-cleanup-validation-2026-09-26.md`。Host 测试仍只验证整数计算、任务/信号覆盖和调用接口；README 中历史 routing 10.0 → 3.4 ms 不是本次结果。
 
 ## Routing metadata 与稳定 scatter
 
@@ -21,7 +21,7 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 - stable cursor 改为 `[cores, expert_block]` exclusive scan。
 - destination 与 wave offsets 复用 source counts 归约。
 - pull starts 改向量归约/前缀。
-- 去掉 histogram 预清零，向量化 signal counter reset；逆映射 `route_to_send=-1` 由 host 侧 `fill_` 在 fused launch 之前重置（EXP-L，设备已验证），kernel 内的 reset 循环保留但停用。
+- 去掉 histogram 预清零，向量化 signal counter reset；逆映射 `route_to_send=-1` 由 host 侧 `fill_` 在 fused launch 之前重置（EXP-L，设备已验证）。2026-09-26 已删除停用的 kernel 内 reset 函数和注释调用。
 - E≥128 的非 MoonEP scatter 使用 32-route block、32×32 两两匹配求块内序号，再用 histogram 更新块间 cursor。两个 Vector lane 各拥有互斥 expert 半区；E<128 保留原 dense 路径。
 
 完整 Kimi E=896、R=65536 时，expert-ID 扫描由 28 遍减少到两个 lane 各 1 遍。pairwise 匹配累计约 419 万元素，原 dense 匹配约 5872 万元素。新路径也有 histogram/gather/循环开销，不能把元素数比例当作加速比。128 的分支阈值未做 NPU 调优。
@@ -32,7 +32,7 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 
 设备实验由用户提供：perf 分支恢复标量 cursor、禁用 ordinal scatter 后仍失败；删除 histogram 内的 `route_to_send=-1` store 后，完整 E896 用例通过。这将融合初始化定位为回归触发点，但尚不能证明底层机制是 count/scatter 掩码不一致；源码中两个 scatter lane 的有效 expert 集合与 count 相同。
 
-当前恢复独立的 `_reset_route_to_send`，按原先的跨 core tile 分配方式，在 histogram 之前的 Vector lane0 scope 中执行；不恢复多余的 histogram 预清零，不增加 launch 或 phase barrier。单纯删除初始化不可用：scatter 不写 dropped route，重复调用会保留旧 send row，导致 combine 错误累加。初始化必须覆盖本次全部 route，每轮重置为 `-1`，由 scatter 覆盖有效项。
+历史尝试曾恢复独立的 `_reset_route_to_send`（该方案已否决并删除）；当前只保留 host 侧 `fill_`。单纯删除初始化不可用：scatter 不写 dropped route，重复调用会保留旧 send row，导致 combine 错误累加。初始化必须覆盖本次全部 route，每轮重置为 `-1`，由 scatter 覆盖有效项。
 
 完整 W8/T4K、topk16 每 rank 有 65536 个 int32 映射项，初始化写入量为 256 KiB。与融合版相比写入量不变，但恢复了独立循环的调度和地址计算；对 `zero_histogram` 段及 e2e 的实际影响待 NPU 测量。新增 host 回归覆盖同一 workspace 的“有效 → 部分 dropped → 全 dropped → 有效”，设备现有连续调用用例额外检查全 dropped 后逆映射全部为 `-1`。用户的删除实验通过不等于本次独立初始化版本已完成设备验收。
 
@@ -40,9 +40,9 @@ send_row(r) = sum(count[e'] for e' < expert[r])
 
 独立 kernel 内 reset（703d8b9）在设备上仍失败，但错误签名变化：5 个 rank 共约 2163 个超差元素（融合版约 11.3 万），最大误差 token 全部落在 0–15 —— 恰是 256-route tile 分配下 pid0 的第一个 reset tile，而 pid0 同时执行 putmem counts 发布。这支持“kernel 内 reset 的 UB 生命周期与 putmem/常量 scratch 交互”这条主线，但 IR/lowering 层根因仍未证实。
 
-当前采用 host 侧方案（1e6c948）：launch 之前在同一条 stream 上 `self._route_to_send[:num_routes].fill_(-1)`，kernel 内调用注释停用。8 卡 W8 E896 saved-fp16 精度门通过。语义不变：每次调用重置有效前缀，scatter 覆盖有效项，dropped route 保持 `-1`。
+当前采用 host 侧方案（1e6c948）：launch 之前在同一条 stream 上 `self._route_to_send[:num_routes].fill_(-1)`；旧 kernel 内函数和注释调用已在 2026-09-26 清理删除。8 卡 W8 E896 saved-fp16 精度门通过。语义不变：每次调用重置有效前缀，scatter 覆盖有效项，dropped route 保持 `-1`。
 
-注意：该构建每次 forward 多一个设备 fill 操作，**e2e 事件计时包含它，不能代表单 kernel 性能**；phase 内 SYS_CNT 段不受影响。若后续查明 kernel 内 reset 的 lowering 根因并恢复，移除 host fill 即可，host 测试约束“恰好一个 reset 机制生效”。
+注意：该构建每次 forward 多一个设备 fill 操作，**e2e 事件计时包含它，不能代表单 kernel 性能**；phase 内 SYS_CNT 段不受影响。后续若重新验证 kernel 内 reset，必须单独建立 correctness 和性能证据；当前 host 回归直接执行生产 host reset 语句，并约束 kernel 中不存在第二个 reset 机制。
 
 ## FC1 / FC2 入口：紧凑 wave 任务表
 
@@ -75,19 +75,19 @@ FC1 的 dispatch source 区间二分和就绪 wait 仍保留；本次没有增�
 
 现在由 `min(2×cores, world)` 个 checker 按 destination 分片：
 
-1. checker 逐波 acquire 自己负责的所有原始 return counters，expected ADD 数仍由原 return-unit 分配推导。
+1. checker 对每个非空 destination acquire 最后一波 return counter；每个 worker 对此前波的 fence 顺序保证可见性。expected ADD 数仍由原 return-unit 分配推导。
 2. 将 acquire token 绑定到原 signal allocation base，经 fence 后向本地 checker slot 发布当前 `signal_epoch`。
 3. 每条 reducer lane acquire 整个 checker epoch slab，所得 token 继续传给原 `consume_token(combine_buf)`。
 
-上述 W8 示例中，原 remote counters 共 acquire 168 次；随后每 lane 一次覆盖 8 个 slots 的本地 wait 调用。后端仍可能逐 slot 检查，不能把调用数减少直接当作耗时倍数。远端 FC2/return 的真实晚到延迟也不会因此消失。
+上述 W8 示例中，当前 checker 只对每个 destination acquire 最后一波 return counter，共 8 次；随后每 lane 一次覆盖 8 个 slots 的本地 wait 调用。后端仍可能逐 slot 检查，不能把调用数减少直接当作耗时倍数。远端 FC2/return 的真实晚到延迟也不会因此消失。
 
 新增 slots 接在原 activation/FC2/return slabs 后，不覆盖旧 counters。初始化 reset 同步扩容；epoch 沿用现有每次 forward 递增机制。零波 destination 的 checker 也发布完成；W>2×cores 时一个 checker 负责多个 destination。所有 dispatch 保持在 return waits 之前，避免引入跨 rank 依赖环。
 
-这条 acquire→fence/发布→acquire 接力需要 NPU 验证跨核、跨 rank 可见性及编译后的 consume-token 依赖。Host 模型只检查覆盖和协议结构，不模拟实际缓存、乱序或异步通信。
+这条 acquire→fence/发布→acquire 接力在当前单点 Ascend950DT 8 卡复验中已随完整 forward correctness 通过；Host 模型仍只检查覆盖和协议结构，不模拟实际缓存、乱序或异步通信。
 
 ## 本地验收
 
-当前修复的完整 host 回归 **391 passed**；Python 语法检查与 `git diff --check` 通过。内存中禁用 reset 的变异检查确认“有效前缀重置”和“dropped 连续调用”测试均能抓住遗漏初始化。NPU 编译、correctness 和性能未在本机运行。
+历史阶段的完整 host 回归记录为 391 passed；清理后的当前回归为 428 passed（含 JIT binding）。Python 语法检查与 git diff --check 通过；内存中禁用 reset 的变异检查确认“有效前缀重置”和“dropped 连续调用”测试均能抓住遗漏初始化。当前 Ascend950DT 8 卡单点复验已通过 correctness、occupancy 和 50+50 event 采样，详见 performance/kimi-forward-cleanup-validation-2026-09-26.md。
 
 测试直接 AST 提取生产 helpers，使用带越界、重复写和 lane 互斥检查的 NumPy shim 执行。覆盖：
 
@@ -95,7 +95,7 @@ FC1 的 dispatch source 区间二分和就绪 wait 仍保留；本次没有增�
 - 稠密旧 wave 扫描与紧凑表逐项对齐；EPR=1/4/7/14/33/112，windows=1/4/16/64，全空、热 expert、零行空洞和重复调用。
 - 任务容量上界与容量溢出不写表。
 - FC1 递增 tile 序列与原除余公式完全一致；实际 FC2 helper 的逐 core tile 顺序与旧调度一致。
-- 每个 remote return counter 恰好一个 checker acquire；所有 reducer 等待全部 checker；缺失任意早期 wave 信号时不能发布该 checker 或放行 reduce；旧 epoch 不放行。
+- 每个非空 destination 的最后一波 counter 恰好一个 checker acquire；所有 reducer 等待全部 checker；缺失最后一波信号时不能发布该 checker 或放行 reduce；旧 epoch 不放行。
 - JIT helper 参数完整绑定、未定义名称检查及 host launch 的新 workspace 参数位置检查。
 
 运行：

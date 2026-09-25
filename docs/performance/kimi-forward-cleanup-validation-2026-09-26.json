@@ -1,0 +1,775 @@
+{
+  "schema_version": 1,
+  "generated_local": "2026-09-26 Asia/Shanghai",
+  "run_artifact": "/tmp/kimi_forward_cleanup_final_20260926/full_t4k_moonep0",
+  "run_metadata": {
+    "git_commit": "7a33afb",
+    "git_status": [
+      " M benchmark/layer/compile_single_kernel_forward.py",
+      " M benchmark/layer/profile_single_kernel_forward.py",
+      " M config/_shapes.py",
+      " M src/mega_moe/kernels/fc2_combine.py",
+      " M src/mega_moe/kernels/fused_forward.py",
+      " M src/mega_moe/ops/forward.py",
+      " M tests/function/test_single_kernel_routing_metadata.py",
+      " M tests/function/test_single_kernel_stable_scatter.py",
+      " M tests/function/test_single_kernel_wave_tasks.py",
+      "?? benchmark/layer/run_kimi_forward_matrix.py",
+      "?? benchmark/layer/summarize_kimi_forward_matrix.py",
+      "?? docs/kimi-forward-optimization-handoff-2026-09-26.md",
+      "?? docs/kimi-forward-optimization-human-summary-2026-09-26.md",
+      "?? docs/performance/kimi-k3-forward-matrix-2026-09-26.json",
+      "?? docs/performance/kimi-k3-forward-matrix-2026-09-26.md"
+    ],
+    "case_id": "performance-fwd-kimi-k3-w8-t4k",
+    "world_size": 8,
+    "candidate": "single_kernel",
+    "baseline": "Torch-NPU grouped-GEMM + HCCL",
+    "benchmark_protocol": {
+      "warmup": 5,
+      "iterations": 50,
+      "clock": "npu_event",
+      "rank_reduction": "MAX"
+    },
+    "host_interval_recording": true,
+    "communication_init_order": "hccl_collectives_then_aclshmem",
+    "config_overrides": {
+      "enable_single_kernel_forward": true,
+      "enable_moonep": false,
+      "moonep_enable_replica_cache": false,
+      "single_kernel_group_windows": 16,
+      "fc1_gemm_block_size_m": 128,
+      "fc1_gemm_block_size_n": 512,
+      "fc1_gemm_block_size_k": 128,
+      "fc2_combine_block_size_m": 128,
+      "fc2_gemm_block_size_n": 512,
+      "fc2_gemm_block_size_k": 128,
+      "single_kernel_dispatch_block_size_m": 256
+    },
+    "environment": {
+      "hostname": "localhost.localdomain",
+      "python": "/home/vllm_kimiw/.venv-udma/bin/python",
+      "python_version": "3.11.10",
+      "torch": "2.10.0+cpu",
+      "torch_npu": "2.10.0.post1.dev20260528",
+      "triton_runtime": "3.6.0",
+      "triton_module": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/triton/__init__.py",
+      "triton_distributions": {
+        "triton_dist": "3.4.0",
+        "triton_ascend": "3.2.2",
+        "triton": "3.5.0"
+      },
+      "ascend_home": "/usr/local/Ascend/cann-9.2.0-beta.2",
+      "ascend_home_resolved": "/usr/local/Ascend/cann-9.2.0-beta.2",
+      "npu_compiler": {
+        "path": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-compile",
+        "resolved_path": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-compile",
+        "bishengir_opt": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-opt",
+        "device_library_sha256": {
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aic.c220.bc": "c2874f73e080ba3bf1446579fd6986b0f93bb5ff7ba1303c8d17454dbd1433dd",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aic.c310.bc": "c3684477e0f8d1ad73654d07f96e2970b64b484e64451db24916c879bbb970bf",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aiv.c220.bc": "3242ca7cc7cbc89f2cc1f42e6c2a80a555d3b6325c6c798d9a9317ee2b717a93",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aiv.c310.bc": "14a0fa5ff1e0064bcbaff017794d2a3cc040fff36ca571358b0c4e18f0dc51b7",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aic.c220.bc": "1b95e7697cf7b883d4ebcf1d4d27e4b3782cc3dc234167c1a4fda4816670fd24",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aic.c310.bc": "f18ab3ddb91b7a176b1dd10b3d92b0ba82a61b71ce8ecc18314a8bd4452382f6",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aiv.c220.bc": "cc5540862cd065949676885df6b442eb22999c3da7f7e1dce1552fdc36c9c327",
+          "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aiv.c310.bc": "3eace4007aaf3b6ae1f91c215e3041785e968e4f067e52af0af409fd0d39018c"
+        },
+        "triton_cache_dir": "/tmp/kimi_forward_cleanup_final_20260926_cache",
+        "triton_disable_ffts": "1",
+        "version": "bishengir-compile 1.2.0 (https://gitcode.com/Ascend/AscendNPU-IR.git b229bc6ccbcc 2026-09-03) \nllvm 19.1.7 3254a1b1c59d\nRelease build"
+      },
+      "communication": {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "48265",
+        "ASH_MASTER_ADDR": "127.0.0.1",
+        "ASH_MASTER_PORT": "39493",
+        "HCCL_IF_BASE_PORT": null,
+        "HCCL_SOCKET_IFNAME": null,
+        "HCCL_EXEC_TIMEOUT": null,
+        "HCCL_HOST_SOCKET_PORT_RANGE": null,
+        "HCCL_NPU_SOCKET_PORT_RANGE": "48864-48927",
+        "ASCEND_LAUNCH_BLOCKING": null
+      }
+    },
+    "profile": {
+      "enabled": false,
+      "profiler_level": "Level1",
+      "aic_metric": "pipe",
+      "activities": [
+        "CPU",
+        "NPU"
+      ],
+      "schedule": {
+        "wait": 0,
+        "warmup": 1,
+        "active": 2,
+        "repeat": 1
+      },
+      "analysis": "offline after every distributed worker finalized"
+    },
+    "source_sha256": {
+      "benchmark/layer/profile_single_kernel_forward.py": "1a954ffbf5e70617e82bd57344a1e38b0a73f2bb0e884f03702764671c72bc30",
+      "src/mega_moe/ops/forward.py": "090732e13d3af02f4ef8ef3d536f4ff38370adea9e5b73cba33bf52e93e94186",
+      "src/mega_moe/kernels/fused_forward.py": "99c78cf3063a07a2fb5031c874ff52fcdbb53c11f6aa0caef2123faa861c0bd0",
+      "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+      "benchmark/layer/_kimi_routes.py": "b09f9b2b0d4147a5599b1c9a2c6ca9aff070295f7164508652e393082b57c9d7",
+      "src/mega_moe/kernels/dispatch_fc1.py": "38a0fa56f9a46e60249077c2b9244e1ce2f012f5c9231b99d2dd25ef693d9aa6",
+      "src/mega_moe/kernels/fc2_combine.py": "497200e5ee197764b7ec90d5eca305c1f3da77da431558d1ec0e82e3597cf33b",
+      "src/mega_moe/config.py": "af39be9baa3174e37db2363244e6a54c018c33e868478cda968c1b29d0859e06",
+      "config/_shapes.py": "4a4d40e1518b913abfefe9415b2d2851f84ea5491d7a63722984b7d8562b3b0a",
+      "benchmark/layer/_grouped_forward_baseline.py": "db0f46cc57358ffcaac787fe067b6f7c2fa07c12456eb61a5ccb8cd1e8423c5c",
+      "benchmark/layer/_npu_occupancy.py": "e024d83af4e8d2542304d55034ea13f96e9abd3a504335b4c59f15f39de9454e",
+      "benchmark/layer/_pipe_profile_summary.py": "4ec440bb6ddc5b9881113780dd248a5eaa6f474c2d84d42bb11c8035ae9c531c"
+    }
+  },
+  "job": {
+    "point": "full_t4k_moonep0",
+    "case": {
+      "case_id": "performance-fwd-kimi-k3-w8-t4k",
+      "direction": "forward",
+      "model": "KIMI-K3",
+      "tokens": 4096,
+      "world_size": 8,
+      "hidden": 3584,
+      "ffn": 3072,
+      "topk": 16,
+      "num_experts": 896,
+      "tags": [
+        "forward",
+        "kimi",
+        "performance",
+        "slow"
+      ],
+      "capacity_factor": 1.25,
+      "drop_frac": 0.0,
+      "tokens_per_rank": 4096
+    },
+    "moonep": false,
+    "fc1_block": [
+      128,
+      512,
+      128
+    ],
+    "fc2_block": [
+      128,
+      512,
+      128
+    ],
+    "dispatch_block": 256,
+    "wave_windows": 16,
+    "command": [
+      "/home/vllm_kimiw/.venv-udma/bin/python",
+      "/home/vllm_kimiw/repo/MOE_Kimi-kimi-forward-perf/benchmark/layer/profile_single_kernel_forward.py",
+      "--case",
+      "performance-fwd-kimi-k3-w8-t4k",
+      "--benchmark-only",
+      "--record-host-intervals",
+      "--fc1-block",
+      "128",
+      "512",
+      "128",
+      "--fc2-block",
+      "128",
+      "512",
+      "128",
+      "--dispatch-block",
+      "256",
+      "--wave-windows",
+      "16",
+      "--output-dir",
+      "/tmp/kimi_forward_cleanup_final_20260926/full_t4k_moonep0/benchmark"
+    ]
+  },
+  "status": {
+    "point": "full_t4k_moonep0",
+    "started_utc": "2026-09-25T18:23:48.335049+00:00",
+    "command": [
+      "/home/vllm_kimiw/.venv-udma/bin/python",
+      "/home/vllm_kimiw/repo/MOE_Kimi-kimi-forward-perf/benchmark/layer/profile_single_kernel_forward.py",
+      "--case",
+      "performance-fwd-kimi-k3-w8-t4k",
+      "--benchmark-only",
+      "--record-host-intervals",
+      "--fc1-block",
+      "128",
+      "512",
+      "128",
+      "--fc2-block",
+      "128",
+      "512",
+      "128",
+      "--dispatch-block",
+      "256",
+      "--wave-windows",
+      "16",
+      "--output-dir",
+      "/tmp/kimi_forward_cleanup_final_20260926/full_t4k_moonep0/benchmark"
+    ],
+    "artifact": "/tmp/kimi_forward_cleanup_final_20260926/full_t4k_moonep0",
+    "pid": 1891776,
+    "returncode": 0,
+    "ended_utc": "2026-09-25T18:24:44.420979+00:00",
+    "duration_s": 56.085948590014596
+  },
+  "benchmark_result": {
+    "schema_version": 1,
+    "case_id": "performance-fwd-kimi-k3-w8-t4k",
+    "model": "KIMI-K3",
+    "world_size": 8,
+    "tokens_per_rank": 4096,
+    "global_tokens": 32768,
+    "shape": {
+      "hidden": 3584,
+      "ffn": 3072,
+      "topk": 16,
+      "num_experts": 896
+    },
+    "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+    "candidate": "single_kernel",
+    "baseline": "Torch-NPU grouped-GEMM + HCCL",
+    "protocol": {
+      "warmup": 5,
+      "iterations": 50,
+      "clock": "npu_event",
+      "rank_reduction": "MAX"
+    },
+    "correctness_gate": {
+      "status": "passed_before_timing",
+      "cases": [
+        "normal",
+        "zero-receive/empty-expert",
+        "negative/out-of-range all-drop"
+      ],
+      "rtol": 0.05,
+      "atol": 0.05
+    },
+    "receive_capacity_factor": 1.25,
+    "operator_config": {
+      "num_aicore_programs": 32,
+      "num_aivector_programs": 64,
+      "receive_capacity_factor": 1.25,
+      "dispatch_fc1_block_size_m": 128,
+      "fc1_gemm_block_size_n": 512,
+      "fc1_gemm_block_size_k": 128,
+      "fc2_combine_block_size_m": 128,
+      "fc2_gemm_block_size_n": 512,
+      "fc2_gemm_block_size_k": 128,
+      "activation": "swiglu",
+      "situ_beta": 1.0,
+      "situ_linear_beta": null,
+      "fc1_gemm_block_size_m": 128,
+      "enable_moonep": false,
+      "moonep_replica_gate_up_chunk_bytes": 16777216,
+      "moonep_replica_down_chunk_bytes": 4194304,
+      "moonep_replica_down_early_programs": 8,
+      "moonep_replica_down_early_descriptors_per_program": 2,
+      "moonep_fused_balanced_count": true,
+      "moonep_fused_route_mapping": true,
+      "moonep_enable_replica_cache": false,
+      "enable_single_kernel_forward": true,
+      "save_fc1_dtype": "bf16",
+      "moonep_udma_chunk_bytes": 67108864,
+      "single_kernel_group_windows": 16,
+      "single_kernel_dispatch_block_size_m": 256
+    },
+    "symmetric_heap_size_gb": 16,
+    "route_distribution": {
+      "active_global_experts": 896,
+      "routes_received_per_rank": [
+        65672,
+        65348,
+        65442,
+        65024,
+        65821,
+        65733,
+        65716,
+        65532
+      ]
+    },
+    "metrics": {
+      "single_kernel_full_e2e_ms": {
+        "min_ms": 14.11,
+        "max_ms": 15.542,
+        "mean_ms": 15.035,
+        "median_ms": 15.129
+      },
+      "torch_grouped_hccl_full_e2e_ms": {
+        "min_ms": 21.641,
+        "max_ms": 24.166,
+        "mean_ms": 21.88,
+        "median_ms": 21.74
+      }
+    },
+    "torch_over_single_kernel_median": 1.437,
+    "samples_ms": {
+      "single_kernel": [
+        14.109961,
+        14.1192,
+        14.159308,
+        14.122288,
+        14.126576,
+        14.217361,
+        14.71856,
+        14.723234,
+        14.858941,
+        15.18201,
+        15.336594,
+        15.303152,
+        15.095632,
+        15.223328,
+        14.899134,
+        15.02624,
+        15.309357,
+        15.038152,
+        15.146909,
+        15.272512,
+        15.040144,
+        15.363936,
+        15.021714,
+        14.995663,
+        15.431804,
+        15.044338,
+        15.153348,
+        15.195456,
+        15.18648,
+        15.05304,
+        15.273886,
+        15.421856,
+        15.542147,
+        15.212896,
+        15.256629,
+        14.975905,
+        15.085219,
+        15.212161,
+        15.209312,
+        15.438544,
+        14.957625,
+        15.428881,
+        15.010325,
+        15.143554,
+        15.288817,
+        15.029664,
+        15.432114,
+        14.993186,
+        15.259604,
+        15.114432
+      ],
+      "torch_grouped_hccl": [
+        22.127674,
+        22.068375,
+        22.109947,
+        22.119188,
+        22.083546,
+        21.761816,
+        21.77067,
+        21.764156,
+        22.06151,
+        22.14855,
+        21.889486,
+        21.910728,
+        21.744308,
+        21.713547,
+        21.720514,
+        21.74155,
+        21.737465,
+        21.754288,
+        21.696251,
+        21.75079,
+        21.720917,
+        21.76585,
+        21.791113,
+        21.694967,
+        21.653559,
+        21.73081,
+        21.695065,
+        21.693928,
+        21.755568,
+        21.719376,
+        21.705921,
+        24.165899,
+        21.747875,
+        21.742868,
+        21.693319,
+        21.748886,
+        21.724012,
+        21.729143,
+        21.726074,
+        21.660904,
+        21.641024,
+        21.722343,
+        21.727308,
+        21.70266,
+        21.708174,
+        21.750013,
+        21.683727,
+        21.721996,
+        21.7124,
+        24.075768
+      ]
+    },
+    "occupancy_gate": {
+      "status": "passed",
+      "log": "device_occupancy.jsonl"
+    }
+  },
+  "recomputed_metrics": {
+    "fused": {
+      "n": 50,
+      "min": 14.109961,
+      "median": 15.128993000000001,
+      "mean": 15.03522258,
+      "p95": 15.4319745,
+      "max": 15.542147
+    },
+    "torch_grouped_hccl": {
+      "n": 50,
+      "min": 21.641024,
+      "median": 21.739507500000002,
+      "mean": 21.87971652,
+      "p95": 22.1391558,
+      "max": 24.165899
+    },
+    "speedup": 1.4369434568447483
+  },
+  "telemetry": {
+    "candidate": {
+      "0": {
+        "frequency": {
+          "n": 77,
+          "min": 1400,
+          "median": 1500,
+          "mean": 1542.857142857143,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 77,
+          "min": 773.6,
+          "median": 895.8000000000001,
+          "mean": 887.0142857142857,
+          "p95": 899.74,
+          "max": 900.5
+        }
+      },
+      "1": {
+        "frequency": {
+          "n": 78,
+          "min": 1400,
+          "median": 1550.0,
+          "mean": 1541.6666666666667,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 78,
+          "min": 827.6,
+          "median": 896.25,
+          "mean": 891.7807692307692,
+          "p95": 899.645,
+          "max": 900.6
+        }
+      },
+      "2": {
+        "frequency": {
+          "n": 79,
+          "min": 1400,
+          "median": 1600,
+          "mean": 1589.240506329114,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 79,
+          "min": 823.0,
+          "median": 894.7,
+          "mean": 890.2518987341773,
+          "p95": 899.9100000000001,
+          "max": 901.2
+        }
+      },
+      "3": {
+        "frequency": {
+          "n": 79,
+          "min": 1450,
+          "median": 1650,
+          "mean": 1611.392405063291,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 79,
+          "min": 802.4000000000001,
+          "median": 892.6,
+          "mean": 885.5291139240506,
+          "p95": 899.01,
+          "max": 899.9000000000001
+        }
+      },
+      "4": {
+        "frequency": {
+          "n": 79,
+          "min": 1400,
+          "median": 1600,
+          "mean": 1588.607594936709,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 79,
+          "min": 813.4000000000001,
+          "median": 894.2,
+          "mean": 889.1949367088608,
+          "p95": 899.71,
+          "max": 900.8000000000001
+        }
+      },
+      "5": {
+        "frequency": {
+          "n": 78,
+          "min": 1400,
+          "median": 1550.0,
+          "mean": 1539.7435897435898,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 78,
+          "min": 828.0,
+          "median": 896.5500000000001,
+          "mean": 892.5179487179488,
+          "p95": 899.945,
+          "max": 901.3000000000001
+        }
+      },
+      "6": {
+        "frequency": {
+          "n": 78,
+          "min": 1400,
+          "median": 1650.0,
+          "mean": 1603.2051282051282,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 78,
+          "min": 804.6,
+          "median": 893.0,
+          "mean": 887.1294871794872,
+          "p95": 899.63,
+          "max": 901.1
+        }
+      },
+      "7": {
+        "frequency": {
+          "n": 76,
+          "min": 1450,
+          "median": 1650.0,
+          "mean": 1620.3947368421052,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 76,
+          "min": 796.1,
+          "median": 890.6,
+          "mean": 884.5578947368422,
+          "p95": 898.55,
+          "max": 899.5
+        }
+      }
+    },
+    "baseline": {
+      "0": {
+        "frequency": {
+          "n": 112,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 112,
+          "min": 798.3000000000001,
+          "median": 817.1,
+          "mean": 817.3946428571429,
+          "p95": 833.54,
+          "max": 845.7
+        }
+      },
+      "1": {
+        "frequency": {
+          "n": 110,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 110,
+          "min": 796.7,
+          "median": 815.45,
+          "mean": 816.3136363636364,
+          "p95": 833.985,
+          "max": 843.4000000000001
+        }
+      },
+      "2": {
+        "frequency": {
+          "n": 110,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 110,
+          "min": 783.1,
+          "median": 806.9000000000001,
+          "mean": 808.01,
+          "p95": 826.94,
+          "max": 845.9000000000001
+        }
+      },
+      "3": {
+        "frequency": {
+          "n": 110,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 110,
+          "min": 775.9000000000001,
+          "median": 797.1,
+          "mean": 797.4618181818182,
+          "p95": 811.6650000000001,
+          "max": 820.5
+        }
+      },
+      "4": {
+        "frequency": {
+          "n": 110,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 110,
+          "min": 784.6,
+          "median": 803.5,
+          "mean": 805.3900000000001,
+          "p95": 825.275,
+          "max": 849.5
+        }
+      },
+      "5": {
+        "frequency": {
+          "n": 109,
+          "min": 1650,
+          "median": 1650,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 109,
+          "min": 792.8000000000001,
+          "median": 811.9000000000001,
+          "mean": 811.7431192660551,
+          "p95": 822.1800000000001,
+          "max": 841.4000000000001
+        }
+      },
+      "6": {
+        "frequency": {
+          "n": 108,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 108,
+          "min": 791.9000000000001,
+          "median": 807.2,
+          "mean": 809.0907407407408,
+          "p95": 830.2950000000001,
+          "max": 839.6
+        }
+      },
+      "7": {
+        "frequency": {
+          "n": 108,
+          "min": 1650,
+          "median": 1650.0,
+          "mean": 1650,
+          "p95": 1650.0,
+          "max": 1650
+        },
+        "power": {
+          "n": 108,
+          "min": 777.6,
+          "median": 793.85,
+          "mean": 795.5046296296297,
+          "p95": 813.955,
+          "max": 829.8000000000001
+        }
+      }
+    }
+  },
+  "current_source_sha256": {
+    "src/mega_moe/kernels/fused_forward.py": "99c78cf3063a07a2fb5031c874ff52fcdbb53c11f6aa0caef2123faa861c0bd0",
+    "src/mega_moe/kernels/fc2_combine.py": "497200e5ee197764b7ec90d5eca305c1f3da77da431558d1ec0e82e3597cf33b",
+    "src/mega_moe/ops/forward.py": "090732e13d3af02f4ef8ef3d536f4ff38370adea9e5b73cba33bf52e93e94186",
+    "benchmark/layer/compile_single_kernel_forward.py": "4f2d39cbc9aea6c7b43d56ff6bac43f65f2a0172e1655b5d8e65f30dc58b9cad",
+    "benchmark/layer/profile_single_kernel_forward.py": "1a954ffbf5e70617e82bd57344a1e38b0a73f2bb0e884f03702764671c72bc30",
+    "config/_shapes.py": "4a4d40e1518b913abfefe9415b2d2851f84ea5491d7a63722984b7d8562b3b0a"
+  },
+  "validation": {
+    "correctness": {
+      "status": "passed_before_timing",
+      "cases": [
+        "normal",
+        "zero-receive/empty-expert",
+        "negative/out-of-range all-drop"
+      ],
+      "rtol": 0.05,
+      "atol": 0.05
+    },
+    "occupancy": {
+      "status": "passed",
+      "log": "device_occupancy.jsonl"
+    },
+    "host_jit_regression": "428 passed, 14 deprecation warnings",
+    "python_compile": "passed",
+    "git_diff_check": "passed",
+    "scope": "cleanup plus final single-point validation; not a replacement for the 9/12 historical matrix"
+  },
+  "cleanup": {
+    "removed": [
+      "dead kernel-side _reset_route_to_send JIT helper and commented launch",
+      "LAST_RETURN_ONLY constexpr, hidden host override, and unreachable all-wave wait fallback",
+      "FC2_V1_HOST_ITEM_TABLE environment branch, host item-table builder, and duplicate wrapper"
+    ],
+    "preserved": [
+      "host inverse-route fill required for dropped-route correctness",
+      "MoonEP UDMA migration and supported saved/FP8/FP16 paths",
+      "SYS_CNT and benchmark telemetry tooling"
+    ]
+  },
+  "remaining_issues": [
+    "full_t4k_moonep1/full_t8k_moonep1/full_t16k_moonep1 remain missing; original runs exceeded 900 s during backend compile before correctness/timing",
+    "historical 9/12 matrix still does not establish full+MoonEP E896 speedup or 1.6x target",
+    "saved-FC1 large-tile compile limits remain a known scope limitation",
+    "kernel-internal reset lowering mechanism is not fully proven; host reset is the verified production path"
+  ]
+}
