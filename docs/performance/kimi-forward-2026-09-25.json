@@ -11909,5 +11909,2629 @@
       "production_integrated": false,
       "decision": "No demonstrated end-to-end or power benefit"
     }
-  ]
+  ],
+  "continued_tile_and_wave_experiments": {
+    "local_fc1_small_m": [
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube",
+          "limit_auto_multi_buffer_of_local_buffer": "no-l0c"
+        },
+        "block": [
+          128,
+          512,
+          128
+        ],
+        "allow_l0c": false,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 7.741658449172974,
+        "samples_ms": [
+          7.715349197387695,
+          7.775381088256836,
+          7.751731872558594,
+          7.745573997497559,
+          7.742412090301514,
+          7.741262912750244,
+          7.73995304107666,
+          7.739924907684326,
+          7.737059116363525,
+          7.735978126525879,
+          7.742682933807373,
+          7.7374701499938965,
+          7.742053985595703,
+          7.736249923706055,
+          7.73851203918457,
+          7.7388200759887695,
+          7.921316146850586,
+          8.439652442932129,
+          8.498047828674316,
+          8.529505729675293
+        ],
+        "kernel_hash": "554fe51efe57a3dc35908d07037ac8b647c884dc453bdfef603eab87bf2a6d07"
+      },
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube",
+          "limit_auto_multi_buffer_of_local_buffer": "no-l0c"
+        },
+        "block": [
+          64,
+          512,
+          128
+        ],
+        "allow_l0c": false,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 12.422461032867432,
+        "samples_ms": [
+          12.061644554138184,
+          12.049221992492676,
+          12.044166564941406,
+          12.044553756713867,
+          12.052156448364258,
+          12.045781135559082,
+          12.027020454406738,
+          12.046086311340332,
+          12.04975700378418,
+          12.407387733459473,
+          12.886795997619629,
+          12.91777229309082,
+          12.43753433227539,
+          12.774431228637695,
+          12.891362190246582,
+          12.87724781036377,
+          12.881553649902344,
+          12.891571044921875,
+          12.888409614562988,
+          12.884709358215332
+        ],
+        "kernel_hash": "b6559ba62b39af9d7ac90f4f62a7817645205ff703415d6aceaa03fb7b51856d"
+      },
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube"
+        },
+        "block": [
+          64,
+          512,
+          128
+        ],
+        "allow_l0c": true,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 12.714454174041748,
+        "samples_ms": [
+          12.047514915466309,
+          12.047647476196289,
+          12.04651927947998,
+          12.04047679901123,
+          12.035280227661133,
+          12.039034843444824,
+          12.042993545532227,
+          12.042739868164062,
+          12.040603637695312,
+          12.552109718322754,
+          12.92249870300293,
+          12.876798629760742,
+          12.896883964538574,
+          12.896360397338867,
+          12.878702163696289,
+          12.881633758544922,
+          12.92197036743164,
+          12.880927085876465,
+          12.9093599319458,
+          12.907700538635254
+        ],
+        "kernel_hash": "840ce10148aa053896534beaadbf5dc98845aa4bedcb1329d4e94f935da81915"
+      },
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube"
+        },
+        "block": [
+          64,
+          256,
+          128
+        ],
+        "allow_l0c": true,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 15.025360584259033,
+        "samples_ms": [
+          15.025099754333496,
+          15.019682884216309,
+          15.02562141418457,
+          15.000505447387695,
+          15.015885353088379,
+          15.013049125671387,
+          15.007134437561035,
+          15.011083602905273,
+          15.018268585205078,
+          15.001712799072266,
+          15.000618934631348,
+          15.246726989746094,
+          15.41065788269043,
+          15.389555931091309,
+          15.435606002807617,
+          15.443353652954102,
+          15.394777297973633,
+          15.438638687133789,
+          15.17452335357666,
+          15.381648063659668
+        ],
+        "kernel_hash": "b4af0766dd5f9bbbb579da4878b4460afd43399b427accab824ab975d7bad863"
+      },
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube"
+        },
+        "block": [
+          128,
+          256,
+          128
+        ],
+        "allow_l0c": true,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 9.160301208496094,
+        "samples_ms": [
+          9.163252830505371,
+          9.159249305725098,
+          9.1609525680542,
+          9.159649848937988,
+          9.144551277160645,
+          9.16357707977295,
+          9.162087440490723,
+          9.150785446166992,
+          9.159181594848633,
+          9.155484199523926,
+          9.154855728149414,
+          9.150371551513672,
+          9.159461975097656,
+          9.153759956359863,
+          9.163896560668945,
+          9.407125473022461,
+          9.732812881469727,
+          9.727558135986328,
+          9.726799011230469,
+          9.726404190063477
+        ],
+        "kernel_hash": "783f49e018ea7c4d91e636f34e1d6686fc58102be53a877fa77a3ff50bf679a2"
+      },
+      {
+        "rows_per_expert": 585,
+        "experts": 112,
+        "options": {
+          "has_auto_blockify_blacklist_op": false,
+          "enable_dynamic_cv_pipeline": false,
+          "enable_mixed_cv": true,
+          "disable_auto_inject_block_sync": true,
+          "set_workspace_multibuffer": 0,
+          "limit_auto_multi_buffer_buffer": "only-cube"
+        },
+        "block": [
+          64,
+          512,
+          256
+        ],
+        "allow_l0c": true,
+        "correctness": [
+          {
+            "expert": 0,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          },
+          {
+            "expert": 56,
+            "bad": 0,
+            "max_abs": 0.000244140625
+          },
+          {
+            "expert": 111,
+            "bad": 0,
+            "max_abs": 0.0001220703125
+          }
+        ],
+        "median_ms": 19.484570503234863,
+        "samples_ms": [
+          19.47104263305664,
+          19.48008155822754,
+          19.494415283203125,
+          19.480690002441406,
+          19.473709106445312,
+          19.47550392150879,
+          19.492778778076172,
+          19.490516662597656,
+          19.486982345581055,
+          19.486621856689453,
+          19.480920791625977,
+          19.486108779907227,
+          19.49494171142578,
+          19.480260848999023,
+          19.479473114013672,
+          19.48402976989746,
+          19.478609085083008,
+          19.496715545654297,
+          19.493520736694336,
+          19.485111236572266
+        ],
+        "kernel_hash": "73c1eb3e2e8c3cf1eb65dd051c289279c72f51105d3450b8dbd315ab1c66d8b0"
+      }
+    ],
+    "explicit_accumulator": {
+      "rows_per_expert": 585,
+      "experts": 112,
+      "options": {
+        "has_auto_blockify_blacklist_op": false,
+        "enable_dynamic_cv_pipeline": false,
+        "enable_mixed_cv": true,
+        "disable_auto_inject_block_sync": true,
+        "set_workspace_multibuffer": 0,
+        "limit_auto_multi_buffer_buffer": "only-cube",
+        "limit_auto_multi_buffer_of_local_buffer": "no-l0c"
+      },
+      "correctness": [
+        {
+          "expert": 0,
+          "bad": 0,
+          "max_abs": 0.0001220703125
+        },
+        {
+          "expert": 56,
+          "bad": 0,
+          "max_abs": 0.000244140625
+        },
+        {
+          "expert": 111,
+          "bad": 0,
+          "max_abs": 0.0001220703125
+        }
+      ],
+      "median_ms": 7.741386651992798,
+      "samples_ms": [
+        7.718448162078857,
+        7.7688069343566895,
+        7.747721195220947,
+        7.74417781829834,
+        7.743034839630127,
+        7.741380214691162,
+        7.741393089294434,
+        7.734532833099365,
+        7.739643096923828,
+        7.742586135864258,
+        7.7369890213012695,
+        7.735692977905273,
+        7.7376179695129395,
+        7.739974021911621,
+        7.734454154968262,
+        7.737144947052002,
+        7.894330978393555,
+        8.39636516571045,
+        8.490299224853516,
+        8.485520362854004
+      ],
+      "kernel_hash": "8344dae83b7403727a0f6ff5173201baa6c977796ede0e08f60c2d0878c9d994"
+    },
+    "wave_windows": [
+      {
+        "windows": 32,
+        "benchmark": {
+          "schema_version": 1,
+          "case_id": "performance-fwd-kimi-k3-w8-t4k",
+          "model": "KIMI-K3",
+          "world_size": 8,
+          "tokens_per_rank": 4096,
+          "global_tokens": 32768,
+          "shape": {
+            "hidden": 3584,
+            "ffn": 3072,
+            "topk": 16,
+            "num_experts": 896
+          },
+          "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+          "candidate": "single_kernel",
+          "baseline": "Torch-NPU grouped-GEMM + HCCL",
+          "protocol": {
+            "warmup": 5,
+            "iterations": 50,
+            "clock": "npu_event",
+            "rank_reduction": "MAX"
+          },
+          "correctness_gate": {
+            "status": "passed_before_timing",
+            "cases": [
+              "normal",
+              "zero-receive/empty-expert",
+              "negative/out-of-range all-drop"
+            ],
+            "rtol": 0.05,
+            "atol": 0.05
+          },
+          "receive_capacity_factor": 1.25,
+          "operator_config": {
+            "num_aicore_programs": 32,
+            "num_aivector_programs": 64,
+            "receive_capacity_factor": 1.25,
+            "dispatch_fc1_block_size_m": 128,
+            "fc1_gemm_block_size_n": 512,
+            "fc1_gemm_block_size_k": 128,
+            "fc2_combine_block_size_m": 128,
+            "fc2_gemm_block_size_n": 512,
+            "fc2_gemm_block_size_k": 128,
+            "activation": "swiglu",
+            "situ_beta": 1.0,
+            "situ_linear_beta": null,
+            "fc1_gemm_block_size_m": 128,
+            "enable_moonep": false,
+            "moonep_replica_gate_up_chunk_bytes": 16777216,
+            "moonep_replica_down_chunk_bytes": 4194304,
+            "moonep_replica_down_early_programs": 8,
+            "moonep_replica_down_early_descriptors_per_program": 2,
+            "moonep_fused_balanced_count": true,
+            "moonep_fused_route_mapping": true,
+            "moonep_enable_replica_cache": false,
+            "enable_single_kernel_forward": true,
+            "save_fc1_dtype": "bf16",
+            "moonep_udma_chunk_bytes": 67108864,
+            "single_kernel_group_windows": 32,
+            "single_kernel_dispatch_block_size_m": 256
+          },
+          "symmetric_heap_size_gb": 16,
+          "route_distribution": {
+            "active_global_experts": 896,
+            "routes_received_per_rank": [
+              65672,
+              65348,
+              65442,
+              65024,
+              65821,
+              65733,
+              65716,
+              65532
+            ]
+          },
+          "metrics": {
+            "single_kernel_full_e2e_ms": {
+              "min_ms": 13.921,
+              "max_ms": 16.244,
+              "mean_ms": 15.26,
+              "median_ms": 15.388
+            },
+            "torch_grouped_hccl_full_e2e_ms": {
+              "min_ms": 21.617,
+              "max_ms": 22.878,
+              "mean_ms": 21.815,
+              "median_ms": 21.737
+            }
+          },
+          "torch_over_single_kernel_median": 1.413,
+          "samples_ms": {
+            "single_kernel": [
+              14.313095,
+              13.962972,
+              13.920507,
+              14.457968,
+              14.301408,
+              14.428816,
+              14.639471,
+              15.507664,
+              15.306654,
+              15.171737,
+              15.27768,
+              15.326511,
+              15.192863,
+              15.375985,
+              15.034048,
+              15.523136,
+              15.522645,
+              15.41517,
+              16.010374,
+              15.245743,
+              15.492687,
+              15.368734,
+              15.293295,
+              15.632064,
+              15.033187,
+              15.42973,
+              15.510271,
+              15.78,
+              15.969986,
+              14.671534,
+              15.419019,
+              15.400752,
+              15.567854,
+              15.421078,
+              14.744084,
+              15.474336,
+              15.553473,
+              15.079776,
+              15.493296,
+              15.434736,
+              15.62606,
+              16.244032,
+              15.461246,
+              15.421456,
+              15.312752,
+              15.197599,
+              16.041904,
+              15.215361,
+              15.80019,
+              14.987813
+            ],
+            "torch_grouped_hccl": [
+              21.730736,
+              21.734257,
+              21.848274,
+              21.76425,
+              21.737204,
+              21.755127,
+              21.911711,
+              21.690269,
+              21.688658,
+              21.735516,
+              21.737141,
+              21.909954,
+              22.013969,
+              21.981337,
+              22.040403,
+              21.959917,
+              21.95657,
+              22.87817,
+              21.998268,
+              21.996166,
+              21.968981,
+              21.96979,
+              21.965096,
+              22.444653,
+              21.770897,
+              21.668547,
+              21.69227,
+              21.678307,
+              21.694279,
+              21.771912,
+              21.725985,
+              21.664286,
+              21.807081,
+              21.648783,
+              21.760298,
+              21.666979,
+              21.721584,
+              21.73011,
+              21.658461,
+              21.754856,
+              21.616552,
+              21.652847,
+              21.744755,
+              21.658726,
+              21.699867,
+              21.872442,
+              21.659676,
+              21.654104,
+              21.675064,
+              21.671661
+            ]
+          },
+          "occupancy_gate": {
+            "status": "passed",
+            "log": "device_occupancy.jsonl"
+          }
+        },
+        "frequency": {
+          "artifact": "/tmp/kimi_forward_perf/final_wave_windows_32",
+          "case": "performance-fwd-kimi-k3-w8-t4k",
+          "config": {
+            "num_aicore_programs": 32,
+            "num_aivector_programs": 64,
+            "receive_capacity_factor": 1.25,
+            "dispatch_fc1_block_size_m": 128,
+            "fc1_gemm_block_size_n": 512,
+            "fc1_gemm_block_size_k": 128,
+            "fc2_combine_block_size_m": 128,
+            "fc2_gemm_block_size_n": 512,
+            "fc2_gemm_block_size_k": 128,
+            "activation": "swiglu",
+            "situ_beta": 1.0,
+            "situ_linear_beta": null,
+            "fc1_gemm_block_size_m": 128,
+            "enable_moonep": false,
+            "moonep_replica_gate_up_chunk_bytes": 16777216,
+            "moonep_replica_down_chunk_bytes": 4194304,
+            "moonep_replica_down_early_programs": 8,
+            "moonep_replica_down_early_descriptors_per_program": 2,
+            "moonep_fused_balanced_count": true,
+            "moonep_fused_route_mapping": true,
+            "moonep_enable_replica_cache": false,
+            "enable_single_kernel_forward": true,
+            "save_fc1_dtype": "bf16",
+            "moonep_udma_chunk_bytes": 67108864,
+            "single_kernel_group_windows": 32,
+            "single_kernel_dispatch_block_size_m": 256
+          },
+          "benchmark_metrics": {
+            "single_kernel_full_e2e_ms": {
+              "min_ms": 13.921,
+              "max_ms": 16.244,
+              "mean_ms": 15.26,
+              "median_ms": 15.388
+            },
+            "torch_grouped_hccl_full_e2e_ms": {
+              "min_ms": 21.617,
+              "max_ms": 22.878,
+              "mean_ms": 21.815,
+              "median_ms": 21.737
+            }
+          },
+          "speedup": 1.413,
+          "correctness": {
+            "status": "passed_before_timing",
+            "cases": [
+              "normal",
+              "zero-receive/empty-expert",
+              "negative/out-of-range all-drop"
+            ],
+            "rtol": 0.05,
+            "atol": 0.05
+          },
+          "phases": {
+            "candidate": {
+              "ranks": [
+                {
+                  "rank": 0,
+                  "frequency_histogram": {
+                    "1400": 2,
+                    "1450": 4,
+                    "1500": 2,
+                    "1550": 6,
+                    "1600": 10,
+                    "1650": 16
+                  },
+                  "power_median_w": 892.1,
+                  "power_max_w": 901.1
+                },
+                {
+                  "rank": 1,
+                  "frequency_histogram": {
+                    "1350": 3,
+                    "1400": 5,
+                    "1450": 5,
+                    "1500": 11,
+                    "1550": 5,
+                    "1600": 1,
+                    "1650": 10
+                  },
+                  "power_median_w": 896.25,
+                  "power_max_w": 900.6
+                },
+                {
+                  "rank": 2,
+                  "frequency_histogram": {
+                    "1400": 1,
+                    "1450": 3,
+                    "1500": 3,
+                    "1550": 6,
+                    "1600": 6,
+                    "1650": 21
+                  },
+                  "power_median_w": 892.9000000000001,
+                  "power_max_w": 900.6
+                },
+                {
+                  "rank": 3,
+                  "frequency_histogram": {
+                    "1450": 4,
+                    "1500": 1,
+                    "1550": 6,
+                    "1600": 7,
+                    "1650": 22
+                  },
+                  "power_median_w": 890.5,
+                  "power_max_w": 899.7
+                },
+                {
+                  "rank": 4,
+                  "frequency_histogram": {
+                    "1450": 2,
+                    "1500": 2,
+                    "1550": 3,
+                    "1600": 2,
+                    "1650": 31
+                  },
+                  "power_median_w": 887.2,
+                  "power_max_w": 899.9000000000001
+                },
+                {
+                  "rank": 5,
+                  "frequency_histogram": {
+                    "1250": 1,
+                    "1350": 4,
+                    "1400": 6,
+                    "1450": 7,
+                    "1500": 9,
+                    "1550": 5,
+                    "1600": 1,
+                    "1650": 7
+                  },
+                  "power_median_w": 898.45,
+                  "power_max_w": 901.2
+                },
+                {
+                  "rank": 6,
+                  "frequency_histogram": {
+                    "1400": 2,
+                    "1450": 6,
+                    "1500": 6,
+                    "1550": 7,
+                    "1600": 3,
+                    "1650": 16
+                  },
+                  "power_median_w": 894.6500000000001,
+                  "power_max_w": 900.4000000000001
+                },
+                {
+                  "rank": 7,
+                  "frequency_histogram": {
+                    "1450": 3,
+                    "1500": 5,
+                    "1550": 3,
+                    "1600": 6,
+                    "1650": 23
+                  },
+                  "power_median_w": 891.1500000000001,
+                  "power_max_w": 899.8000000000001
+                }
+              ],
+              "all_frequency_histogram": {
+                "1250": 1,
+                "1350": 7,
+                "1400": 16,
+                "1450": 34,
+                "1500": 39,
+                "1550": 41,
+                "1600": 36,
+                "1650": 146
+              },
+              "active_frequency_median_mhz": 1600.0,
+              "power_median_w": 893.2,
+              "power_max_w": 901.2
+            },
+            "baseline": {
+              "ranks": [
+                {
+                  "rank": 0,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 824.3,
+                  "power_max_w": 854.4000000000001
+                },
+                {
+                  "rank": 1,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 828.6,
+                  "power_max_w": 854.0
+                },
+                {
+                  "rank": 2,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 818.6,
+                  "power_max_w": 847.0
+                },
+                {
+                  "rank": 3,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 807.2,
+                  "power_max_w": 839.1
+                },
+                {
+                  "rank": 4,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 812.1500000000001,
+                  "power_max_w": 848.6
+                },
+                {
+                  "rank": 5,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 829.6500000000001,
+                  "power_max_w": 853.1
+                },
+                {
+                  "rank": 6,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 817.6500000000001,
+                  "power_max_w": 847.4000000000001
+                },
+                {
+                  "rank": 7,
+                  "frequency_histogram": {
+                    "1650": 56
+                  },
+                  "power_median_w": 797.7,
+                  "power_max_w": 826.8000000000001
+                }
+              ],
+              "all_frequency_histogram": {
+                "1650": 448
+              },
+              "active_frequency_median_mhz": 1650.0,
+              "power_median_w": 819.05,
+              "power_max_w": 854.4000000000001
+            }
+          }
+        }
+      },
+      {
+        "windows": 64,
+        "benchmark": {
+          "schema_version": 1,
+          "case_id": "performance-fwd-kimi-k3-w8-t4k",
+          "model": "KIMI-K3",
+          "world_size": 8,
+          "tokens_per_rank": 4096,
+          "global_tokens": 32768,
+          "shape": {
+            "hidden": 3584,
+            "ffn": 3072,
+            "topk": 16,
+            "num_experts": 896
+          },
+          "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+          "candidate": "single_kernel",
+          "baseline": "Torch-NPU grouped-GEMM + HCCL",
+          "protocol": {
+            "warmup": 5,
+            "iterations": 50,
+            "clock": "npu_event",
+            "rank_reduction": "MAX"
+          },
+          "correctness_gate": {
+            "status": "passed_before_timing",
+            "cases": [
+              "normal",
+              "zero-receive/empty-expert",
+              "negative/out-of-range all-drop"
+            ],
+            "rtol": 0.05,
+            "atol": 0.05
+          },
+          "receive_capacity_factor": 1.25,
+          "operator_config": {
+            "num_aicore_programs": 32,
+            "num_aivector_programs": 64,
+            "receive_capacity_factor": 1.25,
+            "dispatch_fc1_block_size_m": 128,
+            "fc1_gemm_block_size_n": 512,
+            "fc1_gemm_block_size_k": 128,
+            "fc2_combine_block_size_m": 128,
+            "fc2_gemm_block_size_n": 512,
+            "fc2_gemm_block_size_k": 128,
+            "activation": "swiglu",
+            "situ_beta": 1.0,
+            "situ_linear_beta": null,
+            "fc1_gemm_block_size_m": 128,
+            "enable_moonep": false,
+            "moonep_replica_gate_up_chunk_bytes": 16777216,
+            "moonep_replica_down_chunk_bytes": 4194304,
+            "moonep_replica_down_early_programs": 8,
+            "moonep_replica_down_early_descriptors_per_program": 2,
+            "moonep_fused_balanced_count": true,
+            "moonep_fused_route_mapping": true,
+            "moonep_enable_replica_cache": false,
+            "enable_single_kernel_forward": true,
+            "save_fc1_dtype": "bf16",
+            "moonep_udma_chunk_bytes": 67108864,
+            "single_kernel_group_windows": 64,
+            "single_kernel_dispatch_block_size_m": 256
+          },
+          "symmetric_heap_size_gb": 16,
+          "route_distribution": {
+            "active_global_experts": 896,
+            "routes_received_per_rank": [
+              65672,
+              65348,
+              65442,
+              65024,
+              65821,
+              65733,
+              65716,
+              65532
+            ]
+          },
+          "metrics": {
+            "single_kernel_full_e2e_ms": {
+              "min_ms": 14.834,
+              "max_ms": 16.761,
+              "mean_ms": 15.769,
+              "median_ms": 15.816
+            },
+            "torch_grouped_hccl_full_e2e_ms": {
+              "min_ms": 21.59,
+              "max_ms": 22.659,
+              "mean_ms": 21.73,
+              "median_ms": 21.704
+            }
+          },
+          "torch_over_single_kernel_median": 1.372,
+          "samples_ms": {
+            "single_kernel": [
+              14.838616,
+              14.833845,
+              14.940279,
+              14.931438,
+              14.861648,
+              15.217647,
+              15.685024,
+              15.821105,
+              15.725869,
+              15.458067,
+              15.676428,
+              15.902156,
+              15.839105,
+              15.403216,
+              15.853951,
+              15.783569,
+              16.170115,
+              15.639017,
+              15.931823,
+              15.980385,
+              15.310239,
+              15.681807,
+              15.934992,
+              15.835825,
+              15.809949,
+              16.425331,
+              16.122593,
+              15.891968,
+              15.930385,
+              15.636464,
+              15.715712,
+              15.999713,
+              15.714429,
+              15.663277,
+              16.100342,
+              15.799616,
+              15.989504,
+              16.18696,
+              15.518048,
+              15.783743,
+              16.761036,
+              16.160507,
+              16.103971,
+              15.96952,
+              16.189137,
+              16.036079,
+              16.284159,
+              15.516864,
+              15.714159,
+              16.17832
+            ],
+            "torch_grouped_hccl": [
+              21.747375,
+              21.75091,
+              21.702753,
+              21.830889,
+              21.758057,
+              21.709145,
+              21.738953,
+              21.738827,
+              21.59993,
+              21.700218,
+              21.703838,
+              21.69504,
+              21.705624,
+              21.734564,
+              21.739685,
+              21.714426,
+              21.723747,
+              21.719973,
+              21.75342,
+              21.650915,
+              21.715631,
+              21.663523,
+              21.703411,
+              21.70768,
+              21.612347,
+              21.666435,
+              21.66147,
+              21.655928,
+              21.675903,
+              21.683752,
+              21.646551,
+              21.74102,
+              21.69171,
+              21.694412,
+              21.689194,
+              21.651655,
+              22.659006,
+              21.658302,
+              21.655182,
+              21.700748,
+              21.590443,
+              21.699593,
+              22.163298,
+              21.658888,
+              21.74144,
+              21.677048,
+              21.761086,
+              21.751198,
+              21.721643,
+              21.75923
+            ]
+          },
+          "occupancy_gate": {
+            "status": "passed",
+            "log": "device_occupancy.jsonl"
+          }
+        },
+        "frequency": {
+          "artifact": "/tmp/kimi_forward_perf/final_wave_windows_64",
+          "case": "performance-fwd-kimi-k3-w8-t4k",
+          "config": {
+            "num_aicore_programs": 32,
+            "num_aivector_programs": 64,
+            "receive_capacity_factor": 1.25,
+            "dispatch_fc1_block_size_m": 128,
+            "fc1_gemm_block_size_n": 512,
+            "fc1_gemm_block_size_k": 128,
+            "fc2_combine_block_size_m": 128,
+            "fc2_gemm_block_size_n": 512,
+            "fc2_gemm_block_size_k": 128,
+            "activation": "swiglu",
+            "situ_beta": 1.0,
+            "situ_linear_beta": null,
+            "fc1_gemm_block_size_m": 128,
+            "enable_moonep": false,
+            "moonep_replica_gate_up_chunk_bytes": 16777216,
+            "moonep_replica_down_chunk_bytes": 4194304,
+            "moonep_replica_down_early_programs": 8,
+            "moonep_replica_down_early_descriptors_per_program": 2,
+            "moonep_fused_balanced_count": true,
+            "moonep_fused_route_mapping": true,
+            "moonep_enable_replica_cache": false,
+            "enable_single_kernel_forward": true,
+            "save_fc1_dtype": "bf16",
+            "moonep_udma_chunk_bytes": 67108864,
+            "single_kernel_group_windows": 64,
+            "single_kernel_dispatch_block_size_m": 256
+          },
+          "benchmark_metrics": {
+            "single_kernel_full_e2e_ms": {
+              "min_ms": 14.834,
+              "max_ms": 16.761,
+              "mean_ms": 15.769,
+              "median_ms": 15.816
+            },
+            "torch_grouped_hccl_full_e2e_ms": {
+              "min_ms": 21.59,
+              "max_ms": 22.659,
+              "mean_ms": 21.73,
+              "median_ms": 21.704
+            }
+          },
+          "speedup": 1.372,
+          "correctness": {
+            "status": "passed_before_timing",
+            "cases": [
+              "normal",
+              "zero-receive/empty-expert",
+              "negative/out-of-range all-drop"
+            ],
+            "rtol": 0.05,
+            "atol": 0.05
+          },
+          "phases": {
+            "candidate": {
+              "ranks": [
+                {
+                  "rank": 0,
+                  "frequency_histogram": {
+                    "1350": 1,
+                    "1400": 2,
+                    "1450": 4,
+                    "1500": 8,
+                    "1550": 4,
+                    "1600": 5,
+                    "1650": 17
+                  },
+                  "power_median_w": 893.5,
+                  "power_max_w": 899.8000000000001
+                },
+                {
+                  "rank": 1,
+                  "frequency_histogram": {
+                    "1300": 2,
+                    "1350": 11,
+                    "1400": 3,
+                    "1450": 5,
+                    "1500": 5,
+                    "1550": 4,
+                    "1600": 2,
+                    "1650": 9
+                  },
+                  "power_median_w": 897.3000000000001,
+                  "power_max_w": 901.0
+                },
+                {
+                  "rank": 2,
+                  "frequency_histogram": {
+                    "1400": 1,
+                    "1450": 1,
+                    "1500": 4,
+                    "1550": 2,
+                    "1600": 3,
+                    "1650": 30
+                  },
+                  "power_median_w": 891.4000000000001,
+                  "power_max_w": 899.1
+                },
+                {
+                  "rank": 3,
+                  "frequency_histogram": {
+                    "1500": 2,
+                    "1550": 2,
+                    "1600": 5,
+                    "1650": 32
+                  },
+                  "power_median_w": 888.7,
+                  "power_max_w": 896.4000000000001
+                },
+                {
+                  "rank": 4,
+                  "frequency_histogram": {
+                    "1400": 2,
+                    "1450": 2,
+                    "1500": 5,
+                    "1550": 7,
+                    "1600": 5,
+                    "1650": 20
+                  },
+                  "power_median_w": 892.0,
+                  "power_max_w": 900.6
+                },
+                {
+                  "rank": 5,
+                  "frequency_histogram": {
+                    "1350": 2,
+                    "1400": 1,
+                    "1450": 3,
+                    "1500": 10,
+                    "1550": 6,
+                    "1600": 5,
+                    "1650": 14
+                  },
+                  "power_median_w": 895.4000000000001,
+                  "power_max_w": 900.3000000000001
+                },
+                {
+                  "rank": 6,
+                  "frequency_histogram": {
+                    "1400": 2,
+                    "1450": 3,
+                    "1500": 5,
+                    "1550": 4,
+                    "1600": 2,
+                    "1650": 25
+                  },
+                  "power_median_w": 890.1,
+                  "power_max_w": 899.3000000000001
+                },
+                {
+                  "rank": 7,
+                  "frequency_histogram": {
+                    "1550": 5,
+                    "1600": 3,
+                    "1650": 33
+                  },
+                  "power_median_w": 886.3000000000001,
+                  "power_max_w": 897.3000000000001
+                }
+              ],
+              "all_frequency_histogram": {
+                "1300": 2,
+                "1350": 14,
+                "1400": 11,
+                "1450": 18,
+                "1500": 39,
+                "1550": 34,
+                "1600": 30,
+                "1650": 180
+              },
+              "active_frequency_median_mhz": 1650.0,
+              "power_median_w": 892.0,
+              "power_max_w": 901.0
+            },
+            "baseline": {
+              "ranks": [
+                {
+                  "rank": 0,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 826.7,
+                  "power_max_w": 851.7
+                },
+                {
+                  "rank": 1,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 824.2,
+                  "power_max_w": 855.2
+                },
+                {
+                  "rank": 2,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 813.0,
+                  "power_max_w": 853.5
+                },
+                {
+                  "rank": 3,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 803.8000000000001,
+                  "power_max_w": 843.1
+                },
+                {
+                  "rank": 4,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 808.1,
+                  "power_max_w": 844.7
+                },
+                {
+                  "rank": 5,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 823.9000000000001,
+                  "power_max_w": 858.3000000000001
+                },
+                {
+                  "rank": 6,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 816.1,
+                  "power_max_w": 841.5
+                },
+                {
+                  "rank": 7,
+                  "frequency_histogram": {
+                    "1650": 55
+                  },
+                  "power_median_w": 800.5,
+                  "power_max_w": 829.1
+                }
+              ],
+              "all_frequency_histogram": {
+                "1650": 440
+              },
+              "active_frequency_median_mhz": 1650.0,
+              "power_median_w": 816.05,
+              "power_max_w": 858.3000000000001
+            }
+          }
+        }
+      }
+    ]
+  },
+  "direct_pull_reduce_experiments": {
+    "purpose": "Evaluate avoiding return materialization by reducing directly from symmetric FC2 output on each destination rank.",
+    "status": "Rejected; no production changes adopted.",
+    "host_mapping_oracle": [
+      {
+        "world": 8,
+        "experts": 896,
+        "routes_per_rank": 65536,
+        "case": "normal_with_invalid",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 8,
+        "experts": 896,
+        "routes_per_rank": 65536,
+        "case": "single_owner",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 8,
+        "experts": 896,
+        "routes_per_rank": 65536,
+        "case": "all_drop",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 8,
+        "experts": 32,
+        "routes_per_rank": 65536,
+        "case": "normal_with_invalid",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 8,
+        "experts": 32,
+        "routes_per_rank": 65536,
+        "case": "single_owner",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 8,
+        "experts": 32,
+        "routes_per_rank": 65536,
+        "case": "all_drop",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 3,
+        "experts": 15,
+        "routes_per_rank": 1285,
+        "case": "normal_with_invalid",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 3,
+        "experts": 15,
+        "routes_per_rank": 1285,
+        "case": "single_owner",
+        "all_encoded_addresses_match_independent_receive_order": true
+      },
+      {
+        "world": 3,
+        "experts": 15,
+        "routes_per_rank": 1285,
+        "case": "all_drop",
+        "all_encoded_addresses_match_independent_receive_order": true
+      }
+    ],
+    "default_planner_stops": {
+      "direct_pull_reduce_full": {
+        "reason": "First prototype exceeded the 300-second compiler budget; no NPU execution or timing result",
+        "compiler_pids": [
+          1222121,
+          1222130,
+          1222138,
+          1222139,
+          1222140,
+          1222149,
+          1222161,
+          1222196
+        ],
+        "time_unix": 1790344162.2278163,
+        "action": "SIGTERM owned compiler children; distributed workers handle compile failure"
+      },
+      "direct_pull_reduce_serial_full": {
+        "reason": "Owned compiler processes exceeded the 300 second experiment budget before NPU execution; manually terminated after preserving every compiler input. This is not a reported compiler failure.",
+        "time": 1790344572.173834,
+        "pids": [
+          1239751,
+          1239771,
+          1239778,
+          1239779,
+          1239782,
+          1239784,
+          1239814,
+          1239878
+        ]
+      }
+    },
+    "compiler_trace": {
+      "artifact": "/tmp/kimi_forward_perf/direct_pull_reduce_serial_full/compiler_trace",
+      "status": {
+        "timeout_s": 45,
+        "duration_s": 45.01375104000908
+      },
+      "last_entered_pass": "hivm-plan-memory-regbase",
+      "interpretation": "The trace replay remained inside memory planning until its 45 second observation budget expired. The original eight compiler processes were later intentionally terminated after exceeding the 300 second experiment budget; neither default-planner attempt executed the NPU kernel."
+    },
+    "compiler_alternatives": {
+      "largest_first": {
+        "returncode": 0,
+        "duration_s": 44.96728248000727,
+        "files": [
+          {
+            "name": "kernel.o",
+            "bytes": 127616,
+            "sha256": "406e5d0537e35a68eb750bc96c1600f23431344c9adde3b5e44c4bafbdb19925"
+          },
+          {
+            "name": "kernel_mix_aiv.o",
+            "bytes": 131064,
+            "sha256": "064728f008ca37d800c1e445089ba04f1ab9ea37c74be04015ea6aaf1b556401"
+          },
+          {
+            "name": "kernel_mix_aic.o",
+            "bytes": 54992,
+            "sha256": "686172b0e1ee098b2c2d76bb5e1d9811ac5f68f1ee8f0649fcca5441c3d8bac4"
+          }
+        ]
+      },
+      "no_multibuffer": {
+        "timeout_s": 120,
+        "duration_s": 120.01064074999886,
+        "files": []
+      },
+      "paired_npuir": {
+        "timeout_s": 120,
+        "duration_s": 120.0106039600214,
+        "files": []
+      }
+    },
+    "serial_direct_pull_largest_first": {
+      "artifact": "/tmp/kimi_forward_perf/direct_pull_reduce_serial_largest_full",
+      "result": {
+        "schema_version": 1,
+        "case_id": "performance-fwd-kimi-k3-w8-t4k",
+        "model": "KIMI-K3",
+        "world_size": 8,
+        "tokens_per_rank": 4096,
+        "global_tokens": 32768,
+        "shape": {
+          "hidden": 3584,
+          "ffn": 3072,
+          "topk": 16,
+          "num_experts": 896
+        },
+        "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+        "candidate": "single_kernel",
+        "baseline": "Torch-NPU grouped-GEMM + HCCL",
+        "protocol": {
+          "warmup": 5,
+          "iterations": 50,
+          "clock": "npu_event",
+          "rank_reduction": "MAX"
+        },
+        "correctness_gate": {
+          "status": "passed_before_timing",
+          "cases": [
+            "normal",
+            "zero-receive/empty-expert",
+            "negative/out-of-range all-drop",
+            "changed hidden states: gains 0.7, -0.4, 1.1"
+          ],
+          "rtol": 0.05,
+          "atol": 0.05
+        },
+        "receive_capacity_factor": 1.25,
+        "operator_config": {
+          "num_aicore_programs": 32,
+          "num_aivector_programs": 64,
+          "receive_capacity_factor": 1.25,
+          "dispatch_fc1_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "activation": "swiglu",
+          "situ_beta": 1.0,
+          "situ_linear_beta": null,
+          "fc1_gemm_block_size_m": 128,
+          "enable_moonep": false,
+          "moonep_replica_gate_up_chunk_bytes": 16777216,
+          "moonep_replica_down_chunk_bytes": 4194304,
+          "moonep_replica_down_early_programs": 8,
+          "moonep_replica_down_early_descriptors_per_program": 2,
+          "moonep_fused_balanced_count": true,
+          "moonep_fused_route_mapping": true,
+          "moonep_enable_replica_cache": false,
+          "enable_single_kernel_forward": true,
+          "save_fc1_dtype": "bf16",
+          "moonep_udma_chunk_bytes": 67108864,
+          "single_kernel_group_windows": 16,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "symmetric_heap_size_gb": 16,
+        "route_distribution": {
+          "active_global_experts": 896,
+          "routes_received_per_rank": [
+            65672,
+            65348,
+            65442,
+            65024,
+            65821,
+            65733,
+            65716,
+            65532
+          ]
+        },
+        "metrics": {
+          "single_kernel_full_e2e_ms": {
+            "min_ms": 23.834,
+            "max_ms": 24.377,
+            "mean_ms": 23.931,
+            "median_ms": 23.872
+          },
+          "torch_grouped_hccl_full_e2e_ms": {
+            "min_ms": 21.745,
+            "max_ms": 22.46,
+            "mean_ms": 21.941,
+            "median_ms": 21.915
+          }
+        },
+        "torch_over_single_kernel_median": 0.918,
+        "samples_ms": {
+          "single_kernel": [
+            23.865072,
+            23.875916,
+            23.834023,
+            23.94416,
+            24.012993,
+            23.896141,
+            23.858208,
+            23.861839,
+            23.845119,
+            23.844069,
+            23.860582,
+            23.914927,
+            24.02,
+            23.864098,
+            23.861698,
+            23.881426,
+            23.870064,
+            23.858253,
+            23.851107,
+            23.853834,
+            23.857904,
+            23.86907,
+            23.835901,
+            23.833868,
+            23.854336,
+            23.841021,
+            23.861835,
+            23.876648,
+            23.914015,
+            24.000578,
+            23.852335,
+            23.864098,
+            23.868704,
+            23.855118,
+            23.874289,
+            23.849627,
+            24.327168,
+            24.377151,
+            24.035421,
+            24.027216,
+            24.049314,
+            24.295444,
+            23.996918,
+            23.995045,
+            23.982656,
+            23.996061,
+            23.967342,
+            23.975599,
+            23.978016,
+            23.966417
+          ],
+          "torch_grouped_hccl": [
+            22.074072,
+            21.92174,
+            21.918846,
+            22.088999,
+            21.980864,
+            21.996498,
+            21.910873,
+            21.853441,
+            21.951761,
+            22.06678,
+            22.083071,
+            21.86475,
+            21.996284,
+            22.006042,
+            22.009617,
+            21.91474,
+            22.100019,
+            21.874466,
+            21.798513,
+            21.816254,
+            21.900347,
+            22.459818,
+            21.855623,
+            21.91445,
+            21.970654,
+            21.898142,
+            21.892328,
+            21.833227,
+            22.069654,
+            21.819565,
+            21.799114,
+            22.157476,
+            21.876343,
+            21.901108,
+            21.846764,
+            21.916464,
+            21.887558,
+            22.01115,
+            21.970242,
+            21.778006,
+            22.039808,
+            21.825577,
+            21.880308,
+            21.80381,
+            21.790722,
+            21.744722,
+            22.040104,
+            22.066317,
+            21.969376,
+            21.896769
+          ]
+        },
+        "occupancy_gate": {
+          "status": "passed",
+          "log": "device_occupancy.jsonl"
+        }
+      },
+      "frequency": {
+        "artifact": "/tmp/kimi_forward_perf/direct_pull_reduce_serial_largest_full",
+        "case": "performance-fwd-kimi-k3-w8-t4k",
+        "config": {
+          "num_aicore_programs": 32,
+          "num_aivector_programs": 64,
+          "receive_capacity_factor": 1.25,
+          "dispatch_fc1_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "activation": "swiglu",
+          "situ_beta": 1.0,
+          "situ_linear_beta": null,
+          "fc1_gemm_block_size_m": 128,
+          "enable_moonep": false,
+          "moonep_replica_gate_up_chunk_bytes": 16777216,
+          "moonep_replica_down_chunk_bytes": 4194304,
+          "moonep_replica_down_early_programs": 8,
+          "moonep_replica_down_early_descriptors_per_program": 2,
+          "moonep_fused_balanced_count": true,
+          "moonep_fused_route_mapping": true,
+          "moonep_enable_replica_cache": false,
+          "enable_single_kernel_forward": true,
+          "save_fc1_dtype": "bf16",
+          "moonep_udma_chunk_bytes": 67108864,
+          "single_kernel_group_windows": 16,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "benchmark_metrics": {
+          "single_kernel_full_e2e_ms": {
+            "min_ms": 23.834,
+            "max_ms": 24.377,
+            "mean_ms": 23.931,
+            "median_ms": 23.872
+          },
+          "torch_grouped_hccl_full_e2e_ms": {
+            "min_ms": 21.745,
+            "max_ms": 22.46,
+            "mean_ms": 21.941,
+            "median_ms": 21.915
+          }
+        },
+        "speedup": 0.918,
+        "correctness": {
+          "status": "passed_before_timing",
+          "cases": [
+            "normal",
+            "zero-receive/empty-expert",
+            "negative/out-of-range all-drop",
+            "changed hidden states: gains 0.7, -0.4, 1.1"
+          ],
+          "rtol": 0.05,
+          "atol": 0.05
+        },
+        "phases": {
+          "candidate": {
+            "ranks": [
+              {
+                "rank": 0,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 830.7,
+                "power_max_w": 845.7
+              },
+              {
+                "rank": 1,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 830.0,
+                "power_max_w": 842.2
+              },
+              {
+                "rank": 2,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 821.5,
+                "power_max_w": 830.8000000000001
+              },
+              {
+                "rank": 3,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 815.2,
+                "power_max_w": 824.8000000000001
+              },
+              {
+                "rank": 4,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 818.9000000000001,
+                "power_max_w": 828.0
+              },
+              {
+                "rank": 5,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 831.3000000000001,
+                "power_max_w": 841.9000000000001
+              },
+              {
+                "rank": 6,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 819.6,
+                "power_max_w": 829.7
+              },
+              {
+                "rank": 7,
+                "frequency_histogram": {
+                  "1650": 61
+                },
+                "power_median_w": 803.1,
+                "power_max_w": 813.8000000000001
+              }
+            ],
+            "all_frequency_histogram": {
+              "1650": 488
+            },
+            "active_frequency_median_mhz": 1650.0,
+            "power_median_w": 821.5,
+            "power_max_w": 845.7
+          },
+          "baseline": {
+            "ranks": [
+              {
+                "rank": 0,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 813.1000000000001,
+                "power_max_w": 830.2
+              },
+              {
+                "rank": 1,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 815.25,
+                "power_max_w": 838.9000000000001
+              },
+              {
+                "rank": 2,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 806.8000000000001,
+                "power_max_w": 824.9000000000001
+              },
+              {
+                "rank": 3,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 797.45,
+                "power_max_w": 810.3000000000001
+              },
+              {
+                "rank": 4,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 802.2,
+                "power_max_w": 817.4000000000001
+              },
+              {
+                "rank": 5,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 812.6500000000001,
+                "power_max_w": 827.4000000000001
+              },
+              {
+                "rank": 6,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 805.05,
+                "power_max_w": 819.9000000000001
+              },
+              {
+                "rank": 7,
+                "frequency_histogram": {
+                  "1650": 56
+                },
+                "power_median_w": 790.45,
+                "power_max_w": 805.9000000000001
+              }
+            ],
+            "all_frequency_histogram": {
+              "1650": 448
+            },
+            "active_frequency_median_mhz": 1650.0,
+            "power_median_w": 805.8500000000001,
+            "power_max_w": 838.9000000000001
+          }
+        }
+      },
+      "metadata": {
+        "prototype_launch_options": {
+          "plan_memory_strategy": "largest-first"
+        },
+        "compiler": {
+          "path": "/usr/local/Ascend/cann-9.2.0-beta.2/bin/bishengir-compile",
+          "resolved_path": "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/bin/bishengir-compile",
+          "bishengir_opt": "/usr/local/Ascend/cann-9.2.0-beta.2/bin/bishengir-opt",
+          "device_library_sha256": {
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aic.c220.bc": "b2239e53398ca54e5190cbf967e93893f27e966253378cc3b812c1ba0592cae3",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aic.c310.bc": "e33eb85fb9e0a3527d49dd439a3deb821e3107e38b554bbf58f9fcd844c0e85e",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aiv.c220.bc": "aa8da5f4f20adee30f452862d7b2c072949a88a4aa3dfa78fdd2847f2c8ca23e",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aiv.c310.bc": "a33796cf85d96e22db4853c476fee4422675a56583a5463a705439b710c112ce",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aic.c220.bc": "47f15b42157c3d700267d9c0f9b87bc5eb8cc912e6492c80966bc290f3575f62",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aic.c310.bc": "71638f05982d4b6db2c23ebc145ee2f69c2747e63c89fbdeca967f8c487b41da",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aiv.c220.bc": "f30242f3fc9bca59458909df6ba2078d3c2a0e8d9f6e9fa0c492c2534ff9ccef",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aiv.c310.bc": "47df763809c2bc8ccecba737bfecefd5498f58b6361efaf9397125129861d637"
+          },
+          "triton_cache_dir": "/tmp/kimi_forward_perf/cache_pull_reduce_serial_largest",
+          "triton_disable_ffts": "1",
+          "version": "bishengir-compile 1.2.0 (/usr1/npuir-a3/bishengir 01ceb3ba84cb 2026-08-31) \nllvm 19.1.7 3254a1b1c59d\nRelease build"
+        },
+        "git_commit": "7c93cb1",
+        "git_status": [
+          " M docs/kimi-forward-performance-analysis.md",
+          " M docs/performance/kimi-forward-2026-09-25.json"
+        ],
+        "case_id": "performance-fwd-kimi-k3-w8-t4k",
+        "world_size": 8,
+        "candidate": "single_kernel",
+        "baseline": "Torch-NPU grouped-GEMM + HCCL",
+        "benchmark_protocol": {
+          "warmup": 5,
+          "iterations": 50,
+          "clock": "npu_event",
+          "rank_reduction": "MAX"
+        },
+        "communication_init_order": "hccl_collectives_then_aclshmem",
+        "config_overrides": {
+          "enable_single_kernel_forward": true,
+          "enable_moonep": false,
+          "moonep_enable_replica_cache": false,
+          "single_kernel_group_windows": null,
+          "fc1_gemm_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "environment": {
+          "hostname": "localhost.localdomain",
+          "python": "/home/vllm_kimiw/.venv-udma/bin/python",
+          "python_version": "3.11.10",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0.post1.dev20260528",
+          "triton_runtime": "3.6.0",
+          "triton_module": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/triton/__init__.py",
+          "triton_distributions": {
+            "triton_dist": "3.4.0",
+            "triton_ascend": "3.2.2",
+            "triton": "3.5.0"
+          },
+          "ascend_home": "/usr/local/Ascend/cann-9.2.0-beta.2",
+          "ascend_home_resolved": "/usr/local/Ascend/cann-9.2.0-beta.2",
+          "communication": {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": "40421",
+            "ASH_MASTER_ADDR": "127.0.0.1",
+            "ASH_MASTER_PORT": "41851",
+            "HCCL_IF_BASE_PORT": null,
+            "HCCL_SOCKET_IFNAME": null,
+            "HCCL_EXEC_TIMEOUT": null,
+            "HCCL_HOST_SOCKET_PORT_RANGE": null,
+            "HCCL_NPU_SOCKET_PORT_RANGE": "25824-25887",
+            "ASCEND_LAUNCH_BLOCKING": null
+          }
+        },
+        "profile": {
+          "enabled": false,
+          "profiler_level": "Level1",
+          "aic_metric": "pipe",
+          "activities": [
+            "CPU",
+            "NPU"
+          ],
+          "schedule": {
+            "wait": 0,
+            "warmup": 1,
+            "active": 2,
+            "repeat": 1
+          },
+          "analysis": "offline after every distributed worker finalized"
+        },
+        "source_sha256": {
+          "/tmp/kimi_forward_perf/probes/profile_pull_reduce_serial_largest.py": "04c09c194fecad52b682afbac10559290c52d947bf5645340f53593857f39ba3",
+          "/tmp/kimi_forward_perf/probes/fused_pull_reduce_serial.py": "d0ccdb9673e1962d8151c0bddcabd916fd499aa16a9f646a8fc3e1cb70df5378",
+          "src/mega_moe/ops/forward.py": "dbc053daf793610dff3fe5c0b5ce9846a48435d654d061ed23f895b3239d7273",
+          "src/mega_moe/kernels/fused_forward.py": "cbeae461ed961ee9c5785faf1ed80fb1ed5c4d74d348909977ddb4f2f4faf5fb",
+          "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+          "benchmark/layer/_kimi_routes.py": "b09f9b2b0d4147a5599b1c9a2c6ca9aff070295f7164508652e393082b57c9d7",
+          "src/mega_moe/kernels/dispatch_fc1.py": "38a0fa56f9a46e60249077c2b9244e1ce2f012f5c9231b99d2dd25ef693d9aa6",
+          "src/mega_moe/kernels/fc2_combine.py": "c512d93dd45d56ce33145672a3d9bc7b21a799f438815dfd1a7ce3302a644d8c",
+          "src/mega_moe/config.py": "af39be9baa3174e37db2363244e6a54c018c33e868478cda968c1b29d0859e06",
+          "config/_shapes.py": "037dee1c40afb2fe39d575a04ceda06e4fffa9b664b1fd1885ea5050901b2a79",
+          "benchmark/layer/_grouped_forward_baseline.py": "db0f46cc57358ffcaac787fe067b6f7c2fa07c12456eb61a5ccb8cd1e8423c5c",
+          "benchmark/layer/_npu_occupancy.py": "e024d83af4e8d2542304d55034ea13f96e9abd3a504335b4c59f15f39de9454e",
+          "benchmark/layer/_pipe_profile_summary.py": "4ec440bb6ddc5b9881113780dd248a5eaa6f474c2d84d42bb11c8035ae9c531c"
+        }
+      }
+    },
+    "serial_standard_return_largest_first": {
+      "artifact": "/tmp/kimi_forward_perf/standard_serial_largest_full",
+      "result": {
+        "schema_version": 1,
+        "case_id": "performance-fwd-kimi-k3-w8-t4k",
+        "model": "KIMI-K3",
+        "world_size": 8,
+        "tokens_per_rank": 4096,
+        "global_tokens": 32768,
+        "shape": {
+          "hidden": 3584,
+          "ffn": 3072,
+          "topk": 16,
+          "num_experts": 896
+        },
+        "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+        "candidate": "single_kernel",
+        "baseline": "Torch-NPU grouped-GEMM + HCCL",
+        "protocol": {
+          "warmup": 5,
+          "iterations": 50,
+          "clock": "npu_event",
+          "rank_reduction": "MAX"
+        },
+        "correctness_gate": {
+          "status": "passed_before_timing",
+          "cases": [
+            "normal",
+            "zero-receive/empty-expert",
+            "negative/out-of-range all-drop"
+          ],
+          "rtol": 0.05,
+          "atol": 0.05
+        },
+        "receive_capacity_factor": 1.25,
+        "operator_config": {
+          "num_aicore_programs": 32,
+          "num_aivector_programs": 64,
+          "receive_capacity_factor": 1.25,
+          "dispatch_fc1_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "activation": "swiglu",
+          "situ_beta": 1.0,
+          "situ_linear_beta": null,
+          "fc1_gemm_block_size_m": 128,
+          "enable_moonep": false,
+          "moonep_replica_gate_up_chunk_bytes": 16777216,
+          "moonep_replica_down_chunk_bytes": 4194304,
+          "moonep_replica_down_early_programs": 8,
+          "moonep_replica_down_early_descriptors_per_program": 2,
+          "moonep_fused_balanced_count": true,
+          "moonep_fused_route_mapping": true,
+          "moonep_enable_replica_cache": false,
+          "enable_single_kernel_forward": true,
+          "save_fc1_dtype": "bf16",
+          "moonep_udma_chunk_bytes": 67108864,
+          "single_kernel_group_windows": 16,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "symmetric_heap_size_gb": 16,
+        "route_distribution": {
+          "active_global_experts": 896,
+          "routes_received_per_rank": [
+            65672,
+            65348,
+            65442,
+            65024,
+            65821,
+            65733,
+            65716,
+            65532
+          ]
+        },
+        "metrics": {
+          "single_kernel_full_e2e_ms": {
+            "min_ms": 14.147,
+            "max_ms": 16.058,
+            "mean_ms": 15.201,
+            "median_ms": 15.212
+          },
+          "torch_grouped_hccl_full_e2e_ms": {
+            "min_ms": 21.625,
+            "max_ms": 22.08,
+            "mean_ms": 21.722,
+            "median_ms": 21.72
+          }
+        },
+        "torch_over_single_kernel_median": 1.428,
+        "samples_ms": {
+          "single_kernel": [
+            14.191623,
+            14.178927,
+            14.147345,
+            14.844576,
+            15.346848,
+            15.495695,
+            16.058193,
+            15.282497,
+            15.200599,
+            15.319035,
+            15.204779,
+            15.787041,
+            15.374992,
+            15.315872,
+            15.154608,
+            15.180352,
+            15.27283,
+            15.18724,
+            15.179084,
+            15.246127,
+            15.187824,
+            15.205346,
+            15.353184,
+            15.69309,
+            15.291621,
+            15.540304,
+            15.246709,
+            15.294304,
+            15.18416,
+            15.002575,
+            15.583455,
+            15.158609,
+            15.251382,
+            15.218638,
+            15.278769,
+            15.097825,
+            15.169376,
+            15.163744,
+            15.266144,
+            15.067217,
+            15.158619,
+            15.306485,
+            15.013877,
+            15.16403,
+            15.293603,
+            15.268383,
+            15.262431,
+            15.099154,
+            15.126229,
+            15.11618
+          ],
+          "torch_grouped_hccl": [
+            21.762854,
+            21.748297,
+            21.690672,
+            21.733982,
+            21.721708,
+            21.735125,
+            21.70524,
+            21.719187,
+            21.64938,
+            21.734545,
+            21.723116,
+            21.692455,
+            21.709412,
+            21.744532,
+            21.725321,
+            21.711584,
+            21.689219,
+            21.698029,
+            21.784212,
+            21.677944,
+            21.759604,
+            22.080307,
+            21.824055,
+            21.754391,
+            21.631792,
+            21.700249,
+            21.706905,
+            21.658026,
+            21.687572,
+            21.73167,
+            21.708641,
+            21.678528,
+            21.765106,
+            21.766844,
+            21.692015,
+            21.721533,
+            21.741316,
+            21.723019,
+            21.674849,
+            21.722054,
+            21.624933,
+            21.759886,
+            21.721287,
+            21.631008,
+            21.672272,
+            21.683388,
+            21.81605,
+            21.69035,
+            21.736399,
+            21.665791
+          ]
+        },
+        "occupancy_gate": {
+          "status": "passed",
+          "log": "device_occupancy.jsonl"
+        }
+      },
+      "frequency": {
+        "artifact": "/tmp/kimi_forward_perf/standard_serial_largest_full",
+        "case": "performance-fwd-kimi-k3-w8-t4k",
+        "config": {
+          "num_aicore_programs": 32,
+          "num_aivector_programs": 64,
+          "receive_capacity_factor": 1.25,
+          "dispatch_fc1_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "activation": "swiglu",
+          "situ_beta": 1.0,
+          "situ_linear_beta": null,
+          "fc1_gemm_block_size_m": 128,
+          "enable_moonep": false,
+          "moonep_replica_gate_up_chunk_bytes": 16777216,
+          "moonep_replica_down_chunk_bytes": 4194304,
+          "moonep_replica_down_early_programs": 8,
+          "moonep_replica_down_early_descriptors_per_program": 2,
+          "moonep_fused_balanced_count": true,
+          "moonep_fused_route_mapping": true,
+          "moonep_enable_replica_cache": false,
+          "enable_single_kernel_forward": true,
+          "save_fc1_dtype": "bf16",
+          "moonep_udma_chunk_bytes": 67108864,
+          "single_kernel_group_windows": 16,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "benchmark_metrics": {
+          "single_kernel_full_e2e_ms": {
+            "min_ms": 14.147,
+            "max_ms": 16.058,
+            "mean_ms": 15.201,
+            "median_ms": 15.212
+          },
+          "torch_grouped_hccl_full_e2e_ms": {
+            "min_ms": 21.625,
+            "max_ms": 22.08,
+            "mean_ms": 21.722,
+            "median_ms": 21.72
+          }
+        },
+        "speedup": 1.428,
+        "correctness": {
+          "status": "passed_before_timing",
+          "cases": [
+            "normal",
+            "zero-receive/empty-expert",
+            "negative/out-of-range all-drop"
+          ],
+          "rtol": 0.05,
+          "atol": 0.05
+        },
+        "phases": {
+          "candidate": {
+            "ranks": [
+              {
+                "rank": 0,
+                "frequency_histogram": {
+                  "1350": 2,
+                  "1400": 3,
+                  "1450": 10,
+                  "1500": 10,
+                  "1550": 3,
+                  "1600": 1,
+                  "1650": 11
+                },
+                "power_median_w": 895.5500000000001,
+                "power_max_w": 900.7
+              },
+              {
+                "rank": 1,
+                "frequency_histogram": {
+                  "1300": 1,
+                  "1400": 4,
+                  "1450": 11,
+                  "1500": 10,
+                  "1550": 5,
+                  "1650": 9
+                },
+                "power_median_w": 897.4000000000001,
+                "power_max_w": 900.9000000000001
+              },
+              {
+                "rank": 2,
+                "frequency_histogram": {
+                  "1400": 2,
+                  "1450": 5,
+                  "1500": 3,
+                  "1550": 11,
+                  "1600": 5,
+                  "1650": 14
+                },
+                "power_median_w": 894.5500000000001,
+                "power_max_w": 900.2
+              },
+              {
+                "rank": 3,
+                "frequency_histogram": {
+                  "1400": 1,
+                  "1450": 1,
+                  "1500": 7,
+                  "1550": 3,
+                  "1600": 6,
+                  "1650": 22
+                },
+                "power_median_w": 892.25,
+                "power_max_w": 899.4000000000001
+              },
+              {
+                "rank": 4,
+                "frequency_histogram": {
+                  "1400": 3,
+                  "1450": 4,
+                  "1500": 9,
+                  "1550": 8,
+                  "1600": 5,
+                  "1650": 11
+                },
+                "power_median_w": 895.7,
+                "power_max_w": 900.4000000000001
+              },
+              {
+                "rank": 5,
+                "frequency_histogram": {
+                  "1350": 1,
+                  "1400": 3,
+                  "1450": 9,
+                  "1500": 11,
+                  "1550": 5,
+                  "1600": 2,
+                  "1650": 9
+                },
+                "power_median_w": 896.55,
+                "power_max_w": 900.4000000000001
+              },
+              {
+                "rank": 6,
+                "frequency_histogram": {
+                  "1350": 1,
+                  "1400": 1,
+                  "1450": 5,
+                  "1500": 7,
+                  "1550": 7,
+                  "1600": 6,
+                  "1650": 13
+                },
+                "power_median_w": 894.95,
+                "power_max_w": 900.3000000000001
+              },
+              {
+                "rank": 7,
+                "frequency_histogram": {
+                  "1450": 2,
+                  "1550": 3,
+                  "1600": 3,
+                  "1650": 32
+                },
+                "power_median_w": 889.0500000000001,
+                "power_max_w": 899.3000000000001
+              }
+            ],
+            "all_frequency_histogram": {
+              "1300": 1,
+              "1350": 4,
+              "1400": 17,
+              "1450": 47,
+              "1500": 57,
+              "1550": 45,
+              "1600": 28,
+              "1650": 121
+            },
+            "active_frequency_median_mhz": 1550.0,
+            "power_median_w": 894.9000000000001,
+            "power_max_w": 900.9000000000001
+          },
+          "baseline": {
+            "ranks": [
+              {
+                "rank": 0,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 833.8000000000001,
+                "power_max_w": 865.4000000000001
+              },
+              {
+                "rank": 1,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 830.9000000000001,
+                "power_max_w": 863.2
+              },
+              {
+                "rank": 2,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 824.8000000000001,
+                "power_max_w": 863.9000000000001
+              },
+              {
+                "rank": 3,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 815.3000000000001,
+                "power_max_w": 855.7
+              },
+              {
+                "rank": 4,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 819.9000000000001,
+                "power_max_w": 854.7
+              },
+              {
+                "rank": 5,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 831.5,
+                "power_max_w": 859.1
+              },
+              {
+                "rank": 6,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 825.3000000000001,
+                "power_max_w": 862.1
+              },
+              {
+                "rank": 7,
+                "frequency_histogram": {
+                  "1650": 55
+                },
+                "power_median_w": 801.9000000000001,
+                "power_max_w": 831.4000000000001
+              }
+            ],
+            "all_frequency_histogram": {
+              "1650": 440
+            },
+            "active_frequency_median_mhz": 1650.0,
+            "power_median_w": 824.8000000000001,
+            "power_max_w": 865.4000000000001
+          }
+        }
+      },
+      "metadata": {
+        "prototype_launch_options": {
+          "plan_memory_strategy": "largest-first"
+        },
+        "compiler": {
+          "path": "/usr/local/Ascend/cann-9.2.0-beta.2/bin/bishengir-compile",
+          "resolved_path": "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/bin/bishengir-compile",
+          "bishengir_opt": "/usr/local/Ascend/cann-9.2.0-beta.2/bin/bishengir-opt",
+          "device_library_sha256": {
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aic.c220.bc": "b2239e53398ca54e5190cbf967e93893f27e966253378cc3b812c1ba0592cae3",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aic.c310.bc": "e33eb85fb9e0a3527d49dd439a3deb821e3107e38b554bbf58f9fcd844c0e85e",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aiv.c220.bc": "aa8da5f4f20adee30f452862d7b2c072949a88a4aa3dfa78fdd2847f2c8ca23e",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.aiv.c310.bc": "a33796cf85d96e22db4853c476fee4422675a56583a5463a705439b710c112ce",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aic.c220.bc": "47f15b42157c3d700267d9c0f9b87bc5eb8cc912e6492c80966bc290f3575f62",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aic.c310.bc": "71638f05982d4b6db2c23ebc145ee2f69c2747e63c89fbdeca967f8c487b41da",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aiv.c220.bc": "f30242f3fc9bca59458909df6ba2078d3c2a0e8d9f6e9fa0c492c2534ff9ccef",
+            "/usr/local/Ascend/cann-9.2.0-beta.2/tools/bishengir/lib/meta_op.mix.aiv.c310.bc": "47df763809c2bc8ccecba737bfecefd5498f58b6361efaf9397125129861d637"
+          },
+          "triton_cache_dir": "/tmp/kimi_forward_perf/cache_standard_serial_largest",
+          "triton_disable_ffts": "1",
+          "version": "bishengir-compile 1.2.0 (/usr1/npuir-a3/bishengir 01ceb3ba84cb 2026-08-31) \nllvm 19.1.7 3254a1b1c59d\nRelease build"
+        },
+        "git_commit": "7c93cb1",
+        "git_status": [
+          " M docs/kimi-forward-performance-analysis.md",
+          " M docs/performance/kimi-forward-2026-09-25.json"
+        ],
+        "case_id": "performance-fwd-kimi-k3-w8-t4k",
+        "world_size": 8,
+        "candidate": "single_kernel",
+        "baseline": "Torch-NPU grouped-GEMM + HCCL",
+        "benchmark_protocol": {
+          "warmup": 5,
+          "iterations": 50,
+          "clock": "npu_event",
+          "rank_reduction": "MAX"
+        },
+        "communication_init_order": "hccl_collectives_then_aclshmem",
+        "config_overrides": {
+          "enable_single_kernel_forward": true,
+          "enable_moonep": false,
+          "moonep_enable_replica_cache": false,
+          "single_kernel_group_windows": null,
+          "fc1_gemm_block_size_m": 128,
+          "fc1_gemm_block_size_n": 512,
+          "fc1_gemm_block_size_k": 128,
+          "fc2_combine_block_size_m": 128,
+          "fc2_gemm_block_size_n": 512,
+          "fc2_gemm_block_size_k": 128,
+          "single_kernel_dispatch_block_size_m": 256
+        },
+        "environment": {
+          "hostname": "localhost.localdomain",
+          "python": "/home/vllm_kimiw/.venv-udma/bin/python",
+          "python_version": "3.11.10",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0.post1.dev20260528",
+          "triton_runtime": "3.6.0",
+          "triton_module": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/triton/__init__.py",
+          "triton_distributions": {
+            "triton_dist": "3.4.0",
+            "triton_ascend": "3.2.2",
+            "triton": "3.5.0"
+          },
+          "ascend_home": "/usr/local/Ascend/cann-9.2.0-beta.2",
+          "ascend_home_resolved": "/usr/local/Ascend/cann-9.2.0-beta.2",
+          "communication": {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": "52517",
+            "ASH_MASTER_ADDR": "127.0.0.1",
+            "ASH_MASTER_PORT": "36643",
+            "HCCL_IF_BASE_PORT": null,
+            "HCCL_SOCKET_IFNAME": null,
+            "HCCL_EXEC_TIMEOUT": null,
+            "HCCL_HOST_SOCKET_PORT_RANGE": null,
+            "HCCL_NPU_SOCKET_PORT_RANGE": "34848-34911",
+            "ASCEND_LAUNCH_BLOCKING": null
+          }
+        },
+        "profile": {
+          "enabled": false,
+          "profiler_level": "Level1",
+          "aic_metric": "pipe",
+          "activities": [
+            "CPU",
+            "NPU"
+          ],
+          "schedule": {
+            "wait": 0,
+            "warmup": 1,
+            "active": 2,
+            "repeat": 1
+          },
+          "analysis": "offline after every distributed worker finalized"
+        },
+        "source_sha256": {
+          "/tmp/kimi_forward_perf/probes/fused_standard_serial.py": "48993fb0a67e55a8616166cf0b16327a51c36e0f706cf232989f4851a3d1d66f",
+          "/tmp/kimi_forward_perf/probes/profile_standard_serial_largest.py": "b1a7ea931da5a3989138f6b9897aa9480a008c25c076215e57621b07b285088f",
+          "src/mega_moe/ops/forward.py": "dbc053daf793610dff3fe5c0b5ce9846a48435d654d061ed23f895b3239d7273",
+          "src/mega_moe/kernels/fused_forward.py": "cbeae461ed961ee9c5785faf1ed80fb1ed5c4d74d348909977ddb4f2f4faf5fb",
+          "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+          "benchmark/layer/_kimi_routes.py": "b09f9b2b0d4147a5599b1c9a2c6ca9aff070295f7164508652e393082b57c9d7",
+          "src/mega_moe/kernels/dispatch_fc1.py": "38a0fa56f9a46e60249077c2b9244e1ce2f012f5c9231b99d2dd25ef693d9aa6",
+          "src/mega_moe/kernels/fc2_combine.py": "c512d93dd45d56ce33145672a3d9bc7b21a799f438815dfd1a7ce3302a644d8c",
+          "src/mega_moe/config.py": "af39be9baa3174e37db2363244e6a54c018c33e868478cda968c1b29d0859e06",
+          "config/_shapes.py": "037dee1c40afb2fe39d575a04ceda06e4fffa9b664b1fd1885ea5050901b2a79",
+          "benchmark/layer/_grouped_forward_baseline.py": "db0f46cc57358ffcaac787fe067b6f7c2fa07c12456eb61a5ccb8cd1e8423c5c",
+          "benchmark/layer/_npu_occupancy.py": "e024d83af4e8d2542304d55034ea13f96e9abd3a504335b4c59f15f39de9454e",
+          "benchmark/layer/_pipe_profile_summary.py": "4ec440bb6ddc5b9881113780dd248a5eaa6f474c2d84d42bb11c8035ae9c531c"
+        }
+      }
+    },
+    "four_chain_largest_first": {
+      "direct_pull": {
+        "artifact": "/tmp/kimi_forward_perf/direct_pull_reduce_full/compiler_largest",
+        "status": {
+          "returncode": 1,
+          "duration_s": 56.83135170000605,
+          "files": []
+        },
+        "compiler_error": "ub overflow, requires 1897472 bits while 1769472 bits available!"
+      },
+      "production_control": {
+        "artifact": "/tmp/kimi_forward_perf/standard_largest_full",
+        "status": {
+          "benchmark_returncode": 1,
+          "command": [
+            "timeout",
+            "600",
+            "/home/vllm_kimiw/.venv-udma/bin/python",
+            "/tmp/kimi_forward_perf/probes/profile_standard_largest.py",
+            "--case",
+            "performance-fwd-kimi-k3-w8-t4k",
+            "--benchmark-only",
+            "--fc1-block",
+            "128",
+            "512",
+            "128",
+            "--fc2-block",
+            "128",
+            "512",
+            "128",
+            "--dispatch-block",
+            "256",
+            "--output-dir",
+            "/tmp/kimi_forward_perf/standard_largest_full/benchmark"
+          ],
+          "num_cores_override": null,
+          "monitor": "read-only DCMI v2, frequency type 7, power unit 0.1 W"
+        },
+        "compiler_error": "ub overflow, requires 1884160 bits while 1769472 bits available!"
+      }
+    },
+    "limits": [
+      "Separate standard 5 warmup / 50 rank-MAX event runs, not paired AB/BA samples.",
+      "Matching the accumulation chain and planner removes those as intentional configuration differences; changes to routing-map generation, symmetric allocation and communication remain coupled.",
+      "No per-phase instrumentation was captured for this prototype, so the entire slowdown is not assigned to an individual remote-load instruction.",
+      "The compiler-memory-planning issue here is distinct from the earlier rtsGetHardwareSyncAddr startup exception and from the resolved UDMA link-library mismatch."
+    ],
+    "production_source_sha256": "cbeae461ed961ee9c5785faf1ed80fb1ed5c4d74d348909977ddb4f2f4faf5fb",
+    "prototype_source_sha256": {
+      "/tmp/kimi_forward_perf/probes/fused_pull_reduce_probe.py": "3acd1e945404ba78028f914be5143d189fb01da00e4d6d3d0a34f17d2e337bd9",
+      "/tmp/kimi_forward_perf/probes/fused_pull_reduce_serial.py": "d0ccdb9673e1962d8151c0bddcabd916fd499aa16a9f646a8fc3e1cb70df5378",
+      "/tmp/kimi_forward_perf/probes/fused_standard_serial.py": "48993fb0a67e55a8616166cf0b16327a51c36e0f706cf232989f4851a3d1d66f",
+      "/tmp/kimi_forward_perf/probes/profile_pull_reduce_serial_largest.py": "04c09c194fecad52b682afbac10559290c52d947bf5645340f53593857f39ba3",
+      "/tmp/kimi_forward_perf/probes/profile_standard_serial_largest.py": "b1a7ea931da5a3989138f6b9897aa9480a008c25c076215e57621b07b285088f",
+      "/tmp/kimi_forward_perf/probes/replay_pull_compile.py": "5112bc76f11ecf1b6bc448d7711f95a03b734fa02048d3d1c6fd53955f12ac5d"
+    },
+    "conclusion": "The serial direct-pull candidate is 23.872 ms versus 15.212 ms for standard return with the same serial accumulation and largest-first planner. Keep standard return and the production default planner; this experiment does not improve the full E896/top16 case."
+  }
 }
