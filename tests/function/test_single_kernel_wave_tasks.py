@@ -86,6 +86,64 @@ def test_task_builder_reuse_and_capacity_guard():
     np.testing.assert_array_equal(tasks.values, before)
 
 
+@pytest.mark.parametrize("world,epr,cores", [(1, 9, 3), (3, 9, 8), (8, 112, 32), (64, 3, 32)])
+def test_dispatch_tiles_are_sent_once_in_their_first_row_wave(world, epr, cores):
+    """Exercise the production schedule across holes, tails and wide worlds."""
+    block, dispatch, windows = 128, 256, 16
+    rng = np.random.default_rng(331 + world)
+    counts = rng.integers(0, 180 if world < 64 else 20, (world, world, epr))
+    counts[:, :, ::3] = 0
+    counts[0, -1, -1] = 2301
+    received = counts.sum(axis=0)
+    blocks = (received + block - 1) // block
+    max_waves = int((blocks.sum(axis=1).max() + windows - 1) // windows) + 1
+    table, offsets, tasks = make_tables(received, block, windows, max_waves)
+    first_blocks = np.pad(np.cumsum(blocks, axis=1)[:, :-1], ((0, 0), (1, 0)))
+    row_bases = np.pad(np.cumsum(received, axis=1)[:, :-1], ((0, 0), (1, 0)))
+    source_begins = np.cumsum(counts, axis=0) - counts
+    sent = Counter()
+    small_bucket_workers = set()
+
+    def dispatch_task(bucket, lane, lanes, *args, **kwargs):
+        destination, expert = divmod(int(bucket), epr)
+        first, last = map(int, args[-2:])
+        for tile in range(first + int(lane), last, int(lanes)):
+            expected_wave = (first_blocks[destination, expert]
+                             + (source_begins[source, destination, expert]
+                                + tile * dispatch) // block) // windows
+            assert wave == expected_wave
+            sent[source, destination, expert, tile] += 1
+            if counts[source, destination, expert] <= dispatch:
+                small_bucket_workers.add(pid // world)
+
+    h = production_helpers(
+        (*TASK_HELPERS, "_dispatch_dynamic_wave"),
+        {"_dispatch_one_source_tile_task": dispatch_task},
+    )
+    for rank in range(world):
+        h._build_wave_tasks(rank, table, offsets, tasks, epr, max_waves,
+                            block, windows, int(received.sum(axis=1).max()))
+    for source in range(world):
+        dst_starts = Pointer((row_bases + source_begins[source]).reshape(-1))
+        source_counts = Pointer(counts[source].reshape(-1))
+        for wave in range(max_waves):
+            for pid in range(cores):
+                h._dispatch_dynamic_wave(
+                    pid, wave, None, None, None, None, None, None, None,
+                    dst_starts, None, source_counts, offsets, tasks, 1, 3584,
+                    cores, source, world, epr, 3584, block, windows,
+                    1024, dispatch, max_waves,
+                )
+    expected = Counter({(source, destination, expert, tile): 1
+                        for source, destination, expert in np.ndindex(counts.shape)
+                        for tile in range((int(counts[source, destination, expert])
+                                           + dispatch - 1) // dispatch)})
+    assert sent == expected
+    if world == 8:
+        # Kimi's many small experts must use all four workers per peer.
+        assert small_bucket_workers == set(range(cores // world))
+
+
 @pytest.mark.parametrize("cores", [3, 24, 32])
 @pytest.mark.parametrize("parts", [1, 2, 3, 7, 16, 33, 64])
 def test_fc1_incremental_tiles_keep_original_assignment(cores, parts):
@@ -174,8 +232,42 @@ def test_return_relay_acquires_every_counter_once(world, cores, epoch):
         np.testing.assert_array_equal(signals.values[checked_base * 16::16], epoch)
 
 
+@pytest.mark.parametrize("world,cores", [(1, 32), (8, 32), (64, 32), (128, 32)])
+def test_return_relay_can_acquire_only_final_wave(world, cores):
+    """The final per-destination counter covers earlier fenced waves."""
+    epr, max_waves, windows, epoch = 7, 23, 16, 11
+    wave_counts = [0 if rank % 5 == 0 else 1 + rank % 21 for rank in range(world)]
+    table = np.zeros((world, epr + 1, 2), dtype=np.int64)
+    table[:, -1, 0] = np.asarray(wave_counts) * windows
+    checked_base = max_waves * (2 * cores + world)
+    checkers = min(2 * cores, world)
+    return_base = 2 * max_waves * cores
+    local = world // 2
+    expected = (max(2 * cores, world) - local + world - 1) // world
+    signals = buffer((checked_base + checkers) * 16)
+    for destination, waves in enumerate(wave_counts):
+        if waves:
+            signals.values[(return_base + (waves - 1) * world + destination) * 16] = expected
+    relay = ReturnRelay(signals, checked_base, checkers, epoch)
+    h = production_helpers(("_wait_dynamic_wave_returns",),
+                           {"dl": relay, "libshmem_device": relay})
+    for worker in reversed(range(2 * cores)):
+        relay.worker = worker
+        h._wait_dynamic_wave_returns(
+            worker, Pointer(table.reshape(-1)), signals, epoch, cores, local,
+            world, epr, max_waves, windows, LAST_RETURN_ONLY=True)
+    actual = Counter(slot for _, event, slot in relay.events if event == "remote-acquire")
+    desired = Counter(
+        return_base + (waves - 1) * world + destination
+        for destination, waves in enumerate(wave_counts) if waves)
+    assert actual == desired
+    assert sorted(relay.final_checks) == list(range(2 * cores))
+    np.testing.assert_array_equal(signals.values[checked_base * 16::16], epoch)
+
+
 @pytest.mark.parametrize("missing_destination", [0, 3, 7])
-def test_missing_early_return_cannot_publish_or_release_reduce(missing_destination):
+@pytest.mark.parametrize("last_only", [False, True])
+def test_incomplete_return_cannot_publish_or_release_reduce(missing_destination, last_only):
     world, cores, epr, max_waves, windows, epoch = 8, 32, 4, 3, 16, 9
     checked_base = max_waves * (2 * cores + world)
     return_base = 2 * max_waves * cores
@@ -183,7 +275,9 @@ def test_missing_early_return_cannot_publish_or_release_reduce(missing_destinati
     for wave in range(3):
         for destination in range(world):
             signals.values[(return_base + wave * world + destination) * 16] = 8
-    signals.values[(return_base + missing_destination) * 16] = 7
+    missing_wave = 2 if last_only else 0
+    missing_slot = return_base + missing_wave * world + missing_destination
+    signals.values[missing_slot * 16] = 7
     signals.values[checked_base * 16::16] = epoch - 1
     table = np.zeros((world, epr + 1, 2), dtype=np.int64)
     table[:, -1, 0] = 3 * windows
@@ -205,17 +299,20 @@ def test_missing_early_return_cannot_publish_or_release_reduce(missing_destinati
         relay.worker = worker
         with pytest.raises(Blocked):
             h._wait_dynamic_wave_returns(worker, Pointer(table.reshape(-1)), signals,
-                                         epoch, cores, 0, world, epr, max_waves, windows)
+                                         epoch, cores, 0, world, epr, max_waves, windows,
+                                         LAST_RETURN_ONLY=last_only)
     published = {worker for worker, event, _ in relay.events if event == "publish"}
     assert published == set(range(world)) - {missing_destination}
-    signals.values[(return_base + missing_destination) * 16] = 8
+    signals.values[missing_slot * 16] = 8
     relay.worker = missing_destination
     h._wait_dynamic_wave_returns(missing_destination, Pointer(table.reshape(-1)), signals,
-                                 epoch, cores, 0, world, epr, max_waves, windows)
+                                 epoch, cores, 0, world, epr, max_waves, windows,
+                                 LAST_RETURN_ONLY=last_only)
     for worker in range(2 * cores):
         relay.worker = worker
         h._wait_dynamic_wave_returns(worker, Pointer(table.reshape(-1)), signals,
-                                     epoch, cores, 0, world, epr, max_waves, windows)
+                                     epoch, cores, 0, world, epr, max_waves, windows,
+                                     LAST_RETURN_ONLY=last_only)
 
 
 @pytest.mark.parametrize("cores,epr,windows", [(3, 7, 4), (32, 112, 16), (32, 4, 16)])

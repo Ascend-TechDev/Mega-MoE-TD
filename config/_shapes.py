@@ -236,6 +236,17 @@ _CASE_GROUPS = (
         capacity_factor=1.25,
     ),
 
+    # Uniform control for the full E896/top-k=16 case. The historical trimmed
+    # case above routes only eight experts per token and has half the work.
+    CaseGroup(
+        prefix="performance-fwd-kimi-k3-trimmed-top16",
+        direction="forward", model="KIMI-K3-TRIMMED",
+        tokens=(4096,), worlds=(8,), hidden=3584, ffn=3072,
+        topk=16, num_experts=32,
+        tags=frozenset({"performance", "forward", "kimi", "trimmed", "slow"}),
+        capacity_factor=1.25,
+    ),
+
     # Matched unbalanced Kimi cases: only total expert count differs. Keep the
     # old top-k=8 trimmed case above for existing performance regressions.
     CaseGroup(

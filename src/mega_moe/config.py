@@ -92,7 +92,10 @@ class MoEForwardConfig:
     remain independent because they have different shapes and data-movement
     paths.
 
-    ``dispatch_fc1_block_size_m`` controls dispatch readiness slots.
+    ``dispatch_fc1_block_size_m`` controls dispatch readiness slots for the
+    multi-kernel path. ``single_kernel_dispatch_block_size_m`` is the
+    corresponding tile for the fused path. The shared workspace reserves
+    enough readiness slots for the smaller of the two tiles.
     ``fc1_gemm_block_size_{m,n,k}`` independently control the FC1 dot axes.
     Likewise, ``fc2_combine_block_size_m`` controls the FC2 GEMM row tile and
     ``fc2_gemm_block_size_{n,k}`` control the remaining FC2 dot axes.  FC2
@@ -174,6 +177,9 @@ class MoEForwardConfig:
     # M tiles per compute wave. None selects 32 for MoonEP, 16 for home routing.
     # Larger waves amortize synchronization but increase dispatch/startup latency.
     single_kernel_group_windows: Optional[int] = None
+    # Full Kimi routing benefits from 256-row source tiles. Keep the legacy
+    # 128-row value for the grouped multi-kernel implementation above.
+    single_kernel_dispatch_block_size_m: Optional[int] = 256
 
     def __post_init__(self):
         object.__setattr__(
@@ -200,6 +206,19 @@ class MoEForwardConfig:
         ):
             if value < 16 or value & (value - 1):
                 raise ValueError(f"{name} must be a power of two no smaller than 16")
+
+        single_dispatch_m = self.single_kernel_dispatch_block_size_m
+        if single_dispatch_m is None:
+            object.__setattr__(
+                self, "single_kernel_dispatch_block_size_m",
+                self.dispatch_fc1_block_size_m,
+            )
+        elif (single_dispatch_m < 16
+              or single_dispatch_m & (single_dispatch_m - 1)):
+            raise ValueError(
+                "single_kernel_dispatch_block_size_m must be None or a power "
+                "of two no smaller than 16"
+            )
 
         if self.fc1_gemm_block_size_m > _MAX_FC1_GEMM_BLOCK_SIZE_M:
             raise ValueError(

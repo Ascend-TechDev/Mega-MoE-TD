@@ -101,6 +101,8 @@ def _parse_args():
     )
     parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
+    parser.add_argument("--dispatch-block", type=int,
+                        help="single-kernel source tile M (default: 256)")
     parser.add_argument("--moonep", action="store_true",
                         help="enable device planning and UDMA replica prefetch in the same launch")
     parser.add_argument("--wave-windows", type=int,
@@ -124,6 +126,8 @@ def _config_overrides(args):
         ("fc2_combine_block_size_m", "fc2_gemm_block_size_n", "fc2_gemm_block_size_k"),
         args.fc2_block,
     ))
+    if args.dispatch_block is not None:
+        overrides["single_kernel_dispatch_block_size_m"] = args.dispatch_block
     return overrides
 
 
@@ -541,6 +545,36 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _compiler_metadata():
+    # Activating the Python environment does not select its NPU-IR compiler.
+    # Record the backend's actual resolution and the paired device libraries.
+    from triton.backends.ascend.utils import (
+        _get_bishengir_opt_path, _get_npucompiler_path,
+    )
+
+    compiler, compiler_env = _get_npucompiler_path()
+    resolved = Path(compiler).resolve()
+    result = {
+        "path": compiler,
+        "resolved_path": str(resolved),
+        "bishengir_opt": _get_bishengir_opt_path()[0],
+        "device_library_sha256": {
+            str(path): _sha256(path)
+            for path in sorted((resolved.parent.parent / "lib").glob("meta_op*.bc"))
+        },
+        "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
+        "triton_disable_ffts": os.environ.get("TRITON_DISABLE_FFTS"),
+    }
+    try:
+        result["version"] = subprocess.check_output(
+            [compiler, "--version"], env=compiler_env, text=True,
+            stderr=subprocess.STDOUT, timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        result["version_error"] = str(error)
+    return result
+
+
 def _configure_rendezvous():
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("ASH_MASTER_ADDR", "127.0.0.1")
@@ -608,6 +642,7 @@ def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
             "ascend_home": os.environ.get("ASCEND_HOME_PATH"),
             "ascend_home_resolved": str(Path(os.environ["ASCEND_HOME_PATH"]).resolve())
             if os.environ.get("ASCEND_HOME_PATH") else None,
+            "npu_compiler": _compiler_metadata(),
             "communication": {
                 name: os.environ.get(name)
                 for name in (

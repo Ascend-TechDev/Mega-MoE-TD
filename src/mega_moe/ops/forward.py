@@ -165,6 +165,10 @@ class FusedMoEForward(torch.nn.Module):
             world_size=self.world_size,
             receive_capacity_factor=self.receive_capacity_factor,
             dispatch_fc1_block_size_m=self.config.dispatch_fc1_block_size_m,
+            single_kernel_dispatch_block_size_m=(
+                self.config.single_kernel_dispatch_block_size_m
+                if self.enable_single_kernel_forward else None
+            ),
             enable_moonep=self.enable_moonep,
             ep_group=self.ep_group,
         )
@@ -1721,7 +1725,7 @@ class FusedMoEForward(torch.nn.Module):
             NUM_BINS_PAD=self.context.metadata_num_bins,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
-            DISPATCH_BLOCK_M=self.config.dispatch_fc1_block_size_m,
+            DISPATCH_BLOCK_M=self.config.single_kernel_dispatch_block_size_m,
             FC1_BLOCK_M=self.config.fc1_gemm_block_size_m,
             FC1_BLOCK_N=self.config.fc1_gemm_block_size_n,
             FC1_BLOCK_K=self.config.fc1_gemm_block_size_k,
@@ -1746,6 +1750,11 @@ class FusedMoEForward(torch.nn.Module):
             # leaves the worst case unconverged (host-modeled in
             # tests/function/test_single_kernel_wide_world.py).
             WORLD_SEARCH_STEPS=self.world_size.bit_length(),
+            # A final-wave return counter is published only after each return
+            # worker has fenced its earlier waves, so acquiring that counter
+            # establishes visibility for the whole return stream.
+            LAST_RETURN_ONLY=bool(
+                getattr(self, "_single_wait_last_return", True)),
             **launch_options,
         )
         self._tile_signal_epoch += 1

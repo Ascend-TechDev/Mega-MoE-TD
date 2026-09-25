@@ -662,6 +662,7 @@ def _partition_pipeline_fc1_activation_group_ub(
                 local_row_start = row_part * pair_block_m
                 row_count = pair_block_m if FULL_GROUP else tl.minimum(
                     pair_block_m, cube_group_size - local_row_start)
+                full_row_tile = FULL_GROUP or (row_count == pair_block_m)
                 if pipeline_step < first_sweep_steps:
                     group_ready_token += _wait_dispatch_row_range(
                         signal_mem_ptr, recv_seg_starts_ptr, cube_expert_id,
@@ -697,7 +698,7 @@ def _partition_pipeline_fc1_activation_group_ub(
                 for k_start in range(0, K, BLOCK_K):
                     red = k_start + offs_k
                     if K % BLOCK_K == 0:
-                        if FULL_GROUP & (FFN % pair_block_n == 0):
+                        if full_row_tile & (FFN % pair_block_n == 0):
                             a = tl.load(ready_input_ptr +
                                         rows[:, None] * stride_input_m +
                                         red[None, :] * stride_input_k)
@@ -789,6 +790,7 @@ def _partition_pipeline_fc1_activation_group_ub(
                 local_row_start = row_part * pair_block_m
                 row_count = pair_block_m if FULL_GROUP else tl.minimum(
                     pair_block_m, vector_group_size - local_row_start)
+                full_row_tile = FULL_GROUP or (row_count == pair_block_m)
                 output_group_row = vector_expert_off.to(
                     tl.int64) + vector_group_start.to(tl.int64)
                 output_group_ptr = output_ptr + output_group_row * FFN
@@ -855,7 +857,7 @@ def _partition_pipeline_fc1_activation_group_ub(
                     cols = col_start + tl.arange(0, pair_block_n)
                     mask_m = local_rows < row_count
                     mask_n = cols < FFN
-                    if FULL_GROUP:
+                    if full_row_tile:
                         routing_weight = tl.load(routing_group_ptr +
                                                  local_row_start +
                                                  local_rows).to(tl.float32)
@@ -865,7 +867,7 @@ def _partition_pipeline_fc1_activation_group_ub(
                                                  mask=mask_m,
                                                  other=0.0).to(tl.float32)
                     activated *= routing_weight[:, None]
-                    if FULL_GROUP & (FFN % pair_block_n == 0):
+                    if full_row_tile & (FFN % pair_block_n == 0):
                         tl.store(
                             output_group_ptr +
                             (local_row_start + local_rows)[:, None] * FFN +
@@ -1143,8 +1145,16 @@ def _dispatch_dynamic_wave(
                 last_tile = tl.cdiv(tl.minimum(tl.maximum(end - source_begin, 0),
                                                source_rows), DISPATCH_BLOCK_M)
                 if first_tile < last_tile:
+                    # Rotate only single-tile buckets across workers. Small
+                    # experts often have one tile per source; assigning every
+                    # bucket's first tile to lane 0 serializes them. Larger
+                    # buckets retain the contiguous lane assignment used by
+                    # the dense/pruned schedule.
+                    task_lane = lane
+                    if source_rows <= DISPATCH_BLOCK_M:
+                        task_lane = (lane + lanes - expert % lanes) % lanes
                     _dispatch_one_source_tile_task(
-                        bucket, lane, lanes, hidden_states_ptr, peer_mem_ptr,
+                        bucket, task_lane, lanes, hidden_states_ptr, peer_mem_ptr,
                         routing_weights_ptr, routing_weight_recv_ptr, signal_mem_ptr,
                         send_token_indices_ptr, send_route_indices_ptr,
                         send_bucket_dst_starts_ptr, send_bucket_starts_ptr,
@@ -1279,7 +1289,7 @@ def _wait_dynamic_wave_returns(
         worker, wave_expert_offsets_ptr, pipeline_signal_ptr, signal_epoch,
         NUM_CORES: tl.constexpr, LOCAL_RANK, WORLD_SIZE: tl.constexpr,
         EXPERTS_PER_RANK: tl.constexpr, MAX_WAVES: tl.constexpr,
-        WAVE_WINDOWS: tl.constexpr):
+        WAVE_WINDOWS: tl.constexpr, LAST_RETURN_ONLY: tl.constexpr = False):
     return_base: tl.constexpr = 2 * MAX_WAVES * NUM_CORES
     checked_base: tl.constexpr = MAX_WAVES * (2 * NUM_CORES + WORLD_SIZE)
     CHECKERS: tl.constexpr = min(2 * NUM_CORES, WORLD_SIZE)
@@ -1291,7 +1301,15 @@ def _wait_dynamic_wave_returns(
             blocks = tl.load(wave_expert_offsets_ptr
                              + (destination * (EXPERTS_PER_RANK + 1) + EXPERTS_PER_RANK) * 2)
             waves = tl.cdiv(blocks, WAVE_WINDOWS)
-            for wave in range(waves):
+            first_wave = 0
+            if LAST_RETURN_ONLY:
+                # Every return worker processes waves in order, fences its
+                # writes, and then increments the counter for that wave.  An
+                # acquire of the final wave from every worker therefore also
+                # observes all writes from the preceding waves.  Empty
+                # destinations have waves == 0 and contribute no wait.
+                first_wave = tl.maximum(waves - 1, 0)
+            for wave in range(first_wave, waves):
                 ready += dl.wait(
                     pipeline_signal_ptr + (return_base + wave * WORLD_SIZE + destination) * 16,
                     1, 'gpu', 'acquire', waitValue=expected)
@@ -1310,24 +1328,68 @@ def _wait_dynamic_wave_returns(
 def _reduce_topk_rows(pid, combine_buf_ptr, route_to_send_ptr, output_ptr,
                       num_tokens, capacity_ok, NUM_PROGRAM_CORES: tl.constexpr,
                       HIDDEN: tl.constexpr, TOPK: tl.constexpr,
-                      BLOCK_N: tl.constexpr):
+                      BLOCK_N: tl.constexpr,
+                      INTERLEAVE_ACCUMULATORS: tl.constexpr = True):
     cols_in_block = tl.arange(0, BLOCK_N)
     for token_id in range(pid, num_tokens, NUM_PROGRAM_CORES):
         route_base = token_id * TOPK
         for col_start in range(0, HIDDEN, BLOCK_N):
             cols = col_start + cols_in_block
             mask_n = cols < HIDDEN
-            acc = tl.zeros((BLOCK_N, ), dtype=tl.float32)
-            if capacity_ok:
-                for topk_slot in tl.static_range(0, TOPK):
-                    send_row = tl.load(route_to_send_ptr + route_base +
-                                       topk_slot)
-                    valid = send_row >= 0
-                    safe_row = tl.where(valid, send_row, 0).to(tl.int64)
-                    value = tl.load(combine_buf_ptr + safe_row * HIDDEN + cols,
-                                    mask=mask_n & valid,
-                                    other=0.0).to(tl.float32)
-                    acc += value
+            if INTERLEAVE_ACCUMULATORS:
+                # Independent sums shorten the accumulation dependency chain
+                # while preserving contiguous per-route DMA loads.
+                acc0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                acc1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                acc2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                if capacity_ok:
+                    for base in tl.static_range(0, TOPK, 4):
+                        if base + 0 < TOPK:
+                            send0 = tl.load(route_to_send_ptr + route_base + base + 0)
+                            safe0 = tl.maximum(send0, 0).to(tl.int64)
+                            value0 = tl.load(
+                                combine_buf_ptr + safe0 * HIDDEN + cols,
+                                mask=mask_n & (send0 >= 0), other=0.0)
+                        if base + 1 < TOPK:
+                            send1 = tl.load(route_to_send_ptr + route_base + base + 1)
+                            safe1 = tl.maximum(send1, 0).to(tl.int64)
+                            value1 = tl.load(
+                                combine_buf_ptr + safe1 * HIDDEN + cols,
+                                mask=mask_n & (send1 >= 0), other=0.0)
+                        if base + 2 < TOPK:
+                            send2 = tl.load(route_to_send_ptr + route_base + base + 2)
+                            safe2 = tl.maximum(send2, 0).to(tl.int64)
+                            value2 = tl.load(
+                                combine_buf_ptr + safe2 * HIDDEN + cols,
+                                mask=mask_n & (send2 >= 0), other=0.0)
+                        if base + 3 < TOPK:
+                            send3 = tl.load(route_to_send_ptr + route_base + base + 3)
+                            safe3 = tl.maximum(send3, 0).to(tl.int64)
+                            value3 = tl.load(
+                                combine_buf_ptr + safe3 * HIDDEN + cols,
+                                mask=mask_n & (send3 >= 0), other=0.0)
+                        if base + 0 < TOPK:
+                            acc0 += value0.to(tl.float32)
+                        if base + 1 < TOPK:
+                            acc1 += value1.to(tl.float32)
+                        if base + 2 < TOPK:
+                            acc2 += value2.to(tl.float32)
+                        if base + 3 < TOPK:
+                            acc3 += value3.to(tl.float32)
+                acc = (acc0 + acc1) + (acc2 + acc3)
+            else:
+                acc = tl.zeros((BLOCK_N, ), dtype=tl.float32)
+                if capacity_ok:
+                    for topk_slot in tl.static_range(0, TOPK):
+                        send_row = tl.load(route_to_send_ptr + route_base +
+                                           topk_slot)
+                        valid = send_row >= 0
+                        safe_row = tl.where(valid, send_row, 0).to(tl.int64)
+                        value = tl.load(combine_buf_ptr + safe_row * HIDDEN + cols,
+                                        mask=mask_n & valid,
+                                        other=0.0).to(tl.float32)
+                        acc += value
             tl.store(output_ptr + token_id.to(tl.int64) * HIDDEN + cols,
                      acc.to(tl.bfloat16),
                      mask=mask_n)
@@ -1359,7 +1421,7 @@ def _run_dynamic_wave_pipeline(
         # accumulators and the per-call FC1 ring.
         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,
         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,
-        RING_SLOTS: tl.constexpr = 0):
+        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):
     global_waves = 0
     for rank in range(WORLD_SIZE):
         blocks = tl.load(wave_expert_offsets_ptr
@@ -1455,56 +1517,61 @@ def _run_dynamic_wave_pipeline(
                 if begin < end:
                     tile_base = (first_block + begin // BLOCK_M) * fc1_n_tiles
                     lane = (pid + NUM_CORES - tile_base % NUM_CORES) % NUM_CORES
-                    full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)
-                    # Separate allocation bases at compile time: the Ascend
-                    # block-pointer pass cannot merge home/replica pointers.
-                    for replica_kind in tl.static_range(2 if MOONEP else 1):
-                        if (not MOONEP) or ((expert >= HOME_EXPERTS) == (replica_kind == 1)):
-                            ring_slot = fc1_ring_call
-                            fc1_ring_call += 1
-                            # Dead-arg pattern: the wrapper always hands a
-                            # real ring; TIMING=0 compiles the stores out.
-                            ring_base = (ring_ptr
-                                         + pid * 3 * RING_SLOTS
-                                         * FWD_RING_COLS)
-                            if full_rows:
-                                _partition_pipeline_fc1_activation_group_ub(
-                                    lane, peer_mem_ptr, signal_mem_ptr,
-                                    replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
-                                    recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
-                                    stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
-                                    stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
-                                    HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, expert,
-                                    begin, end - begin, gate_ready_ptr,
-                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
-                                    # Trailing knobs pass by keyword: the
-                                    # positional run stops at WAIT_REPLICA so
-                                    # inserted params cannot shift the group
-                                    # geometry args again.
-                                    FC1_FP8=FC1_FP8,
-                                    FC1_SAVE_FP16=FC1_SAVE_FP16,
-                                    SEARCH_STEPS=SEARCH_STEPS,
-                                    ring_base=ring_base, ring_slot=ring_slot,
-                                    TIMING=TIMING, RING_SLOTS=RING_SLOTS)
-                            else:
-                                _partition_pipeline_fc1_activation_group_ub(
-                                    lane, peer_mem_ptr, signal_mem_ptr,
-                                    replica_gate_ptr if replica_kind else gate_up_weight_ptr,
-                                    routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
-                                    recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
-                                    stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
-                                    stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
-                                    HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
-                                    WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, expert,
-                                    begin, end - begin, gate_ready_ptr,
-                                    HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
-                                    FC1_FP8=FC1_FP8,
-                                    FC1_SAVE_FP16=FC1_SAVE_FP16,
-                                    SEARCH_STEPS=SEARCH_STEPS,
-                                    ring_base=ring_base, ring_slot=ring_slot,
-                                    TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                    fc1_tile_count = tl.cdiv(end - begin, BLOCK_M) * fc1_n_tiles
+                    # A task split at a wave boundary can have fewer tiles
+                    # than Cube programs. Skip helper setup on idle programs;
+                    # the active programs keep the same tile assignment.
+                    if lane < fc1_tile_count:
+                        full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)
+                        # Separate allocation bases at compile time: the Ascend
+                        # block-pointer pass cannot merge home/replica pointers.
+                        for replica_kind in tl.static_range(2 if MOONEP else 1):
+                            if (not MOONEP) or ((expert >= HOME_EXPERTS) == (replica_kind == 1)):
+                                ring_slot = fc1_ring_call
+                                fc1_ring_call += 1
+                                # Dead-arg pattern: the wrapper always hands a
+                                # real ring; TIMING=0 compiles the stores out.
+                                ring_base = (ring_ptr
+                                             + pid * 3 * RING_SLOTS
+                                             * FWD_RING_COLS)
+                                if full_rows:
+                                    _partition_pipeline_fc1_activation_group_ub(
+                                        lane, peer_mem_ptr, signal_mem_ptr,
+                                        replica_gate_ptr if replica_kind else gate_up_weight_ptr,
+                                        routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
+                                        recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                        stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
+                                        stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
+                                        HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
+                                        WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, True, SAVE_FC1, expert,
+                                        begin, end - begin, gate_ready_ptr,
+                                        HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
+                                        # Trailing knobs pass by keyword: the
+                                        # positional run stops at WAIT_REPLICA so
+                                        # inserted params cannot shift the group
+                                        # geometry args again.
+                                        FC1_FP8=FC1_FP8,
+                                        FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                        SEARCH_STEPS=SEARCH_STEPS,
+                                        ring_base=ring_base, ring_slot=ring_slot,
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                                else:
+                                    _partition_pipeline_fc1_activation_group_ub(
+                                        lane, peer_mem_ptr, signal_mem_ptr,
+                                        replica_gate_ptr if replica_kind else gate_up_weight_ptr,
+                                        routing_weight_recv_ptr, weighted_activation_ptr, fc1_output_ptr, fc1_scale_ptr, expert_offset,
+                                        recv_seg_starts_ptr, signal_epoch, situ_beta, situ_linear_beta,
+                                        stride_hidden_m, stride_hidden_k, stride_gate_up_e, stride_gate_up_n,
+                                        stride_gate_up_k, WORLD_SIZE, EXPERTS_PER_RANK, MAX_SOURCE_TILES, FFN,
+                                        HIDDEN, DISPATCH_BLOCK_M, BLOCK_M, FC1_BLOCK_N, FC1_BLOCK_K,
+                                        WAVE_WINDOWS, NUM_CORES, ACTIVATION, HAS_LINEAR_BETA, False, SAVE_FC1, expert,
+                                        begin, end - begin, gate_ready_ptr,
+                                        HOME_EXPERTS if replica_kind else 0, replica_kind == 1,
+                                        FC1_FP8=FC1_FP8,
+                                        FC1_SAVE_FP16=FC1_SAVE_FP16,
+                                        SEARCH_STEPS=SEARCH_STEPS,
+                                        ring_base=ring_base, ring_slot=ring_slot,
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
             with al.scope(core_mode='vector', disable_auto_sync=True):
                 libshmem_device.fence()
                 libshmem_device.signal_op(
@@ -1574,7 +1641,8 @@ def _run_dynamic_wave_pipeline(
             return_ready = _wait_dynamic_wave_returns(
                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,
                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,
-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)
+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,
+                LAST_RETURN_ONLY=LAST_RETURN_ONLY)
             if TIMING:
                 # dl.wait blocks the issuing stream: this one is exact.
                 # Column 4 is reported from lane 0 (both lanes wait).
@@ -1584,9 +1652,12 @@ def _run_dynamic_wave_pipeline(
         reduce_block_n: tl.constexpr = _REDUCE_BLOCK_N if HIDDEN >= 2048 else 1024
         if TIMING:
             _e0 = _sys_cnt_tick(dummy_ts)
+        # Saved-FC1 variants keep the original sum to avoid an Ascend
+        # compilation regression with four independent accumulators.
         _reduce_topk_rows(
             pid * 2 + sub_vec_id(), ready_combine, route_to_send_ptr, output_ptr,
-            num_routes // TOPK, capacity_ok, 2 * NUM_CORES, HIDDEN, TOPK, reduce_block_n)
+            num_routes // TOPK, capacity_ok, 2 * NUM_CORES, HIDDEN, TOPK,
+            reduce_block_n, INTERLEAVE_ACCUMULATORS=not SAVE_FC1)
         if TIMING:
             busy += tl.where(busy_offs == 5 + sub_vec_id(),
                              _sys_cnt_tick(dummy_ts) - _e0, 0)
@@ -1633,7 +1704,8 @@ def _kernel_fused_forward(
         RAW_NUM_BINS: tl.constexpr, UDMA_CHUNK_ELEMENTS: tl.constexpr,
         TS_SLOTS: tl.constexpr, ACC_SLOTS: tl.constexpr,
         RING_SLOTS: tl.constexpr, TIMING: tl.constexpr,
-        WORLD_SEARCH_STEPS: tl.constexpr):
+        WORLD_SEARCH_STEPS: tl.constexpr,
+        LAST_RETURN_ONLY: tl.constexpr = False):
     """Production routing-to-reduction pipeline for the single-kernel path."""
     pid = tl.program_id(axis=0)
     # One shared dummy + one precomputed ts row for all ten stamps (the
@@ -1824,7 +1896,8 @@ def _kernel_fused_forward(
         replica_gate_ptr, replica_down_ptr, gate_ready_ptr, down_ready_ptr,
         EXPERTS_PER_RANK, MOONEP, WORLD_SEARCH_STEPS,
         acc_ptr=acc_ptr, ring_ptr=ring_ptr, fc2w_ptr=fc2w_ptr,
-        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS)
+        TIMING=TIMING, ACC_SLOTS=ACC_SLOTS, RING_SLOTS=RING_SLOTS,
+        LAST_RETURN_ONLY=LAST_RETURN_ONLY)
     if TIMING:
         _fwd_stamp_lane0(ts_row, 8, ts_dummy)   # pipeline + reduce done
     if MOONEP:

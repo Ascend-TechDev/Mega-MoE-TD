@@ -112,6 +112,7 @@ def create_moe_forward_context(
     world_size: int,
     receive_capacity_factor: float,
     dispatch_fc1_block_size_m: int,
+    single_kernel_dispatch_block_size_m: Optional[int] = None,
     enable_moonep: bool = False,
     ep_group=None,
 ) -> MoEForwardContext:
@@ -132,9 +133,16 @@ def create_moe_forward_context(
     replica_budget = experts_per_rank if enable_moonep else 0
     physical_experts_per_rank = experts_per_rank + replica_budget
     max_received_routes = int(max_tokens_per_rank * top_k * receive_capacity_factor)
+    # The context is shared by the grouped and fused launches.  Size the
+    # readiness table for the finer of their tiles; otherwise selecting a
+    # single-kernel tile smaller than the legacy 128-row grouped tile could
+    # address beyond the table even though both configurations are valid.
+    source_tile_m = dispatch_fc1_block_size_m
+    if single_kernel_dispatch_block_size_m is not None:
+        source_tile_m = min(source_tile_m, single_kernel_dispatch_block_size_m)
     max_source_tiles = (
-        max_tokens_per_rank * top_k + dispatch_fc1_block_size_m - 1
-    ) // dispatch_fc1_block_size_m
+        max_tokens_per_rank * top_k + source_tile_m - 1
+    ) // source_tile_m
     context = MoEForwardContext(
         hidden_size=hidden_size,
         num_experts=num_experts,

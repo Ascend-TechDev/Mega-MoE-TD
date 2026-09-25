@@ -18,6 +18,7 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 from config import resolve_case
+from mega_moe.config import MoEForwardConfig
 from mega_moe.kernels.fused_forward import (
     FWD_ACC_SLOTS,
     FWD_TS_SLOTS,
@@ -49,6 +50,8 @@ def main():
     parser.add_argument("--dump-sync-ir", action="store_true")
     parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
+    parser.add_argument("--dispatch-block", type=int, default=256,
+                        help="single-kernel source tile M (default: 256)")
     parser.add_argument("--fc2-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -62,6 +65,12 @@ def main():
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output directory must be new or empty")
     h, f = case.hidden, case.ffn
+    dispatch_m = args.dispatch_block
+    if dispatch_m < 16 or dispatch_m & (dispatch_m - 1):
+        parser.error("dispatch-block must be a power of two of at least 16")
+    # The shared workspace accommodates the legacy and fused dispatch paths.
+    # Match its slot stride even when the fused path uses larger source tiles.
+    source_tile_m = min(dispatch_m, MoEForwardConfig.dispatch_fc1_block_size_m)
     fc1_m, fc1_n, fc1_k = args.fc1_block
     fc2_m, fc2_n, fc2_k = args.fc2_block
     if fc1_m != fc2_m:
@@ -89,9 +98,9 @@ def main():
         EXPERTS_PER_RANK=case.experts_per_rank, TOPK=case.topk,
         HIDDEN=h, FFN=f, MAX_RECEIVED_ROUTES=max_recv,
         NUM_BINS_PAD=triton.next_power_of_2(case.num_experts * (2 if args.moonep else 1)),
-        MAX_SOURCE_TILES=triton.cdiv(case.tokens * case.topk, 128),
+        MAX_SOURCE_TILES=triton.cdiv(case.tokens * case.topk, source_tile_m),
         MAX_PIPELINE_GROUPS=max_pipeline_groups,
-        DISPATCH_BLOCK_M=128, FC1_BLOCK_M=fc1_m, FC1_BLOCK_N=fc1_n,
+        DISPATCH_BLOCK_M=dispatch_m, FC1_BLOCK_M=fc1_m, FC1_BLOCK_N=fc1_n,
         FC1_BLOCK_K=fc1_k, FC2_BLOCK_N=fc2_n, FC2_BLOCK_K=fc2_k,
         ACTIVATION=0, HAS_LINEAR_BETA=False, SAVE_FC1=args.save_fc1,
         FC1_SAVE_FP16=args.save_fc1 and args.save_dtype == "fp16",
@@ -103,6 +112,7 @@ def main():
         RING_SLOTS=fwd_ring_slots(max_pipeline_groups, physical_experts),
         TIMING=args.timing,
         WORLD_SEARCH_STEPS=case.world_size.bit_length(),
+        LAST_RETURN_ONLY=True,
     )
     bf16_inputs = {
         "hidden_states_ptr", "gate_up_weight_ptr", "down_weight_ptr",
