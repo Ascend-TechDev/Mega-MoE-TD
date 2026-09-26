@@ -340,6 +340,54 @@ wave16 实测与第一轮文档第 5 节一致（trimmed t4k 1.442 vs 文档 1.4
    E896 时 B=112、BE=`next_pow2(896)`=1024，乘积 114688，是 E32 的 896 倍）：
    诊断性地把 B 压到 4 后，**编译仍 >3.5 分钟未完成，排除**。
 
+### 7.3b 第三个被排除的根因：MoonEP 规划整体
+
+把内联的 b0 + b2 + b3 + alloc_cumsum **全部移除**后重编（诊断性，破坏正确性），
+编译**仍 >3.5 分钟未完成**（正常配置 28-33 s）。
+
+**所以 MoonEP 规划三阶段整体都不是爆炸源**，爆炸在 MoonEP 的**数据路径**侧。
+
+这同时否定了 7.6 中"把规划拆成独立小 kernel"的建议 —— 拆了也不会解决编译问题，
+下一位不要按那条走。
+
+已知 MoonEP 数据路径的两个膨胀点（`fused_forward.py:1512` 附近）：
+
+1. `for replica_kind in tl.static_range(2 if MOONEP else 1)` ——
+   MoonEP 下把**整个 FC1 流水实例化两份**（home 权重表 + replica 权重表），
+   因为"Ascend block-pointer pass 无法合并 home/replica 指针"。
+2. `full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)` ——
+   MoonEP 下 `full_rows` 恒为 False，FC1 只能走**带 mask 的通用路径**，
+   其代码量显著大于 no-mask 快路径。
+
+两者叠加解释了 MoonEP 使 `kernel.source` 膨胀 63%（718 KB → 1168 KB）。
+但**仍未解释 E896 特异性**（E32+MoonEP 同样有这两个膨胀点却 33 s 编完），
+所以推测是"MoonEP 的大 IR × E896 的大 constexpr 宽度"在某个超线性 pass 上相乘。
+下一位应优先拿 per-pass timing 定位，而不是继续猜构造。
+
+### 7.3c 第四个被排除的根因：FC1 `full_rows` 恒假分支
+
+`fused_forward.py` 中 `full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)`。
+我推测 MoonEP 下它虽恒为 False 但是**运行时值**，Triton 会把 no-mask 快路径和
+mask 路径两份都 trace，叠加 `replica_kind` 的 2 份 = FC1 实例化 4 份。
+
+改成编译期 `if MOONEP: full_rows = False` 后实测（E32+MoonEP t4k）：
+
+| | source | ttir | 编译 |
+|---|---:|---:|---:|
+| 改前 | 1167607 | 573906 | 33 s |
+| 改后 | 1166212 | **573906（逐字节相同）** | 37 s |
+
+**ttir 完全一致 —— Triton 本来就已经折叠了这个分支，该假设错误，改动零收益，已回滚。**
+E896+MoonEP 在该改动下编译仍 >3.7 分钟未完成。
+
+### 7.3d 重要观察：是超线性慢，不是死锁
+
+standalone 用 90 分钟预算跑 `/tmp/kimi_u18/e896_moonep_kernel.mlir`，
+持续 100% CPU 跑到 **20 分钟以上仍在推进**（无死锁特征、无内存爆炸）。
+所以这是**编译时间超线性增长**问题，理论上给足预算可能能编出来，
+下一位可以先用一个很长的预算（如 2-4 小时）确认它到底能不能收敛 ——
+如果能，短期可用"预编译 + 缓存 npubin"绕过，不必先解决编译器问题。
+
 ### 7.4 IR 体量对比（线索）
 
 | 配置 | kernel.ttir | kernel.source |
@@ -383,9 +431,11 @@ MoonEP 把 source 撑大 63%，但 E32+MoonEP 仍 33s 编完。
    拿到 per-pass 耗时表直接锁定热点 pass。这是最高效的路径，不要再靠猜。
    环境无 gdb/py-spy，无法采样栈，只能靠 pass timing。
 2. 若确认是某个 pass 超线性，尝试用 `--mlir-disable-pass=<name>` 或对应开关绕过。
-3. 备选：把 MoonEP 规划（B.0/B.2/B.3）从 fused kernel 里**拆成独立的小 kernel 预启动**，
-   规划本身只有 `WORLD_SIZE` 量级的工作、不在性能关键路径上，
-   拆出去能同时消掉 IR 体量和 constexpr 宽度两个因子。这是我认为最可能奏效的方向。
+3. **不要**再试"把 MoonEP 规划拆成独立 kernel" —— 7.3b 已实测证明移除整个规划
+   也不能解决编译阻塞。
+4. 若 pass timing 指向 FC1 的 `replica_kind` 双实例化，可考虑让 home/replica
+   共用一份 FC1 代码、用运行时选择权重基址（需先确认该 Ascend block-pointer
+   限制在当前工具链版本是否仍然存在——原注释可能已过时，就像 al.sort 的 A5 限制一样）。
 
 ---
 
