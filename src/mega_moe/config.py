@@ -8,6 +8,12 @@ from typing import Optional
 # The mixed FC1 kernel has been validated through a 256-row GEMM window on
 # the current Ascend backend. Larger FP32 accumulators can fail in codegen.
 _MAX_FC1_GEMM_BLOCK_SIZE_M = 256
+# 256*256 is not a conservative guess: it is exactly the Ascend950DT L0C.
+# One FC1 tile holds gate+up accumulators, m * (n/2) * 2 fp32 = m * n * 4 B,
+# so 256x256 needs 262144 B = 2097152 bits.  Probed 2026-09-26 on
+# Ascend950DT_9582 with M256/N512: bishengir rejects it at codegen with
+# "cc overflow, requires 4194304 bits while 2097152 bits available!".
+# Raising this cap cannot work on this part; it is a hardware bound.
 _MAX_FC1_GEMM_ACCUMULATOR_ELEMENTS = 256 * 256
 
 # FC2 uses the same FP32 Cube accumulator limit; this bound applies only to the
@@ -298,7 +304,15 @@ class MoEForwardConfig:
                                     or windows & (windows - 1)):
             raise ValueError("single_kernel_group_windows must be None or a power of two in [1, 64]")
         if windows is None:
-            object.__setattr__(self, "single_kernel_group_windows", 32 if self.enable_moonep else 16)
+            # 32 everywhere: the FC1 wave window sets how many row tiles a
+            # core reuses one A panel across before it moves on, and MTE2 is
+            # the FC1 bottleneck (MAC 80% / MTE2 71% at 16 on Ascend950DT).
+            # Measured E32 uniform top-16 W8 T4K non-MoonEP, M256/N256/K128:
+            # windows=8 14.725 ms, 16 14.214 ms, 32 13.476 ms, 64 13.348 ms;
+            # MAC ratio rises 80.1% -> 84.7% from 16 to 32.  64 is within
+            # noise of 32 and needs a whole expert per wave, so 32 is the
+            # default for both paths.
+            object.__setattr__(self, "single_kernel_group_windows", 32)
         if (self.enable_single_kernel_forward
                 and self.fc1_gemm_block_size_m != self.fc2_combine_block_size_m):
             raise ValueError("single-kernel forward requires matching FC1 and FC2 M tiles")
