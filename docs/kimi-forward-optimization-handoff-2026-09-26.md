@@ -136,14 +136,15 @@ docs/performance/kimi-forward-2026-09-25.json
 
 为补齐 full + MoonEP，做过以下额外尝试，均没有产生可写入主矩阵的结果：
 
-1. 与原点相同的 full E896/t4k/M128-N512/K128/wave32，使用原始 profile，900 秒预算。后端停在 linalg_to_bin_enable_npu_compile_910_95，returncode=-15。
+1. 与原点相同的 full E896/t4k/M128-N512/K128/wave32，使用原始 profile，900 秒预算。后端停在 `linalg_to_bin_enable_npu_compile_910_95`，returncode=-15。
 2. compile-only，E896/t4k/MoonEP，M256/N256/K128，wave32，240 秒预算超时。
 3. compile-only，E896/t4k/MoonEP，M128/N256/K128，wave32，240 秒预算超时。
-4. 另建的 isolated largest-first wrapper 原意是对 full+t4k+MoonEP 只改变 compiler plan_memory_strategy=largest-first，但实际启动的 bishengir-compile 命令行没有出现 --plan-memory-strategy=largest-first，说明该 wrapper 没有把参数传入真正的 Triton launch；这次不能作为 largest-first 结论。它仍在普通 compiler plan 下持续约 5 分钟，没有 status.json 或 benchmark_result.json。文档任务开始时该 probe 仍占用 NPU/编译资源，随后结束并完整保留目录：
-   - /tmp/kimi_forward_matrix_20260926_completion/full_t4k_moonep1_largest
-   - wrapper：/tmp/kimi_forward_matrix_20260926_completion/profile_largest_wrapper.py
+4. 第一版 isolated largest-first wrapper 只想改 `plan_memory_strategy=largest-first`，但实际 `bishengir-compile` argv 没有该参数；它在普通 plan 下运行约 5 分钟，没有 status 或 binary。这次被标记为无效诊断，不能用来判断 largest-first。原始目录和 wrapper 仍保留：
+   - `/tmp/kimi_forward_matrix_20260926_completion/full_t4k_moonep1_largest`
+   - `/tmp/kimi_forward_matrix_20260926_completion/profile_largest_wrapper.py`
+5. 后续改用已核对命令行的 compiler-only probe，直接读取首次 full+t4k+MoonEP 产生的 `kernel.mlir`，确认 `--plan-memory-strategy=largest-first` 确实传入。该 probe 及所有 variant 的完整 status、stdout、stderr 保存在 `/tmp/kimi_forward_planmemory_20260926/`；结论见第 6.7 节。
 
-这些补测不能证明 CANN 版本错误，也不能证明性能差；它们只能证明当前 full+MoonEP 特化编译压力仍没有在规定预算内解决。
+因此，当前可靠结论不是“largest-first 已成功绕过”，而是：默认 plan 在预算内持续搜索，verified largest-first 较快进入 `PlanMemoryRegBase` 失败后的向量化失败；`preload=false` 也没有绕过该失败。上述补测不能证明 CANN 版本错误，也不能证明性能差；它们说明当前 full+MoonEP 特化编译压力尚未解决。
 
 ## 3. 固定硬件、软件和环境
 
