@@ -13,8 +13,6 @@ three-stream event chain's end-to-end data contract:
     weighted_activation -> peer_mem -> fc2_buf -> local top-k reduction.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -600,79 +598,13 @@ def _build_fc2_item_table(
     block_m: int,
     num_received_routes: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Flatten (expert, M-window) work items from the received-row layout.
-
-    One entry is emitted for every non-empty ``block_m``-row window of each
-    active expert, in expert-major / M-window-minor order.  AIV0, AIC, and AIV1
-    all consume this exact item sequence (striped across AI cores), which is
-    what lets one per-core semaphore pair hand the activation / FC2 results
-    between the stages without cross-pid signal interference.
-
-    The table is built by a device kernel by default (see
-    ``_build_fc2_item_table_device``): the hot path must contain zero
-    ``.item()`` calls -- every ``.item()`` drains the whole stream queue, and
-    the previous host-side build turned the gap between
-    ``prepare_fc2_device_put_metadata`` and the mixed-kernel launch into a
-    multi-millisecond void where the device sat idle.  Set
-    ``FC2_V1_HOST_ITEM_TABLE=1`` to restore the synchronous host build for
-    one-variable A/B.
-    """
-    if os.environ.get("FC2_V1_HOST_ITEM_TABLE"):
-        return _build_fc2_item_table_host(
-            received_routes_per_expert,
-            received_expert_offsets,
-            active_experts_per_rank,
-            block_m,
-        )
-    return _build_fc2_item_table_device(
-        received_routes_per_expert,
-        received_expert_offsets,
-        active_experts_per_rank,
-        block_m,
-        num_received_routes,
-    )
-
-
-def _build_fc2_item_table_host(
-    received_routes_per_expert: torch.Tensor,
-    received_expert_offsets: torch.Tensor,
-    active_experts_per_rank: int,
-    block_m: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Synchronous host-side item-table build (diagnostic fallback)."""
-    device = received_routes_per_expert.device
-    expert, rb, rc = [], [], []
-    for e in range(active_experts_per_rank):
-        cnt = int(received_routes_per_expert[e].item())
-        base = int(received_expert_offsets[e].item())
-        for m in range(0, (cnt + block_m - 1) // block_m):
-            expert.append(e)
-            rb.append(base + m * block_m)
-            rc.append(min(block_m, cnt - m * block_m))
-    n = len(expert)
-    return (
-        torch.as_tensor(expert, dtype=torch.int32, device=device),
-        torch.as_tensor(rb, dtype=torch.int32, device=device),
-        torch.as_tensor(rc, dtype=torch.int32, device=device),
-        torch.as_tensor([n], dtype=torch.int32, device=device),
-    )
-
-
-def _build_fc2_item_table_device(
-    received_routes_per_expert: torch.Tensor,
-    received_expert_offsets: torch.Tensor,
-    active_experts_per_rank: int,
-    block_m: int,
-    num_received_routes: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the item table entirely on device -- no host sync on the hot path.
 
     One program per active expert recomputes the expert-major item prefix
     from the received counts (a scalar O(E) loop over at most a few dozen
     experts), stores its own windows, and the last program stores the total.
-    Semantics match ``_build_fc2_item_table_host`` entry for entry: same
-    expert-major / M-window-minor order, same tail-window row-count shrink,
-    zero items for an empty expert.
+    Items are emitted in expert-major / M-window-minor order, with a
+    shortened row count for the tail and zero items for an empty expert.
 
     Workspace sizing note: the table's true length is only known on device
     (it depends on the per-expert received counts), so the buffers are

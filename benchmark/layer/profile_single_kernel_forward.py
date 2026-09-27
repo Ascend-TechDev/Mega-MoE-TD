@@ -35,6 +35,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -99,8 +100,14 @@ def _parse_args():
         action="store_true",
         help="run correctness gates and timing without collecting profiles",
     )
+    parser.add_argument(
+        "--record-host-intervals", action="store_true",
+        help="record each call through event completion for external device telemetry",
+    )
     parser.add_argument("--fc1-block", type=int, nargs=3, default=(256, 256, 128),
                         metavar=("M", "N", "K"))
+    parser.add_argument("--dispatch-block", type=int,
+                        help="single-kernel source tile M (default: 256)")
     parser.add_argument("--moonep", action="store_true",
                         help="enable device planning and UDMA replica prefetch in the same launch")
     parser.add_argument("--wave-windows", type=int,
@@ -124,6 +131,8 @@ def _config_overrides(args):
         ("fc2_combine_block_size_m", "fc2_gemm_block_size_n", "fc2_gemm_block_size_k"),
         args.fc2_block,
     ))
+    if args.dispatch_block is not None:
+        overrides["single_kernel_dispatch_block_size_m"] = args.dispatch_block
     return overrides
 
 
@@ -294,6 +303,7 @@ def _worker(
     metric: str,
     benchmark_only: bool,
     config_overrides: dict,
+    record_host_intervals: bool = False,
 ):
     faulthandler.dump_traceback_later(120, repeat=True)
     if rank == 0:
@@ -440,14 +450,43 @@ def _worker(
                 if rank == 0:
                     print("[timing] correctness passed; measuring Triton then Torch", flush=True)
                 faulthandler.cancel_dump_traceback_later()
-                runner = kit.PerformanceRunner(
-                    run_candidate,
-                    run_torch_grouped,
+                host_intervals = {"candidate": [], "baseline": []}
+                last_interval = [None]
+
+                def observe_call(fn, phase):
+                    if not record_host_intervals:
+                        return fn
+
+                    def observed():
+                        interval = [time.monotonic_ns(), None]
+                        output = fn()
+                        interval[1] = time.monotonic_ns()
+                        host_intervals[phase].append(interval)
+                        last_interval[0] = interval
+                        return output
+
+                    return observed
+
+                class ObservedRunner(kit.PerformanceRunner):
+                    def _rank_max(self, value_ms):
+                        # The runner has already synchronized the end event.
+                        # Record completion outside the event-timed region and
+                        # before the rank-MAX collective; warmups have no hook.
+                        last_interval[0][1] = time.monotonic_ns()
+                        return super()._rank_max(value_ms)
+
+                runner_type = ObservedRunner if record_host_intervals else kit.PerformanceRunner
+                runner = runner_type(
+                    observe_call(run_candidate, "candidate"),
+                    observe_call(run_torch_grouped, "baseline"),
                     kit.FORWARD_TIMING,
                     device=device,
                     ep_group=ep_group,
                 )
                 candidate_result, baseline_result = runner.run()
+                if record_host_intervals:
+                    (Path(output_dir) / f"host_call_intervals_rank{rank}.json").write_text(
+                        json.dumps(host_intervals, indent=2) + "\n")
                 if rank == 0:
                     _write_benchmark_result(
                         Path(output_dir),
@@ -541,6 +580,36 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _compiler_metadata():
+    # Activating the Python environment does not select its NPU-IR compiler.
+    # Record the backend's actual resolution and the paired device libraries.
+    from triton.backends.ascend.utils import (
+        _get_bishengir_opt_path, _get_npucompiler_path,
+    )
+
+    compiler, compiler_env = _get_npucompiler_path()
+    resolved = Path(compiler).resolve()
+    result = {
+        "path": compiler,
+        "resolved_path": str(resolved),
+        "bishengir_opt": _get_bishengir_opt_path()[0],
+        "device_library_sha256": {
+            str(path): _sha256(path)
+            for path in sorted((resolved.parent.parent / "lib").glob("meta_op*.bc"))
+        },
+        "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
+        "triton_disable_ffts": os.environ.get("TRITON_DISABLE_FFTS"),
+    }
+    try:
+        result["version"] = subprocess.check_output(
+            [compiler, "--version"], env=compiler_env, text=True,
+            stderr=subprocess.STDOUT, timeout=10,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        result["version_error"] = str(error)
+    return result
+
+
 def _configure_rendezvous():
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("ASH_MASTER_ADDR", "127.0.0.1")
@@ -559,7 +628,7 @@ def _configure_rendezvous():
 
 
 def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
-                    config_overrides: dict):
+                    config_overrides: dict, record_host_intervals: bool = False):
     source_paths = (
         Path(__file__).resolve(),
         _REPO_ROOT / "src/mega_moe/ops/forward.py",
@@ -590,6 +659,7 @@ def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
         "candidate": "single_kernel",
         "baseline": "Torch-NPU grouped-GEMM + HCCL",
         "benchmark_protocol": kit.FORWARD_TIMING.as_dict(),
+        "host_interval_recording": record_host_intervals,
         "communication_init_order": "hccl_collectives_then_aclshmem",
         "config_overrides": config_overrides,
         "environment": {
@@ -608,6 +678,7 @@ def _write_metadata(output_dir: Path, metric: str, case, benchmark_only: bool,
             "ascend_home": os.environ.get("ASCEND_HOME_PATH"),
             "ascend_home_resolved": str(Path(os.environ["ASCEND_HOME_PATH"]).resolve())
             if os.environ.get("ASCEND_HOME_PATH") else None,
+            "npu_compiler": _compiler_metadata(),
             "communication": {
                 name: os.environ.get(name)
                 for name in (
@@ -662,7 +733,7 @@ if __name__ == "__main__":
         raise ValueError("visible NPU devices do not cover the selected world")
     check_npu_occupancy(args.output_dir, device_ids, phase="before_spawn")
     _write_metadata(args.output_dir, args.metric, selected_case, args.benchmark_only,
-                    config_overrides)
+                    config_overrides, args.record_host_intervals)
     context = mp.spawn(
         _worker,
         args=(
@@ -672,6 +743,7 @@ if __name__ == "__main__":
             args.metric,
             args.benchmark_only,
             config_overrides,
+            args.record_host_intervals,
         ),
         nprocs=selected_case.world_size,
         join=False,

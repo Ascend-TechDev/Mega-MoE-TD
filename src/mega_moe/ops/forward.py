@@ -165,6 +165,10 @@ class FusedMoEForward(torch.nn.Module):
             world_size=self.world_size,
             receive_capacity_factor=self.receive_capacity_factor,
             dispatch_fc1_block_size_m=self.config.dispatch_fc1_block_size_m,
+            single_kernel_dispatch_block_size_m=(
+                self.config.single_kernel_dispatch_block_size_m
+                if self.enable_single_kernel_forward else None
+            ),
             enable_moonep=self.enable_moonep,
             ep_group=self.ep_group,
         )
@@ -1636,9 +1640,9 @@ class FusedMoEForward(torch.nn.Module):
             self._fwd_acc_buf.zero_()
             self._fwd_ring_buf.zero_()
             self._fwd_fc2w_buf.zero_()
-        # EXP-L: host-side route_to_send reset (moved OUT of the fused kernel).
-        # Device op on the same stream as the launch; only for discrimination —
-        # timing from this build is NOT representative of single-kernel perf.
+        # Scatter does not write dropped routes. Reset the active inverse on
+        # the launch stream so reused workspaces cannot retain stale rows.
+        # This device fill is part of the end-to-end forward timing boundary.
         self._route_to_send[:num_routes].fill_(-1)
         _kernel_fused_forward[self.num_aicore_programs, 1, 1](
             hidden_states,
@@ -1721,7 +1725,7 @@ class FusedMoEForward(torch.nn.Module):
             NUM_BINS_PAD=self.context.metadata_num_bins,
             MAX_SOURCE_TILES=self.context.max_source_tiles,
             MAX_PIPELINE_GROUPS=self._single_pipeline_max_groups,
-            DISPATCH_BLOCK_M=self.config.dispatch_fc1_block_size_m,
+            DISPATCH_BLOCK_M=self.config.single_kernel_dispatch_block_size_m,
             FC1_BLOCK_M=self.config.fc1_gemm_block_size_m,
             FC1_BLOCK_N=self.config.fc1_gemm_block_size_n,
             FC1_BLOCK_K=self.config.fc1_gemm_block_size_k,
