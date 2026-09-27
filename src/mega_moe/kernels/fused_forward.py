@@ -560,7 +560,8 @@ def _partition_pipeline_fc1_activation_group_ub(
         # MOE_FWD_TIMING=1 only: this program's ring row base and the call's
         # ring slot (dead args when TIMING=0; stores clamp to RING_SLOTS).
         ring_base=None, ring_slot=0,
-        TIMING: tl.constexpr = False, RING_SLOTS: tl.constexpr = 0):
+        TIMING: tl.constexpr = False, RING_SLOTS: tl.constexpr = 0,
+        DYNAMIC_ACTIVATION_STORE: tl.constexpr = True):
     """Pipeline FC1 gate/up tiles through UB directly into activation output.
 
     ``SAVE_FC1`` stores the raw gate/up Fixpipe results (pre-activation,
@@ -854,7 +855,13 @@ def _partition_pipeline_fc1_activation_group_ub(
                                                  mask=mask_m,
                                                  other=0.0).to(tl.float32)
                     activated *= routing_weight[:, None]
-                    if full_row_tile & (FFN % pair_block_n == 0):
+                    # The runtime store branch triggers pathological Ascend
+                    # regbase memory planning with MoonEP's home/replica UB
+                    # lifetimes. A masked store is also valid for full tiles;
+                    # keep the Cube and routing-weight load fast paths.
+                    full_store_tile = FULL_GROUP or (
+                        DYNAMIC_ACTIVATION_STORE and full_row_tile)
+                    if full_store_tile & (FFN % pair_block_n == 0):
                         tl.store(
                             output_group_ptr +
                             (local_row_start + local_rows)[:, None] * FFN +
@@ -1538,7 +1545,8 @@ def _run_dynamic_wave_pipeline(
                                         FC1_SAVE_FP16=FC1_SAVE_FP16,
                                         SEARCH_STEPS=SEARCH_STEPS,
                                         ring_base=ring_base, ring_slot=ring_slot,
-                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS,
+                                        DYNAMIC_ACTIVATION_STORE=not MOONEP)
                                 else:
                                     _partition_pipeline_fc1_activation_group_ub(
                                         lane, peer_mem_ptr, signal_mem_ptr,
@@ -1555,7 +1563,8 @@ def _run_dynamic_wave_pipeline(
                                         FC1_SAVE_FP16=FC1_SAVE_FP16,
                                         SEARCH_STEPS=SEARCH_STEPS,
                                         ring_base=ring_base, ring_slot=ring_slot,
-                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS)
+                                        TIMING=TIMING, RING_SLOTS=RING_SLOTS,
+                                        DYNAMIC_ACTIVATION_STORE=not MOONEP)
             with al.scope(core_mode='vector', disable_auto_sync=True):
                 libshmem_device.fence()
                 libshmem_device.signal_op(
@@ -1635,12 +1644,13 @@ def _run_dynamic_wave_pipeline(
         reduce_block_n: tl.constexpr = _REDUCE_BLOCK_N if HIDDEN >= 2048 else 1024
         if TIMING:
             _e0 = _sys_cnt_tick(dummy_ts)
-        # Saved-FC1 variants keep the original sum to avoid an Ascend
-        # compilation regression with four independent accumulators.
+        # Saved-FC1 and MoonEP variants use the serial sum: the four-way
+        # unrolled reduction triggers pathological regbase memory planning
+        # with their larger live-buffer graph (E896 MoonEP in particular).
         _reduce_topk_rows(
             pid * 2 + sub_vec_id(), ready_combine, route_to_send_ptr, output_ptr,
             num_routes // TOPK, capacity_ok, 2 * NUM_CORES, HIDDEN, TOPK,
-            reduce_block_n, INTERLEAVE_ACCUMULATORS=not SAVE_FC1)
+            reduce_block_n, INTERLEAVE_ACCUMULATORS=not (SAVE_FC1 or MOONEP))
         if TIMING:
             busy += tl.where(busy_offs == 5 + sub_vec_id(),
                              _sys_cnt_tick(dummy_ts) - _e0, 0)
