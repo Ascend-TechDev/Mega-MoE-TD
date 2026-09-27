@@ -1,0 +1,1326 @@
+{
+  "schema_version": 1,
+  "purpose": "Final hardware acceptance of the E896 MoonEP compiler workaround; not a new optimization or a pre/post performance comparison",
+  "exit_code": 0,
+  "run_commit": "6483aaaae83b5adbc5cdc2348bc7731e885015b9",
+  "run_git_status": [],
+  "production_fix_commit": "537c652c44693c80b595404e31804f6c333c8686",
+  "original_artifact_directory": "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed",
+  "source_sha256": {
+    "benchmark/layer/profile_single_kernel_forward.py": "1a954ffbf5e70617e82bd57344a1e38b0a73f2bb0e884f03702764671c72bc30",
+    "src/mega_moe/ops/forward.py": "5b6418783dbda004512a901f8748cb4b78b5668a0dc5f44ff76f03a178d14f3b",
+    "src/mega_moe/kernels/fused_forward.py": "bc24fac1c12c428cf79e8dcfa10af31d5a3d2a72d1befc4f4f9640b0d15dfb04",
+    "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+    "benchmark/layer/_kimi_routes.py": "b09f9b2b0d4147a5599b1c9a2c6ca9aff070295f7164508652e393082b57c9d7",
+    "src/mega_moe/kernels/dispatch_fc1.py": "38a0fa56f9a46e60249077c2b9244e1ce2f012f5c9231b99d2dd25ef693d9aa6",
+    "src/mega_moe/kernels/fc2_combine.py": "497200e5ee197764b7ec90d5eca305c1f3da77da431558d1ec0e82e3597cf33b",
+    "src/mega_moe/config.py": "f1b184c4b4fd5049a57d081fee6e4bc34e4bb52c56886b901197c212125c3465",
+    "config/_shapes.py": "4a4d40e1518b913abfefe9415b2d2851f84ea5491d7a63722984b7d8562b3b0a",
+    "benchmark/layer/_grouped_forward_baseline.py": "db0f46cc57358ffcaac787fe067b6f7c2fa07c12456eb61a5ccb8cd1e8423c5c",
+    "benchmark/layer/_npu_occupancy.py": "e024d83af4e8d2542304d55034ea13f96e9abd3a504335b4c59f15f39de9454e",
+    "benchmark/layer/_pipe_profile_summary.py": "4ec440bb6ddc5b9881113780dd248a5eaa6f474c2d84d42bb11c8035ae9c531c"
+  },
+  "environment": {
+    "hostname": "localhost.localdomain",
+    "python": "/home/vllm_kimiw/.venv-udma/bin/python",
+    "python_version": "3.11.10",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post1.dev20260528",
+    "triton_runtime": "3.6.0",
+    "triton_module": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/triton/__init__.py",
+    "triton_distributions": {
+      "triton_dist": "3.4.0",
+      "triton_ascend": "3.2.2",
+      "triton": "3.5.0"
+    },
+    "ascend_home": "/usr/local/Ascend/cann-9.2.0-beta.2",
+    "ascend_home_resolved": "/usr/local/Ascend/cann-9.2.0-beta.2",
+    "npu_compiler": {
+      "path": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-compile",
+      "resolved_path": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-compile",
+      "bishengir_opt": "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/bin/bishengir-opt",
+      "device_library_sha256": {
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aic.c220.bc": "c2874f73e080ba3bf1446579fd6986b0f93bb5ff7ba1303c8d17454dbd1433dd",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aic.c310.bc": "c3684477e0f8d1ad73654d07f96e2970b64b484e64451db24916c879bbb970bf",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aiv.c220.bc": "3242ca7cc7cbc89f2cc1f42e6c2a80a555d3b6325c6c798d9a9317ee2b717a93",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.aiv.c310.bc": "14a0fa5ff1e0064bcbaff017794d2a3cc040fff36ca571358b0c4e18f0dc51b7",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aic.c220.bc": "1b95e7697cf7b883d4ebcf1d4d27e4b3782cc3dc234167c1a4fda4816670fd24",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aic.c310.bc": "f18ab3ddb91b7a176b1dd10b3d92b0ba82a61b71ce8ecc18314a8bd4452382f6",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aiv.c220.bc": "cc5540862cd065949676885df6b442eb22999c3da7f7e1dce1552fdc36c9c327",
+        "/home/vllm_kimiw/.venv-udma/lib/python3.11/site-packages/ascendnpuir/lib/meta_op.mix.aiv.c310.bc": "3eace4007aaf3b6ae1f91c215e3041785e968e4f067e52af0af409fd0d39018c"
+      },
+      "triton_cache_dir": "/tmp/kimi_e896_rootcause_20260927/hardware_e896_cache",
+      "triton_disable_ffts": "1",
+      "version": "bishengir-compile 1.2.0 (https://gitcode.com/Ascend/AscendNPU-IR.git b229bc6ccbcc 2026-09-03) \nllvm 19.1.7 3254a1b1c59d\nRelease build"
+    },
+    "communication": {
+      "MASTER_ADDR": "127.0.0.1",
+      "MASTER_PORT": "46313",
+      "ASH_MASTER_ADDR": "127.0.0.1",
+      "ASH_MASTER_PORT": "46635",
+      "HCCL_IF_BASE_PORT": null,
+      "HCCL_SOCKET_IFNAME": null,
+      "HCCL_EXEC_TIMEOUT": null,
+      "HCCL_HOST_SOCKET_PORT_RANGE": null,
+      "HCCL_NPU_SOCKET_PORT_RANGE": "47840-47903",
+      "ASCEND_LAUNCH_BLOCKING": null
+    }
+  },
+  "hardware": "8 x Ascend950DT",
+  "command": "MOE_FUSED_ASH_SIZE_GB=16 PYTHONPATH=src:. python benchmark/layer/profile_single_kernel_forward.py --case performance-fwd-kimi-k3-skewed-w8-t4k --moonep --fc1-block 128 512 128 --fc2-block 128 512 128 --dispatch-block 256 --wave-windows 32 --benchmark-only --output-dir /tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed",
+  "case_id": "performance-fwd-kimi-k3-skewed-w8-t4k",
+  "world_size": 8,
+  "tokens_per_rank": 4096,
+  "global_tokens": 32768,
+  "shape": {
+    "hidden": 3584,
+    "ffn": 3072,
+    "topk": 16,
+    "num_experts": 896
+  },
+  "measured_boundary": "post-router full forward: routing metadata, dispatch, FC1, weighted SwiGLU, FC2, and combine",
+  "protocol": {
+    "warmup": 5,
+    "iterations": 50,
+    "clock": "npu_event",
+    "rank_reduction": "MAX"
+  },
+  "correctness_gate": {
+    "status": "passed_before_timing",
+    "cases": [
+      "normal",
+      "zero-receive/empty-expert",
+      "negative/out-of-range all-drop"
+    ],
+    "rtol": 0.05,
+    "atol": 0.05
+  },
+  "operator_config": {
+    "num_aicore_programs": 32,
+    "num_aivector_programs": 64,
+    "receive_capacity_factor": 1.6875,
+    "dispatch_fc1_block_size_m": 128,
+    "fc1_gemm_block_size_n": 512,
+    "fc1_gemm_block_size_k": 128,
+    "fc2_combine_block_size_m": 128,
+    "fc2_gemm_block_size_n": 512,
+    "fc2_gemm_block_size_k": 128,
+    "activation": "swiglu",
+    "situ_beta": 1.0,
+    "situ_linear_beta": null,
+    "fc1_gemm_block_size_m": 128,
+    "enable_moonep": true,
+    "moonep_replica_gate_up_chunk_bytes": 16777216,
+    "moonep_replica_down_chunk_bytes": 4194304,
+    "moonep_replica_down_early_programs": 8,
+    "moonep_replica_down_early_descriptors_per_program": 2,
+    "moonep_fused_balanced_count": true,
+    "moonep_fused_route_mapping": true,
+    "moonep_enable_replica_cache": false,
+    "enable_single_kernel_forward": true,
+    "save_fc1_dtype": "bf16",
+    "moonep_udma_chunk_bytes": 67108864,
+    "single_kernel_group_windows": 32,
+    "single_kernel_dispatch_block_size_m": 256
+  },
+  "symmetric_heap_size_gb": 16,
+  "samples_ms": {
+    "single_kernel": [
+      30.719696,
+      30.695663,
+      30.712511,
+      30.705809,
+      30.68136,
+      30.697533,
+      30.66383,
+      30.71077,
+      30.706545,
+      30.822033,
+      30.688658,
+      30.687166,
+      30.69808,
+      30.684027,
+      30.68821,
+      30.699127,
+      30.729889,
+      30.749714,
+      30.687088,
+      30.666256,
+      30.682032,
+      30.730268,
+      30.86783,
+      30.741579,
+      30.725231,
+      30.826574,
+      30.783792,
+      30.676498,
+      30.673409,
+      30.652761,
+      30.663233,
+      30.649584,
+      30.670448,
+      30.658211,
+      30.655872,
+      30.656338,
+      30.657936,
+      30.659424,
+      30.658283,
+      30.650175,
+      30.645697,
+      30.662991,
+      30.65037,
+      30.655249,
+      30.652754,
+      30.65958,
+      30.668959,
+      30.654743,
+      30.682224,
+      30.651091
+    ],
+    "torch_grouped_hccl": [
+      33.311619,
+      33.199638,
+      33.21349,
+      33.208813,
+      33.232758,
+      33.225624,
+      33.332771,
+      33.379581,
+      33.19059,
+      33.487492,
+      33.292439,
+      33.280403,
+      33.272343,
+      33.206844,
+      33.351921,
+      33.288811,
+      33.291424,
+      33.271656,
+      33.680782,
+      33.269714,
+      33.338142,
+      33.322716,
+      33.279999,
+      33.265923,
+      33.247955,
+      33.283916,
+      33.349022,
+      33.36124,
+      33.297031,
+      33.353756,
+      33.321869,
+      33.325607,
+      33.389225,
+      33.301174,
+      33.35091,
+      33.587208,
+      33.358875,
+      33.304531,
+      33.36639,
+      33.304104,
+      33.183441,
+      33.332264,
+      33.34132,
+      33.318794,
+      33.265163,
+      33.271862,
+      33.242332,
+      33.234142,
+      33.25174,
+      33.263107
+    ]
+  },
+  "moonep_validation": {
+    "experts_to_copy_matches_cpu_oracle": true,
+    "alloc_cumsum_matches_cpu_oracle": true,
+    "copies_per_rank": [
+      0,
+      0,
+      21,
+      21,
+      6,
+      6,
+      6,
+      5
+    ],
+    "total_weight_bytes_per_forward": 4293918720,
+    "transport": "upstream PIPE_S UDMA",
+    "replica_refresh": "every_forward"
+  },
+  "recomputed_statistics": {
+    "single_kernel": {
+      "sample_count": 50,
+      "min_ms": 30.645697,
+      "median_ms": 30.681696000000002,
+      "mean_ms": 30.69234202,
+      "p95_ms": 30.80482455,
+      "max_ms": 30.86783
+    },
+    "torch_grouped_hccl": {
+      "sample_count": 50,
+      "min_ms": 33.183441,
+      "median_ms": 33.294735,
+      "mean_ms": 33.30804942,
+      "p95_ms": 33.44327185,
+      "max_ms": 33.680782
+    }
+  },
+  "p95_method": "Linear interpolation at sorted index 0.95*(n-1)",
+  "comparison": {
+    "reference": "Torch-NPU grouped-GEMM + HCCL in the same benchmark run",
+    "median_speedup": 1.0851660547057111,
+    "median_latency_difference_ms": 2.6130390000000006,
+    "median_latency_reduction_pct": 7.8482048287814905,
+    "independent_run_count": 1,
+    "pre_fix_runtime_comparison": false,
+    "mac_ratio_measured": false
+  },
+  "occupancy_gate": {
+    "status": "passed",
+    "log": "device_occupancy.jsonl"
+  },
+  "occupancy_observations": [
+    {
+      "time_utc": "2026-09-27T01:32:50.197059+00:00",
+      "phase": "before_spawn",
+      "processes": [],
+      "foreign_processes": [],
+      "known_host_pids": [],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:32:53.642345+00:00",
+      "phase": "running",
+      "processes": [],
+      "foreign_processes": [],
+      "known_host_pids": [],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:32:56.992827+00:00",
+      "phase": "running",
+      "processes": [],
+      "foreign_processes": [],
+      "known_host_pids": [],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:00.388783+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:04.456911+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:07.884858+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:11.264727+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:14.932828+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:18.180821+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:21.522853+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:24.763075+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:28.112687+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:31.488899+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:34.820980+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:38.140987+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:41.488892+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:44.832893+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:48.148871+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:51.428998+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 1854035,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 1854036,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 1854037,
+          "name": "python"
+        },
+        {
+          "device": 3,
+          "host_pid": 3432331,
+          "container_pid": 1854038,
+          "name": "python"
+        },
+        {
+          "device": 4,
+          "host_pid": 3432332,
+          "container_pid": 1854039,
+          "name": "python"
+        },
+        {
+          "device": 5,
+          "host_pid": 3432333,
+          "container_pid": 1854040,
+          "name": "python"
+        },
+        {
+          "device": 6,
+          "host_pid": 3432334,
+          "container_pid": 1854041,
+          "name": "python"
+        },
+        {
+          "device": 7,
+          "host_pid": 3432335,
+          "container_pid": 1854042,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:33:53.878426+00:00",
+      "phase": "running",
+      "processes": [
+        {
+          "device": 0,
+          "host_pid": 3432328,
+          "container_pid": 0,
+          "name": "python"
+        },
+        {
+          "device": 1,
+          "host_pid": 3432329,
+          "container_pid": 0,
+          "name": "python"
+        },
+        {
+          "device": 2,
+          "host_pid": 3432330,
+          "container_pid": 0,
+          "name": "python"
+        }
+      ],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    },
+    {
+      "time_utc": "2026-09-27T01:34:00.513544+00:00",
+      "phase": "after_join",
+      "processes": [],
+      "foreign_processes": [],
+      "known_host_pids": [
+        3432328,
+        3432329,
+        3432330,
+        3432331,
+        3432332,
+        3432333,
+        3432334,
+        3432335
+      ],
+      "status": "passed"
+    }
+  ],
+  "raw_artifact_sha256": {
+    "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed/benchmark_result.json": "708b87e183260beaa177aec4f2b0d32a47f9ec061fcf6cb81f935a12e70b0736",
+    "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed/run_metadata.json": "1b16328ddf42e50f965606495cedbe8aeafe4e0f5f3dc8ffaa87b263f738118e",
+    "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed/device_occupancy.jsonl": "94e45bdbf1ee8e5b2557f665c5c0ee5c36a65489a9e1e537da9250bfba785bc2",
+    "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed/occupancy_result.json": "a0204870c28ea94cabf6551954cd4d9755f53dfc46f4cd40a7d52c5b847f4c31",
+    "/tmp/kimi_e896_rootcause_20260927/hardware_e896_skewed_resume.log": "14d1815e1a8d7298e8fcc0a871ed8fbde793e3b6ebdd27e53592ebb2fd53e113",
+    "/tmp/kimi_e896_rootcause_20260927/compile_regression.xml": "935b15324e913724617269e8b671bf4b21868ca098b85bbc6a54c8734e9c3b81",
+    "/tmp/kimi_e896_rootcause_20260927/final_host_regression.xml": "58ba7e32d0cccd872b3b5086b25d82bb1b5cdf7831104a043e700ed175fe9daf",
+    "/tmp/kimi_e896_rootcause_20260927/final_host_regression.log": "f55414e6968093648e3cccfd5a35937f139cd8aecbd64cb5b18ff793e1db3001"
+  },
+  "regression_suites": {
+    "actual_cold_compile": {
+      "junit": "/tmp/kimi_e896_rootcause_20260927/compile_regression.xml",
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "4",
+      "time": "239.177",
+      "timestamp": "2026-09-27T08:43:26.025411+08:00",
+      "hostname": "localhost.localdomain",
+      "testcases": [
+        {
+          "classname": "tests.function.test_e896_moonep_compile",
+          "name": "test_e896_moonep_cold_compile_finishes[performance-fwd-kimi-k3-skewed-w8-t4k-False]",
+          "time": "36.914"
+        },
+        {
+          "classname": "tests.function.test_e896_moonep_compile",
+          "name": "test_e896_moonep_cold_compile_finishes[performance-fwd-kimi-k3-skewed-w8-t4k-True]",
+          "time": "122.055"
+        },
+        {
+          "classname": "tests.function.test_e896_moonep_compile",
+          "name": "test_e896_moonep_cold_compile_finishes[performance-fwd-kimi-k3-w8-t4k-False]",
+          "time": "40.365"
+        },
+        {
+          "classname": "tests.function.test_e896_moonep_compile",
+          "name": "test_e896_moonep_cold_compile_finishes[performance-fwd-kimi-k3-skewed-w8-t8k-False]",
+          "time": "39.817"
+        }
+      ]
+    },
+    "host_functional": {
+      "junit": "/tmp/kimi_e896_rootcause_20260927/final_host_regression.xml",
+      "name": "pytest",
+      "errors": "0",
+      "failures": "0",
+      "skipped": "0",
+      "tests": "358",
+      "time": "45.093",
+      "timestamp": "2026-09-27T09:35:57.711281+08:00",
+      "hostname": "localhost.localdomain"
+    }
+  }
+}

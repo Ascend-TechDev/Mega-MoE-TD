@@ -1,0 +1,1176 @@
+[
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 49.623054680007044,
+    "git_head": "a7293ab1caadf650819ab22bc7d9a358dcc70576",
+    "started_utc": "2026-09-26T23:47:01.735124+00:00",
+    "name": "a729_original_d128_v2",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-fc1-backward-debug",
+      "name": "a729_original_d128_v2",
+      "dispatch": 128,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 15.871099770010915
+    },
+    "ir": {
+      "bytes": 629945,
+      "sha256": "5e84c82d69eaec45e8acc9bbae1e89f00ef127823d3ea2272055670a1391c6c1",
+      "allocs": 82,
+      "ifs": 121,
+      "fors": 101
+    },
+    "plan_memory_timings": [
+      "0.9688 (  1.1%)    0.9688 (  6.1%)    PlanMemoryRegBase",
+      "0.5060 (  0.6%)    0.5060 (  3.2%)    PlanMemoryRegBase",
+      "0.4074 (  0.5%)    0.4074 (  2.6%)    PlanMemoryRegBase"
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.3167620699969,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:01:23.602218+00:00",
+    "name": "b210_fc1_cube_masked",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_fc1_cube_masked",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_partition_pipeline_fc1_activation_group_ub",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/fc1_cube_masked.py"
+    },
+    "ir": {
+      "bytes": 695740,
+      "sha256": "ca4ee4f6e715f833336d522907728bdc3016be90891a36802fde3ff79a0961c5",
+      "allocs": 85,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -9,
+    "elapsed_s": 177.09417388995644,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:01:23.568847+00:00",
+    "name": "b210_fc1_static_rows",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_fc1_static_rows",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_partition_pipeline_fc1_activation_group_ub",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/fc1_no_dynamic_fullrow.py"
+    },
+    "ir": {
+      "bytes": 685896,
+      "sha256": "9d34e62458765cf0f12eb25e2e31fa44ec1df0417ac385bd2fdc731625d8ce6e",
+      "allocs": 83,
+      "ifs": 126,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.16775980003877,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:02:41.240331+00:00",
+    "name": "b210_no_idle_guard",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_no_idle_guard",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_run_dynamic_wave_pipeline",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/pipeline_no_idle_guard.py"
+    },
+    "ir": {
+      "bytes": 704368,
+      "sha256": "bb78f5cb8e00cfdaa684e67b4afdf8af75ac48d2214512ed80cac9e6e1c087c8",
+      "allocs": 91,
+      "ifs": 131,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 240.21700935001718,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-26T23:47:01.812094+00:00",
+    "name": "b210_original_d128",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_original_d128",
+      "dispatch": 128,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "ir": {
+      "bytes": 705935,
+      "sha256": "593bcdb205b9310013f9829300289cd91ee82c42f70efe4006e0b655ab8c2a4d",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    },
+    "plan_memory_timings": []
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 240.21607619000133,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-26T23:47:01.772403+00:00",
+    "name": "b210_original_d256",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_original_d256",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "ir": {
+      "bytes": 706046,
+      "sha256": "232ef8aa1795f896472f72ae95a65b4bc1187c604faaeab03a5832b1590e005b",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    },
+    "plan_memory_timings": []
+  },
+  {
+    "status": "timeout",
+    "returncode": -9,
+    "elapsed_s": 177.02349205000792,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:01:23.532048+00:00",
+    "name": "b210_serial_reduce",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_serial_reduce",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_reduce_topk_rows",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/serial_reduce.py"
+    },
+    "ir": {
+      "bytes": 705569,
+      "sha256": "29bbb87adbde2cd94dfa464f663eab16f619cfc96d60be67423902f48eaa540a",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -9,
+    "elapsed_s": 90.00623565004207,
+    "git_head": null,
+    "started_utc": null,
+    "name": "b210_standard_ir_trace",
+    "arguments": {}
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 18.786234129976947,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:01:47.950134+00:00",
+    "name": "b210_tlrange_capture",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-mac-baseline-20260926",
+      "name": "b210_tlrange_capture",
+      "dispatch": 256,
+      "loop": "tlrange",
+      "timeout": 120,
+      "worker": false,
+      "trace": false,
+      "capture_only": true,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "ir": {
+      "bytes": 706046,
+      "sha256": "2b5fb04d2a12c2b8781f2b0f9489d1e8231204880cefe8eae875cd3c6d677a49",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    }
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 38.71029620000627,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:26:55.883227+00:00",
+    "name": "b7c_activation_store_static",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_activation_store_static",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/activation_store_static.json"
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 19.298684670007788
+    },
+    "ir": {
+      "bytes": 701521,
+      "sha256": "6cf849da525c69c80c73804e31c12e392c82fbfa16efd45efd736573d77a8dc5",
+      "allocs": 91,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1854 (  0.9%)    1.1854 (  6.2%)    PlanMemoryRegBase",
+      "0.6225 (  0.5%)    0.6225 (  3.2%)    PlanMemoryRegBase",
+      "0.4403 (  0.3%)    0.4403 (  2.3%)    PlanMemoryRegBase"
+    ],
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      },
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -308,5 +308,5 @@\n                                                  other=0.0).to(tl.float32)\n                     activated *= routing_weight[:, None]\n-                    if full_row_tile & (FFN % pair_block_n == 0):\n+                    if FULL_GROUP & (FFN % pair_block_n == 0):\n                         tl.store(\n                             output_group_ptr +\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.21889268996892,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:18:22.723225+00:00",
+    "name": "b7c_all_wait",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_all_wait",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_wait_dynamic_wave_returns",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/_wait_dynamic_wave_returns.py",
+      "replace_manifest": null
+    },
+    "ir": {
+      "bytes": 705806,
+      "sha256": "3db4db220348a34cf7a8b9436b449b5b7ecff81f6c656dc5a716e83bd07c449d",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_wait_dynamic_wave_returns",
+        "diff": "--- _wait_dynamic_wave_returns.original\n+++ _wait_dynamic_wave_returns.probe\n@@ -22,5 +22,5 @@\n                 # observes all writes from the preceding waves.  Empty\n                 # destinations have waves == 0 and contribute no wait.\n-                first_wave = tl.maximum(waves - 1, 0)\n+                first_wave = 0\n             for wave in range(first_wave, waves):\n                 ready += dl.wait(\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.21704129996942,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:24:54.949899+00:00",
+    "name": "b7c_cube_static_serial",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_cube_static_serial",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/cube_static_serial.json"
+    },
+    "ir": {
+      "bytes": 695263,
+      "sha256": "49e5a0ce96516a959dca70d72fe3c3a099f1c0e539774356f34aaa914b538c90",
+      "allocs": 85,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      },
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.1664538999903,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:18:22.684490+00:00",
+    "name": "b7c_no_rotation",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_no_rotation",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_dispatch_dynamic_wave",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/_dispatch_dynamic_wave.py",
+      "replace_manifest": null
+    },
+    "ir": {
+      "bytes": 703966,
+      "sha256": "0458b9f8e35fa5ae3f519e45b1fe9cd2360520ded7f345b3f4451a9e6bba314e",
+      "allocs": 91,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_dispatch_dynamic_wave",
+        "diff": "--- _dispatch_dynamic_wave.original\n+++ _dispatch_dynamic_wave.probe\n@@ -41,5 +41,5 @@\n                     # the dense/pruned schedule.\n                     task_lane = lane\n-                    if source_rows <= DISPATCH_BLOCK_M:\n+                    if False:\n                         task_lane = (lane + lanes - expert % lanes) % lanes\n                     _dispatch_one_source_tile_task(\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.2183739200118,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:21:40.059991+00:00",
+    "name": "b7c_noidle_serial",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_noidle_serial",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/noidle_serial.json"
+    },
+    "ir": {
+      "bytes": 703651,
+      "sha256": "c3aab3cecba9cf42b9f016d303f583757c336901d387333dc9bc278618801a41",
+      "allocs": 91,
+      "ifs": 131,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -24,5 +24,5 @@\n         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,\n         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,\n-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):\n+        RING_SLOTS: tl.constexpr = 0):\n     global_waves = 0\n     for rank in range(WORLD_SIZE):\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n@@ -244,6 +244,5 @@\n                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,\n                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,\n-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,\n-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)\n+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)\n             if TIMING:\n                 # dl.wait blocks the issuing stream: this one is exact.\n"
+      },
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.2169743499835,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:21:40.091821+00:00",
+    "name": "b7c_reduce2048",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_reduce2048",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_run_dynamic_wave_pipeline",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/pipeline_reduce2048.py",
+      "replace_manifest": null
+    },
+    "ir": {
+      "bytes": 710096,
+      "sha256": "144da9701e2949df47d5123156787220a3c7da62e64a920d6460645229bf7757",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 97
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -252,5 +252,5 @@\n                                  _sys_cnt_tick(dummy_ts) - _w0, 0)\n         ready_combine = dl.consume_token(combine_buf_ptr, return_ready)\n-        reduce_block_n: tl.constexpr = _REDUCE_BLOCK_N if HIDDEN >= 2048 else 1024\n+        reduce_block_n: tl.constexpr = 2048 if HIDDEN >= 2048 else 1024\n         if TIMING:\n             _e0 = _sys_cnt_tick(dummy_ts)\n"
+      }
+    ]
+  },
+  {
+    "status": "error",
+    "returncode": 1,
+    "elapsed_s": 17.18719826999586,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:21:40.121840+00:00",
+    "name": "b7c_reduce_runtime",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_reduce_runtime",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": "mega_moe.kernels.fused_forward",
+      "replace_symbol": "_reduce_topk_rows",
+      "replace_file": "/tmp/kimi_e896_rootcause_20260927/reduce_runtime_groups.py",
+      "replace_manifest": null
+    },
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -18,5 +18,5 @@\n                 acc3 = tl.zeros((BLOCK_N,), dtype=tl.float32)\n                 if capacity_ok:\n-                    for base in tl.static_range(0, TOPK, 4):\n+                    for base in range(0, TOPK, 4):\n                         if base + 0 < TOPK:\n                             send0 = tl.load(route_to_send_ptr + route_base + base + 0)\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.2175574900466,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:26:55.915538+00:00",
+    "name": "b7c_routing_load_static",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_routing_load_static",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/routing_load_static.json"
+    },
+    "ir": {
+      "bytes": 699741,
+      "sha256": "e589f01f9164c3d74146447d4998f1a89d1a437cf325123f04c6c5680123494d",
+      "allocs": 89,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      },
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -298,5 +298,5 @@\n                     mask_m = local_rows < row_count\n                     mask_n = cols < FFN\n-                    if full_row_tile:\n+                    if FULL_GROUP:\n                         routing_weight = tl.load(routing_group_ptr +\n                                                  local_row_start +\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.21655820996966,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:18:22.758234+00:00",
+    "name": "b7c_static_no_idle",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_static_no_idle",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/static_rows_no_idle.json"
+    },
+    "ir": {
+      "bytes": 684242,
+      "sha256": "b0e1bf466935a3c2055f614df0b50d910ae83dc5b081812aff64f36ce99e4279",
+      "allocs": 83,
+      "ifs": 125,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      },
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -24,5 +24,5 @@\n         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,\n         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,\n-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):\n+        RING_SLOTS: tl.constexpr = 0):\n     global_waves = 0\n     for rank in range(WORLD_SIZE):\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n@@ -244,6 +244,5 @@\n                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,\n                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,\n-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,\n-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)\n+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)\n             if TIMING:\n                 # dl.wait blocks the issuing stream: this one is exact.\n"
+      }
+    ]
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 150.16770306002581,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:19:41.143620+00:00",
+    "name": "b7c_static_noidle_norotate",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_static_noidle_norotate",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/static_noidle_norotate.json"
+    },
+    "ir": {
+      "bytes": 682162,
+      "sha256": "26344a52e49682a1dd8a409f33e1e801fb93f66243a7711695380cd44d124b4e",
+      "allocs": 83,
+      "ifs": 123,
+      "fors": 96
+    },
+    "plan_memory_timings": [],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      },
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -24,5 +24,5 @@\n         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,\n         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,\n-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):\n+        RING_SLOTS: tl.constexpr = 0):\n     global_waves = 0\n     for rank in range(WORLD_SIZE):\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n@@ -244,6 +244,5 @@\n                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,\n                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,\n-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,\n-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)\n+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)\n             if TIMING:\n                 # dl.wait blocks the issuing stream: this one is exact.\n"
+      },
+      {
+        "symbol": "_dispatch_dynamic_wave",
+        "diff": "--- _dispatch_dynamic_wave.original\n+++ _dispatch_dynamic_wave.probe\n@@ -41,5 +41,5 @@\n                     # the dense/pruned schedule.\n                     task_lane = lane\n-                    if source_rows <= DISPATCH_BLOCK_M:\n+                    if False:\n                         task_lane = (lane + lanes - expert % lanes) % lanes\n                     _dispatch_one_source_tile_task(\n"
+      }
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 39.41371260001324,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:19:41.106385+00:00",
+    "name": "b7c_static_noidle_serial",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_static_noidle_serial",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/static_noidle_serial.json"
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 19.1591244500014
+    },
+    "ir": {
+      "bytes": 683765,
+      "sha256": "b59bd945e8a5193393a5a47c3645d9e729d03218c0d46cfadf6c5c77c7a72af3",
+      "allocs": 83,
+      "ifs": 125,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1326 (  0.8%)    1.1326 (  5.9%)    PlanMemoryRegBase",
+      "0.6103 (  0.4%)    0.6103 (  3.2%)    PlanMemoryRegBase",
+      "0.3787 (  0.3%)    0.3787 (  2.0%)    PlanMemoryRegBase"
+    ],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      },
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -24,5 +24,5 @@\n         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,\n         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,\n-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):\n+        RING_SLOTS: tl.constexpr = 0):\n     global_waves = 0\n     for rank in range(WORLD_SIZE):\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n@@ -244,6 +244,5 @@\n                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,\n                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,\n-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,\n-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)\n+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)\n             if TIMING:\n                 # dl.wait blocks the issuing stream: this one is exact.\n"
+      },
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      }
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 39.26140402001329,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:19:41.184880+00:00",
+    "name": "b7c_static_noidle_serial_norotate",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_static_noidle_serial_norotate",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/static_noidle_serial_norotate.json"
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 18.795046910003293
+    },
+    "ir": {
+      "bytes": 681685,
+      "sha256": "f8f22804dd390c69f839b52478c58ade351e3328685b9b8a6b4a61b9696eae48",
+      "allocs": 83,
+      "ifs": 123,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.0920 (  0.8%)    1.0920 (  5.8%)    PlanMemoryRegBase",
+      "0.6042 (  0.5%)    0.6042 (  3.2%)    PlanMemoryRegBase",
+      "0.3828 (  0.3%)    0.3828 (  2.0%)    PlanMemoryRegBase"
+    ],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      },
+      {
+        "symbol": "_run_dynamic_wave_pipeline",
+        "diff": "--- _run_dynamic_wave_pipeline.original\n+++ _run_dynamic_wave_pipeline.probe\n@@ -24,5 +24,5 @@\n         acc_ptr=None, ring_ptr=None, fc2w_ptr=None,\n         TIMING: tl.constexpr = False, ACC_SLOTS: tl.constexpr = 0,\n-        RING_SLOTS: tl.constexpr = 0, LAST_RETURN_ONLY: tl.constexpr = False):\n+        RING_SLOTS: tl.constexpr = 0):\n     global_waves = 0\n     for rank in range(WORLD_SIZE):\n@@ -124,5 +124,5 @@\n                     # than Cube programs. Skip helper setup on idle programs;\n                     # the active programs keep the same tile assignment.\n-                    if lane < fc1_tile_count:\n+                    if True:\n                         full_rows = (end - begin == WAVE_WINDOWS * BLOCK_M) & (not MOONEP)\n                         # Separate allocation bases at compile time: the Ascend\n@@ -244,6 +244,5 @@\n                 pid * 2 + sub_vec_id(), wave_expert_offsets_ptr,\n                 pipeline_signal_ptr, signal_epoch, NUM_CORES, LOCAL_RANK,\n-                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS,\n-                LAST_RETURN_ONLY=LAST_RETURN_ONLY)\n+                WORLD_SIZE, EXPERTS_PER_RANK, MAX_WAVES, WAVE_WINDOWS)\n             if TIMING:\n                 # dl.wait blocks the issuing stream: this one is exact.\n"
+      },
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      },
+      {
+        "symbol": "_dispatch_dynamic_wave",
+        "diff": "--- _dispatch_dynamic_wave.original\n+++ _dispatch_dynamic_wave.probe\n@@ -41,5 +41,5 @@\n                     # the dense/pruned schedule.\n                     task_lane = lane\n-                    if source_rows <= DISPATCH_BLOCK_M:\n+                    if False:\n                         task_lane = (lane + lanes - expert % lanes) % lanes\n                     _dispatch_one_source_tile_task(\n"
+      }
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 39.41058925999096,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:21:40.022678+00:00",
+    "name": "b7c_static_serial",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_static_serial",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/static_serial.json"
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 19.057678919984028
+    },
+    "ir": {
+      "bytes": 685419,
+      "sha256": "39dce09458e869f6815ab4798736e2e3c46ff16b9d7052d066bae072deea98b8",
+      "allocs": 83,
+      "ifs": 126,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1248 (  0.9%)    1.1248 (  5.9%)    PlanMemoryRegBase",
+      "0.6131 (  0.5%)    0.6131 (  3.2%)    PlanMemoryRegBase",
+      "0.4173 (  0.3%)    0.4173 (  2.2%)    PlanMemoryRegBase"
+    ],
+    "source_replacements": [
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -103,5 +103,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, cube_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 if pipeline_step < first_sweep_steps:\n                     group_ready_token += _wait_dispatch_row_range(\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      },
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      }
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 38.710733040003106,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:24:54.982543+00:00",
+    "name": "b7c_vector_static_serial",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "b7c_vector_static_serial",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": "/tmp/kimi_e896_rootcause_20260927/vector_static_serial.json"
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 18.95360065001296
+    },
+    "ir": {
+      "bytes": 695725,
+      "sha256": "22ce132b6d4a783e69f1012347c9c3653026c54eea6165cf70c126e63bcdd0e6",
+      "allocs": 89,
+      "ifs": 128,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1592 (  0.9%)    1.1592 (  6.2%)    PlanMemoryRegBase",
+      "0.6115 (  0.5%)    0.6115 (  3.2%)    PlanMemoryRegBase",
+      "0.4198 (  0.3%)    0.4198 (  2.2%)    PlanMemoryRegBase"
+    ],
+    "source_replacements": [
+      {
+        "symbol": "_reduce_topk_rows",
+        "diff": "--- _reduce_topk_rows.original\n+++ _reduce_topk_rows.probe\n@@ -10,5 +10,5 @@\n             cols = col_start + cols_in_block\n             mask_n = cols < HIDDEN\n-            if INTERLEAVE_ACCUMULATORS:\n+            if False:\n                 # Independent sums shorten the accumulation dependency chain\n                 # while preserving contiguous per-route DMA loads.\n"
+      },
+      {
+        "symbol": "_partition_pipeline_fc1_activation_group_ub",
+        "diff": "--- _partition_pipeline_fc1_activation_group_ub.original\n+++ _partition_pipeline_fc1_activation_group_ub.probe\n@@ -231,5 +231,5 @@\n                 row_count = pair_block_m if FULL_GROUP else tl.minimum(\n                     pair_block_m, vector_group_size - local_row_start)\n-                full_row_tile = FULL_GROUP or (row_count == pair_block_m)\n+                full_row_tile = FULL_GROUP\n                 output_group_row = vector_expert_off.to(\n                     tl.int64) + vector_group_start.to(tl.int64)\n"
+      }
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 39.864510049985256,
+    "git_head": "07a5de8b1f479fd7cd570d77d3b14a20b2fa2cd5",
+    "started_utc": "2026-09-27T00:18:22.652126+00:00",
+    "name": "commit_07a5de8",
+    "arguments": {
+      "repo": "/tmp/moe_e896_07a5de8",
+      "name": "commit_07a5de8",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 150,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 19.078772279957775
+    },
+    "ir": {
+      "bytes": 681685,
+      "sha256": "c8e193df066b7938f3e408eaf0bed61f98f0d20bb1aafb903de12639c17359dd",
+      "allocs": 83,
+      "ifs": 123,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.0928 (  0.8%)    1.0928 (  5.8%)    PlanMemoryRegBase",
+      "0.5984 (  0.4%)    0.5984 (  3.2%)    PlanMemoryRegBase",
+      "0.3798 (  0.3%)    0.3798 (  2.0%)    PlanMemoryRegBase"
+    ]
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 50.12476302002324,
+    "git_head": "5ad5f020db11d4f003c8af08b486ca9f845782ff",
+    "started_utc": "2026-09-26T23:59:16.704452+00:00",
+    "name": "commit_5ad5f02",
+    "arguments": {
+      "repo": "/tmp/moe_e896_5ad5f02",
+      "name": "commit_5ad5f02",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 120,
+      "worker": false,
+      "trace": false,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 17.648349359980784
+    },
+    "ir": {
+      "bytes": 682082,
+      "sha256": "d50481c375b03444b9050e3e976948bb30520546b4f757500970001725599ad4",
+      "allocs": 83,
+      "ifs": 123,
+      "fors": 96
+    },
+    "plan_memory_timings": []
+  },
+  {
+    "status": "timeout",
+    "returncode": -15,
+    "elapsed_s": 120.2173393900157,
+    "git_head": "7c93cb12b2cae11a3b23e65e2ad0ea09baa59534",
+    "started_utc": "2026-09-27T00:00:28.554187+00:00",
+    "name": "commit_7c93cb1",
+    "arguments": {
+      "repo": "/tmp/moe_e896_7c93cb1",
+      "name": "commit_7c93cb1",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 120,
+      "worker": false,
+      "trace": false,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null
+    },
+    "ir": {
+      "bytes": 706046,
+      "sha256": "e239b86c3877ea00c3ca77c40666a421c3df3f070ce99a6a83dc2390ac165642",
+      "allocs": 91,
+      "ifs": 132,
+      "fors": 96
+    },
+    "plan_memory_timings": []
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 38.31021614000201,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:28:04.351262+00:00",
+    "name": "fixed_e896_full",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-e896-compile-fix",
+      "name": "fixed_e896_full",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 180,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "compile_flags": "[]",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 18.91618754999945
+    },
+    "ir": {
+      "bytes": 695725,
+      "sha256": "8e3187b19c0807ebde44c5f786ebf8f49ac37d459a1794fc57a7ade4a777bc2d",
+      "allocs": 89,
+      "ifs": 128,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1987 (  0.9%)    1.1987 (  6.4%)    PlanMemoryRegBase",
+      "0.6271 (  0.5%)    0.6271 (  3.3%)    PlanMemoryRegBase",
+      "0.4240 (  0.3%)    0.4240 (  2.3%)    PlanMemoryRegBase"
+    ],
+    "provenance_note": "Superseded broader Vector rollback; not the final store-only patch."
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 52.828965410008095,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:34:38.930576+00:00",
+    "name": "fixed_v2_e896_full",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-e896-compile-fix",
+      "name": "fixed_v2_e896_full",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "compile_flags": "[]",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 19.609106020012405
+    },
+    "ir": {
+      "bytes": 701521,
+      "sha256": "228a6d7db2b54a8914b254fdf7c7829ad46679f1f728114cf78c2c4260ef1b41",
+      "allocs": 91,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.1982 (  0.9%)    1.1982 (  6.1%)    PlanMemoryRegBase",
+      "0.6522 (  0.5%)    0.6522 (  3.3%)    PlanMemoryRegBase",
+      "0.4381 (  0.3%)    0.4381 (  2.2%)    PlanMemoryRegBase"
+    ],
+    "source_sha256": {
+      "src/mega_moe/kernels/fused_forward.py": "bc24fac1c12c428cf79e8dcfa10af31d5a3d2a72d1befc4f4f9640b0d15dfb04",
+      "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+      "benchmark/layer/compile_single_kernel_forward.py": "4f2d39cbc9aea6c7b43d56ff6bac43f65f2a0172e1655b5d8e65f30dc58b9cad"
+    }
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 135.27062536997255,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:34:38.973687+00:00",
+    "name": "fixed_v2_e896_saved",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-e896-compile-fix",
+      "name": "fixed_v2_e896_saved",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "compile_flags": "[\"--save-fc1\"]",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 101.26829406997422
+    },
+    "ir": {
+      "bytes": 707616,
+      "sha256": "a2106fbe24d45271ae05ac85b1304fdd6d858586899089fa86f98db3499c9a08",
+      "allocs": 91,
+      "ifs": 130,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.2361 (  0.6%)    1.2361 (  1.2%)    PlanMemoryRegBase",
+      "0.6779 (  0.3%)    0.6779 (  0.7%)    PlanMemoryRegBase",
+      "81.9942 ( 37.7%)   81.9942 ( 81.1%)    PlanMemoryRegBase"
+    ],
+    "source_sha256": {
+      "src/mega_moe/kernels/fused_forward.py": "bc24fac1c12c428cf79e8dcfa10af31d5a3d2a72d1befc4f4f9640b0d15dfb04",
+      "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+      "benchmark/layer/compile_single_kernel_forward.py": "4f2d39cbc9aea6c7b43d56ff6bac43f65f2a0172e1655b5d8e65f30dc58b9cad"
+    }
+  },
+  {
+    "status": "success",
+    "returncode": 0,
+    "elapsed_s": 56.78521424002247,
+    "git_head": "b210dabb558722c36407dacb5d8d0e56721ef9e8",
+    "started_utc": "2026-09-27T00:34:39.005794+00:00",
+    "name": "fixed_v2_e896_timing",
+    "arguments": {
+      "repo": "/home/vllm_kimiw/repo/MOE_Kimi-e896-compile-fix",
+      "name": "fixed_v2_e896_timing",
+      "dispatch": 256,
+      "loop": "original",
+      "timeout": 240,
+      "worker": false,
+      "trace": true,
+      "capture_only": false,
+      "case": "performance-fwd-kimi-k3-skewed-w8-t4k",
+      "compile_flags": "[\"--timing\"]",
+      "replace_module": null,
+      "replace_symbol": null,
+      "replace_file": null,
+      "replace_manifest": null
+    },
+    "native": {
+      "returncode": 0,
+      "elapsed_s": 23.168265150045045
+    },
+    "ir": {
+      "bytes": 755077,
+      "sha256": "b539084080e2e7f1abc54aadcb01378bc629f7fb9c3f32446dde813b7f4d823a",
+      "allocs": 91,
+      "ifs": 154,
+      "fors": 96
+    },
+    "plan_memory_timings": [
+      "1.4953 (  0.9%)    1.4953 (  6.5%)    PlanMemoryRegBase",
+      "0.8858 (  0.5%)    0.8858 (  3.8%)    PlanMemoryRegBase",
+      "0.6029 (  0.4%)    0.6029 (  2.6%)    PlanMemoryRegBase"
+    ],
+    "source_sha256": {
+      "src/mega_moe/kernels/fused_forward.py": "bc24fac1c12c428cf79e8dcfa10af31d5a3d2a72d1befc4f4f9640b0d15dfb04",
+      "src/mega_moe/kernels/fused_moonep.py": "2ef421ad78a4fceff3d56326a55f42ad38e83213177da96347fe810f387e2561",
+      "benchmark/layer/compile_single_kernel_forward.py": "4f2d39cbc9aea6c7b43d56ff6bac43f65f2a0172e1655b5d8e65f30dc58b9cad"
+    }
+  },
+  {
+    "status": "finished",
+    "returncode": 0,
+    "elapsed_s": 17.987171199987642,
+    "git_head": null,
+    "started_utc": null,
+    "name": "good_standard_ir_trace",
+    "arguments": {}
+  }
+]
