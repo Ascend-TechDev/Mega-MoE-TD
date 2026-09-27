@@ -1626,6 +1626,16 @@ class FusedMoEForward(torch.nn.Module):
         launch_options["has_auto_blockify_blacklist_op"] = False
         # UB slots already have explicit lifetimes. Auto-buffering Vector
         # temporaries can exhaust UB and make the backend drop L1 buffering.
+        # These three stay as they are; every alternative was measured on
+        # Ascend950DT (E32 uniform top-16 W8 T4K, M256/N256/K128, wave 32,
+        # 13.48 ms / 1.56x baseline) and lost:
+        #   limit_auto_multi_buffer_buffer="no-limit"    16.98 ms / 1.24x
+        #   limit_auto_multi_buffer_buffer="only-vector" 16.91 ms / 1.24x
+        #   set_workspace_multibuffer=2                  13.59 ms (noise)
+        #   enable_preload=True                          13.62 ms (noise)
+        # The "no-limit"/"only-vector" regressions confirm the comment above:
+        # auto-buffering Vector temporaries evicts the backend's L1 buffering,
+        # and FC1 is MTE2-bound, so losing L1 reuse costs ~25%.
         launch_options.update(
             enable_dynamic_cv_pipeline=False, enable_mixed_cv=True,
             disable_auto_inject_block_sync=True, set_workspace_multibuffer=0,
