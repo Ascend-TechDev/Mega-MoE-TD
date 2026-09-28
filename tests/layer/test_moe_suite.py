@@ -928,8 +928,10 @@ def run_single_kernel_forward_case(
 
 def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
     """Validate the fused launch at the trimmed Kimi-K3 W8/T4K shape."""
-    if world_size != 8:
-        raise ValueError("the Kimi-K3 single-kernel case requires eight ranks")
+    if world_size not in (4, 8):
+        raise ValueError(
+            "the Kimi-K3 single-kernel case requires four or eight ranks"
+        )
     if kit.ash is None or kit.torch_npu is None:
         raise RuntimeError("Kimi-K3 single-kernel forward requires NPU and ACLSHMEM")
 
@@ -979,7 +981,14 @@ def run_single_kernel_kimi_k3_case(rank: int, world_size: int) -> None:
                     if token_count == base_case.tokens
                     else replace(
                         base_case,
-                        case_id="performance-fwd-kimi-k3-trimmed-w8-t64",
+                        case_id=(
+                            # swap the trailing token slug (…-w4-t4k → …-t64);
+                            # a hardcoded -w8- id would fail validate() at w4
+                            base_case.case_id[
+                                : base_case.case_id.rfind("-")
+                            ]
+                            + "-t64"
+                        ),
                         tokens=token_count,
                     ).validate()
                 )
@@ -6110,6 +6119,16 @@ def test_single_kernel_kimi_k3_t4k_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
+@pytest.mark.slow
+@pytest.mark.kimi
+def test_single_kernel_kimi_k3_t4k_w4(dist_test):
+    """Dual-node G2 shape (2x2): same trimmed Kimi topology with E=32 kept,
+    so each rank hosts eight local experts instead of four."""
+    dist_test(run_single_kernel_kimi_k3_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 def test_single_kernel_situglu_autograd_w2(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=2)
 
@@ -6181,6 +6200,25 @@ def test_single_kernel_moonep_autograd_fp8_w2(dist_test):
     """
     dist_test(
         run_single_kernel_moonep_autograd_case, world_size=2, args=("fp8",)
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_w4(dist_test):
+    """Dual-node G2 shape (2x2): the world!=8 branch gives the small smoke
+    shape with experts=32, so EPR doubles instead of the shape changing —
+    the MoonEP mirror of the situglu_w4 twin."""
+    dist_test(run_single_kernel_moonep_autograd_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_moonep_autograd_fp8_w4(dist_test):
+    """fp8 saved-FC1 + FC1 host offload under the moonep path at the
+    dual-node G2 shape (2x2) — the w4 twin of the fp8_w2 case above."""
+    dist_test(
+        run_single_kernel_moonep_autograd_case, world_size=4, args=("fp8",)
     )
 
 

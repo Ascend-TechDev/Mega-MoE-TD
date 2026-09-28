@@ -222,12 +222,14 @@ _CASE_GROUPS = (
     # Small expert-parallel projection used before scaling Kimi to multiple
     # machines.  Keep the model dimensions and T4K/T16K loads while reducing the
     # routed expert topology to four local experts on each of eight ranks.
+    # The w4 twin (dual-node G2, two ranks per node) keeps E=32 so each rank
+    # hosts eight local experts — the expert-trimmed way to cut card count.
     CaseGroup(
         prefix="performance-fwd-kimi-k3-trimmed",
         direction="forward",
         model="KIMI-K3-TRIMMED",
         tokens=(4096, 16384),
-        worlds=(8,),
+        worlds=(4, 8),
         hidden=3584,
         ffn=3072,
         topk=8,
