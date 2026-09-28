@@ -6054,6 +6054,18 @@ def test_single_kernel_forward_w8(dist_test):
 
 @pytest.mark.dist
 @pytest.mark.functional
+def test_single_kernel_forward_w4(dist_test):
+    """Dual-node G2 shape: two ranks per node, EPR doubles (experts stay 8).
+
+    The w4 variant covers the 2x2 gate (PE count >= device count semantics)
+    on machines where only two cards per node are free; the w8 forms remain
+    the G3 gate.
+    """
+    dist_test(run_single_kernel_forward_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
 def test_single_kernel_forward_fp16_saved_w2(dist_test):
     dist_test(
         run_single_kernel_forward_case, world_size=2, args=(256, 64, 8, "fp16")
@@ -6069,6 +6081,21 @@ def test_single_kernel_forward_fp16_saved_w2(dist_test):
 def test_single_kernel_dynamic_waves_w8(dist_test, tokens, block_m):
     dist_test(
         run_single_kernel_forward_case, world_size=8,
+        args=(block_m, tokens, 32),
+    )
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize(
+    "tokens,block_m", [(3, 256), (4097, 256), (4097, 128)],
+    ids=("tiny-tail", "m256-multi-wave", "m128-multi-wave"),
+)
+def test_single_kernel_dynamic_waves_w4(dist_test, tokens, block_m):
+    """Multi-wave semantics are token-driven; world=4 keeps experts=32
+    (EPR=8) so the wave-splitting logic is exercised identically."""
+    dist_test(
+        run_single_kernel_forward_case, world_size=4,
         args=(block_m, tokens, 32),
     )
 
@@ -6108,6 +6135,23 @@ def test_single_kernel_situglu_autograd_fc1offload_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_situglu_autograd_w8(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+def test_single_kernel_situglu_autograd_w4(dist_test):
+    """Dual-node G2 shape (2x2): world!=8 branch gives the small smoke shape
+    with experts=32, so EPR doubles instead of the shape changing."""
+    dist_test(run_single_kernel_situglu_autograd_case, world_size=4)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.kimi
+def test_single_kernel_situglu_autograd_fc1offload_w4(dist_test):
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=4, args=(True,)
+    )
 
 
 @pytest.mark.dist
