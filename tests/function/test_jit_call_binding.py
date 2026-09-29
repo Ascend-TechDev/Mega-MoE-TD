@@ -16,7 +16,10 @@ exactly where the keyword tail begins (no gaps, no double binding).
 """
 
 import ast
+import builtins
+import inspect
 from pathlib import Path
+import symtable
 
 import pytest
 
@@ -95,3 +98,94 @@ def test_knob_tail_is_keyword_bound(helper):
                 "positional (inserting a positional arg here shifts the "
                 "wave geometry)"
             )
+
+
+def test_local_helper_calls_bind_complete_signatures():
+    tree = _parse()
+    signatures = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        parameters = []
+        arguments = node.args.posonlyargs + node.args.args
+        required = len(arguments) - len(node.args.defaults)
+        for index, argument in enumerate(arguments):
+            kind = (inspect.Parameter.POSITIONAL_ONLY
+                    if index < len(node.args.posonlyargs)
+                    else inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            parameters.append(inspect.Parameter(
+                argument.arg, kind,
+                default=inspect.Parameter.empty if index < required else None,
+            ))
+        if node.args.vararg:
+            parameters.append(inspect.Parameter(
+                node.args.vararg.arg, inspect.Parameter.VAR_POSITIONAL))
+        for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            parameters.append(inspect.Parameter(
+                argument.arg, inspect.Parameter.KEYWORD_ONLY,
+                default=inspect.Parameter.empty if default is None else None,
+            ))
+        if node.args.kwarg:
+            parameters.append(inspect.Parameter(
+                node.args.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
+        signatures[node.name] = inspect.Signature(parameters)
+    for call in ast.walk(tree):
+        if (not isinstance(call, ast.Call)
+                or not isinstance(call.func, ast.Name)
+                or call.func.id not in signatures):
+            continue
+        assert not any(isinstance(arg, ast.Starred) for arg in call.args)
+        names = [keyword.arg for keyword in call.keywords]
+        assert None not in names and len(names) == len(set(names))
+        try:
+            signatures[call.func.id].bind(
+                *([None] * len(call.args)), **dict.fromkeys(names))
+        except TypeError as exc:
+            pytest.fail(f"{call.func.id} at line {call.lineno}: {exc}")
+
+
+def test_fused_forward_helpers_have_no_unbound_global_names():
+    table = symtable.symtable(
+        _FUSED_FORWARD.read_text(encoding="utf-8"), str(_FUSED_FORWARD), "exec")
+    known = set(dir(builtins)) | {
+        symbol.get_name() for symbol in table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported()
+    }
+    for function in table.get_children():
+        missing = {
+            symbol.get_name() for symbol in function.get_symbols()
+            if symbol.is_global() and symbol.is_referenced()
+            and symbol.get_name() not in known
+        }
+        assert not missing, f"{function.get_name()}: unbound names {sorted(missing)}"
+
+
+def test_host_launch_binds_wave_workspaces_in_order():
+    root = _FUSED_FORWARD.parents[3]
+    host = ast.parse((root / "src/mega_moe/ops/forward.py").read_text())
+    params = _signature_params(_parse(), "_kernel_fused_forward")
+    launches = [node for node in ast.walk(host)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "_kernel_fused_forward"]
+    assert len(launches) == 1
+    call = launches[0]
+    names = [keyword.arg for keyword in call.keywords if keyword.arg is not None]
+    options = [keyword.value for keyword in call.keywords if keyword.arg is None]
+    assert len(options) == 1
+    assert isinstance(options[0], ast.Name) and options[0].id == "launch_options"
+    assert len(names) == len(set(names))
+    assert set(params[len(call.args):]) == set(names)
+    for parameter, attribute in (
+        ("wave_expert_offsets_ptr", "_single_wave_expert_offsets"),
+        ("wave_task_offsets_ptr", "_single_wave_task_offsets"),
+        ("wave_tasks_ptr", "_single_wave_tasks"),
+        ("raw_counts_ptr", None),
+    ):
+        argument = call.args[params.index(parameter)]
+        if attribute is not None:
+            assert isinstance(argument, ast.Attribute) and argument.attr == attribute
+        else:
+            assert isinstance(argument, ast.IfExp)
+            assert isinstance(argument.body, ast.Attribute)
+            assert argument.body.attr == "planning_counts_mem"
