@@ -889,6 +889,7 @@ def _launch_fc2_combine(
     activation_situ_beta: float = 1.0,
     activation_situ_linear_beta: float = 0.0,
     activation_has_linear_beta: bool = False,
+    activation_clamp_limit: float = 7.0,
     pipeline_group_ids: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Launch the fused FC2/combine kernel, then the local top-k reduction."""
@@ -1097,6 +1098,7 @@ def _launch_fc2_combine(
         activation_situ_beta=activation_situ_beta,
         activation_situ_linear_beta=activation_situ_linear_beta,
         activation_has_linear_beta=activation_has_linear_beta,
+        activation_clamp_limit=activation_clamp_limit,
     )
 
     # The fused kernel has already fenced remote writes.  Keep the validated
