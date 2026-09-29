@@ -332,7 +332,7 @@ def _kernel_replica_repush_store(
         LOCAL_RANK, EPR, GU_ELEMS, rb_ptr=rb_ptr)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["signal_epoch", "submit"])
 def _kernel_replica_repush_udma(
         gu_src_ptr, dn_src_ptr,
         replica_gu_ptr, replica_dn_ptr,
@@ -341,7 +341,11 @@ def _kernel_replica_repush_udma(
         LOCAL_RANK: tl.constexpr, WORLD_SIZE: tl.constexpr,
         EPR: tl.constexpr,
         GU_ELEMS: tl.constexpr, GU_CHUNK: tl.constexpr,
-        DN_ELEMS: tl.constexpr, DN_CHUNK: tl.constexpr):
+        DN_ELEMS: tl.constexpr, DN_CHUNK: tl.constexpr,
+        WAIT_COMPLETION: tl.constexpr = True,
+        PANEL_MASK: tl.constexpr = 3,
+        DOWN_FIRST_ALL_SLOTS: tl.constexpr = False,
+        submit=1):
     """UDMA-panel twin of ``_kernel_replica_repush_store`` (2026-09-22, the
     MTE|UDMA combo plan): same ETC ownership scan as the forward's
     _single_moonep_push, riding the peer QPs via _udma_push_panel.  Needs
@@ -354,19 +358,27 @@ def _kernel_replica_repush_udma(
     peers' QPs before exiting (the strided peer loop gives every peer
     exactly one owner program).  The store twin needs no drain (plain
     remote stores retire with the kernel); skipping it here would let the
-    mega kernel read pre-push replica slots through a passed barrier."""
+    mega kernel read pre-push replica slots through a passed barrier.
+
+    WAIT_COMPLETION=False requires fused per-slot acquires and late quiet
+    before QP handoff. Stream order only ends submission, not remote writes.
+    ``submit=0`` is the matched empty-launch residency diagnostic; production
+    callers always submit. It remains a runtime scalar for binary identity.
+    """
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
     with al.scope(core_mode="vector", disable_auto_sync=True):
         for peer in range(pid, WORLD_SIZE, nprogs):
-            if peer != LOCAL_RANK:
+            if (peer != LOCAL_RANK) & (submit != 0):
                 _push_replica_weights_udma_peer(
                     peer, gu_src_ptr, dn_src_ptr,
                     replica_gu_ptr, replica_dn_ptr,
                     gate_ready_u64_ptr, down_ready_u64_ptr,
                     experts_to_copy_ptr, signal_epoch,
-                    LOCAL_RANK, EPR, GU_ELEMS, GU_CHUNK, DN_ELEMS, DN_CHUNK)
-                _udma_quiet(peer)
+                    LOCAL_RANK, EPR, GU_ELEMS, GU_CHUNK, DN_ELEMS, DN_CHUNK,
+                    PANEL_MASK=PANEL_MASK, DOWN_FIRST_ALL_SLOTS=DOWN_FIRST_ALL_SLOTS)
+                if WAIT_COMPLETION:
+                    _udma_quiet(peer)
 
 
 @triton.jit
@@ -421,24 +433,31 @@ def _push_replica_weights_udma_peer(
         experts_to_copy_ptr, signal_epoch,
         LOCAL_RANK: tl.constexpr, EPN: tl.constexpr,
         GU_ELEMS: tl.constexpr, GU_CHUNK: tl.constexpr,
-        DN_ELEMS: tl.constexpr, DN_CHUNK: tl.constexpr):
+        DN_ELEMS: tl.constexpr, DN_CHUNK: tl.constexpr,
+        DOWN_FIRST_ALL_SLOTS: tl.constexpr = False,
+        PANEL_MASK: tl.constexpr = 3):
     """Push every expert of mine that `peer` replica-cached (ETC row scan —
     the forward's _single_moonep_push ownership: one program owns one peer's
     QP).  Ready slots keep the pooling ABI: 64B per slot (16 int32 == 8
     uint64), the UDMA notify lands in the slot's first two words and the
     consumers dl.wait its low int32 at ready + slot*16."""
-    for slot in range(EPN):
-        expert = tl.load(experts_to_copy_ptr + peer * EPN + slot)
-        if (expert >= 0) & (expert // EPN == LOCAL_RANK):
-            local = (expert % EPN).to(tl.int64)
-            _udma_push_panel(replica_dn_ptr + slot * DN_ELEMS,
-                             dn_src_ptr + local * DN_ELEMS,
-                             down_ready_u64_ptr + slot * 8,
-                             signal_epoch, peer, DN_ELEMS, DN_CHUNK)
-            _udma_push_panel(replica_gu_ptr + slot * GU_ELEMS,
-                             gu_src_ptr + local * GU_ELEMS,
-                             gate_ready_u64_ptr + slot * 8,
-                             signal_epoch, peer, GU_ELEMS, GU_CHUNK)
+    # P1 consumes down for every replica before P4 consumes any gate/up.
+    # Keep the old interleaving available for the serialized control.
+    for panel in tl.static_range(2 if DOWN_FIRST_ALL_SLOTS else 1):
+        for slot in range(EPN):
+            expert = tl.load(experts_to_copy_ptr + peer * EPN + slot)
+            if (expert >= 0) & (expert // EPN == LOCAL_RANK):
+                local = (expert % EPN).to(tl.int64)
+                if (PANEL_MASK & 1) and (not DOWN_FIRST_ALL_SLOTS or panel == 0):
+                    _udma_push_panel(replica_dn_ptr + slot * DN_ELEMS,
+                                     dn_src_ptr + local * DN_ELEMS,
+                                     down_ready_u64_ptr + slot * 8,
+                                     signal_epoch, peer, DN_ELEMS, DN_CHUNK)
+                if (PANEL_MASK & 2) and (not DOWN_FIRST_ALL_SLOTS or panel == 1):
+                    _udma_push_panel(replica_gu_ptr + slot * GU_ELEMS,
+                                     gu_src_ptr + local * GU_ELEMS,
+                                     gate_ready_u64_ptr + slot * 8,
+                                     signal_epoch, peer, GU_ELEMS, GU_CHUNK)
 
 
 __all__ = [

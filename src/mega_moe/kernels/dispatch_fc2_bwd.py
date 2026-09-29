@@ -202,7 +202,12 @@ def _prepare_dispatch_fc2_bwd(saved, dy):
     topk = saved["topk"]
     # gco in expert-major (bwd_expert_sort) order: the producer pushes (dst,expert)
     # buckets and the consumer reads peer_mem contiguously — no sort_idxs gather.
-    gco = dy.repeat_interleave(topk, dim=0)[p["bwd_expert_sort"].to(torch.int64)].contiguous()
+    # Each flat route id refers to token (route // topk). Gather from dy
+    # directly instead of materializing a topk-times repeated [B*topk, H]
+    # tensor first (1.75 GiB per rank at Kimi T16K). Keep the same route
+    # order for both the staged and single-kernel saved contracts.
+    source_rows = p["bwd_expert_sort"].to(torch.int64) // topk
+    gco = dy[source_rows].contiguous()
     p = dict(p)
     p["gco"] = gco
     return p
@@ -390,22 +395,22 @@ def _fc2_bwd_gemm_merged_tiles_wait(
                 # slot must hold THIS layer's push (table-level epoch) —
                 # slot ids are table-local, base WEIGHT_EXPERT_BASE into
                 # the replica table (the forward's consumer shape).
-                # Post-R1 (2026-09-21): compiled out everywhere — the
-                # mega wrapper never sets REPREFETCH_WAIT any more (the
-                # publication edge is the pre-launch collective barrier,
-                # mega_bwd.py R1 note); kept for signature stability.
+                # The fused pipeline publishes each whole down expert
+                # with payload+signal; bind the acquire to the allocation
+                # base before _dispatch_gemm_tile adds its expert offset.
                 replica_slot = expert_id - WEIGHT_EXPERT_BASE
                 if WAIT_DEBUG:
                     _wait_bounded_report(
                         replica_weight_ready_ptr + replica_slot * 16,
                         replica_weight_epoch, 1, replica_slot, expert_id,
                         pid, wait_dbg_ptr)
+                    sweep_weight_ptr = fc2_ptr
                 else:
-                    dl.wait(
+                    weight_token = dl.wait(
                         replica_weight_ready_ptr + replica_slot * 16,
                         1, "gpu", "acquire",
                         waitValue=replica_weight_epoch)
-                sweep_weight_ptr = fc2_ptr
+                    sweep_weight_ptr = dl.consume_token(fc2_ptr, weight_token)
             else:
                 sweep_weight_ptr = fc2_ptr
             num_m_windows = tl.cdiv(expert_size, BLOCK_M)
