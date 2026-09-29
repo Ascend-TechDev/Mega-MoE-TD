@@ -87,6 +87,42 @@ def _single_moonep_scatter(
         R: tl.constexpr, E: tl.constexpr, EPN: tl.constexpr,
         CURSOR_STRIDE: tl.constexpr, TOPK: tl.constexpr,
         SEARCH_STEPS: tl.constexpr, BLOCK: tl.constexpr):
+    """Scatter this core's route chunk; the traversal shape follows E.
+
+    At the production expert counts the route chunk is walked once
+    (``_single_moonep_scatter_ordinal``); small-E configurations keep the
+    historical window sweep, mirroring the home-routing threshold.  The two
+    forms store the same rows and are compared against each other by
+    tests/function/test_single_kernel_moonep_scatter.py.
+    """
+    if E >= 128:
+        _single_moonep_scatter_ordinal(
+            pid, selected_ptr, cursors_ptr, source_prefix_ptr,
+            alloc_cumsum_ptr, inverse_ptr, send_starts_ptr, send_tokens_ptr,
+            send_routes_ptr, route_to_send_ptr, num_routes, NUM_CORES, R, E,
+            EPN, CURSOR_STRIDE, TOPK, SEARCH_STEPS)
+    else:
+        _single_moonep_scatter_dense(
+            pid, selected_ptr, cursors_ptr, source_prefix_ptr,
+            alloc_cumsum_ptr, inverse_ptr, send_starts_ptr, send_tokens_ptr,
+            send_routes_ptr, route_to_send_ptr, num_routes, NUM_CORES, R, E,
+            EPN, CURSOR_STRIDE, TOPK, SEARCH_STEPS, BLOCK)
+
+
+@triton.jit
+def _single_moonep_scatter_dense(
+        pid, selected_ptr, cursors_ptr, source_prefix_ptr, alloc_cumsum_ptr,
+        inverse_ptr, send_starts_ptr, send_tokens_ptr, send_routes_ptr,
+        route_to_send_ptr, num_routes, NUM_CORES: tl.constexpr,
+        R: tl.constexpr, E: tl.constexpr, EPN: tl.constexpr,
+        CURSOR_STRIDE: tl.constexpr, TOPK: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr, BLOCK: tl.constexpr):
+    """Reference form: one 32-bin expert window per outer step.
+
+    Every step re-reads the whole route chunk through a [bins, routes] match
+    matrix, so the chunk is scanned E/32 times.  Kept as the small-E path and
+    as the host tests' oracle.
+    """
     per_core = tl.cdiv(num_routes, NUM_CORES)
     begin = pid * per_core
     end = tl.minimum(begin + per_core, num_routes)
@@ -137,6 +173,88 @@ def _single_moonep_scatter(
             tl.store(send_routes_ptr + row, route, mask=valid)
             tl.store(route_to_send_ptr + route, row, mask=valid)
             cursors += tl.sum(matches, 1)
+
+
+@triton.jit
+def _single_moonep_scatter_ordinal(
+        pid, selected_ptr, cursors_ptr, source_prefix_ptr, alloc_cumsum_ptr,
+        inverse_ptr, send_starts_ptr, send_tokens_ptr, send_routes_ptr,
+        route_to_send_ptr, num_routes, NUM_CORES: tl.constexpr,
+        R: tl.constexpr, E: tl.constexpr, EPN: tl.constexpr,
+        CURSOR_STRIDE: tl.constexpr, TOPK: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr):
+    """Single-pass scatter: the route chunk is read exactly once.
+
+    The whole expert axis of this core's cursor row lives in one register
+    vector, so the per-expert base is a gather and a block's intra-expert
+    order is a 32x32 pairwise compare instead of a [bins, routes] matrix.  The
+    dense form re-read the chunk E/32 times; here the histogram that advances
+    the cursors is the only per-block expert-axis work.  Everything after
+    ``global_ordinal`` is the dense form's arithmetic, kept identical on
+    purpose: only the traversal changed.  Like the dense form, the cursor row
+    is read-only (the per-core prefix is the input, and the advance lives in
+    registers), so the workspace is left exactly as found.
+
+    ``CURSOR_STRIDE`` is the dispatch-bucket row width, at least
+    ``next_power_of_2(2 * E)``, so the ``next_power_of_2(E)``-wide cursor
+    vector never runs past the row.  One subcore runs this; splitting the
+    expert axis across both subcores would halve the vector width and is the
+    natural follow-up if the device cost turns out to sit here.
+    """
+    per_core = tl.cdiv(num_routes, NUM_CORES)
+    begin = pid * per_core
+    end = tl.minimum(begin + per_core, num_routes)
+    SCAN_BINS: tl.constexpr = triton.next_power_of_2(E)
+    bins = tl.arange(0, SCAN_BINS)
+    in_range = bins < E
+    cursors = tl.load(cursors_ptr + pid * CURSOR_STRIDE + bins,
+                      mask=in_range, other=0)
+    block: tl.constexpr = 32
+    lanes = tl.arange(0, block)
+    earlier = lanes[None, :] < lanes[:, None]
+    for block_start in range(begin, end, block):
+        route = block_start + lanes
+        # Masked lanes still form their address; clamp them into the chunk.
+        safe_route = tl.minimum(route, num_routes - 1)
+        expert = tl.load(selected_ptr + safe_route, mask=route < end, other=-1)
+        valid = (route < end) & (expert >= 0) & (expert < E)
+        # Dropped routes fold into bin 0 and are subtracted back out below,
+        # so expert 0 keeps only its own count.
+        safe_expert = tl.where(valid, expert, 0).to(tl.int32)
+        matches = ((expert[:, None] == expert[None, :]) & earlier
+                   & valid[None, :]).to(tl.int32)
+        ordinal = tl.gather(cursors, safe_expert, 0) + tl.sum(matches, 1)
+        source_lo = tl.load(source_prefix_ptr + safe_expert)
+        global_ordinal = ordinal + source_lo
+        lo = tl.zeros((block,), dtype=tl.int32)
+        hi = tl.full((block,), R, dtype=tl.int32)
+        for _ in range(SEARCH_STEPS):
+            active = lo < hi
+            mid = tl.where(active, (lo + hi) // 2, 0)
+            bound = tl.load(alloc_cumsum_ptr
+                            + safe_expert * R + tl.minimum(mid, R - 1))
+            take = active & (bound <= global_ordinal)
+            lo = tl.where(take, mid + 1, lo)
+            hi = tl.where(take, hi, tl.where(active, mid, hi))
+        destination = tl.minimum(lo, R - 1)
+        previous = tl.maximum(destination - 1, 0)
+        allocation_lo = tl.load(alloc_cumsum_ptr + safe_expert * R + previous)
+        allocation_lo = tl.where(destination > 0, allocation_lo, 0)
+        replica = tl.load(inverse_ptr + destination * E + safe_expert)
+        slot = tl.where(destination == safe_expert // EPN,
+                        safe_expert % EPN, EPN + replica)
+        bucket = destination * (2 * EPN) + slot
+        start = tl.load(send_starts_ptr + bucket)
+        row = start + global_ordinal - tl.maximum(source_lo, allocation_lo)
+        # Same discipline as the home-routing scatter: masked lanes contribute
+        # nothing, but their addresses must stay inside the tables.
+        safe_rows = tl.where(valid, row, 0)
+        tl.store(send_tokens_ptr + safe_rows, route // TOPK, mask=valid)
+        tl.store(send_routes_ptr + safe_rows, route, mask=valid)
+        tl.store(route_to_send_ptr + safe_route, row, mask=valid)
+        counts = tl.histogram(safe_expert, SCAN_BINS)
+        invalid = tl.sum((~valid).to(tl.int32), 0)
+        cursors += tl.where(bins == 0, counts - invalid, counts)
 
 
 @triton.jit
