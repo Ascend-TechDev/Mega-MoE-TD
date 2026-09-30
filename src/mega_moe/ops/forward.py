@@ -365,6 +365,25 @@ class FusedMoEForward(torch.nn.Module):
         self._fwd_timing_last = None
         self.context.finalize()
 
+    def _reserve_single_signal_epoch(self) -> int:
+        """Reserve the shared ready value before a single-kernel push.
+
+        Tile readiness and replica readiness use the same launch epoch. Every
+        writer of pooled replica slots, including backward and other layers,
+        must participate in the buffers' monotonic sequence. A local-only
+        reservation can let a subsequent reprefetch accept this forward's
+        stale ready value before the new weights have arrived.
+        """
+        if self.enable_moonep:
+            self._tile_signal_epoch = self._replica_weight_buffers.next_push_epoch(
+                floor=max(self._tile_signal_epoch, self._replica_weight_epoch) - 1
+            )
+            self._replica_weight_cache_valid = False
+            self._replica_weight_epoch = self._tile_signal_epoch + 1
+        if self._tile_signal_epoch >= torch.iinfo(torch.int32).max:
+            raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
+        return self._tile_signal_epoch
+
     def _ensure_replica_weight_buffers(
         self,
         gate_up_weight: torch.Tensor,
@@ -1604,15 +1623,7 @@ class FusedMoEForward(torch.nn.Module):
             dtype=self.activation_dtype,
             device=hidden_states.device,
         )
-        if self.enable_moonep:
-            # Saved-forward shares these destinations but has its own cache
-            # and epoch counter. Switching paths must not reuse an old signal.
-            self._tile_signal_epoch = max(self._tile_signal_epoch, self._replica_weight_epoch)
-            self._replica_weight_cache_valid = False
-            self._replica_weight_epoch = self._tile_signal_epoch + 1
-        signal_epoch = self._tile_signal_epoch
-        if signal_epoch >= torch.iinfo(torch.int32).max:
-            raise RuntimeError("forward readiness epoch exhausted; recreate the operator")
+        signal_epoch = self._reserve_single_signal_epoch()
         # FC1 holds two (M, N/2) accumulators with the same total L0C footprint.
         launch_options = (
             {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}

@@ -33,7 +33,20 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 
-def moe_backward_bigop(saved, dy):
+def _redispatch_hidden(hidden_states, saved):
+    """Rebuild expert inputs from the retained pre-dispatch token copy."""
+    source_rows = saved["sort_idxs"].to(torch.int64) // saved["topk"]
+    send = hidden_states[source_rows]
+    recv = torch.empty((saved["total_recv"], saved["hidden_dim"]),
+                       dtype=hidden_states.dtype, device=hidden_states.device)
+    dist.all_to_all_single(recv, send,
+                          output_split_sizes=saved["splits_recv_list"],
+                          input_split_sizes=saved["splits_send_list"],
+                          group=saved["ep_group"])
+    return recv[saved["local_sort_idxs"]]
+
+
+def moe_backward_bigop(saved, dy, *, recompute=False, hidden_states=None):
     """bigop-compute backward golden. Return keys are identical to ``moe_backward_torch``.
 
     A2A on both ends (combine_bwd_a2a / dispatch_bwd) reuse the torch golden;
@@ -47,7 +60,17 @@ def moe_backward_bigop(saved, dy):
     already match), while wgrad steps transpose the result back. Note the wgrad
     arg order is SWAPPED vs mega_moe ``grouped_transposed_matmul(grad_out, orig_in)``:
     bigop is ``(orig_in, grad_out)``.
+
+    ``recompute=True`` matches MOE_SAVED_RECOMPUTE: retain FC1 output and
+    pre-dispatch hidden states, then rebuild weighted SwiGLU and redispatch
+    hidden states inside this call. Neither cached activation is read.
     """
+    if recompute:
+        if hidden_states is None or tuple(hidden_states.shape) != (
+                saved["batch_size"], saved["hidden_dim"]):
+            raise ValueError("recompute requires pre-dispatch hidden_states [B, H]")
+        if saved.get("activation", "swiglu") != "swiglu":
+            raise ValueError("bigop recompute currently requires SwiGLU")
     dy = dy.to(saved["output"].dtype)
     counts = saved["expert_counts"]                  # int32; bigop casts to int64 internally
 
@@ -62,12 +85,21 @@ def moe_backward_bigop(saved, dy):
     grad_swiglu_for_npu = grad_swiglu * probs                                   # bwd of *scale
     grad_fc1_output = torch_npu.npu_swiglu_backward(
         grad_swiglu_for_npu, saved["fc1_output"], dim=-1)                       # [M, 2*ffn]
-    swiglu_out = torch_npu.npu_swiglu(saved["fc1_output"], dim=-1)              # [M, ffn] recomputed (probs-grad needs it)
+    if recompute:
+        # Match the forward/Triton weighted activation's single BF16 rounding.
+        swiglu_f32 = torch_npu.npu_swiglu(saved["fc1_output"].float(), dim=-1)
+        weighted_swiglu = (swiglu_f32 * probs.float()).to(dy.dtype)
+        swiglu_out = swiglu_f32.to(dy.dtype)
+        del swiglu_f32
+    else:
+        swiglu_out = torch_npu.npu_swiglu(saved["fc1_output"], dim=-1)
+        weighted_swiglu = saved["swiglu_out_weighted"]
     grad_gate = (grad_swiglu * swiglu_out).sum(dim=-1)                          # [M] = dScale, feeds dispatch_bwd
 
     # 3 fc2 wgrad — bigop: returns [E,ffn,H], transpose back to [E,H,ffn]
-    g = _grouped_wgrad(saved["swiglu_out_weighted"], grad_fc2_out_sorted, counts)  # [E, ffn, H]
+    g = _grouped_wgrad(weighted_swiglu, grad_fc2_out_sorted, counts)            # [E, ffn, H]
     grad_fc2 = g.transpose(-1, -2).contiguous()                                # [E, H, ffn]
+    del weighted_swiglu
 
     # 4a fc1 input-grad — bigop: fc1_combined[E,2*ffn,H] is [E,K=2*ffn,N=H], no adapt
     grad_recv_hidden_sorted = _grouped_matmul(grad_fc1_output, saved["fc1_combined"], counts)  # [M, H]
@@ -76,7 +108,9 @@ def moe_backward_bigop(saved, dy):
     grad_hidden, grad_routing_weights = dispatch_bwd(grad_recv_hidden_sorted, grad_gate, saved)
 
     # 5 fc1 wgrad — bigop: returns [E,H,2*ffn], transpose -> [E,2*ffn,H], chunk
-    g = _grouped_wgrad(saved["recv_hidden_sorted"], grad_fc1_output, counts)   # [E, H, 2*ffn]
+    recv_hidden = (_redispatch_hidden(hidden_states, saved) if recompute
+                   else saved["recv_hidden_sorted"])
+    g = _grouped_wgrad(recv_hidden, grad_fc1_output, counts)                   # [E, H, 2*ffn]
     grad_fc1 = g.transpose(-1, -2).contiguous()                                # [E, 2*ffn, H]
     grad_fc1_1, grad_fc1_2 = torch.chunk(grad_fc1, 2, dim=1)                   # each [E, ffn, H]
 

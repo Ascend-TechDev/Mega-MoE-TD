@@ -79,7 +79,9 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     every call and would go stale between layers).
     """
     use_moonep = bool(op.enable_moonep)
-    if int(op.world_size) * int(op.experts_per_rank) > 32:
+    if not use_moonep and int(op.world_size) * int(op.experts_per_rank) > 32:
+        # MoonEP uses _single_moonep_scatter, not this legacy scatter.
+        # Its large-expert contract is checked by all tripwires below.
         # workspace.py pads the bins to next_power_of_2(E); above 32 the
         # scatter's multi-bin-block loop (bin_block=32) corrupts the send
         # tables — observed at E=128 as duplicate slots + uninitialized
@@ -101,6 +103,19 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     device = hidden_states.device
     W = int(op.world_size)
     epn = int(op.experts_per_rank)
+    selected = saved["selected_experts"]
+    expected_topk = int(op.top_k)
+    if selected.ndim != 2 or int(selected.shape[1]) != expected_topk:
+        raise ValueError(
+            "single-kernel backward Top-K mismatch: selected_experts has "
+            f"shape {tuple(selected.shape)}, operator top_k={expected_topk}"
+        )
+    if int(hidden_states.shape[0]) * expected_topk != int(selected.numel()):
+        raise ValueError(
+            "single-kernel backward route shape is inconsistent with Top-K: "
+            f"tokens={int(hidden_states.shape[0])}, top_k={expected_topk}, "
+            f"selected_experts.numel={int(selected.numel())}"
+        )
     # Slot stride of every layout table below: the MoonEP physical table
     # (home | replica) under enable_moonep, the home table otherwise.
     EPR = int(op.physical_experts_per_rank) if use_moonep else epn

@@ -301,6 +301,19 @@ _CASE_GROUPS = (
         topk=16, num_experts=896,
         tags=frozenset({"performance", "backward", "kimi", "slow"}),
     ),
+    # Explicit MoonEP/reprefetch diagnostics, outside the default performance
+    # suite. Includes E896 for the large-expert MoonEP reprefetch path.
+    *(
+        CaseGroup(
+            prefix=f"moonep-bwd-kimi-k3-e{experts}-k{topk}",
+            direction="backward", model="Kimi-K3",
+            tokens=(1024, 4096, 8192, 16384), worlds=(8,),
+            hidden=3584, ffn=3072, topk=topk, num_experts=experts,
+            tags=frozenset({"backward", "kimi", "moonep", "reprefetch"}),
+            capacity_factor=1.6875,
+        )
+        for experts, topk in ((16, 8), (32, 8), (32, 16), (896, 16))
+    ),
 )
 
 

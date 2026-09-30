@@ -33,6 +33,7 @@ _MEGA_PERSISTENT_KEYS = (
     "_mega_redispatch_buf", "_mega_combine_buf",
     "_mega_b3_signal_mem", "_mega_b1_signal_mem",
     "_mega_b3_signal_epoch", "_mega_b1_signal_epoch",
+    "_mega_p3_signal_mem", "_mega_p3_signal_epoch",
     "_mega_ts_buf", "_mega_wait1_buf",
 )
 
