@@ -160,6 +160,55 @@ Mega-MoE-TD 的主要阶段 median 耗时 如下：
 | 8K | 0.946 ms | 16.635 ms | 11.085 ms | 28.022 ms |
 | 16K | 0.946 ms | 30.770 ms | 19.878 ms | 51.171 ms |
 
+#### Fused 单kernel性能测试
+
+本次完整 *950DT 八卡* Mega-MoE-TD forward 的 median 耗时如下，基线是
+`Grouped Torch` 。
+
+| 用例 | tokens/rank | Mega-MoE-TD median | Grouped Torch median | Grouped Torch / Mega-MoE-TD |
+|---|---:|---:|---:|---:|
+| E32 均衡，非 MoonEP | 4K | 13.560 ms | 21.359 ms | **1.575x** |
+| E32 均衡，非 MoonEP | 8K | 28.402 ms | 40.959 ms | **1.442x** |
+| E32 均衡，非 MoonEP | 16K | 58.833 ms | 79.874 ms | **1.358x** |
+| E896 均衡，非 MoonEP | 4K | 15.099 ms | 21.780 ms | **1.442x** |
+| E896 均衡，非 MoonEP | 8K | 28.833 ms | 40.925 ms | **1.419x** |
+| E896 均衡，非 MoonEP | 16K | 54.154 ms | 83.370 ms | **1.540x** |
+| E32 偏斜，非 MoonEP | 4K | 21.309 ms | 32.378 ms | **1.519x** |
+| E32 偏斜，非 MoonEP | 8K | 45.676 ms | 64.002 ms | **1.401x** |
+| E32 偏斜，非 MoonEP | 16K | 91.240 ms | 126.685 ms | **1.388x** |
+| E896 偏斜，非 MoonEP | 4K | 22.784 ms | 33.184 ms | **1.456x** |
+| E896 偏斜，非 MoonEP | 8K | 43.773 ms | 65.279 ms | **1.491x** |
+| E896 偏斜，非 MoonEP | 16K | 86.344 ms | 129.432 ms | **1.499x** |
+| E32 偏斜，MoonEP | 4K | 14.612 ms | 32.396 ms | **2.217x** |
+| E32 偏斜，MoonEP | 8K | 29.306 ms | 63.838 ms | **2.178x** |
+| E32 偏斜，MoonEP | 16K | 60.302 ms | 126.979 ms | **2.106x** |
+
+计时边界是 router 之后的完整
+forward（routing metadata、dispatch、FC1、weighted SwiGLU、FC2、combine），不含
+JIT、初始化和输入准备。所有测点使用 `wave_windows=32`、`dispatch-block=256`；
+E32 使用 FC1/FC2 `M256/N256/K128`，E896 均衡 4K/8K 和偏斜用例使用
+`M128/N512/K128`，E896 均衡 16K 使用 `M256/N256/K128`。非 MoonEP 对称堆为
+6 GiB，MoonEP 对称堆为 16 GiB，replica cache 关闭。
+
+测试命令：
+
+```bash
+$PY benchmark/layer/profile_single_kernel_forward.py \
+  --case performance-fwd-kimi-k3-trimmed-top16-w8-t4k \
+  --benchmark-only --record-host-intervals \
+  --fc1-block 256 256 128 --fc2-block 256 256 128 \
+  --dispatch-block 256 --wave-windows 32 \
+  --output-dir /tmp/mega-moe-td-e32-t4k
+```
+
+将 `--case`、`--fc1-block`、`--fc2-block` 和输出目录替换为目标测点即可；
+E32 均衡使用 `performance-fwd-kimi-k3-trimmed-top16-w8-t{4k,8k,16k}`，
+E32 偏斜使用 `performance-fwd-kimi-k3-trimmed-skewed-w8-t{4k,8k,16k}`，
+E896 均衡使用 `performance-fwd-kimi-k3-w8-t{4k,8k,16k}`，E896 偏斜使用
+`performance-fwd-kimi-k3-skewed-w8-t{4k,8k,16k}`。MoonEP 测点在命令末尾增加
+`--moonep` 并将 `MOE_FUSED_ASH_SIZE_GB` 改为 `16`。
+
+
 #### 单 kernel 前向相位打点（`MOE_FWD_TIMING`）
 
 `MOE_FWD_TIMING=1` 让单 kernel 前向的同一次 launch 携带 SYS_CNT 相位打点

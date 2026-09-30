@@ -116,7 +116,7 @@ def power2(value):
 def production_helpers(extra_names=(), extra_globals=None):
     tree = ast.parse(SOURCE.read_text())
     names = {
-        "_reset_route_to_send", "_zero_pipeline_counters", "_count_routes_by_core",
+        "_zero_pipeline_counters", "_count_routes_by_core",
         "_build_destination_metadata", "_convert_counts_to_stable_cursors",
         "_build_pull_destination_starts", "_build_recv_segment_starts",
         "_scatter_routes_by_ordinal", "_scatter_stable_routes",
@@ -228,18 +228,70 @@ def test_counter_reset_keeps_padding(count, cores):
     assert len(storage.writes) == count
 
 
-@pytest.mark.parametrize("routes,cores", [
-    (0, 32), (1, 32), (3, 32), (255, 3), (256, 32), (257, 3),
-    (2051, 32), (65536, 32),
-])
-def test_route_reset_covers_active_prefix_only(routes, cores):
-    h = production_helpers()
+def reset_route_inverse(inverse, routes):
+    """Execute the production host reset statement on shared CPU storage."""
+    class Fillable:
+        def __init__(self, values, selection=slice(None)):
+            self.values = values
+            self.selection = selection
+
+        def __getitem__(self, selection):
+            return Fillable(self.values, selection)
+
+        def fill_(self, value):
+            self.values[self.selection].fill(value)
+
+    path = SOURCE.parents[3] / "src/mega_moe/ops/forward.py"
+    tree = ast.parse(path.read_text())
+    fills = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+             and isinstance(node.value.func, ast.Attribute)
+             and node.value.func.attr == "fill_"
+             and "_route_to_send" in ast.unparse(node.value.func.value)]
+    assert len(fills) == 1
+    scope = {"self": SimpleNamespace(_route_to_send=Fillable(inverse.values)),
+             "num_routes": routes}
+    exec(compile(ast.Module(body=fills, type_ignores=[]), str(path), "exec"), scope)
+
+
+@pytest.mark.parametrize("routes", [0, 1, 3, 255, 256, 257, 2051, 65536])
+def test_route_reset_covers_active_prefix_only(routes):
     inverse = buffer(routes + 19, 99)
-    for core in reversed(range(cores)):
-        h._reset_route_to_send(core, inverse, routes, cores, 256)
+    reset_route_inverse(inverse, routes)
     np.testing.assert_array_equal(inverse.values[:routes], -1)
     np.testing.assert_array_equal(inverse.values[routes:], 99)
-    assert sorted(offset for _, offset in inverse.writes) == list(range(routes))
+
+
+def test_route_reset_is_separate_from_histogram():
+    tree = ast.parse(SOURCE.read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    count = functions["_count_routes_by_core"]
+    assert "route_to_send_ptr" not in {arg.arg for arg in count.args.args}
+    stores = [node for node in ast.walk(count)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "store"]
+    assert len(stores) == 1
+    assert "core_bucket_cursor_ptr" in ast.unparse(stores[0].args[0])
+
+    kernel = functions["_kernel_fused_forward"]
+    reset_calls = [node for node in ast.walk(kernel)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "_reset_route_to_send"]
+    host = ast.parse((SOURCE.parents[3] / "src/mega_moe/ops/forward.py").read_text())
+    launch = next(node for node in ast.walk(host)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
+                  and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id == "_kernel_fused_forward")
+    fills = [node for node in ast.walk(host)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "fill_"
+             and "_route_to_send" in ast.unparse(node.func.value)
+             and ast.unparse(node.args[0]) == "-1"]
+    # The device-verified reset has one owner: the launch stream on host.
+    assert "_reset_route_to_send" not in functions
+    assert not reset_calls
+    assert len(fills) == 1
+    assert fills[0].lineno < launch.lineno
 
 
 def test_metadata_does_not_repeat_wave_reductions():
