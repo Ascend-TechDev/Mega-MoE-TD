@@ -4997,7 +4997,7 @@ def run_megamoe_situglu_autograd_case(rank: int, world_size: int) -> None:
 
 def run_single_kernel_situglu_autograd_case(
     rank: int, world_size: int, fc1_offload: bool = False,
-    down_direct: bool = False,
+    down_direct: bool = False, num_experts: int = 0,
 ) -> None:
     """End-to-end gate for the single-kernel forward + mega recompute backward.
 
@@ -5039,11 +5039,15 @@ def run_single_kernel_situglu_autograd_case(
     _env_before = {k: os.environ.get(k) for k in _bwd_env}
     os.environ.update(_bwd_env)
 
-    # E must stay <= 32: the kernel scatter's multi-bin-block path corrupts
-    # the send tables above 32 bins (adapter rejects it; see
-    # _single_saved_adapter).  At w8 use the exact Kimi-K3 integration shape
-    # (S=1024, H=7168, F=3072, topk=8, E=32, EPR=4); w2 is the small smoke.
-    if world_size == 8:
+    # E>32 is legal now: the route scatter takes the ordinal path past one
+    # bin block (the corrupting multi-bin-block loop is gone; see
+    # _scatter_stable_routes).  The default shapes stay historical — at w8
+    # the exact Kimi-K3 integration shape (S=1024, H=7168, F=3072, topk=8,
+    # E=32, EPR=4); w2 is the small smoke.  An explicit ``num_experts``
+    # overrides E and keeps the small shape.
+    if num_experts > 0:
+        tokens, hidden, ffn, topk = 512, 512, 256, 4
+    elif world_size == 8:
         tokens, hidden, ffn, topk, num_experts = 1024, 7168, 3072, 8, 32
     else:
         tokens, hidden, ffn, topk, num_experts = 512, 512, 256, 4, 32
@@ -5943,6 +5947,20 @@ def test_single_kernel_situglu_autograd_fc1offload_w8(dist_test):
 @pytest.mark.functional
 def test_single_kernel_situglu_autograd_w8(dist_test):
     dist_test(run_single_kernel_situglu_autograd_case, world_size=8)
+
+
+@pytest.mark.dist
+@pytest.mark.functional
+@pytest.mark.parametrize("num_experts", (64, 96), ids=("e64", "e96"))
+def test_single_kernel_situglu_autograd_large_e_w8(dist_test, num_experts):
+    """E>32 legacy (non-MoonEP) forward+backward contract: the route scatter
+    now goes through the ordinal path past one bin block, which lifts the
+    historical E<=32 adapter guard.  E=64/96 land squarely in the previously
+    rejected 33..127 window (NUM_BINS_PAD 64/128, two padded lanes)."""
+    dist_test(
+        run_single_kernel_situglu_autograd_case, world_size=8,
+        args=(False, False, num_experts),
+    )
 
 
 @pytest.mark.dist

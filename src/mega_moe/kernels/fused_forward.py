@@ -406,7 +406,11 @@ def _scatter_stable_routes(pid, selected_experts_ptr, core_bucket_cursor_ptr,
                            NUM_BINS_PAD: tl.constexpr, TOPK: tl.constexpr,
                            BLOCK_SIZE: tl.constexpr):
     """Stable expert-major scatter; each lane owns disjoint expert bins."""
-    if NUM_EXPERTS >= 128:
+    # >32 bins: the multi-bin-block loop below (bin_block=32) corrupts the
+    # send tables (duplicate slots / uninitialized send_route_indices,
+    # observed at E=128) — the ordinal scatter is the correct path for any
+    # E past one bin block.  E<=32 keeps the historical single-block form.
+    if NUM_EXPERTS > 32:
         _scatter_routes_by_ordinal(
             pid, selected_experts_ptr, core_bucket_cursor_ptr,
             send_token_indices_ptr, send_route_indices_ptr, route_to_send_ptr,
