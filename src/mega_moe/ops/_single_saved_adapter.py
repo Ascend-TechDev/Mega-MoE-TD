@@ -55,6 +55,8 @@ Droless routing is REQUIRED: the backward's map build asserts
 (capacity_factor < world_size) fail here first with a clear message.
 """
 
+import os
+
 import torch
 
 from ._moonep_torch_forward import _arrival_to_slot_permutation
@@ -125,45 +127,55 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     recv_expert_offs = saved["recv_expert_offsets"].to(
         torch.int64)                                        # [EPR + 1]
 
-    # Tripwire 1: the expert-major receive prefix must match the counts the
-    # contract carries (both sides derive it by cumsum over per-expert totals).
-    expected_offs = torch.zeros_like(recv_expert_offs)
-    expected_offs[1:] = recv_counts64.sum(0).cumsum(0)
-    if not torch.equal(recv_expert_offs, expected_offs):
-        raise RuntimeError(
-            "single-kernel receive layout diverged from the backward's "
-            "expert-major algebra (recv_expert_offsets != cumsum of "
-            "recv_counts_by_source_expert sums)"
-        )
+    # Tripwires (structural cross-checks of the kernel's layout products)
+    # are debug-only: each torch.equal / .item() here is its own device
+    # queue drain, and the steady-state production contract has them green.
+    # MOE_ENRICH_TRIPWIRES=0 compiles them out (default keeps them).
+    _tripwires = os.environ.get("MOE_ENRICH_TRIPWIRES", "1") == "1"
+    if _tripwires:
+        # Tripwire 1: the expert-major receive prefix must match the counts
+        # the contract carries (both sides derive it by cumsum over
+        # per-expert totals).
+        expected_offs = torch.zeros_like(recv_expert_offs)
+        expected_offs[1:] = recv_counts64.sum(0).cumsum(0)
+        if not torch.equal(recv_expert_offs, expected_offs):
+            raise RuntimeError(
+                "single-kernel receive layout diverged from the backward's "
+                "expert-major algebra (recv_expert_offsets != cumsum of "
+                "recv_counts_by_source_expert sums)"
+            )
 
-    # Tripwire 2: the send table this adapter is about to hand the backward
-    # as its canonical send order (plan B).  Two structural requirements:
-    # (1) it is a permutation of 0..total_send-1 — the re-dispatch's source
-    #     gather (send_src_idx = sort_idxs // topk) and the reduce's
-    #     inv_sort scatter are only well-defined over a true permutation;
-    # (2) it is bucket-segmented — flat expert ids non-decreasing along the
-    #     table.  The backward's sweeps walk (dst, expert) buckets through
-    #     send_bucket_starts, so a table laid out in any other order would
-    #     push rows into the wrong receive slots.  The forward's
-    #     `_scatter_stable_routes` bucket cursors guarantee both.  (The old
-    #     adapter instead index_select-reordered fc1_output /
-    #     recv_weights_sorted INTO the backward's stable-argsort order —
-    #     plan B flips the direction and drops both copies.)
-    send_route = saved["send_route_indices"].to(torch.int64)
-    sorted_route = torch.sort(send_route).values
-    if not torch.equal(
-        sorted_route,
-        torch.arange(total_send, dtype=torch.int64, device=device),
-    ):
-        raise RuntimeError(
-            "single-kernel send_route_indices is not a permutation of "
-            "0..total_send-1 — it cannot serve as the backward's send "
-            f"order: len={send_route.numel()} total_send={total_send} "
-            f"min={int(sorted_route[0]) if sorted_route.numel() else -1} "
-            f"max={int(sorted_route[-1]) if sorted_route.numel() else -1} "
-            f"distinct={int(torch.unique(send_route).numel())} "
-            f"head={send_route[:8].tolist()}"
-        )
+        # Tripwire 2: the send table this adapter is about to hand the
+        # backward as its canonical send order (plan B).  Two structural
+        # requirements: (1) it is a permutation of 0..total_send-1 — the
+        # re-dispatch's source gather (send_src_idx = sort_idxs // topk) and
+        # the reduce's inv_sort scatter are only well-defined over a true
+        # permutation; (2) it is bucket-segmented — flat expert ids
+        # non-decreasing along the table.  The backward's sweeps walk
+        # (dst, expert) buckets through send_bucket_starts, so a table laid
+        # out in any other order would push rows into the wrong receive
+        # slots.  The forward's `_scatter_stable_routes` bucket cursors
+        # guarantee both.  (The old adapter instead index_select-reordered
+        # fc1_output / recv_weights_sorted INTO the backward's
+        # stable-argsort order — plan B flips the direction and drops both
+        # copies.)
+        send_route = saved["send_route_indices"].to(torch.int64)
+        sorted_route = torch.sort(send_route).values
+        if not torch.equal(
+            sorted_route,
+            torch.arange(total_send, dtype=torch.int64, device=device),
+        ):
+            raise RuntimeError(
+                "single-kernel send_route_indices is not a permutation of "
+                "0..total_send-1 — it cannot serve as the backward's send "
+                f"order: len={send_route.numel()} total_send={total_send} "
+                f"min={int(sorted_route[0]) if sorted_route.numel() else -1} "
+                f"max={int(sorted_route[-1]) if sorted_route.numel() else -1} "
+                f"distinct={int(torch.unique(send_route).numel())} "
+                f"head={send_route[:8].tolist()}"
+            )
+    else:
+        send_route = saved["send_route_indices"].to(torch.int64)
     # MoonEP plan snapshot: the device planner's products, settled by the
     # forward's metadata .item() sync before this adapter runs.  Cloned here
     # because a framework host sharing one operator across same-shape layers
@@ -171,6 +183,7 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     # layer's backward (the _single_kernel_snapshot contract).
     experts_to_copy = experts_to_copy_cpu = None
     active_phys = 0
+    replica_max = None
     if use_moonep:
         ctxn = op.context
         if op._replica_weight_buffers is None:
@@ -182,7 +195,9 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         experts_to_copy_cpu = ctxn.planning_experts_to_copy.cpu().contiguous()
         # world-max replica count, mirroring build_routing_plan
         # (runtime/routing.py): active is rank-uniform by construction.
-        active_phys = epn + int(ctxn.planning_replica_counts.max().item())
+        # Kept as a device scalar — folded into the one host sync below
+        # instead of draining the queue here.
+        replica_max = ctxn.planning_replica_counts.max()
         replica_budget = int(experts_to_copy.shape[1])
         if EPR != epn + replica_budget:
             raise RuntimeError(
@@ -192,62 +207,88 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
 
     expert_seq = flat[send_route]
     if use_moonep:
-        # MoonEP tripwire 2b: buckets are (dst, PHYSICAL slot) and a route's
-        # flat expert id is NOT monotone along the table (a replica bucket
-        # holds its owner's expert id, which may sort anywhere).  The strong
-        # invariant instead: every bucket's rows carry exactly the expert
-        # that bucket holds — dst*epn+slot for home slots, the copied expert
-        # for replica slots — checked against the planner's own count row.
+        # The metadata count row is BOTH a tripwire input and a live plan
+        # product (the send-count source below), so it is always derived;
+        # only the checks behind it are tripwire-gated.
         counts_row = op.context.metadata_counts_mem.view(
             W, op.context.metadata_num_bins
         )[op.rank, : W * EPR].to(torch.int64).reshape(-1)          # [W*EPR]
-        if int(counts_row.sum().item()) != total_send:
-            raise RuntimeError(
-                "MoonEP send count row disagrees with the contract: "
-                f"{int(counts_row.sum().item())} != {total_send}"
+        # Full count-cube snapshot for the backward's combine map build:
+        # every rank derived the SAME balanced cube in the forward's
+        # metadata phase (runtime/routing.py: "Every rank has the same raw
+        # count cube ... derive the complete balanced cube locally"), so
+        # all_send[r][d] is a device-side reshape+sum away — no
+        # all_gather_list round trip in _combine_static_maps.  Cloned for
+        # the same reason as planning_experts_to_copy above: this adapter
+        # runs inside MegaMoEFunction.forward, before any later layer's
+        # forward can rewrite the shared workspace.
+        saved["plan_all_send_counts"] = op.context.metadata_counts_mem.view(
+            W, op.context.metadata_num_bins
+        )[:, : W * EPR].to(torch.int64).reshape(W, W * EPR)
+        if _tripwires:
+            # MoonEP tripwire 2b: buckets are (dst, PHYSICAL slot) and a
+            # route's flat expert id is NOT monotone along the table (a
+            # replica bucket holds its owner's expert id, which may sort
+            # anywhere).  The strong invariant instead: every bucket's rows
+            # carry exactly the expert that bucket holds — dst*epn+slot for
+            # home slots, the copied expert for replica slots — checked
+            # against the planner's own count row.
+            if int(counts_row.sum().item()) != total_send:
+                raise RuntimeError(
+                    "MoonEP send count row disagrees with the contract: "
+                    f"{int(counts_row.sum().item())} != {total_send}"
+                )
+            # Cross-check two independent kernel products: the metadata
+            # count row and the send bucket starts must be each other's
+            # cumsum.
+            expected_starts = counts_row.cumsum(0) - counts_row
+            if not torch.equal(
+                op.context.metadata_send_bucket_starts.to(torch.int64),
+                expected_starts,
+            ):
+                raise RuntimeError(
+                    "MoonEP send bucket starts are not the exclusive cumsum "
+                    "of the metadata count row — the backward's bucket walk "
+                    "would scatter rows to wrong slots"
+                )
+            bucket_ids = torch.arange(
+                W * EPR, dtype=torch.int64, device=device)
+            dst_of = bucket_ids // EPR
+            slot_of = bucket_ids % EPR
+            etc_flat = experts_to_copy.reshape(-1).to(torch.int64)
+            replica_expert = etc_flat[
+                dst_of * replica_budget + (slot_of - epn).clamp_min(0)
+            ]
+            expected_expert = torch.where(
+                slot_of < epn, dst_of * epn + slot_of, replica_expert
             )
-        # Cross-check two independent kernel products: the metadata count
-        # row and the send bucket starts must be each other's cumsum.
-        expected_starts = counts_row.cumsum(0) - counts_row
-        if not torch.equal(
-            op.context.metadata_send_bucket_starts.to(torch.int64),
-            expected_starts,
-        ):
-            raise RuntimeError(
-                "MoonEP send bucket starts are not the exclusive cumsum of "
-                "the metadata count row — the backward's bucket walk would "
-                "scatter rows to wrong slots"
+            expected_seq = torch.repeat_interleave(
+                expected_expert, counts_row, output_size=total_send
             )
-        bucket_ids = torch.arange(W * EPR, dtype=torch.int64, device=device)
-        dst_of = bucket_ids // EPR
-        slot_of = bucket_ids % EPR
-        etc_flat = experts_to_copy.reshape(-1).to(torch.int64)
-        replica_expert = etc_flat[
-            dst_of * replica_budget + (slot_of - epn).clamp_min(0)
-        ]
-        expected_expert = torch.where(
-            slot_of < epn, dst_of * epn + slot_of, replica_expert
-        )
-        expected_seq = torch.repeat_interleave(
-            expected_expert, counts_row, output_size=total_send
-        )
-        if not torch.equal(expert_seq, expected_seq):
-            raise RuntimeError(
-                "single-kernel send_route_indices disagrees with the MoonEP "
-                "plan: a (dst, slot) bucket's rows must carry exactly the "
-                "expert that slot holds (home: dst*epn+slot; replica: the "
-                "planner's experts_to_copy entry)"
-            )
-    elif bool((expert_seq[1:] < expert_seq[:-1]).any()):
+            if not torch.equal(expert_seq, expected_seq):
+                raise RuntimeError(
+                    "single-kernel send_route_indices disagrees with the "
+                    "MoonEP plan: a (dst, slot) bucket's rows must carry "
+                    "exactly the expert that slot holds (home: dst*epn+slot; "
+                    "replica: the planner's experts_to_copy entry)"
+                )
+    elif _tripwires and bool((expert_seq[1:] < expert_seq[:-1]).any()):
         raise RuntimeError(
             "single-kernel send_route_indices is not bucket-segmented "
             "(flat expert ids decrease along the table): the backward's "
             "(dst, expert) bucket walk would scatter rows to wrong slots"
         )
-    # inv_sort: the send position of each route id (int argsort falls back
-    # to AICPU on Ascend — float32, routing.py precedent).  This is exactly
-    # the old reorder permutation, now consumed by the reduce scatter.
-    perm = torch.argsort(send_route.to(torch.float32))
+    # inv_sort: the send position of each route id.  send_route IS a
+    # permutation of ..total_send-1 (tripwire 2 / the forward's bucket
+    # cursors guarantee it), so the inverse is a single scatter — no sort
+    # network, and none of the int-argsort-falls-back-to-AICPU trouble the
+    # float32 cast used to paper over (routing.py precedent).
+    if os.environ.get("MOE_ENRICH_SCATTER_INV", "1") == "1":
+        perm = torch.empty_like(send_route)
+        perm[send_route] = torch.arange(
+            total_send, dtype=torch.int64, device=device)
+    else:
+        perm = torch.argsort(send_route.to(torch.float32))
     fc1_output = saved["fc1_output"]
     if int(fc1_output.shape[0]) != total_recv:
         raise RuntimeError(
@@ -269,8 +310,59 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         EPR + 1, dtype=torch.int32, device=device)
     split_size_cum_per_expert[1:] = expert_counts64.cumsum(0)
 
+    # Send-side per-destination totals: the same bincount the backward's
+    # _dispatch_static_maps runs — done here once, host-side, so the split
+    # lists need no extra collective round.  Under MoonEP the destination is
+    # the PLANNER's choice (home hit stays home, overflow lands on a replica
+    # holder), so the counts are not derivable from expert bincounts — reuse
+    # the kernel's own count row derived above.
+    if use_moonep:
+        send_counts_re = counts_row.reshape(W, EPR)             # [W, phys]
+    else:
+        send_counts_re = torch.bincount(
+            flat, minlength=W * EPR).to(torch.int64).reshape(W, EPR)  # [W, phys]
+
     tiles_per_expert = (expert_counts64 + (BLOCK_SIZE_M - 1)) // BLOCK_SIZE_M
-    num_tiles = int(tiles_per_expert.sum().item())
+    # ONE device->host sync for every host int this adapter and the backward
+    # wrapper need: the tile total, the wgrad pad bound (per-expert max),
+    # the world replica max, and both split lists.  Every element is an
+    # independent device reduction issued back-to-back, so a single
+    # .tolist() retires them all — the wrapper used to re-drain the queue
+    # for the first two of these on every call (expert_counts.max().item(),
+    # num_tiles_total.item()).
+    _pack_rows = [
+        tiles_per_expert.sum().reshape(1),
+        expert_counts64.max().reshape(1),
+        send_counts_re.sum(dim=1),
+        recv_counts64.sum(dim=1),
+    ]
+    # positions in the FLATTENED cat output (scalars 0-1, then W + W split
+    # entries) — len(_pack_rows) would count list entries, not elements.
+    _off = 2 + 2 * W
+    _pos_replica = _pos_cube = None
+    if replica_max is not None:
+        # planning_replica_counts is int32 — cast for the int64 cat.
+        _pos_replica = _off
+        _off += 1
+        _pack_rows.append(replica_max.reshape(1).to(torch.int64))
+    if use_moonep:
+        # cube-wide bucket max: the backward's max_bwd_tiles used to take a
+        # cross-rank MAX all_reduce of this value — the shared cube makes
+        # the global max a local reduction.
+        _pos_cube = _off
+        _pack_rows.append(
+            saved["plan_all_send_counts"].max().to(torch.int64).reshape(1))
+    _host = torch.cat(_pack_rows).tolist()
+    num_tiles = int(_host[0])
+    # floored at 1 so the backward's in-kernel m-loop never degenerates to a
+    # zero-trip shape (mirrors the wrapper's max(1, ...) on this value).
+    max_rows_w_hint = max(1, int(_host[1]))
+    splits_send_list = [int(v) for v in _host[2:2 + W]]
+    splits_recv_list = [int(v) for v in _host[2 + W:2 + 2 * W]]
+    if _pos_replica is not None:
+        active_phys = epn + int(_host[_pos_replica])
+    if _pos_cube is not None:
+        saved["max_bwd_tiles_hint"] = max(1, (int(_host[_pos_cube]) + 63) // 64)
     num_tiles_total = torch.tensor([num_tiles], dtype=torch.int32, device=device)
     if num_tiles:
         token_starts = expert_counts64.cumsum(0) - expert_counts64
@@ -296,19 +388,7 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
         meta_tile_num = torch.empty(0, dtype=torch.int32, device=device)
         meta_tile_num_cum = torch.empty(0, dtype=torch.int32, device=device)
 
-    # Send-side per-destination totals: the same bincount the backward's
-    # _dispatch_static_maps runs — done here once, host-side, so the split
-    # lists need no extra collective round.  Under MoonEP the destination is
-    # the PLANNER's choice (home hit stays home, overflow lands on a replica
-    # holder), so the counts are not derivable from expert bincounts — reuse
-    # the kernel's own count row validated by the tripwire above.
-    if use_moonep:
-        send_counts_re = counts_row.reshape(W, EPR)             # [W, phys]
-    else:
-        send_counts_re = torch.bincount(
-            flat, minlength=W * EPR).to(torch.int64).reshape(W, EPR)  # [W, EPR]
-    splits_send_list = send_counts_re.sum(dim=1).tolist()
-    splits_recv_list = recv_counts64.sum(dim=1).tolist()
+    # Host-only sanity on the packed split lists — no device work.
     if sum(splits_send_list) != total_send:
         raise RuntimeError(
             "send counts disagree with the contract's send size: "
@@ -320,23 +400,34 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
             f"{sum(splits_recv_list)} != {total_recv}"
         )
 
-    # Permutation invariants, from the arrival algebra (int argsort falls
-    # back to AICPU on Ascend — every argsort goes through float32,
-    # routing.py precedent).  sort_idxs IS the forward's send table (plan
-    # B): the re-dispatch P0 walks routes in this order, rows land in the
-    # forward's receive layout, and fc1_output / recv_weights_sorted ride
-    # along un-reordered.  inv_sort is its inverse (== perm above).
+    # Permutation invariants, from the arrival algebra.  sort_idxs IS the
+    # forward's send table (plan B): the re-dispatch P0 walks routes in this
+    # order, rows land in the forward's receive layout, and fc1_output /
+    # recv_weights_sorted ride along un-reordered.  inv_sort is its inverse
+    # (== perm above).  inv_local is likewise the inverse of a permutation
+    # (_arrival_to_slot_permutation's output), so a scatter replaces the
+    # historical float32 argsort.
     sort_idxs = send_route.contiguous()
     inv_sort = perm
     slot_starts = recv_expert_offs[:-1]
     local_sort_idxs = _arrival_to_slot_permutation(recv_counts64, slot_starts)
-    inv_local = torch.argsort(local_sort_idxs.to(torch.float32))
+    if os.environ.get("MOE_ENRICH_SCATTER_INV", "1") == "1":
+        inv_local = torch.empty_like(local_sort_idxs)
+        inv_local[local_sort_idxs] = torch.arange(
+            local_sort_idxs.numel(), dtype=torch.int64, device=device)
+    else:
+        inv_local = torch.argsort(local_sort_idxs.to(torch.float32))
 
     saved.update(
         # plan tables
         expert_counts=expert_counts,
         split_size_cum_per_expert=split_size_cum_per_expert,
         num_tiles_total=num_tiles_total,
+        # host ints from the single packed sync above — the backward wrapper
+        # reads these instead of re-draining the device queue
+        # (expert_counts.max().item() / num_tiles_total.item()).
+        num_tiles_host=num_tiles,
+        max_rows_w_hint=max_rows_w_hint,
         meta_expert_ids=meta_expert_ids,
         meta_split_cum=meta_split_cum,
         meta_tile_num=meta_tile_num,

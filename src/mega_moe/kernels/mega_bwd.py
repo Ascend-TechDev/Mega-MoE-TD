@@ -2969,6 +2969,25 @@ def _ensure_mega_signal_local(saved, key, slots):
     return mem
 
 
+_PREP_CLOCK = [None]
+
+
+def _prep_stamp(label, rank):
+    """Fine-grained host-side prep attribution (MOE_MEGA_PREP_TIMING=1).
+
+    Prints the wall-clock since the previous stamp so consecutive stamps
+    around the wrapper's host sections localize the entry->launch gap
+    (the .item()/all_reduce/list() device round trips are the suspects).
+    """
+    if os.environ.get("MOE_MEGA_PREP_TIMING") != "1":
+        return
+    now = time.perf_counter()
+    prev = _PREP_CLOCK[0]
+    _PREP_CLOCK[0] = now
+    delta = 0.0 if prev is None else (now - prev) * 1e3
+    print(f"[prep r{rank}] {label} +{delta:.2f}ms", flush=True)
+
+
 def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
                          hidden_states=None):
     """MOE_BWD_MEGA=1 backward: the whole 5-step backward in ONE kernel
@@ -3029,6 +3048,8 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # [entry -> post-.item()] = wrapper prep + device drain of the queue.
     if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
         print(f"[mega-ent r{rank} t={time.time():.2f}]", flush=True)
+    _PREP_CLOCK[0] = None
+    _prep_stamp("ent", rank)
 
     # Selected fine-sync schedule: submit both panels on the caller stream
     # before metadata preparation. Stream order ends issuance before mega
@@ -3122,8 +3143,13 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     p4 = _combine_static_maps(saved)
     # floored at 1 so the in-kernel m-loop never degenerates to a zero-trip
     # shape (all-experts-empty routings; see the miscompile note in
-    # _mega_wgrad_sweep)
-    max_rows_w = max(1, int(p4["expert_counts"].max().item()))
+    # _mega_wgrad_sweep).  The single-kernel adapter packs this per-expert
+    # max into its one enrich-side sync (max_rows_w_hint) — reading the hint
+    # skips this .item() drain; other saved contracts keep the tensor read.
+    _mrw_hint = saved.get("max_rows_w_hint")
+    max_rows_w = (max(1, int(_mrw_hint)) if isinstance(_mrw_hint, int)
+                  else max(1, int(p4["expert_counts"].max().item())))
+    _prep_stamp("static_maps+max_item", rank)
     # Limit the per-expert loop to the tested architecture. Empty physical
     # experts take one fully masked tile, retaining a nonzero loop bound.
     # Preserve the 91ed770 workaround elsewhere, and allow forcing
@@ -3246,6 +3272,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     grad_fc1 = torch.empty(EPR, 2 * ffn, H, dtype=dy.dtype, device=device)
     hidden_buf = torch.empty(
         M + pad_rows_w, H, dtype=dy.dtype, device=device)
+    _prep_stamp("output_allocs", rank)
 
     # P4 prep: cached combine maps + per-GEMM-tile expert/row tables.
     # A3 (910B-class) L0C halves 256KB -> 128KB: a 256x256 accumulator (the
@@ -3493,21 +3520,31 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     # every rank pushes onto its peers, so a rank-local count would skew the
     # symmetric heap (the same discipline as every other slab here).
     if os.environ.get("MOE_MEGA_COMBINE_BUF", "1") == "1":
-        _rows = torch.tensor(
-            [p4["B"] * p4["topk"]], dtype=torch.int64, device=device)
-        # attribution probe (attempt-4 perf anomaly): bracket the per-launch
-        # 1-elem sizing all_reduce — the 5-op baseline backward has no such
-        # collective and a degraded ~730ms/call would exactly explain the
-        # stable +17.5s/iter plateau from iter3 on.
-        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
-            print(f"[mega-ar r{rank} t={time.time():.2f}]", flush=True)
-        dist.all_reduce(_rows, op=dist.ReduceOp.MAX, group=saved["ep_group"])
-        if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
-            print(f"[mega-ar+done r{rank} t={time.time():.2f}]", flush=True)
+        # B*topk is rank-uniform by construction (SPMD shapes are identical),
+        # so the historical cross-rank MAX sizing all_reduce here reduced a
+        # constant to itself — a synchronous collective + .item() round trip
+        # per launch for nothing.  The re-dispatch slab's sizing note is the
+        # precedent ("uniform across ranks by construction, so no all_reduce
+        # is needed to keep the symmetric heap aligned"); MOE_MEGA_AR=1
+        # restores the old form for A/B.
+        if os.environ.get("MOE_MEGA_AR", "0") == "1":
+            _rows = torch.tensor(
+                [p4["B"] * p4["topk"]], dtype=torch.int64, device=device)
+            if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+                print(f"[mega-ar r{rank} t={time.time():.2f}]", flush=True)
+            dist.all_reduce(_rows, op=dist.ReduceOp.MAX,
+                            group=saved["ep_group"])
+            if os.environ.get("MOE_MEGA_HEAP_PROBE") == "1":
+                print(f"[mega-ar+done r{rank} t={time.time():.2f]}",
+                      flush=True)
+            _rows_val = int(_rows.item())
+        else:
+            _rows_val = int(p4["B"]) * int(p4["topk"])
         combine_buf = _ensure_mega_combine_buf(
-            saved, int(_rows.item()) * (H + GATE_PAD))
+            saved, _rows_val * (H + GATE_PAD))
     else:
         combine_buf = peer_mem
+    _prep_stamp("tiles+combine_buf(ar+item)", rank)
 
     # MOE_MEGA_HEAP_PROBE=1: per-launch symmetric-heap audit (host-side
     # pointer arithmetic only, no device sync).  Prints every symmetric
@@ -3541,6 +3578,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     replica_w4 = p4["replica_weight"]
     tile_home_bound4 = tiles["tile_home_bound"]
     home_base4 = int(p4["home_experts"])
+    _prep_stamp("p4_tail", rank)
 
     # P6 prep (grad_reduce): the by-home descriptors/consumed slots/staging
     # exactly as launch_grad_reduce_transport derives them, minus the host
@@ -3681,6 +3719,8 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         rref_rb = torch.zeros(ncore() * 64, dtype=torch.bfloat16,
                               device=device)
         saved["_mega_rref_rb"] = rref_rb
+
+    _prep_stamp("p6_desc+grad_scratch", rank)
 
     # ---- MOE_MEGA_WAIT_DEBUG (2026-09-20): bounded-spin diagnostics ----
     wait_debug = os.environ.get("MOE_MEGA_WAIT_DEBUG", "0") == "1"
@@ -3878,6 +3918,8 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         repref_gate_ready_u64 = repref_down_ready_u64 = \
             signal_mem[:2].view(torch.uint64)
 
+    _prep_stamp("repref_block", rank)
+
     launch_options = (
         {"limit_auto_multi_buffer_of_local_buffer": "no-l0c"}
         if cbm * cbn > 128 * 256 else {}
@@ -4006,6 +4048,7 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
         # DUALVEC variants were convicted by the w2 value oracle (subcore-1
         # remote stores escape barrier_all's fence), the rest never beat the
         # baseline cleanly.
+        _prep_stamp("args_built", rank)
         kernel_moe_backward_mega_recompute[(ncore(), 1, 1)](
             *mega_args, **mega_kwargs,
             redis_src_ptr=redis_src, stride_rm=redis_src.stride(0),

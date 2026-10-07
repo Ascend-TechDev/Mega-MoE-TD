@@ -93,9 +93,20 @@ def _gemm_tile_maps(saved, block_m):
     tiles_per_expert = (counts.to(torch.int64) + block_m - 1) // block_m
     cum_tiles = torch.zeros(epr + 1, dtype=torch.int64, device=device)
     cum_tiles[1:] = tiles_per_expert.cumsum(0)
+    # One host sync for both ints the table needs (tile total + the MoonEP
+    # home/replica range cut) — the arange/repeat bounds and the dict values
+    # all read from it.  The historical form paid four separate drains
+    # (arange's implicit .item, the unbounded repeat_interleave, and two
+    # explicit .item()s).
+    _pair = torch.cat((
+        tiles_per_expert.sum().reshape(1),
+        cum_tiles[home_experts].reshape(1),
+    )).tolist()
+    tiles_total = int(_pair[0])
     tile_expert = torch.repeat_interleave(
-        torch.arange(epr, dtype=torch.int64, device=device), tiles_per_expert)
-    chunk = torch.arange(int(tiles_per_expert.sum()), dtype=torch.int64, device=device) \
+        torch.arange(epr, dtype=torch.int64, device=device), tiles_per_expert,
+        output_size=tiles_total)
+    chunk = torch.arange(tiles_total, dtype=torch.int64, device=device) \
         - cum_tiles[tile_expert]
     row_cum = saved["split_size_cum_per_expert"].to(device).to(torch.int64)
     row0 = row_cum[tile_expert] + chunk * block_m
@@ -105,8 +116,8 @@ def _gemm_tile_maps(saved, block_m):
         tile_expert=tile_expert.to(torch.int32).contiguous(),
         tile_row0=row0.to(torch.int32).contiguous(),
         tile_rows=rows.contiguous(),
-        num_tiles_m=int(tiles_per_expert.sum().item()),
-        tile_home_bound=int(cum_tiles[home_experts].item()),
+        num_tiles_m=tiles_total,
+        tile_home_bound=int(_pair[1]),
     )
     saved[cache_key] = cached
     return cached
@@ -412,18 +423,33 @@ def _combine_static_maps(saved):
     pe = saved["ep_rank"]; W = saved["world_size"]; H = saved["hidden_dim"]
     ep_group = saved["ep_group"]; M = saved["M"]
 
-    send_t = torch.tensor(saved["splits_send_list"], dtype=torch.int64, device=device)
-    all_send = torch.stack(all_gather_list(send_t, ep_group))     # [W,W]: all_send[r][d] = r sends to d
+    # all_send[r][d] = rows r sends to d.  The single-kernel adapter
+    # snapshots the forward's balanced count cube (plan_all_send_counts):
+    # every rank derived the same cube during the metadata phase, so the
+    # [r, d] volumes are a device-side reshape+sum — no torch.tensor H2D, no
+    # all_gather_list collective (and its implicit queue drain).  Saved
+    # contracts without the snapshot keep the gathered form.
+    _plan_all = saved.get("plan_all_send_counts")
+    if _plan_all is not None:
+        all_send = _plan_all.view(W, W, -1).sum(dim=-1)
+    else:
+        send_t = torch.tensor(
+            saved["splits_send_list"], dtype=torch.int64, device=device)
+        all_send = torch.stack(all_gather_list(send_t, ep_group))
     send_cum = torch.zeros_like(all_send)
     send_cum[:, 1:] = all_send[:, :-1].cumsum(dim=1)               # send_cum[d, me] = sum_{s<me} all_send[d, s]
 
     recv_t = torch.tensor(saved["splits_recv_list"], dtype=torch.int64, device=device)
     # write_rank[p] = d for p in dest-d segment  -> repeat_interleave(arange(W), recv_t)
-    write_rank = torch.repeat_interleave(torch.arange(W, dtype=torch.int32, device=device), recv_t)
+    # (output_size=M keeps both repeats pure device ops — the unbounded form
+    # drains the queue to read the counts back for its output shape)
+    write_rank = torch.repeat_interleave(
+        torch.arange(W, dtype=torch.int32, device=device), recv_t, output_size=M)
     # within-segment position of each p
     seg_start = torch.zeros(W, dtype=torch.int64, device=device)
     seg_start[1:] = recv_t[:-1].cumsum(0)
-    within = torch.arange(M, dtype=torch.int64, device=device) - torch.repeat_interleave(seg_start, recv_t)
+    within = torch.arange(M, dtype=torch.int64, device=device) - torch.repeat_interleave(
+        seg_start, recv_t, output_size=M)
     base_per_dest = send_cum[:, pe].to(torch.int64)               # [W]: base offset per dest
     write_off = base_per_dest[write_rank.to(torch.int64)] + within  # [M]
 
@@ -433,17 +459,28 @@ def _combine_static_maps(saved):
 
     # Reindex the push maps to expert-major (src_pos) order so the push kernel
     # can iterate src_pos directly and be range-grouped by expert. inv_local
-    # [out_pos] = src_pos, so its argsort local_sort_idxs[src_pos] = out_pos is
-    # the inverse permutation; gathering write_rank/write_off through it indexes
-    # by src_pos. The (hidden_buf row -> peer_mem slot) store SET is unchanged
-    # -> bit-identical; only the iteration order changes, and each pushed
-    # peer_mem row is disjoint so order is safe.
-    local_sort_idxs = inv_local.argsort()
+    # [out_pos] = src_pos, so its inverse local_sort_idxs[src_pos] = out_pos
+    # gathers write_rank/write_off by src_pos. The single-kernel adapter
+    # already built local_sort_idxs (its scatter-based inverse lives in
+    # saved["inv_local"]) — re-deriving it here used to be an int64 argsort,
+    # which AICPU serves. The (hidden_buf row -> peer_mem slot) store SET is
+    # unchanged -> bit-identical; only the iteration order changes, and each
+    # pushed peer_mem row is disjoint so order is safe.
+    _lsi = saved.get("local_sort_idxs")
+    local_sort_idxs = (
+        _lsi.to(torch.int64).to(device).contiguous()
+        if (_lsi is not None
+            and os.environ.get("MOE_COMBINE_LSI_REUSE", "1") == "1")
+        else inv_local.argsort())
     write_rank_by_src = write_rank[local_sort_idxs].contiguous()
     write_off_by_src = write_off[local_sort_idxs].contiguous()
 
     num_tn = (H + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
-    num_tm = int(saved["num_tiles_total"].item())
+    # host int staged by the single-kernel adapter's packed sync — skips
+    # this .item() drain; other contracts fall back to the tensor read.
+    num_tm_host = saved.get("num_tiles_host")
+    num_tm = (int(num_tm_host) if num_tm_host is not None
+              else int(saved["num_tiles_total"].item()))
     # Stride view accepted as-is: the GEMM addresses the weight table through
     # we/wk/wn, and the native saved hands over gate_up_weight.transpose(1, 2)
     # (materializing it would copy ~4.6 GiB per step).  The replay's

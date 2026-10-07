@@ -210,8 +210,11 @@ def _arrival_to_slot_permutation(receive_counts_by_source_expert, slot_starts):
     total = int(group_sizes.sum().item())
     permutation = torch.empty(total, dtype=torch.int64, device=counts.device)
     if total:
+        # output_size bound keeps the repeat a pure device op — the
+        # unbounded form reads the counts back to the host for its shape.
         group_ids = torch.repeat_interleave(
-            torch.arange(group_sizes.numel(), device=counts.device), group_sizes
+            torch.arange(group_sizes.numel(), device=counts.device),
+            group_sizes, output_size=total,
         )
         group_base = group_sizes.cumsum(dim=0) - group_sizes
         lane_offsets = (

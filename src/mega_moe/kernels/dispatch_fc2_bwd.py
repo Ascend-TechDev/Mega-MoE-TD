@@ -161,10 +161,21 @@ def _dispatch_static_maps_moonep(saved):
     ep_group = saved["ep_group"]
     physical_experts = int(saved["physical_experts_per_rank"])
     send_counts = saved["plan_send_counts_by_rank_expert"].to(device)
-    _local_max = torch.tensor(
-        [int(send_counts.max().item())], dtype=torch.int64, device=device
-    )
-    dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
+    # max_bwd_tiles must be rank-uniform (it sizes the signal-slot stride).
+    # Historically a cross-rank MAX all_reduce of my row — but the
+    # single-kernel adapter snapshots the shared balanced count cube and
+    # packs its max as a host int, so the global max is local.  Legacy
+    # contracts keep the collective.
+    _tiles_hint = saved.get("max_bwd_tiles_hint")
+    if (_tiles_hint is not None
+            and os.environ.get("MOE_MEGA_TILES_HINT", "1") == "1"):
+        _global_max = int(_tiles_hint)
+    else:
+        _local_max = torch.tensor(
+            [int(send_counts.max().item())], dtype=torch.int64, device=device
+        )
+        dist.all_reduce(_local_max, op=dist.ReduceOp.MAX, group=ep_group)
+        _global_max = int(_local_max.item())
     cache = dict(
         M=saved["M"], N=saved["ffn_dim"], K=saved["hidden_dim"], E=physical_experts,
         fc2=saved["fc2"].contiguous(),
@@ -189,7 +200,7 @@ def _dispatch_static_maps_moonep(saved):
         recv_counts_re=(
             saved["plan_recv_counts_by_source_expert"].to(device).contiguous()
         ),
-        max_bwd_tiles=max(1, (int(_local_max.item()) + 63) // 64),
+        max_bwd_tiles=max(1, (_global_max + 63) // 64),
     )
     saved["_dispatch_cache"] = cache
     return cache
