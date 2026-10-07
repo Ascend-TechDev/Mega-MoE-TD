@@ -410,7 +410,8 @@ def enrich_single_kernel_saved(op, saved, *, hidden_states, gate_up_weight,
     sort_idxs = send_route.contiguous()
     inv_sort = perm
     slot_starts = recv_expert_offs[:-1]
-    local_sort_idxs = _arrival_to_slot_permutation(recv_counts64, slot_starts)
+    local_sort_idxs = _arrival_to_slot_permutation(
+        recv_counts64, slot_starts, total=total_recv)
     if os.environ.get("MOE_ENRICH_SCATTER_INV", "1") == "1":
         inv_local = torch.empty_like(local_sort_idxs)
         inv_local[local_sort_idxs] = torch.arange(

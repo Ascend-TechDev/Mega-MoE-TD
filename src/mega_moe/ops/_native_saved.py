@@ -214,7 +214,8 @@ def _snapshot_home_plan_sections(op, plan: MoERoutingPlan) -> dict:
     sort_idxs = send_route_indices.to(torch.int64).clone()
     inv_sort = torch.argsort(sort_idxs.to(torch.float32))
     slot_starts = received_expert_offsets.to(torch.int64)[:-1]
-    local_sort_idxs = _arrival_to_slot_permutation(recv_counts64, slot_starts)
+    local_sort_idxs = _arrival_to_slot_permutation(
+        recv_counts64, slot_starts, total=total_recv)
     inv_local = torch.argsort(local_sort_idxs.to(torch.float32))
 
     return {

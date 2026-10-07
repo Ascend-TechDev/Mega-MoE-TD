@@ -189,7 +189,8 @@ def _dual_table_grouped_matmul(
     return torch.cat((home_part, replica_part), dim=0)
 
 
-def _arrival_to_slot_permutation(receive_counts_by_source_expert, slot_starts):
+def _arrival_to_slot_permutation(receive_counts_by_source_expert, slot_starts,
+                                 *, total=None):
     """Map the source-major arrival buffer onto ``(slot, source)`` row order.
 
     The all-to-all arrival buffer groups rows by source rank and, inside one
@@ -197,6 +198,11 @@ def _arrival_to_slot_permutation(receive_counts_by_source_expert, slot_starts):
     slot with source ranks in increasing order inside each slot.  Both layouts
     move whole ``(source, slot)`` blocks, so the permutation is a block
     reshuffle computed with plain torch ops.
+
+    ``total`` (the row count) may be passed by callers that already hold it
+    as a host int — it is always ``counts.sum()`` (the receive-total
+    invariant the saved contract carries), and deriving it with a .item()
+    here would be an otherwise-unneeded queue drain.
     """
     counts = receive_counts_by_source_expert
     source_totals = counts.sum(dim=1)
@@ -207,7 +213,10 @@ def _arrival_to_slot_permutation(receive_counts_by_source_expert, slot_starts):
     sorted_start = (slot_starts.unsqueeze(0) + within_slot).reshape(-1)
     group_sizes = counts.reshape(-1)
 
-    total = int(group_sizes.sum().item())
+    if total is None:
+        total = int(group_sizes.sum().item())
+    else:
+        total = int(total)
     permutation = torch.empty(total, dtype=torch.int64, device=counts.device)
     if total:
         # output_size bound keeps the repeat a pure device op — the
@@ -331,7 +340,8 @@ def build_physical_saved_from_plan(
         raise ValueError(
             "plan received_expert_offsets disagree with the receive counts"
         )
-    local_sort_idxs = _arrival_to_slot_permutation(recv_counts_snapshot, slot_starts)
+    local_sort_idxs = _arrival_to_slot_permutation(
+        recv_counts_snapshot, slot_starts, total=total_recv)
     inv_local = torch.argsort(local_sort_idxs)
     recv_hidden_sorted = tokens_recv[local_sort_idxs]
     recv_weights_sorted = weights_recv[local_sort_idxs]
