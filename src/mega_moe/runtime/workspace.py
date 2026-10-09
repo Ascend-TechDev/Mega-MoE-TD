@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """ACLSHMEM buffers owned by one standalone Mega-MoE forward instance."""
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -141,7 +142,10 @@ def create_moe_forward_context(
     experts_per_rank = num_experts // world_size
     replica_budget = experts_per_rank if enable_moonep else 0
     physical_experts_per_rank = experts_per_rank + replica_budget
-    max_received_routes = int(max_tokens_per_rank * top_k * receive_capacity_factor)
+    # ceil, not int(): a fractional factor must not shave boundary rows off
+    # the window (the wgrad pad check in mega_bwd treats the window as exact)
+    max_received_routes = math.ceil(
+        max_tokens_per_rank * top_k * receive_capacity_factor)
     # The context is shared by the grouped and fused launches.  Size the
     # readiness table for the finer of their tiles; otherwise selecting a
     # single-kernel tile smaller than the legacy 128-row grouped tile could

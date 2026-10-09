@@ -3165,6 +3165,20 @@ def mega_backward_triton(saved, dy, peer_mem, grad_transport=None,
     )
     # Keep mapped tail rows for masked loads in both loop variants.
     pad_rows_w = max_rows_w
+    # peer_mem is the one buffer this wrapper cannot re-alloc: the wgrad
+    # masked lanes address up to M + pad_rows_w rows, so the window must
+    # cover it.  The MoonEP default cf=2.0 holds by BOUND (receive pinned
+    # at S*topk by the B.0-B.3 planner; max_rows_w <= that receive); an
+    # explicitly pressed smaller factor trips HERE, loudly, instead of
+    # silently overrunning into the next symmetric-heap region.
+    _peer_budget_rows = peer_mem.numel() // H
+    if M + pad_rows_w > _peer_budget_rows:
+        raise ValueError(
+            f"mega backward wgrad pad overruns peer_mem: needs "
+            f"{M} + {pad_rows_w} = {M + pad_rows_w} rows, window has "
+            f"{_peer_budget_rows} — raise ep_plan."
+            "megamoe_receive_capacity_factor (the MoonEP default 2.0 "
+            "covers the bound; smaller explicit values fail here loudly)")
     # attribution probe: right after the .item() device sync — everything
     # queued by this rank's autograd up to here (prev mega kernel, framework
     # dense backward, p1 gather) is now retired; the wall clock it took to

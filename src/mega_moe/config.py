@@ -386,8 +386,23 @@ class MoEForwardConfig:
             )
 
     def resolved_receive_capacity_factor(self, world_size: int) -> float:
-        """Return the configured capacity, or the worst-case-safe default."""
+        """Return the configured capacity, or the safe default.
+
+        Plain-EP default stays ``world_size``: receive is unbalanced and
+        unbounded up to every route in the world.  MoonEP default is the
+        proven tight bound ``2.0``: the B.0-B.3 planner pins every
+        destination's receive to EXACTLY ``S*topk`` rows (destination-
+        capacity assert in moonep_planning.py), and the backward wgrad
+        masked-lane pad ``max_rows_w`` (hottest local expert) can never
+        exceed the rank's own receive — so ``2*S*topk`` rows cover every
+        routing.  An explicit receive_capacity_factor is honored as-is:
+        the staged hosts raise on the metadata (routing.py) and the fused
+        kernel zeroes its waves on ``capacity_ok`` (fused_forward.py),
+        so an undersized window fails LOUDLY, never the silent
+        single-rank-vanish overrun of the H3 era."""
         if self.receive_capacity_factor is None:
+            if self.enable_moonep:
+                return 2.0
             return float(world_size)
         return float(self.receive_capacity_factor)
 
